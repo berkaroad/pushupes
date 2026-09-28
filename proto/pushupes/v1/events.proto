@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package pushupes.v1;
+
+option go_package = "pushupes/internal/grpcapi/pushupes/v1;pushupesv1";
+
+// EventService is the client-facing data plane: event writes and event
+// queries, served on its own port, independent of the HTTP admin/replication
+// plane. Semantics mirror the JSON API (DESIGN.md): command_id idempotency,
+// version = tail+1, reads observe <=HW, MOVED/ASK redirects carry the
+// authoritative slot + node.
+service EventService {
+  // Append appends one record to one aggregate stream.
+  rpc Append(AppendRequest) returns (AppendResponse);
+  // ReadStream reads a version range of one aggregate stream.
+  rpc ReadStream(ReadStreamRequest) returns (ReadStreamResponse);
+  // ReadByCommand looks one record up by command_id (idempotency probe).
+  rpc ReadByCommand(ReadByCommandRequest) returns (ReadByCommandResponse);
+}
+
+message Event {
+  string type = 1;
+  bytes body = 2; // raw payload bytes (no JSON/base64 layering)
+}
+
+// Record is one stored event-stream entry.
+message Record {
+  string aggregate_id = 1;
+  uint64 version = 2;
+  int64 unix_time = 3;
+  string command_id = 4;
+  repeated Event events = 5;
+  uint64 seq = 6; // slot sequence
+}
+
+message AppendRequest {
+  string aggregate_id = 1;
+  uint64 version = 2; // must be stream tail + 1
+  int64 unix_time = 3; // 0 = server clock
+  string command_id = 4; // idempotency key
+  repeated Event events = 5;
+  string acks = 6; // "leader" | "all" | "none"; empty = node default
+}
+
+message AppendResponse {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_SUCCESS = 1;
+    STATUS_EXISTS = 2; // idempotent duplicate; record carries the stored entry
+    STATUS_FAIL = 3;
+  }
+  Status status = 1;
+  uint32 err_id = 2; // wire error table: 1001 conflict, 1003 MOVED, 1004 ASK...
+  string message = 3;
+  uint64 current_version = 4; // set on 1001 for client self-heal
+  uint64 seq = 5;
+  int32 slot = 6; // routing slot (authoritative even on redirects)
+  string node = 7; // redirect target "host:port" for MOVED/ASK/NOT_LEADER
+  Record record = 8; // set on SUCCESS/EXISTS
+}
+
+message ReadStreamRequest {
+  string aggregate_id = 1;
+  uint64 from_version = 2; // 0 = 1
+  uint64 limit = 3; // 0 = all
+}
+
+message ReadStreamResponse {
+  repeated Record records = 1;
+  uint64 next_version = 2;
+  uint64 last_version = 3;
+}
+
+message ReadByCommandRequest {
+  string aggregate_id = 1;
+  string command_id = 2;
+}
+
+message ReadByCommandResponse {
+  bool found = 1;
+  Record record = 2;
+}

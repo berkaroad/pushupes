@@ -1,0 +1,421 @@
+package storage
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"pushupes/internal/data"
+)
+
+// Store owns all local slot WALs and the aggregate->slot routing.
+type Store struct {
+	Dir          string
+	SlotCount    int32
+	SegmentBytes int64
+	FlushPolicy  FlushPolicy
+
+	slots []*Slot
+	mu    sync.RWMutex
+	stop  chan struct{}
+	done  chan struct{}
+
+	// dirtyMu guards the set of slots with unflushed records; flushLoop
+	// consults only this set, so an idle 4096-slot node costs O(active)
+	// lock acquisitions per tick instead of O(4096).
+	dirtyMu sync.Mutex
+	dirty   map[int32]bool
+
+	// per-slot counters of records made durable locally (both client
+	// appends and replica/migration applies); the basis for write-rate
+	// reporting in the admin API.
+	writes []atomic.Uint64
+}
+
+// OpenStore loads every existing slot directory under dir and creates the
+// missing ones lazily on first write. Recovery is parallel: each slot's WAL
+// scan is independent, and with 4096 slots a serial scan would dominate
+// cold start (one disk walk + index rebuild per slot).
+func OpenStore(dir string, slotCount int32, segmentBytes int64, flush FlushPolicy) (*Store, error) {
+	if slotCount <= 0 {
+		slotCount = data.DefaultSlotCount
+	}
+	if segmentBytes <= 0 {
+		segmentBytes = DefaultSegmentBytes
+	}
+	st := &Store{
+		Dir:          dir,
+		SlotCount:    slotCount,
+		SegmentBytes: segmentBytes,
+		FlushPolicy:  flush,
+		slots:        make([]*Slot, slotCount),
+		writes:       make([]atomic.Uint64, slotCount),
+		dirty:        map[int32]bool{},
+		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	// Phase 1: which slot dirs have data? (one readdir, cheap)
+	type task struct {
+		id   int32
+		path string
+	}
+	var tasks []task
+	for i := int32(0); i < slotCount; i++ {
+		path := st.slotDir(i)
+		if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+			if entries, err := os.ReadDir(path); err == nil && len(entries) > 0 {
+				tasks = append(tasks, task{i, path})
+			}
+		}
+	}
+	// Phase 2: open/rebuild them with a bounded worker pool. The first
+	// error wins; callers treat a failed open as fatal startup anyway.
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 4 {
+		workers = 4
+	}
+	var (
+		wg      sync.WaitGroup
+		errOnce sync.Once
+		openErr error
+	)
+	ch := make(chan task)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for t := range ch {
+				slot, err := OpenSlot(t.path, t.id, segmentBytes, flush)
+				if err != nil {
+					errOnce.Do(func() { openErr = err })
+					continue
+				}
+				st.mu.Lock()
+				st.slots[t.id] = slot
+				st.mu.Unlock()
+			}
+		}()
+	}
+	for _, t := range tasks {
+		ch <- t
+	}
+	close(ch)
+	wg.Wait()
+	if openErr != nil {
+		return nil, openErr
+	}
+	go st.flushLoop()
+	return st, nil
+}
+
+func (st *Store) slotDir(slot int32) string {
+	return filepath.Join(st.Dir, fmt.Sprintf("slot-%03d", slot))
+}
+
+// SlotDir exposes a slot's WAL directory.
+func (st *Store) SlotDir(slot int32) string { return st.slotDir(slot) }
+
+// DropSlot closes and removes a slot's WAL (post-migration cleanup).
+func (st *Store) DropSlot(slotID int32) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if slotID < 0 || slotID >= st.SlotCount {
+		return fmt.Errorf("slot %d out of range", slotID)
+	}
+	if s := st.slots[slotID]; s != nil {
+		s.Close()
+		st.slots[slotID] = nil
+	}
+	st.clearDirty(slotID)
+	return os.RemoveAll(st.slotDir(slotID))
+}
+
+// ReloadSlot reopens a slot from disk (after migration segments were pushed
+// into its directory).
+func (st *Store) ReloadSlot(slotID int32) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if slotID < 0 || slotID >= st.SlotCount {
+		return fmt.Errorf("slot %d out of range", slotID)
+	}
+	if s := st.slots[slotID]; s != nil {
+		s.Close()
+	}
+	slot, err := OpenSlot(st.slotDir(slotID), slotID, st.SegmentBytes, st.FlushPolicy)
+	if err != nil {
+		return err
+	}
+	st.slots[slotID] = slot
+	return nil
+}
+
+// SlotOf routes an aggregate ID to its slot.
+func (st *Store) SlotOf(aggregateID string) int32 {
+	return data.SlotOf(aggregateID, int(st.SlotCount))
+}
+
+// Slot returns slot i, creating its WAL lazily.
+func (st *Store) Slot(i int32) (*Slot, error) {
+	if i < 0 || i >= st.SlotCount {
+		return nil, fmt.Errorf("slot %d out of range [0,%d)", i, st.SlotCount)
+	}
+	st.mu.RLock()
+	s := st.slots[i]
+	st.mu.RUnlock()
+	if s != nil {
+		return s, nil
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.slots[i] == nil {
+		slot, err := OpenSlot(st.slotDir(i), i, st.SegmentBytes, st.FlushPolicy)
+		if err != nil {
+			return nil, err
+		}
+		st.slots[i] = slot
+	}
+	return st.slots[i], nil
+}
+
+// Append routes by aggregate_id and applies the business rules.
+func (st *Store) Append(rec *data.EventRecord) (*AppendOutcome, error) {
+	slotID := st.SlotOf(rec.AggregateID)
+	slot, err := st.Slot(slotID)
+	if err != nil {
+		return nil, err
+	}
+	out, err := slot.Append(rec)
+	if err == nil && out.Status == data.StatusSuccess {
+		st.writes[slotID].Add(1)
+		st.markDirty(slotID)
+	}
+	return out, err
+}
+
+// AppendAtSeq writes a leader-assigned record into a specific slot (replica
+// and migration catch-up path).
+func (st *Store) AppendAtSeq(slotID int32, seq uint64, rec *data.EventRecord) error {
+	slot, err := st.Slot(slotID)
+	if err != nil {
+		return err
+	}
+	newly, err := slot.appendAtSeq(seq, rec)
+	if err != nil {
+		return err
+	}
+	if newly {
+		st.writes[slotID].Add(1)
+		st.markDirty(slotID)
+	}
+	return nil
+}
+
+// markDirty registers a slot as holding unflushed records (flushLoop only
+// visits these; the set is emptied once FlushDue reports nothing pending).
+func (st *Store) markDirty(slotID int32) {
+	st.dirtyMu.Lock()
+	st.dirty[slotID] = true
+	st.dirtyMu.Unlock()
+}
+
+func (st *Store) clearDirty(slotID int32) {
+	st.dirtyMu.Lock()
+	delete(st.dirty, slotID)
+	st.dirtyMu.Unlock()
+}
+
+// WriteCount returns the number of records made durable in one slot since
+// the process started.
+func (st *Store) WriteCount(slotID int32) uint64 {
+	if slotID < 0 || int(slotID) >= len(st.writes) {
+		return 0
+	}
+	return st.writes[slotID].Load()
+}
+
+// WriteCounts snapshots the per-slot durable write counters.
+func (st *Store) WriteCounts() []uint64 {
+	out := make([]uint64, len(st.writes))
+	for i := range st.writes {
+		out[i] = st.writes[i].Load()
+	}
+	return out
+}
+
+// ReadAggregate reads up to limit records of one aggregate from a version,
+// capped at uptoSeq (0 = LEO). Returns records, their seqs, and the next
+// version to read.
+func (st *Store) ReadAggregate(aggregateID string, fromVersion, limit, uptoSeq uint64) ([]*data.EventRecord, []uint64, error) {
+	slot, err := st.Slot(st.SlotOf(aggregateID))
+	if err != nil {
+		return nil, nil, err
+	}
+	recs, seqs, err := slot.AggregateVersion(aggregateID, fromVersion, limit, uptoSeq)
+	return recs, seqs, err
+}
+
+// RecordByCommand looks a record up by idempotency key (within its slot).
+func (st *Store) RecordByCommand(aggregateID, commandID string) (*data.EventRecord, uint64, error) {
+	slot, err := st.Slot(st.SlotOf(aggregateID))
+	if err != nil {
+		return nil, 0, err
+	}
+	return slot.RecordByCommand(commandID)
+}
+
+// LastSeq returns the durable LEO for one slot (0 when the slot is unknown).
+func (st *Store) LastSeqOf(slotID int32) uint64 {
+	s, err := st.Slot(slotID)
+	if err != nil {
+		return 0
+	}
+	return s.LastSeq()
+}
+
+// WakeChan returns the current wake handle for one slot: it closes on the
+// next LEO advance (any append or replica apply). Take it *after* your last
+// read of the slot — advances from then on are caught either by a re-read or
+// by the handle firing. Used by the multi-fetch long-poll, which selects
+// across every requested slot's handle (a sync.Cond cannot be selected on).
+func (st *Store) WakeChan(slotID int32) <-chan struct{} {
+	s, err := st.Slot(slotID)
+	if err != nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.wake
+}
+
+// WaitForSeq blocks on one slot until its LEO reaches wantSeq or the
+// deadline passes (single-slot long-poll helper, kept for tests).
+func (st *Store) WaitForSeq(slotID int32, wantSeq uint64, deadline time.Time) uint64 {
+	s, err := st.Slot(slotID)
+	if err != nil {
+		return 0
+	}
+	return s.WaitForSeq(wantSeq, deadline)
+}
+
+// ReadSlotBytes returns the record byte ranges for fromSeq <= seq < untilSeq
+// (untilSeq 0 = LEO+1) capped at maxBytes, plus the concatenated payload.
+// This is the unit of work for replica fetch and migration catch-up. Payload
+// bytes are read through the segment's already-open handle (one preallocated
+// buffer, size-to-fit ranges) — reopening each segment file per range showed
+// up as epoll/read syscall pressure on the leader under fetch fan-out.
+func (st *Store) ReadSlotBytes(slotID int32, fromSeq, untilSeq uint64, maxBytes int64) ([]data.ByteRange, uint64, []byte, error) {
+	slot, err := st.Slot(slotID)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	ranges, next, err := slot.ReadRange(fromSeq, untilSeq, maxBytes)
+	if err != nil {
+		return ranges, next, nil, err
+	}
+	var payload []byte
+	if len(ranges) > 0 {
+		var total int64
+		for _, r := range ranges {
+			total += r.End - r.Start
+		}
+		payload = make([]byte, total)
+		rest := payload
+		var buf []byte
+		for _, r := range ranges {
+			n := r.End - r.Start
+			if int64(len(buf)) < n {
+				buf = make([]byte, n)
+			}
+			if err := st.slotReadRange(slot, r, buf[:n]); err != nil {
+				return ranges, next, nil, err
+			}
+			copy(rest, buf[:n])
+			rest = rest[n:]
+		}
+	}
+	return ranges, next, payload, nil
+}
+
+// slotReadRange reads [Start,End) of one ByteRange through the open segment
+// handle whose base seq covers r. Falls back to reading the file by name if
+// the in-memory segment list is behind (should not happen: ReadRange and the
+// payload read run under the same slot RLock via Slot.SegmentFile).
+func (st *Store) slotReadRange(slot *Slot, r data.ByteRange, buf []byte) error {
+	seg := slot.SegmentFile(r.Segment)
+	if seg == nil {
+		b, err := os.ReadFile(filepath.Join(slot.Dir, r.Segment))
+		if err != nil {
+			return err
+		}
+		copy(buf, b[r.Start:r.End])
+		return nil
+	}
+	_, err := seg.File.ReadAt(buf, r.Start)
+	return err
+}
+
+// Flush flushes every loaded slot.
+func (st *Store) Flush() error {
+	st.mu.RLock()
+	slots := make([]*Slot, 0, len(st.slots))
+	for _, s := range st.slots {
+		if s != nil {
+			slots = append(slots, s)
+		}
+	}
+	st.mu.RUnlock()
+	for _, s := range slots {
+		if err := s.Flush(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (st *Store) flushLoop() {
+	defer close(st.done)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-st.stop:
+			return
+		case now := <-ticker.C:
+			st.dirtyMu.Lock()
+			ids := make([]int32, 0, len(st.dirty))
+			for id := range st.dirty {
+				ids = append(ids, id)
+			}
+			st.dirtyMu.Unlock()
+			for _, id := range ids {
+				st.mu.RLock()
+				s := st.slots[id]
+				st.mu.RUnlock()
+				if s == nil {
+					st.clearDirty(id)
+					continue
+				}
+				if _, pending := s.FlushDue(now); !pending && !s.HasPending() {
+					// double-check closes the window where a concurrent append
+					// marked the slot dirty during FlushDue; at worst one
+					// policy cycle slips (Close full-flushes on shutdown).
+					st.clearDirty(id)
+				}
+			}
+		}
+	}
+}
+
+// Close stops the flush loop and flushes everything.
+func (st *Store) Close() error {
+	close(st.stop)
+	<-st.done
+	return st.Flush()
+}
