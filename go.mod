@@ -7,9 +7,9 @@ require (
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	github.com/sirupsen/logrus v1.9.3
-	golang.org/x/sys v0.20.0
-	google.golang.org/grpc v1.65.0
-	google.golang.org/protobuf v1.34.2
+	golang.org/x/sys v0.47.0
+	google.golang.org/grpc v1.84.0
+	google.golang.org/protobuf v1.36.11
 )
 
 require (
@@ -23,7 +23,7 @@ require (
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect
 	go.etcd.io/bbolt v1.3.5 // indirect
-	golang.org/x/net v0.25.0 // indirect
-	golang.org/x/text v0.15.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20240528184218-531527333157 // indirect
+	golang.org/x/net v0.57.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
 )

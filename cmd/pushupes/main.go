@@ -46,6 +46,12 @@ func main() {
 	)
 	flag.Parse()
 
+	// gRPC's stock buffer pool zeroes every buffer it hands out and its size
+	// classes are too sparse for event payloads (a 100KiB message would take a
+	// 1MiB buffer and pay a 1MiB memclr). Install ours before anything creates
+	// a client or server — gRPC requires the setter to run at init time.
+	grpcapi.InstallPayloadBufferPool()
+
 	base := logrus.New()
 	base.SetLevel(logrus.InfoLevel)
 	logger := logrus.NewEntry(base).WithField("node", *nodeID)
