@@ -108,7 +108,14 @@ Body: Record*，每条记录：
     空闲轮零额外往返。
   - follower 追加到自己 WAL 后回报 LEO（批量 `replica-progress`）；
     leader 推进 **HW**（高水位 = ISR 内最小 LEO）。leader 端有全局
-    payload 预算 + 轮转游标，防积压槽饿死。
+    payload 预算 + 轮转游标，防积压槽饿死。应答语义对齐 Kafka fetch：
+    **请求到达即有货的槽立即随响应返回（有货即答，不长轮询滞留）**，
+    全空才 park 进长轮询；park 后任一槽被 append 唤醒时做 **burst
+    drain**——短暂合并窗口内扫全部 waiter，一次响应带走本轮所有有货
+    的槽（否则每个槽各付一个 RTT，HW 才能推进，`acks=all` 的写延迟
+    直接乘以槽数）。预算耗尽但有货的槽不 park（新句柄等不到"未来"的
+    append，会空睡到 deadline），交给下一轮轮转游标。follower 侧健康
+    轮（有数据或被长轮询吸收的空轮）零退避立即重发，仅传输错误退避。
   - `acks=all`：leader 等 `seq ≤ HW` 再回 success；`acks=leader`：本地追加
     成功即返回；`acks=none`：不等响应。
   - ISR 维护同 Kafka：follower 在 `replica.lag.time.max` 内跟上进 ISR；

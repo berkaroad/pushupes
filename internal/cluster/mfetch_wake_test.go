@@ -1,13 +1,20 @@
 package cluster
 
 import (
-	"strconv"
 	"testing"
 	"time"
 
-	"pushupes/internal/data"
 	"pushupes/internal/storage"
 )
+
+// appendOne routes one record (via the package's makeRecord/aggInSlot test
+// helpers) into store and fails the test on error.
+func appendOne(t *testing.T, store *storage.Store, agg, cmd string) {
+	t.Helper()
+	if _, err := store.Append(makeRecord(agg, 1, cmd)); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // TestMFetchLongPollWakesOnAppend pins the leader-side long-poll contract:
 // a round with WaitMS must return well before the wait deadline once a
@@ -29,6 +36,7 @@ func TestMFetchLongPollWakesOnAppend(t *testing.T) {
 
 	const wait = 2 * time.Second
 	done := make(chan *MFetchResponse, 1)
+	start := time.Now()
 	go func() {
 		resp, err := e.HandleMFetch(MFetchRequest{
 			Follower: "node-2",
@@ -42,30 +50,81 @@ func TestMFetchLongPollWakesOnAppend(t *testing.T) {
 	}()
 
 	time.Sleep(150 * time.Millisecond)
-	// route the record INTO slot 3 (CRC16(agg)%8 == 3): the wake handle is
-	// per-slot, a record landing elsewhere must not (and will not) wake it.
-	agg := ""
-	for i := 0; i < 100000 && agg == ""; i++ {
-		c := "wake-agg-" + strconv.Itoa(i)
-		if store.SlotOf(c) == 3 {
-			agg = c
+	// The wake handle is per-slot: route the record INTO slot 3, a record
+	// landing elsewhere must not (and will not) wake it.
+	agg := aggInSlot(t, e, 3)
+	appendOne(t, store, agg, "wake-cmd")
+
+	select {
+	case resp := <-done:
+		if el := time.Since(start); el > wait/2 {
+			t.Fatalf("long-poll ignored the append wake: waited %v (deadline %v)", el, wait)
 		}
+		if resp == nil || len(resp.Items[0].Payload) == 0 {
+			t.Fatalf("wake round returned no payload: %+v", resp)
+		}
+	case <-time.After(wait + 2*time.Second):
+		t.Fatal("round never returned")
 	}
-	if agg == "" {
-		t.Fatal("no agg routed to slot 3")
-	}
-	rec := &data.EventRecord{AggregateID: agg, Version: 1, UnixTime: time.Now().Unix(), CommandID: "wake-cmd",
-		Events: []data.Event{{Type: "T", Body: []byte(`{}`)}}}
-	if _, err := store.Append(rec); err != nil {
+}
+
+// TestMFetchBurstDrainAllWaiters pins the per-slot incremental contract:
+// when all polled slots are empty (everything parks) and a wake burst
+// then touches several of them, ONE long-poll response must carry data
+// for every slot the burst advanced — the old behavior answered for the
+// first fired slot only and made the follower pay one round trip per
+// remaining slot (RTT x slots of HW lag under acks=all). Note this is
+// the idle→burst path: with data present at request time phase 1 answers
+// immediately (Kafka fetch semantics), so no waiters park at all.
+func TestMFetchBurstDrainAllWaiters(t *testing.T) {
+	dir := t.TempDir()
+	store, err := storage.OpenStore(dir, 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
+	if err != nil {
 		t.Fatal(err)
+	}
+	defer store.Close()
+
+	e := NewEngine(nil, store, "node-1", "leader", nil)
+	e.tableMu.Lock()
+	for s := range 8 {
+		e.table.Slots[int32(s)] = &Placement{Leader: "node-1", Replicas: []string{"node-1", "node-2"}, Epoch: 1, State: SlotStable}
+	}
+	e.tableMu.Unlock()
+
+	const wait = 2 * time.Second
+	items := []FetchItem{{Slot: 1, FromSeq: 1}, {Slot: 3, FromSeq: 1}, {Slot: 6, FromSeq: 1}}
+	done := make(chan *MFetchResponse, 1)
+	go func() {
+		resp, err := e.HandleMFetch(MFetchRequest{Follower: "node-2", WaitMS: wait.Milliseconds(), Items: items})
+		if err != nil {
+			t.Errorf("handle: %v", err)
+		}
+		done <- resp
+	}()
+
+	time.Sleep(150 * time.Millisecond) // all three slots now park as waiters
+	// Burst: append into ALL three parked slots back-to-back. The first
+	// close wakes the poll; the settle window lets the rest land before
+	// the sweep, so one response drains them all.
+	for _, want := range []int32{1, 3, 6} {
+		appendOne(t, store, aggInSlot(t, e, want), "burst-cmd")
 	}
 
 	select {
 	case resp := <-done:
-		if resp == nil || len(resp.Items) == 0 || len(resp.Items[0].Payload) == 0 {
-			t.Fatalf("wake round returned no payload: %+v", resp)
+		if resp == nil {
+			t.Fatal("nil response")
 		}
-	case <-time.After(wait + time.Second):
-		t.Fatalf("long-poll did not wake on append within %v: wake handle broken", wait)
+		got := map[int32]bool{}
+		for _, it := range resp.Items {
+			if len(it.Payload) > 0 {
+				got[it.Slot] = true
+			}
+		}
+		if len(got) < 2 {
+			t.Fatalf("burst drain regressed: one wake must answer for every ready slot (got=%v)", got)
+		}
+	case <-time.After(wait + 2*time.Second):
+		t.Fatal("no response at all")
 	}
 }

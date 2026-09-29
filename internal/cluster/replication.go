@@ -85,10 +85,11 @@ type fetchSession struct {
 const (
 	fetchBaseInterval = 100 * time.Millisecond
 	fetchMaxBackoff   = 2 * time.Second
-	fetchWait         = 2 * time.Second  // follower-requested long-poll budget
-	fetchSlack        = 1 * time.Second  // client-side timeout margin
-	fetchMaxWait      = 5 * time.Second  // leader-side cap on a requested wait
-	isrStaleAfter     = 10 * time.Second // must exceed fetchWait+fetchMaxBackoff
+	fetchWait         = 2 * time.Second      // follower-requested long-poll budget
+	fetchSlack        = 1 * time.Second      // client-side timeout margin
+	fetchMaxWait      = 5 * time.Second      // leader-side cap on a requested wait
+	fetchBurstSettle  = 2 * time.Millisecond // coalescing window after one waiter wakes
+	isrStaleAfter     = 10 * time.Second     // must exceed fetchWait+fetchMaxBackoff
 
 	// maxPayloadBytes caps one long-poll response: during a backlog the
 	// session streams item by item across rounds instead of building a
@@ -548,6 +549,11 @@ type MFetchResponse struct {
 // Slots this node does not lead are answered empty (failover is in flight);
 // the session retries and the table will reassign them.
 func (e *Engine) HandleMFetch(req MFetchRequest) (*MFetchResponse, error) {
+	t0 := time.Now()
+	defer func() {
+		e.logger.WithFields(logrus.Fields{"self": e.self, "follower": req.Follower, "items": len(req.Items),
+			"ms": time.Since(t0).Milliseconds()}).Debug("mfetch round")
+	}()
 	if len(req.Items) > 8192 {
 		return nil, fmt.Errorf("mfetch: %d items exceeds cap", len(req.Items))
 	}
@@ -560,6 +566,8 @@ func (e *Engine) HandleMFetch(req MFetchRequest) (*MFetchResponse, error) {
 	}
 	out := &MFetchResponse{Follower: req.Follower, Items: make([]FetchItem, len(req.Items))}
 	var waiters []pending
+	starved := false
+	served := false // phase 1 found fetchable data for at least one slot
 	budget := int64(maxPayloadBytes)
 	rot := int(e.fetchRot.Add(1)) % max(1, len(req.Items))
 	order := make([]int, len(req.Items))
@@ -570,11 +578,21 @@ func (e *Engine) HandleMFetch(req MFetchRequest) (*MFetchResponse, error) {
 		it := req.Items[i]
 		out.Items[i] = FetchItem{Slot: it.Slot, FromSeq: it.FromSeq}
 		if budget <= 0 {
-			// out of budget: no data this round; waiter registered below so
-			// the long-poll still picks this slot up when others advance.
+			// out of budget: no data this round. If the slot HAS pending
+			// data, do NOT park a fresh wake handle — the data landed
+			// before this point, so a clean handle would only fire on the
+			// NEXT append and the slot would idle until the wait deadline
+			// (that stall, not the wake path, was the acks=all p99=fetchWait
+			// tail). The rotating cursor serves it next round; marking
+			// starved makes the response return now instead. If the slot
+			// is truly empty, park so future appends still wake the poll.
 			if req.WaitMS > 0 {
 				if p, ok := e.tableLeaderSlot(it.Slot); ok && p.Leader == e.self {
-					waiters = append(waiters, pending{i, e.store.WakeChan(it.Slot)})
+					if e.store.LastSeqOf(it.Slot) >= it.FromSeq {
+						starved = true
+					} else {
+						waiters = append(waiters, pending{i, e.store.WakeChan(it.Slot)})
+					}
 				}
 			}
 			continue
@@ -606,11 +624,14 @@ func (e *Engine) HandleMFetch(req MFetchRequest) (*MFetchResponse, error) {
 		out.Items[i].Payload = payload
 		out.Items[i].LeaderLEO = e.store.LastSeqOf(it.Slot)
 		out.Items[i].LeaderHW = e.HW(it.Slot)
+		if len(payload) > 0 {
+			served = true
+		}
 		if len(payload) == 0 && wake != nil {
 			waiters = append(waiters, pending{i, wake})
 		}
 	}
-	if len(waiters) > 0 && req.WaitMS > 0 {
+	if len(waiters) > 0 && req.WaitMS > 0 && !starved && !served {
 		wait := time.Duration(req.WaitMS) * time.Millisecond
 		if wait > fetchMaxWait {
 			wait = fetchMaxWait
@@ -627,23 +648,47 @@ func (e *Engine) HandleMFetch(req MFetchRequest) (*MFetchResponse, error) {
 			if chosen == 0 {
 				break waitLoop // deadline: answer with whatever phase 1 found
 			}
-			w := &waiters[chosen-1]
-			it := req.Items[w.idx]
-			// Re-arm BEFORE re-reading: an advance that lands during the
-			// read closes the fresh handle, so the next select iteration
-			// (or this read) catches it — no lost-wakeup window.
-			w.wake = e.store.WakeChan(it.Slot)
-			_, next, payload, err := e.store.ReadSlotBytes(it.Slot, it.FromSeq, 0, min(int64(4<<20), max(budget, 1<<10)))
-			budget -= int64(len(payload))
-			if err != nil {
-				return nil, err
-			}
-			if len(payload) > 0 {
+			// Burst drain with a coalescing window: one wake event answers
+			// for EVERY slot that has data, not just the one that fired.
+			// A write burst scatters across slots; answering one slot per
+			// round would cost the follower one RTT per remaining slot
+			// before HW can advance (acks=all pays this on every write).
+			// The short settle lets sibling appends of the same burst land
+			// before we sweep — without it the sweep races the burst and
+			// captures only the first slot. 2ms against a multi-second
+			// fetch cadence is negligible.
+			time.Sleep(fetchBurstSettle)
+			anyData := false
+			for i := range waiters {
+				w := &waiters[i]
+				it := req.Items[w.idx]
+				select {
+				case <-w.wake:
+					// New appends since it parked: re-arm BEFORE re-reading
+					// (no-lost-wake discipline) and drain the slot.
+					w.wake = e.store.WakeChan(it.Slot)
+				default:
+					continue // no wake: stays parked for the next select round
+				}
+				if budget <= 0 {
+					continue // out of budget: ride the next round
+				}
+				_, next, payload, err := e.store.ReadSlotBytes(it.Slot, it.FromSeq, 0, min(int64(4<<20), budget))
+				if err != nil {
+					return nil, err
+				}
+				budget -= int64(len(payload))
+				if len(payload) == 0 {
+					continue // woke without fetchable data (e.g. client stream consumer)
+				}
 				out.Items[w.idx].NextSeq = next
 				out.Items[w.idx].Payload = payload
 				out.Items[w.idx].LeaderLEO = e.store.LastSeqOf(it.Slot)
 				out.Items[w.idx].LeaderHW = e.HW(it.Slot)
-				break waitLoop // answer now; other slots ride the next round
+				anyData = true
+			}
+			if anyData {
+				break waitLoop // answer with the whole burst
 			}
 		}
 	}
@@ -759,8 +804,15 @@ func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
 			backoff = fetchBaseInterval
 			continue
 		}
-		productive, err := e.fetchRound(ctx, sess.leader, slots)
-		if err != nil || !productive {
+		_, err := e.fetchRound(ctx, sess.leader, slots)
+		if err != nil {
+			e.logger.WithField("leader", sess.leader).WithError(err).Warn("fetch round failed")
+			// Transport/leader trouble: back off so a dead leader does not
+			// spin. An *empty* round is NOT backed off — the long-poll made
+			// it zero-CPU, and sleeping between rounds is exactly what
+			// stalled records past the wait deadline (acks=all p90 =
+			// fetchWait tail): a record landing in the backoff window rode
+			// no wake until the next round started.
 			if backoff == 0 {
 				backoff = fetchBaseInterval
 			} else {
@@ -769,12 +821,9 @@ func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
 			if backoff > fetchMaxBackoff {
 				backoff = fetchMaxBackoff
 			}
-		} else {
-			// A productive round means the leader had backlog: keep the
-			// pipeline saturated (no sleep). Idle supply is absorbed by
-			// the round's long-poll itself, so 0-backoff cannot busy-loop.
-			backoff = 0
+			continue
 		}
+		backoff = 0 // healthy round (data or absorbed-idle): re-park at once
 	}
 }
 
