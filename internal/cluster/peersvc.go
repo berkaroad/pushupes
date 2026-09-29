@@ -33,13 +33,14 @@ const (
 	// with an RPC version byte (0), so the classification never collides.
 	grpcMagicByte = byte('P')
 
-	peerRPCTimeout  = 30 * time.Second // segments push streams whole files
+	peerRPCTimeout  = 30 * time.Second
 	peerPingTimeout = 2 * time.Second
 
-	// peerMaxMsgBytes bounds gRPC messages on the peer plane: a migration
-	// snapshot may carry multiple sealed segments (256MiB each) in one
-	// PushSegments call.
-	peerMaxMsgBytes = 600 << 20
+	// peerMaxMsgBytes bounds gRPC messages on the peer plane. Snapshot
+	// segments stream in <=4MiB chunks and fetch rounds cap at
+	// maxPayloadBytes (32MiB), so a 64MiB ceiling covers every message
+	// with headroom while keeping a malicious peer from pinning memory.
+	peerMaxMsgBytes = 64 << 20
 )
 
 // peerServer adapts Engine onto pushupesv1.PeerServiceServer. The adapter
@@ -96,15 +97,11 @@ func (s *peerServer) SlotLeo(_ context.Context, req *pushupesv1.SlotLeoRequest) 
 	return &pushupesv1.SlotLeoResponse{Leo: s.e.HandleLEO(req.Slot)}, nil
 }
 
-func (s *peerServer) PushSegments(_ context.Context, req *pushupesv1.PushSegmentsRequest) (*pushupesv1.PushSegmentsResponse, error) {
-	internal := PushSegmentsRequest{Slot: req.Slot}
-	for _, sg := range req.Segments {
-		internal.Segments = append(internal.Segments, SegmentFile{Name: sg.Name, Payload: sg.Payload})
+func (s *peerServer) PushSegments(stream pushupesv1.PeerService_PushSegmentsServer) error {
+	if err := s.e.writeSegments(stream); err != nil {
+		return err
 	}
-	if err := s.e.HandlePushSegments(internal); err != nil {
-		return nil, err
-	}
-	return &pushupesv1.PushSegmentsResponse{}, nil
+	return stream.SendAndClose(&pushupesv1.PushSegmentsResponse{})
 }
 
 func (s *peerServer) TriggerSnapshot(ctx context.Context, req *pushupesv1.TriggerSnapshotRequest) (*pushupesv1.TriggerSnapshotResponse, error) {
@@ -259,17 +256,14 @@ func (e *Engine) peerLeo(ctx context.Context, addr string, slot int32) (uint64, 
 	return resp.Leo, nil
 }
 
-func (e *Engine) peerPushSegments(ctx context.Context, addr string, req PushSegmentsRequest) error {
+// peerOpenPush starts a PushSegments client stream to addr. The caller
+// sends the bounded chunks and closes with CloseAndRecv.
+func (e *Engine) peerOpenPush(ctx context.Context, addr string) (pushupesv1.PeerService_PushSegmentsClient, error) {
 	c, err := e.peerRPC(addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	ps := make([]*pushupesv1.SegmentFile, 0, len(req.Segments))
-	for _, sg := range req.Segments {
-		ps = append(ps, &pushupesv1.SegmentFile{Name: sg.Name, Payload: sg.Payload})
-	}
-	_, err = c.PushSegments(ctx, &pushupesv1.PushSegmentsRequest{Slot: req.Slot, Segments: ps})
-	return err
+	return c.PushSegments(ctx)
 }
 
 func (e *Engine) peerTriggerSnapshot(ctx context.Context, addr string, slot int32, toNode string) error {

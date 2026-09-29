@@ -142,8 +142,9 @@ Body: Record*，每条记录：
 1. **准备**：controller 经 Raft 把 `slot → T` 写入 T 分配表（state=importing），
    S 置 state=migrating。
 2. **快照拷贝**：S 上该槽所有**已封段**（非活动段）经 `PeerService.PushSegments`
-   整文件 gRPC 流式拷到 T（`FetchItem`/`SegmentFile.payload` 为原始 bytes，
-   无 base64/JSON 层；T 校验每段 header 的 magic/slotID/baseSeq）。
+   **client-streaming 分块**（≤4MiB/块）流式拷到 T，两端内存占用为 O(块)
+   而非 O(槽)；payload 为原始 WAL 字节，无 base64/JSON 层；T 从流的前 20
+   字节装配并校验每段 header 的 magic/slotID/baseSeq 后才落盘（写 .tmp 再改名）。
 3. **增量追平**：T 从 `lastCopiedSeq+1` 起用与复制相同的 PeerService.MFetch
    协议向 S 拉增量记录；迁移协调者轮询双端 LEO（`PeerService.SlotLeo`）直到
    `T.leo >= S.leo`（超时 30s 回滚）。期间写请求仍由 S 正常处理。
@@ -196,7 +197,7 @@ gRPC  PeerService/MFetch          副本拉取（长轮询，多槽复用，payl
 gRPC  PeerService/ReplicaProgress 副本 LEO 上报（批量）
 gRPC  PeerService/Replicate       迁移写转发（同 seq 落盘）
 gRPC  PeerService/SlotLeo         查询节点某槽 LEO（迁移追平判定，见 §5 步骤3+4）
-gRPC  PeerService/PushSegments    迁移段拷贝（整段文件，原始 bytes）
+gRPC  PeerService/PushSegments    迁移段拷贝（client-streaming，≤4MiB 分块，原始 bytes）
 gRPC  PeerService/TriggerSnapshot 迁移快照（源端向目标推封段）
 gRPC  PeerService/Ping            探活（controller 故障切换）
 gRPC  PeerService/Register        数据面地址自报（OpRegister 提交/转发）
@@ -217,7 +218,7 @@ GET  /healthz
 - **顺序追加 + 页缓存**：写路径 = memcpy 进段缓冲 + write()；fsync 交给
   flush 策略/acks 语义，组提交合并（dirty 集合定向刷盘，不遍历全槽）。
 - **二进制协议面**：节点间流量全部 PeerService gRPC（protobuf 二进制帧，
-  `FetchItem.payload`/`SegmentFile.payload` 为裸 WAL 字节区间，不经
+  `FetchItem.payload`/`PushSegmentsChunk.data` 为裸 WAL 字节区间，不经
   base64/重编码）；客户端事件面 gRPC protobuf，body 原始 bytes。
   路由表快照同为二进制编码（字符串字典 + varint + gzip）。
   **sendfile 零拷贝已实测否决**：payload ~40-64KiB、需用户态解码过滤、

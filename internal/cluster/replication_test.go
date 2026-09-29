@@ -3,12 +3,15 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"pushupes/internal/data"
+	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
 	"pushupes/internal/storage"
 )
 
@@ -232,15 +235,25 @@ func TestSubmitAppendMigratingRedirectsToSource(t *testing.T) {
 
 // ---- migration abort path ---------------------------------------------------
 
-func TestHandlePushSegmentsRejectsCorrupt(t *testing.T) {
+// fakeChunks plays back a chunk list through the chunkSource interface.
+type fakeChunks struct {
+	chunks []*pushupesv1.PushSegmentsChunk
+	i      int
+}
+
+func (f *fakeChunks) Recv() (*pushupesv1.PushSegmentsChunk, error) {
+	if f.i >= len(f.chunks) {
+		return nil, io.EOF
+	}
+	c := f.chunks[f.i]
+	f.i++
+	return c, nil
+}
+
+func TestWriteSegmentsRejectsCorrupt(t *testing.T) {
 	e, _ := newTestEngine(t, "node-2")
-	// header claims slot 5 but request says slot 0
-	hdr := make([]byte, storage.WALHeaderLen)
-	copy(hdr, []byte("ESWL"))
-	slotIn := int32(5)
-	// rebuild a valid header via CreateSegment on a scratch dir instead of
-	// hand-rolling bytes: simpler to let storage produce it.
-	seg, err := storage.CreateSegment(t.TempDir(), slotIn, 1)
+	// header claims slot 5 but the stream says slot 0
+	seg, err := storage.CreateSegment(t.TempDir(), 5, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,14 +263,82 @@ func TestHandlePushSegmentsRejectsCorrupt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = e.HandlePushSegments(PushSegmentsRequest{Slot: 0, Segments: []SegmentFile{{Name: "x.wal", Payload: raw}}})
+	err = e.writeSegments(&fakeChunks{chunks: []*pushupesv1.PushSegmentsChunk{
+		{Slot: 0, Name: "x.wal", Size: uint64(len(raw))},
+		{Slot: 0, Data: raw},
+	}})
 	if err == nil || !strings.Contains(err.Error(), "header slot") {
 		t.Fatalf("expected slot mismatch refusal, got %v", err)
 	}
-	// truncated payload
-	err = e.HandlePushSegments(PushSegmentsRequest{Slot: 0, Segments: []SegmentFile{{Name: "y.wal", Payload: raw[:8]}}})
-	if err == nil || !strings.Contains(err.Error(), "too short") {
-		t.Fatalf("expected too-short refusal, got %v", err)
+	// first chunk shorter than the WAL header and the stream then ends:
+	// the header never assembles, so the file comes up short
+	err = e.writeSegments(&fakeChunks{chunks: []*pushupesv1.PushSegmentsChunk{
+		{Slot: 0, Name: "y.wal", Size: 8},
+		{Slot: 0, Data: raw[:8]},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "got 0 of 8") {
+		t.Fatalf("expected incomplete-stream refusal, got %v", err)
+	}
+	// announced size never fully arrives (valid slot-0 header, one byte short)
+	seg0, err := storage.CreateSegment(t.TempDir(), 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seg0.Append(1, makeRecord("agg-1", 1, "c-1")); err != nil {
+		t.Fatal(err)
+	}
+	seg0.Close()
+	raw0, err := os.ReadFile(seg0.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.writeSegments(&fakeChunks{chunks: []*pushupesv1.PushSegmentsChunk{
+		{Slot: 0, Name: "z.wal", Size: uint64(len(raw0))},
+		{Slot: 0, Data: raw0[:len(raw0)-1]},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "bytes") {
+		t.Fatalf("expected incomplete-stream refusal, got %v", err)
+	}
+	// nothing landed, no .tmp debris
+	entries, _ := os.ReadDir(e.store.SlotDir(0))
+	for _, en := range entries {
+		t.Fatalf("unexpected file after refused imports: %s", en.Name())
+	}
+}
+
+func TestWriteSegmentsAcceptsGoodStream(t *testing.T) {
+	e, _ := newTestEngine(t, "node-2")
+	dir := t.TempDir()
+	seg, err := storage.CreateSegment(dir, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seg.Append(1, makeRecord("agg-1", 1, "c-1")); err != nil {
+		t.Fatal(err)
+	}
+	segPath := seg.Path
+	seg.Close()
+	raw, err := os.ReadFile(segPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Base(segPath)
+	// split into 3-byte chunks: header must survive streaming regardless
+	var chunks []*pushupesv1.PushSegmentsChunk
+	chunks = append(chunks, &pushupesv1.PushSegmentsChunk{Slot: 0, Name: name, Size: uint64(len(raw))})
+	for off := 0; off < len(raw); off += 3 {
+		end := min(off+3, len(raw))
+		chunks = append(chunks, &pushupesv1.PushSegmentsChunk{Slot: 0, Data: raw[off:end]})
+	}
+	if err := e.writeSegments(&fakeChunks{chunks: chunks}); err != nil {
+		t.Fatalf("good stream refused: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(e.store.SlotDir(0), name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(raw) {
+		t.Fatalf("imported %d bytes want %d", len(got), len(raw))
 	}
 }
 
