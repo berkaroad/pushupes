@@ -38,6 +38,15 @@ type EventRecord struct {
 	Events      []Event
 }
 
+// RecordMeta is the header portion of an encoded record frame: exactly the
+// fields the WAL indexes need, with no event bodies retained.
+type RecordMeta struct {
+	AggregateID string
+	Version     uint32
+	UnixTime    int64
+	CommandID   string
+}
+
 // ---- Binary encoding ------------------------------------------------------
 //
 // Record layout (all integers big-endian):
@@ -116,80 +125,105 @@ func (r *EventRecord) EncodeBinary(buf []byte) []byte {
 	return buf[:size]
 }
 
-// DecodeRecord parses one length-prefixed record from buf.
-func DecodeRecord(buf []byte) (EventRecord, int, error) {
+// scanRecord parses one length-prefixed record frame from buf, validating the
+// full frame shape. When withBodies is false the event bodies are validated
+// but not copied — replication lands the very bytes it received.
+func scanRecord(buf []byte, withBodies bool) (EventRecord, RecordMeta, int, error) {
 	var r EventRecord
+	var m RecordMeta
 	if len(buf) < 4 {
-		return r, 0, errors.New("truncated record length")
+		return r, m, 0, errors.New("truncated record length")
 	}
 	recLen := int(binary.BigEndian.Uint32(buf[0:4]))
 	if recLen < 0 || recLen > 64<<20 || 4+recLen > len(buf) {
-		return r, 0, fmt.Errorf("record body unavailable: need %d have %d", 4+recLen, len(buf))
+		return r, m, 0, fmt.Errorf("record body unavailable: need %d have %d", 4+recLen, len(buf))
 	}
 	rest := buf[4 : 4+recLen]
 
 	aggLen, err := takeU16(&rest)
 	if err != nil {
-		return r, 0, err
+		return r, m, 0, err
 	}
 	if int(aggLen) > MaxAggregateIDLen || len(rest) < int(aggLen) {
-		return r, 0, errors.New("truncated aggregate_id")
+		return r, m, 0, errors.New("truncated aggregate_id")
 	}
-	r.AggregateID = string(rest[:aggLen])
+	m.AggregateID = string(rest[:aggLen])
 	rest = rest[aggLen:]
 
-	r.Version, err = takeU32(&rest)
+	m.Version, err = takeU32(&rest)
 	if err != nil {
-		return r, 0, err
+		return r, m, 0, err
 	}
 	var ts uint64
 	ts, err = takeU64(&rest)
 	if err != nil {
-		return r, 0, err
+		return r, m, 0, err
 	}
-	r.UnixTime = int64(ts)
+	m.UnixTime = int64(ts)
 
 	cmdLen, err := takeU16(&rest)
 	if err != nil {
-		return r, 0, err
+		return r, m, 0, err
 	}
 	if int(cmdLen) > MaxCommandIDLen || len(rest) < int(cmdLen) {
-		return r, 0, errors.New("truncated command_id")
+		return r, m, 0, errors.New("truncated command_id")
 	}
-	r.CommandID = string(rest[:cmdLen])
+	m.CommandID = string(rest[:cmdLen])
 	rest = rest[cmdLen:]
 
 	count, err := takeU16(&rest)
 	if err != nil {
-		return r, 0, err
+		return r, m, 0, err
 	}
 	if int(count) > MaxEventsPerRec {
-		return r, 0, fmt.Errorf("event count %d exceeds max %d", count, MaxEventsPerRec)
+		return r, m, 0, fmt.Errorf("event count %d exceeds max %d", count, MaxEventsPerRec)
 	}
-	r.Events = make([]Event, 0, count)
+	r.AggregateID, r.Version, r.UnixTime, r.CommandID = m.AggregateID, m.Version, m.UnixTime, m.CommandID
+	if withBodies {
+		r.Events = make([]Event, 0, count)
+	}
 	for i := 0; i < int(count); i++ {
 		var ev Event
 		typeLen, err := takeU16(&rest)
 		if err != nil {
-			return r, 0, err
+			return r, m, 0, err
 		}
 		if int(typeLen) > MaxEventTypeLen || len(rest) < int(typeLen) {
-			return r, 0, errors.New("truncated event type")
+			return r, m, 0, errors.New("truncated event type")
 		}
 		ev.Type = string(rest[:typeLen])
 		rest = rest[typeLen:]
 		bodyLen, err := takeU32(&rest)
 		if err != nil {
-			return r, 0, err
+			return r, m, 0, err
 		}
 		if int(bodyLen) > MaxBodySize || len(rest) < int(bodyLen) {
-			return r, 0, errors.New("truncated event body")
+			return r, m, 0, errors.New("truncated event body")
 		}
-		ev.Body = append([]byte(nil), rest[:bodyLen]...)
+		if withBodies {
+			ev.Body = append([]byte(nil), rest[:bodyLen]...)
+			r.Events = append(r.Events, ev)
+		}
 		rest = rest[bodyLen:]
-		r.Events = append(r.Events, ev)
 	}
-	return r, 4 + recLen, nil
+	return r, m, 4 + recLen, nil
+}
+
+// DecodeRecord parses one length-prefixed record from buf, materialising its
+// event bodies as fresh slices (safe to retain after buf is reused).
+func DecodeRecord(buf []byte) (EventRecord, int, error) {
+	r, _, n, err := scanRecord(buf, true)
+	return r, n, err
+}
+
+// DecodeRecordMeta validates one length-prefixed record frame and returns only
+// its header fields plus the frame's total length (4+recLen). Event bodies are
+// checked for bounds but never copied and never retained: the replication hot
+// path indexes from the metadata and writes the received bytes straight
+// through.
+func DecodeRecordMeta(buf []byte) (RecordMeta, int, error) {
+	_, m, n, err := scanRecord(buf, false)
+	return m, n, err
 }
 
 // ---- small binary helpers -------------------------------------------------

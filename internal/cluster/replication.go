@@ -377,14 +377,14 @@ func (e *Engine) forwardTo(ctx context.Context, toAddr string, slot int32, seq u
 // HandleReplicate serves PeerService.Replicate: a migration forwarding push.
 // The payload is a single encoded record to be appended at a fixed seq.
 func (e *Engine) HandleReplicate(slot int32, seq uint64, payload []byte) error {
-	rec, consumed, err := data.DecodeRecord(payload)
+	_, consumed, err := data.DecodeRecordMeta(payload)
 	if err != nil {
 		return err
 	}
 	if consumed != len(payload) {
 		return fmt.Errorf("replicate: payload holds %d extra bytes", len(payload)-consumed)
 	}
-	return e.store.AppendAtSeq(slot, seq, &rec)
+	return e.store.AppendFrameAtSeq(slot, seq, payload)
 }
 
 // ---- High watermark / ISR ----------------------------------------------------
@@ -912,17 +912,17 @@ func (e *Engine) ownershipSnapshot() *ownership {
 	return o
 }
 
-// ReplicateRecord applies a leader-assigned record on a follower (or import
-// target): decode each record and append at its fixed seq.
+// ReplicateRecord applies a leader-assigned record frame on a follower (or
+// import target) at its fixed seq, landing the leader's bytes verbatim.
 func (e *Engine) ReplicateRecord(slot int32, seq uint64, payload []byte) error {
-	rec, consumed, err := data.DecodeRecord(payload)
+	_, consumed, err := data.DecodeRecordMeta(payload)
 	if err != nil {
 		return err
 	}
 	if consumed != len(payload) {
 		return fmt.Errorf("payload holds %d extra bytes", len(payload)-consumed)
 	}
-	return e.store.AppendAtSeq(slot, seq, &rec)
+	return e.store.AppendFrameAtSeq(slot, seq, payload)
 }
 
 // ---- Multiplexed replication sessions ----------------------------------------
@@ -1094,11 +1094,11 @@ func applyFetchPayload(store *storage.Store, slot int32, nextSeq uint64, payload
 	seq := nextSeq - uint64(countRecords(payload))
 	rest := payload
 	for len(rest) > 0 {
-		rec, consumed, err := data.DecodeRecord(rest)
+		_, consumed, err := data.DecodeRecordMeta(rest)
 		if err != nil {
 			return err
 		}
-		if err := store.AppendAtSeq(slot, seq, &rec); err != nil {
+		if err := store.AppendFrameAtSeq(slot, seq, rest[:consumed]); err != nil {
 			return err
 		}
 		rest = rest[consumed:]

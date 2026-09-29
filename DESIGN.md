@@ -112,7 +112,12 @@ Body: Record*，每条记录：
     select 分支，而是 watch 一条**全 store 唤醒总线**（任一槽 append 触发），
     命中后对 parked 槽的各自句柄做非阻塞扫描判定"哪些槽真的动了"。
   - follower 追加到自己 WAL 后回报 LEO（批量 PeerService.ReplicaProgress）；
-    leader 推进 **HW**（高水位 = ISR 内最小 LEO）。leader 端有全局
+    leader 推进 **HW**（高水位 = ISR 内最小 LEO）。**follower 的落盘是帧直写**：
+    收到的裸 WAL 字节按 seq 校验后**原样写入**（`Slot.AppendFrameAtSeq` /
+    `Segment.AppendFrame`），内存索引只从帧头解析（`data.DecodeRecordMeta`，
+    不物化事件体）——复制路径不 decode 成记录再 re-encode，100KiB 事件体下
+    每条省掉两份大分配与两次全量拷贝（迁移写转发 `Replicate` 同路径）。
+    leader 端有全局
     payload 预算 + 轮转游标，防积压槽饿死。应答语义：
     **请求到达即有货的槽立即随响应返回（有货即答，不长轮询滞留）**，
     全空才 park 进长轮询；park 后任一槽被 append 唤醒时做 **burst

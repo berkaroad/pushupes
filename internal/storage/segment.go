@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"pushupes/internal/data"
@@ -159,8 +161,55 @@ func (s *Segment) Writable() bool { return s.writable }
 // SizeBytes is the current file size including the header.
 func (s *Segment) SizeBytes() int64 { return s.sizeBytes }
 
-// Append encodes rec under the given seq at the segment tail.
-func (s *Segment) Append(seq uint64, rec *data.EventRecord) error {
+// Encode-buffer pool: the leader-side append path needs one contiguous frame
+// buffer per record, which for large event bodies is a large allocation each
+// time. Buckets are powers of two from 8 KiB to 2 MiB; anything bigger falls
+// back to a plain allocation.
+const (
+	poolClassShift = 13 // 8 KiB minimum class
+	poolClassMax   = 21 // 2 MiB maximum class
+	poolClassCount = poolClassMax - poolClassShift + 1
+)
+
+var encodeBufPools [poolClassCount]sync.Pool
+
+// getEncodeBuf returns a buffer of exactly n bytes, recycled from a
+// power-of-two size class when one is free. The buffer is written once and
+// handed to a synchronous pwrite, so pooling it is safe.
+func getEncodeBuf(n int) []byte {
+	if n <= 0 {
+		n = 1
+	}
+	c := bits.Len(uint(n - 1)) // ceil(log2(n))
+	if c < poolClassShift {
+		c = poolClassShift
+	}
+	if c > poolClassMax {
+		return make([]byte, n)
+	}
+	if b := encodeBufPools[c-poolClassShift].Get(); b != nil {
+		return b.([]byte)[:n]
+	}
+	// Length exactly n, capacity one full size class: the caller sees a
+	// buffer of the size it asked for, and putEncodeBuf can still classify it.
+	return make([]byte, 1<<c)[:n]
+}
+
+// putEncodeBuf recycles a buffer previously returned by getEncodeBuf.
+func putEncodeBuf(buf []byte) {
+	if buf == nil {
+		return
+	}
+	c := bits.Len(uint(cap(buf) - 1))
+	if c < poolClassShift || c > poolClassMax || cap(buf) != 1<<c {
+		return // not a pooled size class: let it be collected
+	}
+	encodeBufPools[c-poolClassShift].Put(buf[:cap(buf)])
+}
+
+// writeFrame appends one already-encoded frame (recLen(4) + record) at the
+// segment tail, maintaining the sparse index. The bytes land verbatim.
+func (s *Segment) writeFrame(seq uint64, frame []byte) error {
 	if !s.writable {
 		return errors.New("segment is sealed")
 	}
@@ -171,21 +220,35 @@ func (s *Segment) Append(seq uint64, rec *data.EventRecord) error {
 	if seq != want {
 		return fmt.Errorf("segment %d: seq %d out of order (want %d)", s.BaseSeq, seq, want)
 	}
-	buf := rec.EncodeBinary(nil)
 	pos := s.sizeBytes
 	if s.RecordCnt == 0 || s.bytesSinceIndex >= indexIntervalB {
 		s.index = append(s.index, indexEntry{seq: seq, pos: pos})
 		s.bytesSinceIndex = 0
 	}
-	if _, err := s.File.WriteAt(buf, pos); err != nil {
+	if _, err := s.File.WriteAt(frame, pos); err != nil {
 		return err
 	}
-	s.sizeBytes += int64(len(buf))
+	s.sizeBytes += int64(len(frame))
 	s.RecordCnt++
 	s.LastSeq = seq
-	s.bytesSinceIndex += int64(len(buf))
+	s.bytesSinceIndex += int64(len(frame))
 	s.unflushed++
 	return nil
+}
+
+// Append encodes rec under the given seq at the segment tail.
+func (s *Segment) Append(seq uint64, rec *data.EventRecord) error {
+	frame := rec.EncodeBinary(getEncodeBuf(rec.EncodedSize()))
+	err := s.writeFrame(seq, frame)
+	putEncodeBuf(frame)
+	return err
+}
+
+// AppendFrame appends a leader-encoded frame verbatim: follower replication
+// and migration catch-up land the bytes the leader produced, with no
+// decode-to-record and re-encode round trip in between.
+func (s *Segment) AppendFrame(seq uint64, frame []byte) error {
+	return s.writeFrame(seq, frame)
 }
 
 // Flush fsyncs the segment file.

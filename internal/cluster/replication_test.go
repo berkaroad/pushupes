@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -404,7 +405,7 @@ func TestHandleFetchAndReplicateOverPeerPlane(t *testing.T) {
 	applyCmd(t, leader, &Command{Op: OpPlanSlots})
 	addr := newPeerHarness(t, leader)
 
-	follower, _ := newTestEngine(t, "node-2")
+	follower, fdrStore := newTestEngine(t, "node-2")
 	join(t, follower, "node-1", addr)
 	join(t, follower, "node-2", "127.0.0.1:2")
 	applyCmd(t, follower, &Command{Op: OpPlanSlots})
@@ -431,6 +432,23 @@ func TestHandleFetchAndReplicateOverPeerPlane(t *testing.T) {
 	}
 	if hw := leader.HW(0); hw != 3 {
 		t.Fatalf("leader HW %d want 3", hw)
+	}
+
+	// The follower must have landed the leader's bytes verbatim: replication
+	// writes frames through, it does not decode and re-encode them.
+	_, _, want, err := ldrStore.ReadSlotBytes(0, 1, 4, 1<<20)
+	if err != nil {
+		t.Fatalf("leader ReadSlotBytes: %v", err)
+	}
+	_, _, got, err := fdrStore.ReadSlotBytes(0, 1, 4, 1<<20)
+	if err != nil {
+		t.Fatalf("follower ReadSlotBytes: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("follower WAL differs from leader WAL: %d vs %d bytes", len(got), len(want))
+	}
+	if _, n, err := data.DecodeRecordMeta(got); err != nil || n <= 0 {
+		t.Fatalf("follower payload does not start with a valid frame: n=%d err=%v", n, err)
 	}
 	_ = storage.WALHeaderLen
 }

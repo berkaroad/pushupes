@@ -227,6 +227,25 @@ func (st *Store) AppendAtSeq(slotID int32, seq uint64, rec *data.EventRecord) er
 	return nil
 }
 
+// AppendFrameAtSeq lands a leader-encoded record frame at a fixed seq — the
+// follower replication and migration catch-up path — without decoding or
+// re-encoding it.
+func (st *Store) AppendFrameAtSeq(slotID int32, seq uint64, frame []byte) error {
+	slot, err := st.Slot(slotID)
+	if err != nil {
+		return err
+	}
+	newly, err := slot.appendFrameAtSeq(seq, frame)
+	if err != nil {
+		return err
+	}
+	if newly {
+		st.writes[slotID].Add(1)
+		st.markDirty(slotID)
+	}
+	return nil
+}
+
 // markDirty registers a slot as holding unflushed records (flushLoop only
 // visits these; the set is emptied once FlushDue reports nothing pending).
 func (st *Store) markDirty(slotID int32) {
@@ -353,19 +372,16 @@ func (st *Store) ReadSlotBytes(slotID int32, fromSeq, untilSeq uint64, maxBytes 
 		for _, r := range ranges {
 			total += r.End - r.Start
 		}
+		// Ranges are read straight into the payload slice: the extra
+		// staging buffer (and its memcpy of every fetched byte) is gone.
 		payload = make([]byte, total)
-		rest := payload
-		var buf []byte
+		off := int64(0)
 		for _, r := range ranges {
 			n := r.End - r.Start
-			if int64(len(buf)) < n {
-				buf = make([]byte, n)
-			}
-			if err := st.slotReadRange(slot, r, buf[:n]); err != nil {
+			if err := st.slotReadRange(slot, r, payload[off:off+n]); err != nil {
 				return ranges, next, nil, err
 			}
-			copy(rest, buf[:n])
-			rest = rest[n:]
+			off += n
 		}
 	}
 	return ranges, next, payload, nil

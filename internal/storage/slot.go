@@ -152,12 +152,22 @@ func OpenSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy) (
 // indexRecordLocked updates the in-memory indexes for one stored record.
 // Caller holds the write lock.
 func (s *Slot) indexRecordLocked(seq uint64, rec *data.EventRecord) {
-	if v := rec.Version; v > s.aggVersions[rec.AggregateID] {
-		s.aggVersions[rec.AggregateID] = v
+	s.indexMetaLocked(seq, data.RecordMeta{
+		AggregateID: rec.AggregateID,
+		Version:     rec.Version,
+		CommandID:   rec.CommandID,
+	})
+}
+
+// indexMetaLocked indexes a record from its header alone — the replicated
+// path never materialises event bodies, so it indexes from RecordMeta.
+func (s *Slot) indexMetaLocked(seq uint64, m data.RecordMeta) {
+	if m.Version > s.aggVersions[m.AggregateID] {
+		s.aggVersions[m.AggregateID] = m.Version
 	}
-	s.cmdIndex[rec.CommandID] = seq
-	if rec.Version == uint32(len(s.aggSeqs[rec.AggregateID])+1) {
-		s.aggSeqs[rec.AggregateID] = append(s.aggSeqs[rec.AggregateID], seq)
+	s.cmdIndex[m.CommandID] = seq
+	if m.Version == uint32(len(s.aggSeqs[m.AggregateID])+1) {
+		s.aggSeqs[m.AggregateID] = append(s.aggSeqs[m.AggregateID], seq)
 	}
 }
 
@@ -252,6 +262,49 @@ func (s *Slot) appendAtSeq(seq uint64, rec *data.EventRecord) (bool, error) {
 	}
 	s.seqCounter.Store(seq)
 	s.indexRecordLocked(seq, rec)
+	s.pendingFlush++
+	s.advanceNotifyLocked()
+	return true, nil
+}
+
+// AppendFrameAtSeq appends a leader-encoded record frame under an externally
+// fixed seq — the follower replication and migration catch-up path. The frame
+// is validated and indexed from its header, then written to the WAL verbatim.
+func (s *Slot) AppendFrameAtSeq(seq uint64, frame []byte) error {
+	_, err := s.appendFrameAtSeq(seq, frame)
+	return err
+}
+
+// appendFrameAtSeq is AppendFrameAtSeq plus the "newly written" flag used for
+// write-rate accounting (an idempotent replay does not count as a write).
+func (s *Slot) appendFrameAtSeq(seq uint64, frame []byte) (bool, error) {
+	meta, _, err := data.DecodeRecordMeta(frame)
+	if err != nil {
+		return false, fmt.Errorf("slot %d: bad record frame: %w", s.ID, err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if seq <= s.seqCounter.Load() {
+		if existing, err := s.readBySeqLocked(seq); err == nil && existing != nil {
+			if existing.CommandID == meta.CommandID && existing.Version == meta.Version {
+				return false, nil // already replicated
+			}
+			return false, fmt.Errorf("slot %d: seq %d diverged on replay", s.ID, seq)
+		}
+		return false, fmt.Errorf("slot %d: seq %d below counter %d", s.ID, seq, s.seqCounter.Load())
+	}
+	if seq != s.seqCounter.Load()+1 {
+		return false, fmt.Errorf("slot %d: seq %d not contiguous (counter %d)", s.ID, seq, s.seqCounter.Load())
+	}
+	seg, err := s.tail()
+	if err != nil {
+		return false, err
+	}
+	if err := seg.AppendFrame(seq, frame); err != nil {
+		return false, err
+	}
+	s.seqCounter.Store(seq)
+	s.indexMetaLocked(seq, meta)
 	s.pendingFlush++
 	s.advanceNotifyLocked()
 	return true, nil
