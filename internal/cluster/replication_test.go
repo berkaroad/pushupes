@@ -241,11 +241,11 @@ func TestSubmitAppendMigratingRedirectsToSource(t *testing.T) {
 
 // fakeChunks plays back a chunk list through the chunkSource interface.
 type fakeChunks struct {
-	chunks []*pushupesv1.PushSegmentsChunk
+	chunks []*pushupesv1.PushSegmentsRequest
 	i      int
 }
 
-func (f *fakeChunks) Recv() (*pushupesv1.PushSegmentsChunk, error) {
+func (f *fakeChunks) Recv() (*pushupesv1.PushSegmentsRequest, error) {
 	if f.i >= len(f.chunks) {
 		return nil, io.EOF
 	}
@@ -267,7 +267,7 @@ func TestWriteSegmentsRejectsCorrupt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = e.writeSegments(&fakeChunks{chunks: []*pushupesv1.PushSegmentsChunk{
+	err = e.writeSegments(&fakeChunks{chunks: []*pushupesv1.PushSegmentsRequest{
 		{Slot: 0, Name: "x.wal", Size: uint64(len(raw))},
 		{Slot: 0, Data: raw},
 	}})
@@ -276,7 +276,7 @@ func TestWriteSegmentsRejectsCorrupt(t *testing.T) {
 	}
 	// first chunk shorter than the WAL header and the stream then ends:
 	// the header never assembles, so the file comes up short
-	err = e.writeSegments(&fakeChunks{chunks: []*pushupesv1.PushSegmentsChunk{
+	err = e.writeSegments(&fakeChunks{chunks: []*pushupesv1.PushSegmentsRequest{
 		{Slot: 0, Name: "y.wal", Size: 8},
 		{Slot: 0, Data: raw[:8]},
 	}})
@@ -296,7 +296,7 @@ func TestWriteSegmentsRejectsCorrupt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = e.writeSegments(&fakeChunks{chunks: []*pushupesv1.PushSegmentsChunk{
+	err = e.writeSegments(&fakeChunks{chunks: []*pushupesv1.PushSegmentsRequest{
 		{Slot: 0, Name: "z.wal", Size: uint64(len(raw0))},
 		{Slot: 0, Data: raw0[:len(raw0)-1]},
 	}})
@@ -328,11 +328,11 @@ func TestWriteSegmentsAcceptsGoodStream(t *testing.T) {
 	}
 	name := filepath.Base(segPath)
 	// split into 3-byte chunks: header must survive streaming regardless
-	var chunks []*pushupesv1.PushSegmentsChunk
-	chunks = append(chunks, &pushupesv1.PushSegmentsChunk{Slot: 0, Name: name, Size: uint64(len(raw))})
+	var chunks []*pushupesv1.PushSegmentsRequest
+	chunks = append(chunks, &pushupesv1.PushSegmentsRequest{Slot: 0, Name: name, Size: uint64(len(raw))})
 	for off := 0; off < len(raw); off += 3 {
 		end := min(off+3, len(raw))
-		chunks = append(chunks, &pushupesv1.PushSegmentsChunk{Slot: 0, Data: raw[off:end]})
+		chunks = append(chunks, &pushupesv1.PushSegmentsRequest{Slot: 0, Data: raw[off:end]})
 	}
 	if err := e.writeSegments(&fakeChunks{chunks: chunks}); err != nil {
 		t.Fatalf("good stream refused: %v", err)

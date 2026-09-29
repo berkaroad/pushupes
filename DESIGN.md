@@ -237,7 +237,7 @@ GET  /healthz
 - **顺序追加 + 页缓存**：写路径 = memcpy 进段缓冲 + write()；fsync 交给
   flush 策略/acks 语义，组提交合并（dirty 集合定向刷盘，不遍历全槽）。
 - **二进制协议面**：节点间流量全部 PeerService gRPC（protobuf 二进制帧，
-  `FetchItem.payload`/`PushSegmentsChunk.data` 为裸 WAL 字节区间，不经
+  `FetchItem.payload`/`PushSegmentsRequest.data` 为裸 WAL 字节区间，不经
   base64/重编码）；客户端事件面 gRPC protobuf，body 原始 bytes。
   路由表快照同为二进制编码（字符串字典 + varint + gzip）。
   **sendfile 零拷贝已实测否决**：payload ~40-64KiB、需用户态解码过滤、

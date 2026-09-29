@@ -152,7 +152,7 @@ func (e *Engine) pushSealedSegments(ctx context.Context, slot int32, toNode stri
 			f.Close()
 			return fail(err)
 		}
-		if err := stream.Send(&pushupesv1.PushSegmentsChunk{Slot: slot, Name: name, Size: uint64(st.Size())}); err != nil {
+		if err := stream.Send(&pushupesv1.PushSegmentsRequest{Slot: slot, Name: name, Size: uint64(st.Size())}); err != nil {
 			f.Close()
 			return err // stream already dead; CloseAndRecv would mask the cause
 		}
@@ -160,7 +160,7 @@ func (e *Engine) pushSealedSegments(ctx context.Context, slot int32, toNode stri
 		for sent < st.Size() {
 			n, err := f.Read(buf)
 			if n > 0 {
-				if serr := stream.Send(&pushupesv1.PushSegmentsChunk{Slot: slot, Data: buf[:n]}); serr != nil {
+				if serr := stream.Send(&pushupesv1.PushSegmentsRequest{Slot: slot, Data: buf[:n]}); serr != nil {
 					f.Close()
 					return serr
 				}
@@ -271,7 +271,7 @@ func (e *Engine) scheduleDropAfter(ctx context.Context, slot int32, from string,
 // chunkSource is the receive half of a PushSegments stream, extracted as an
 // interface so the importer can be unit-tested without a live gRPC server.
 type chunkSource interface {
-	Recv() (*pushupesv1.PushSegmentsChunk, error)
+	Recv() (*pushupesv1.PushSegmentsRequest, error)
 }
 
 // writeSegments consumes a PushSegments chunk stream and lands the sealed

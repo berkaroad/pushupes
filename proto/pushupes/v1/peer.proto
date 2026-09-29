@@ -29,9 +29,9 @@ service PeerService {
   // SlotLeo answers a single slot's log end offset (migration catch-up).
   rpc SlotLeo(SlotLeoRequest) returns (SlotLeoResponse);
   // PushSegments streams sealed WAL segments of a slot into the importing
-  // node (migration snapshot step) in bounded chunks — the source never
+  // node (migration snapshot step) in bounded messages — the source never
   // holds a whole segment in memory.
-  rpc PushSegments(stream PushSegmentsChunk) returns (PushSegmentsResponse);
+  rpc PushSegments(stream PushSegmentsRequest) returns (PushSegmentsResponse);
   // TriggerSnapshot asks this node, as migration source, to push its
   // sealed segments of a slot to the target.
   rpc TriggerSnapshot(TriggerSnapshotRequest) returns (TriggerSnapshotResponse);
@@ -97,10 +97,10 @@ message ReplicateResponse {}
 message SlotLeoRequest { int32 slot = 1; }
 message SlotLeoResponse { uint64 leo = 1; }
 
-// PushSegmentsChunk is one piece of the snapshot stream. The first chunk
-// of a file carries its name and total size (header bytes included);
-// following chunks carry data only. A new name starts a new file.
-message PushSegmentsChunk {
+// PushSegmentsRequest is one message of the snapshot stream: the first
+// message of a file carries its name and total size (header bytes included),
+// following messages carry data only. A new name starts a new file.
+message PushSegmentsRequest {
   int32 slot = 1;
   string name = 2;    // set on the first chunk of each segment file
   uint64 size = 3;    // total bytes of the file, set with name

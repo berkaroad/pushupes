@@ -694,10 +694,10 @@ func (x *SlotLeoResponse) GetLeo() uint64 {
 	return 0
 }
 
-// PushSegmentsChunk is one piece of the snapshot stream. The first chunk
-// of a file carries its name and total size (header bytes included);
-// following chunks carry data only. A new name starts a new file.
-type PushSegmentsChunk struct {
+// PushSegmentsRequest is one message of the snapshot stream: the first
+// message of a file carries its name and total size (header bytes included),
+// following messages carry data only. A new name starts a new file.
+type PushSegmentsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Slot          int32                  `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
 	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`  // set on the first chunk of each segment file
@@ -707,20 +707,20 @@ type PushSegmentsChunk struct {
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *PushSegmentsChunk) Reset() {
-	*x = PushSegmentsChunk{}
+func (x *PushSegmentsRequest) Reset() {
+	*x = PushSegmentsRequest{}
 	mi := &file_pushupes_v1_peer_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *PushSegmentsChunk) String() string {
+func (x *PushSegmentsRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*PushSegmentsChunk) ProtoMessage() {}
+func (*PushSegmentsRequest) ProtoMessage() {}
 
-func (x *PushSegmentsChunk) ProtoReflect() protoreflect.Message {
+func (x *PushSegmentsRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_pushupes_v1_peer_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -732,33 +732,33 @@ func (x *PushSegmentsChunk) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use PushSegmentsChunk.ProtoReflect.Descriptor instead.
-func (*PushSegmentsChunk) Descriptor() ([]byte, []int) {
+// Deprecated: Use PushSegmentsRequest.ProtoReflect.Descriptor instead.
+func (*PushSegmentsRequest) Descriptor() ([]byte, []int) {
 	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{13}
 }
 
-func (x *PushSegmentsChunk) GetSlot() int32 {
+func (x *PushSegmentsRequest) GetSlot() int32 {
 	if x != nil {
 		return x.Slot
 	}
 	return 0
 }
 
-func (x *PushSegmentsChunk) GetName() string {
+func (x *PushSegmentsRequest) GetName() string {
 	if x != nil {
 		return x.Name
 	}
 	return ""
 }
 
-func (x *PushSegmentsChunk) GetSize() uint64 {
+func (x *PushSegmentsRequest) GetSize() uint64 {
 	if x != nil {
 		return x.Size
 	}
 	return 0
 }
 
-func (x *PushSegmentsChunk) GetData() []byte {
+func (x *PushSegmentsRequest) GetData() []byte {
 	if x != nil {
 		return x.Data
 	}
@@ -932,8 +932,8 @@ const file_pushupes_v1_peer_proto_rawDesc = "" +
 	"\x0eSlotLeoRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\"#\n" +
 	"\x0fSlotLeoResponse\x12\x10\n" +
-	"\x03leo\x18\x01 \x01(\x04R\x03leo\"c\n" +
-	"\x11PushSegmentsChunk\x12\x12\n" +
+	"\x03leo\x18\x01 \x01(\x04R\x03leo\"e\n" +
+	"\x13PushSegmentsRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +
 	"\x04size\x18\x03 \x01(\x04R\x04size\x12\x12\n" +
@@ -942,15 +942,15 @@ const file_pushupes_v1_peer_proto_rawDesc = "" +
 	"\x16TriggerSnapshotRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x17\n" +
 	"\ato_node\x18\x02 \x01(\tR\x06toNode\"\x19\n" +
-	"\x17TriggerSnapshotResponse2\xf9\x04\n" +
+	"\x17TriggerSnapshotResponse2\xfb\x04\n" +
 	"\vPeerService\x12;\n" +
 	"\x04Ping\x12\x18.pushupes.v1.PingRequest\x1a\x19.pushupes.v1.PingResponse\x12G\n" +
 	"\bRegister\x12\x1c.pushupes.v1.RegisterRequest\x1a\x1d.pushupes.v1.RegisterResponse\x12A\n" +
 	"\x06MFetch\x12\x1a.pushupes.v1.MFetchRequest\x1a\x1b.pushupes.v1.MFetchResponse\x12\\\n" +
 	"\x0fReplicaProgress\x12#.pushupes.v1.ReplicaProgressRequest\x1a$.pushupes.v1.ReplicaProgressResponse\x12J\n" +
 	"\tReplicate\x12\x1d.pushupes.v1.ReplicateRequest\x1a\x1e.pushupes.v1.ReplicateResponse\x12D\n" +
-	"\aSlotLeo\x12\x1b.pushupes.v1.SlotLeoRequest\x1a\x1c.pushupes.v1.SlotLeoResponse\x12S\n" +
-	"\fPushSegments\x12\x1e.pushupes.v1.PushSegmentsChunk\x1a!.pushupes.v1.PushSegmentsResponse(\x01\x12\\\n" +
+	"\aSlotLeo\x12\x1b.pushupes.v1.SlotLeoRequest\x1a\x1c.pushupes.v1.SlotLeoResponse\x12U\n" +
+	"\fPushSegments\x12 .pushupes.v1.PushSegmentsRequest\x1a!.pushupes.v1.PushSegmentsResponse(\x01\x12\\\n" +
 	"\x0fTriggerSnapshot\x12#.pushupes.v1.TriggerSnapshotRequest\x1a$.pushupes.v1.TriggerSnapshotResponseB2Z0pushupes/internal/grpcapi/pushupes/v1;pushupesv1b\x06proto3"
 
 var (
@@ -980,7 +980,7 @@ var file_pushupes_v1_peer_proto_goTypes = []any{
 	(*ReplicateResponse)(nil),       // 10: pushupes.v1.ReplicateResponse
 	(*SlotLeoRequest)(nil),          // 11: pushupes.v1.SlotLeoRequest
 	(*SlotLeoResponse)(nil),         // 12: pushupes.v1.SlotLeoResponse
-	(*PushSegmentsChunk)(nil),       // 13: pushupes.v1.PushSegmentsChunk
+	(*PushSegmentsRequest)(nil),     // 13: pushupes.v1.PushSegmentsRequest
 	(*PushSegmentsResponse)(nil),    // 14: pushupes.v1.PushSegmentsResponse
 	(*TriggerSnapshotRequest)(nil),  // 15: pushupes.v1.TriggerSnapshotRequest
 	(*TriggerSnapshotResponse)(nil), // 16: pushupes.v1.TriggerSnapshotResponse
@@ -993,7 +993,7 @@ var file_pushupes_v1_peer_proto_depIdxs = []int32{
 	7,  // 4: pushupes.v1.PeerService.ReplicaProgress:input_type -> pushupes.v1.ReplicaProgressRequest
 	9,  // 5: pushupes.v1.PeerService.Replicate:input_type -> pushupes.v1.ReplicateRequest
 	11, // 6: pushupes.v1.PeerService.SlotLeo:input_type -> pushupes.v1.SlotLeoRequest
-	13, // 7: pushupes.v1.PeerService.PushSegments:input_type -> pushupes.v1.PushSegmentsChunk
+	13, // 7: pushupes.v1.PeerService.PushSegments:input_type -> pushupes.v1.PushSegmentsRequest
 	15, // 8: pushupes.v1.PeerService.TriggerSnapshot:input_type -> pushupes.v1.TriggerSnapshotRequest
 	1,  // 9: pushupes.v1.PeerService.Ping:output_type -> pushupes.v1.PingResponse
 	3,  // 10: pushupes.v1.PeerService.Register:output_type -> pushupes.v1.RegisterResponse

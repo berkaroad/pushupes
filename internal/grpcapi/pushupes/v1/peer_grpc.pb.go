@@ -58,9 +58,9 @@ type PeerServiceClient interface {
 	// SlotLeo answers a single slot's log end offset (migration catch-up).
 	SlotLeo(ctx context.Context, in *SlotLeoRequest, opts ...grpc.CallOption) (*SlotLeoResponse, error)
 	// PushSegments streams sealed WAL segments of a slot into the importing
-	// node (migration snapshot step) in bounded chunks — the source never
+	// node (migration snapshot step) in bounded messages — the source never
 	// holds a whole segment in memory.
-	PushSegments(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushSegmentsChunk, PushSegmentsResponse], error)
+	PushSegments(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushSegmentsRequest, PushSegmentsResponse], error)
 	// TriggerSnapshot asks this node, as migration source, to push its
 	// sealed segments of a slot to the target.
 	TriggerSnapshot(ctx context.Context, in *TriggerSnapshotRequest, opts ...grpc.CallOption) (*TriggerSnapshotResponse, error)
@@ -134,18 +134,18 @@ func (c *peerServiceClient) SlotLeo(ctx context.Context, in *SlotLeoRequest, opt
 	return out, nil
 }
 
-func (c *peerServiceClient) PushSegments(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushSegmentsChunk, PushSegmentsResponse], error) {
+func (c *peerServiceClient) PushSegments(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushSegmentsRequest, PushSegmentsResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &PeerService_ServiceDesc.Streams[0], PeerService_PushSegments_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[PushSegmentsChunk, PushSegmentsResponse]{ClientStream: stream}
+	x := &grpc.GenericClientStream[PushSegmentsRequest, PushSegmentsResponse]{ClientStream: stream}
 	return x, nil
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type PeerService_PushSegmentsClient = grpc.ClientStreamingClient[PushSegmentsChunk, PushSegmentsResponse]
+type PeerService_PushSegmentsClient = grpc.ClientStreamingClient[PushSegmentsRequest, PushSegmentsResponse]
 
 func (c *peerServiceClient) TriggerSnapshot(ctx context.Context, in *TriggerSnapshotRequest, opts ...grpc.CallOption) (*TriggerSnapshotResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -186,9 +186,9 @@ type PeerServiceServer interface {
 	// SlotLeo answers a single slot's log end offset (migration catch-up).
 	SlotLeo(context.Context, *SlotLeoRequest) (*SlotLeoResponse, error)
 	// PushSegments streams sealed WAL segments of a slot into the importing
-	// node (migration snapshot step) in bounded chunks — the source never
+	// node (migration snapshot step) in bounded messages — the source never
 	// holds a whole segment in memory.
-	PushSegments(grpc.ClientStreamingServer[PushSegmentsChunk, PushSegmentsResponse]) error
+	PushSegments(grpc.ClientStreamingServer[PushSegmentsRequest, PushSegmentsResponse]) error
 	// TriggerSnapshot asks this node, as migration source, to push its
 	// sealed segments of a slot to the target.
 	TriggerSnapshot(context.Context, *TriggerSnapshotRequest) (*TriggerSnapshotResponse, error)
@@ -220,7 +220,7 @@ func (UnimplementedPeerServiceServer) Replicate(context.Context, *ReplicateReque
 func (UnimplementedPeerServiceServer) SlotLeo(context.Context, *SlotLeoRequest) (*SlotLeoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SlotLeo not implemented")
 }
-func (UnimplementedPeerServiceServer) PushSegments(grpc.ClientStreamingServer[PushSegmentsChunk, PushSegmentsResponse]) error {
+func (UnimplementedPeerServiceServer) PushSegments(grpc.ClientStreamingServer[PushSegmentsRequest, PushSegmentsResponse]) error {
 	return status.Error(codes.Unimplemented, "method PushSegments not implemented")
 }
 func (UnimplementedPeerServiceServer) TriggerSnapshot(context.Context, *TriggerSnapshotRequest) (*TriggerSnapshotResponse, error) {
@@ -356,11 +356,11 @@ func _PeerService_SlotLeo_Handler(srv interface{}, ctx context.Context, dec func
 }
 
 func _PeerService_PushSegments_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(PeerServiceServer).PushSegments(&grpc.GenericServerStream[PushSegmentsChunk, PushSegmentsResponse]{ServerStream: stream})
+	return srv.(PeerServiceServer).PushSegments(&grpc.GenericServerStream[PushSegmentsRequest, PushSegmentsResponse]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type PeerService_PushSegmentsServer = grpc.ClientStreamingServer[PushSegmentsChunk, PushSegmentsResponse]
+type PeerService_PushSegmentsServer = grpc.ClientStreamingServer[PushSegmentsRequest, PushSegmentsResponse]
 
 func _PeerService_TriggerSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(TriggerSnapshotRequest)
