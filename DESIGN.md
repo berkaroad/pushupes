@@ -190,8 +190,11 @@ Body: Record*，每条记录：
 - **admin 面（HTTP，默认 `-admin http://127.0.0.1:8091`，`PUSHUPES_ADMIN`）**：**仅管理**——
   status/writes/plan/migrate/槽 describe/healthz/pprof，**不再承载任何节点间流量**
   （原 `/internal/*` 复制/迁移端点已全部迁到 peer 面 PeerService gRPC，admin HTTP
-  路由已删除）。事件 body 若是合法 JSON 原样透传，否则经
-  `{"_b64":"..."}` 包装（`data.DecodeBodyJSON` 精确还原，见 record.go）。
+  路由已删除）。事件 body 是任意字节，在 gRPC 面端到端裸传（proto `bytes`），
+  append 的 success/exists 回显直接挂存储记录本体（`*EventRecord`），不存在
+  JSON 包装平面——旧 `{"_b64":...}` 方案会在大 body 上付出 json.Valid 全量
+  校验 + base64 重建 + 解码往返的 CPU（实测 100KiB body 下占 leader CPU 一半），
+  已随 HTTP 事件面退役删除。
 - **peer 面（Raft + PeerService gRPC，默认 `-peer http://127.0.0.1:8391`，`PUSHUPES_PEER`）**：复制槽位分配表等元数据（Raft），并承载**全部节点间数据面**——副本拉取、LEO 上报/探活、迁移快照/段拷贝/写转发/LEO 追平、地址注册协议（proto3 契约 `proto/pushupes/v1/peer.proto`，`pushupes.v1.PeerService`，服务端 `peersvc.go`）。**运维只配这一个端口**：`-peers` 主格式 `node-id=http://ip:peerport`（或裸 `ip:peerport`，地址兼作节点 id）。**地址统一规范：存储/路由表/status JSON 中所有 admin/client/peer 地址都带 scheme——未写协议默认补 `http://`，显式协议以传入为准；TCP 拨号（listen/dial/gRPC/Raft transport）前再剥掉 scheme**（`cluster.NormalizeAddr`/`HostPort`）。admin/client 地址不配置，由各节点自报进路由表：
   - peer 端口上是复用监听器（`peerMux`/`peer_mux.go`，实现 raft.StreamLayer）：按连接**首字节 `P`**（HTTP/2 client preface `"PRI ..."` 以 `P` 开头）把 PeerService gRPC 流量与 Raft 流量分流（Raft 线上协议首字节是版本号 0，永不冲突；两路都经 `replayConn` 回填被 peek 消费的字节）。gRPC 服务端由 `Engine.ServePeer` 挂在该分流 listener 上，peer 面与 Raft 从此共用一个端口、一套 gRPC 语义（HTTP/2 多路复用，每对节点一条缓存连接 `peerClient`，keepalive 10s，服务端放宽 enforcement）。
   - leader 收到注册 RPC 后提交 `OpRegister`（就地修补路由表中该成员的 `AdminAddr/ClientAddr`，不新增成员——成员集合仍由 Raft 配置决定）；follower 收到则转发给 leader 的 peer 地址。

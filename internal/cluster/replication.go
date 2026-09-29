@@ -287,16 +287,7 @@ func (e *Engine) SubmitAppend(ctx context.Context, rec *data.EventRecord, acks s
 			}
 		case resp.Status == data.StatusExists && resp.Seq > 0 && resp.Record != nil:
 			// a retried command: make sure the target converged too
-			stored := &data.EventRecord{
-				AggregateID: resp.Record.AggregateID,
-				Version:     resp.Record.Version,
-				UnixTime:    resp.Record.UnixTime,
-				CommandID:   resp.Record.CommandID,
-			}
-			for _, ev := range resp.Record.Events {
-				stored.Events = append(stored.Events, data.Event{Type: ev.Type, Body: ev.Body})
-			}
-			if ferr := e.forwardTo(ctx, e.peerAddr(p.MigratingTo), slot, resp.Seq, stored); ferr != nil {
+			if ferr := e.forwardTo(ctx, e.peerAddr(p.MigratingTo), slot, resp.Seq, resp.Record); ferr != nil {
 				e.logger.WithError(ferr).WithField("slot", slot).Warn("migration exists-forward failed")
 				e.rollbackMigration(slot)
 				return nil, ferr
@@ -358,7 +349,7 @@ func (e *Engine) localAppend(slot int32, rec *data.EventRecord, acks string) (*d
 		}
 		return resp, nil
 	case data.StatusExists:
-		resp.Record = out.Record.ToRecordJSON(out.Seq)
+		resp.Record = out.Record // stored record, raw bytes end to end
 		return resp, nil
 	}
 	// success: optionally wait for replication
@@ -370,7 +361,7 @@ func (e *Engine) localAppend(slot int32, rec *data.EventRecord, acks string) (*d
 			return resp, nil
 		}
 	}
-	resp.Record = out.Record.ToRecordJSON(out.Seq)
+	resp.Record = out.Record // success: the record just stored, verbatim
 	return resp, nil
 }
 

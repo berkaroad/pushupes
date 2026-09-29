@@ -4,9 +4,7 @@
 package data
 
 import (
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -327,23 +325,12 @@ var (
 	ErrRecordNotFound = errors.New("record not found")
 )
 
-// ---- API wire types (JSON) ------------------------------------------------
-
-// EventJSON is the JSON form of one domain event.
-type EventJSON struct {
-	Type string          `json:"type"`
-	Body json.RawMessage `json:"body"`
-}
-
-// AppendRequest is the client append payload. Acks: "leader" (default),
-// "all", "none".
-type AppendRequest struct {
-	Version   uint32      `json:"version"`
-	UnixTime  int64       `json:"unix_time"`
-	CommandID string      `json:"command_id"`
-	Events    []EventJSON `json:"events"`
-	Acks      string      `json:"acks,omitempty"`
-}
+// ---- Append result --------------------------------------------------------
+//
+// The client-facing request/response message shapes live in the gRPC proto
+// (pushupes.v1.EventService); the engine works on EventRecord values, and
+// the stored record an "exists" replays travels as a plain *EventRecord:
+// event bodies are arbitrary bytes end to end, no JSON wrapping plane.
 
 // Status values for AppendResponse.Status.
 const (
@@ -355,89 +342,12 @@ const (
 // AppendResponse reports the outcome of an append. On "exists" the stored
 // record is returned; on "fail" ErrID explains why.
 type AppendResponse struct {
-	Status         string      `json:"status"`
-	ErrID          int         `json:"err_id,omitempty"`
-	Err            string      `json:"error,omitempty"`
-	CurrentVersion uint32      `json:"current_version,omitempty"`
-	Seq            uint64      `json:"seq,omitempty"`
-	Slot           int32       `json:"slot"`
-	Node           string      `json:"node,omitempty"`   // redirect target for MOVED/ASK/NOT_LEADER
-	Record         *RecordJSON `json:"record,omitempty"` // set on success/exists
-}
-
-// RecordJSON is the JSON form of an EventRecord.
-type RecordJSON struct {
-	AggregateID string      `json:"aggregate_id"`
-	Version     uint32      `json:"version"`
-	UnixTime    int64       `json:"unix_time"`
-	CommandID   string      `json:"command_id"`
-	Events      []EventJSON `json:"events"`
-	Seq         uint64      `json:"seq,omitempty"`
-}
-
-// Event bodies are arbitrary bytes in the WAL (DESIGN.md). The JSON plane
-// needs every body value to be a valid JSON document, so encodeBodyJSON
-// passes JSON bodies through untouched and marks non-JSON bodies with the
-// explicit wrapper {"_b64":base64}. DecodeBodyJSON reverses it, which lets
-// planes that transport JSON (the internal read proxy) restore the original
-// bytes unambiguously. A client that deliberately stores the wrapper
-// document is the only collision case.
-const b64BodyKey = "_b64"
-
-func encodeBodyJSON(b []byte) json.RawMessage {
-	if json.Valid(b) {
-		return json.RawMessage(b)
-	}
-	return json.RawMessage(`{"` + b64BodyKey + `":"` + base64.StdEncoding.EncodeToString(b) + `"}`)
-}
-
-// DecodeBodyJSON maps a JSON-plane body value back to the original bytes:
-// {"_b64":"..."} decodes; any other JSON document is returned verbatim.
-func DecodeBodyJSON(raw []byte) []byte {
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &doc); err == nil && len(doc) == 1 {
-		if enc, ok := doc[b64BodyKey]; ok {
-			var s string
-			if err := json.Unmarshal(enc, &s); err == nil {
-				if b, err := base64.StdEncoding.DecodeString(s); err == nil {
-					return b
-				}
-			}
-		}
-	}
-	return raw
-}
-
-// ToRecordJSON converts a record for the wire. Event bodies are raw bytes
-// in the WAL (DESIGN.md); on the JSON plane a body that is not itself valid
-// JSON (a gRPC client may send any bytes) is emitted base64-encoded so the
-// response stays encodable.
-func (r *EventRecord) ToRecordJSON(seq uint64) *RecordJSON {
-	evs := make([]EventJSON, len(r.Events))
-	for i, e := range r.Events {
-		evs[i] = EventJSON{Type: e.Type, Body: encodeBodyJSON(e.Body)}
-	}
-	return &RecordJSON{
-		AggregateID: r.AggregateID,
-		Version:     r.Version,
-		UnixTime:    r.UnixTime,
-		CommandID:   r.CommandID,
-		Events:      evs,
-		Seq:         seq,
-	}
-}
-
-// ToRecord converts an AppendRequest into an EventRecord for one aggregate.
-func (req *AppendRequest) ToRecord(aggregateID string) *EventRecord {
-	evs := make([]Event, len(req.Events))
-	for i, e := range req.Events {
-		evs[i] = Event{Type: e.Type, Body: []byte(e.Body)}
-	}
-	return &EventRecord{
-		AggregateID: aggregateID,
-		Version:     req.Version,
-		UnixTime:    req.UnixTime,
-		CommandID:   req.CommandID,
-		Events:      evs,
-	}
+	Status         string       `json:"status"`
+	ErrID          int          `json:"err_id,omitempty"`
+	Err            string       `json:"error,omitempty"`
+	CurrentVersion uint32       `json:"current_version,omitempty"`
+	Seq            uint64       `json:"seq,omitempty"`
+	Slot           int32        `json:"slot"`
+	Node           string       `json:"node,omitempty"`   // redirect target for MOVED/ASK/NOT_LEADER
+	Record         *EventRecord `json:"record,omitempty"` // set on success/exists
 }

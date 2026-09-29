@@ -110,7 +110,9 @@ func convertAppend(r *data.AppendResponse) *pushupesv1.AppendResponse {
 		Node:           r.Node,
 	}
 	if r.Record != nil {
-		out.Record = fromRecordJSON(r.Record, r.Seq)
+		// the stored record is a plain EventRecord: raw bytes end to end,
+		// no JSON-plane body wrapping on the gRPC surface
+		out.Record = recordToProto(r.Record, r.Seq)
 	}
 	return out
 }
@@ -226,30 +228,6 @@ func recordToProto(r *data.EventRecord, seq uint64) *pushupesv1.Record {
 	out.Events = make([]*pushupesv1.Event, len(r.Events))
 	for i, ev := range r.Events {
 		out.Events[i] = &pushupesv1.Event{Type: ev.Type, Body: ev.Body}
-	}
-	return out
-}
-
-// fromRecordJSON maps a wire record (the AppendResponse path, which carries
-// data.RecordJSON) to its proto form. RecordJSON has no seq field, so it is
-// passed explicitly; non-JSON bodies carry the {"_b64":...} wrapper that
-// DecodeBodyJSON restores to the original bytes.
-func fromRecordJSON(r *data.RecordJSON, seq uint64) *pushupesv1.Record {
-	if r == nil {
-		return nil
-	}
-	out := &pushupesv1.Record{
-		AggregateId: r.AggregateID,
-		Version:     r.Version,
-		UnixTime:    r.UnixTime,
-		CommandId:   r.CommandID,
-		Seq:         seq,
-	}
-	out.Events = make([]*pushupesv1.Event, len(r.Events))
-	for i, ev := range r.Events {
-		// Bodies travel the JSON plane wrapped when they are not valid JSON
-		// (data.encodeBodyJSON); gRPC hands out the original bytes again.
-		out.Events[i] = &pushupesv1.Event{Type: ev.Type, Body: data.DecodeBodyJSON(ev.Body)}
 	}
 	return out
 }
