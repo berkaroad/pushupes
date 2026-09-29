@@ -73,10 +73,44 @@ type Engine struct {
 // slotRepl tracks follower LEOs and the high watermark for one slot's
 // replication group.
 type slotRepl struct {
-	// replica LEO per follower node id (leader LEO = store.LastSeqOf(slot))
-	leo    map[string]uint64
-	lastOK map[string]time.Time
+	// Parallel per-follower arrays (replica factor is 2-3: a linear scan
+	// beats two string-keyed maps — no hash, no GC write barriers on the
+	// fetch hot path, which re-reports every followed slot each round).
+	// The leader's own LEO is never stored: it is store.LastSeqOf(slot).
+	node   []string
+	leo    []uint64
+	lastOK []time.Time
 	hw     uint64
+}
+
+// find returns the array index of one follower, or -1.
+func (sr *slotRepl) find(node string) int {
+	for i, n := range sr.node {
+		if n == node {
+			return i
+		}
+	}
+	return -1
+}
+
+// touch records (leo, now) for one follower, creating its entry when new.
+func (sr *slotRepl) touch(node string, leo uint64, now time.Time) {
+	i := sr.find(node)
+	if i < 0 {
+		sr.node = append(sr.node, node)
+		sr.leo = append(sr.leo, leo)
+		sr.lastOK = append(sr.lastOK, now)
+		return
+	}
+	sr.leo[i] = leo
+	sr.lastOK[i] = now
+}
+
+// setLastOK overrides a follower's freshness stamp (test/ops helper).
+func (sr *slotRepl) setLastOK(node string, t time.Time) {
+	if i := sr.find(node); i >= 0 {
+		sr.lastOK[i] = t
+	}
 }
 
 // fetchSession is one follower's multiplexed fetch loop against one slot
@@ -87,6 +121,11 @@ type fetchSession struct {
 	leader string
 	slots  atomic.Value // []int32, refreshed by sessionLoop
 	stop   chan struct{}
+	// lastSweep bounds when unchanged positions were last stamped: the
+	// liveness of frozen slots rides the periodic sweep round (time-based
+	// because idle rounds each last the full long-poll wait, so a count
+	// cadence would sweep every N*fetchWait and brush isrStaleAfter).
+	lastSweep time.Time
 }
 
 // Fetch cadence per session: a productive round restarts immediately
@@ -95,13 +134,14 @@ type fetchSession struct {
 // whole idle cycle (wait+maxBackoff) must stay inside the ISR staleness
 // window for replicas to remain in-sync.
 const (
-	fetchBaseInterval = 100 * time.Millisecond
-	fetchMaxBackoff   = 2 * time.Second
-	fetchWait         = 2 * time.Second      // follower-requested long-poll budget
-	fetchSlack        = 1 * time.Second      // client-side timeout margin
-	fetchMaxWait      = 5 * time.Second      // leader-side cap on a requested wait
-	fetchBurstSettle  = 2 * time.Millisecond // coalescing window after one waiter wakes
-	isrStaleAfter     = 10 * time.Second     // must exceed fetchWait+fetchMaxBackoff
+	fetchBaseInterval  = 100 * time.Millisecond
+	fetchMaxBackoff    = 2 * time.Second
+	fetchWait          = 2 * time.Second      // follower-requested long-poll budget
+	fetchSlack         = 1 * time.Second      // client-side timeout margin
+	fetchMaxWait       = 5 * time.Second      // leader-side cap on a requested wait
+	fetchBurstSettle   = 2 * time.Millisecond // coalescing window after one waiter wakes
+	fetchSweepInterval = 2 * time.Second      // stamp all positions at least this often
+	isrStaleAfter      = 10 * time.Second     // must exceed fetchWait+fetchMaxBackoff
 
 	// maxPayloadBytes caps one long-poll response: during a backlog the
 	// session streams item by item across rounds instead of building a
@@ -402,8 +442,8 @@ func (e *Engine) isr(slot int32) []string {
 	}
 	cutoff := time.Now().Add(-isrStaleAfter)
 	var out []string
-	for node, t := range sr.lastOK {
-		if t.After(cutoff) {
+	for i, node := range sr.node {
+		if sr.lastOK[i].After(cutoff) {
 			out = append(out, node)
 		}
 	}
@@ -426,10 +466,11 @@ func (e *Engine) advanceHW(slot int32) {
 		if node == e.self {
 			continue
 		}
-		if !sr.lastOK[node].After(cutoff) {
-			continue // out of ISR: excluded from HW computation
+		i := sr.find(node)
+		if i < 0 || !sr.lastOK[i].After(cutoff) {
+			continue // unknown or out of ISR: excluded from HW computation
 		}
-		if l := sr.leo[node]; l < minLEO {
+		if l := sr.leo[i]; l < minLEO {
 			minLEO = l
 		}
 	}
@@ -488,12 +529,15 @@ func (e *Engine) noteReplicaProgress(slot int32, follower string, leo uint64, no
 	e.replMu.Lock()
 	sr := e.repl[slot]
 	if sr == nil {
-		sr = &slotRepl{leo: map[string]uint64{}, lastOK: map[string]time.Time{}}
+		sr = &slotRepl{}
 		e.repl[slot] = sr
 	}
-	prev, wasFresh := sr.leo[follower], now.Sub(sr.lastOK[follower]) <= isrStaleAfter
-	sr.leo[follower] = leo
-	sr.lastOK[follower] = now
+	i := sr.find(follower)
+	prev, wasFresh := uint64(0), false
+	if i >= 0 {
+		prev, wasFresh = sr.leo[i], now.Sub(sr.lastOK[i]) <= isrStaleAfter
+	}
+	sr.touch(follower, leo, now)
 	e.replMu.Unlock()
 	if leo > prev || !wasFresh {
 		e.advanceHW(slot)
@@ -505,9 +549,14 @@ func (e *Engine) noteReplicaProgress(slot int32, follower string, leo uint64, no
 // item (the leader-side hot path: thousands of items per second).
 type progressBatch struct {
 	follower string
-	slots    []int32
-	leos     []uint64
-	now      time.Time
+	// stamp=true refreshes the liveness last-seen for every position
+	// (sweep rounds); with false (ordinary rounds) entries whose LEO did
+	// not move are read, compared, skipped — no writes, no advanceHW.
+	stamp   bool
+	slots   []int32
+	leos    []uint64
+	now     time.Time
+	changed []int32 // scratch: slots whose HW computation may move
 }
 
 func (b *progressBatch) add(slot int32, leo uint64) {
@@ -519,8 +568,10 @@ func (b *progressBatch) add(slot int32, leo uint64) {
 // truncates the position slices; this also drops the follower/now stamps.
 func (b *progressBatch) reset() *progressBatch {
 	b.follower = ""
+	b.stamp = false
 	b.slots = b.slots[:0]
 	b.leos = b.leos[:0]
+	b.changed = b.changed[:0]
 	b.now = time.Time{}
 	return b
 }
@@ -531,26 +582,44 @@ func (b *progressBatch) apply(e *Engine) {
 	if len(b.slots) == 0 {
 		return
 	}
-	changed := make([]int32, 0, len(b.slots))
+	changed := b.changed[:0]
 	e.replMu.Lock()
 	for i, slot := range b.slots {
 		leo := b.leos[i]
 		sr := e.repl[slot]
 		if sr == nil {
-			sr = &slotRepl{leo: map[string]uint64{}, lastOK: map[string]time.Time{}}
+			sr = &slotRepl{}
 			e.repl[slot] = sr
 		}
-		prev, wasFresh := sr.leo[b.follower], b.now.Sub(sr.lastOK[b.follower]) <= isrStaleAfter
-		sr.leo[b.follower] = leo
-		sr.lastOK[b.follower] = b.now
-		if leo > prev || !wasFresh {
+		j := sr.find(b.follower)
+		if j < 0 { // new replica: record + (re)join the in-sync set
+			sr.touch(b.follower, leo, b.now)
 			changed = append(changed, slot)
+			continue
+		}
+		if leo != sr.leo[j] {
+			sr.touch(b.follower, leo, b.now)
+			changed = append(changed, slot)
+			continue
+		}
+		// LEO unchanged: refresh the liveness stamp only on sweep rounds
+		// (steady followers re-report hundreds of frozen slots every
+		// round; a full write per entry was the top CPU consumer). A
+		// STALE replica re-reporting the same LEO must still re-join the
+		// in-sync set — advanceHW runs when freshness flipped.
+		wasFresh := b.now.Sub(sr.lastOK[j]) <= isrStaleAfter
+		if b.stamp || !wasFresh {
+			sr.lastOK[j] = b.now
+			if !wasFresh {
+				changed = append(changed, slot) // re-joined: HW may move
+			}
 		}
 	}
 	e.replMu.Unlock()
 	for _, slot := range changed {
 		e.advanceHW(slot)
 	}
+	b.changed = changed
 	b.slots = b.slots[:0]
 	b.leos = b.leos[:0]
 }
@@ -578,6 +647,9 @@ type MFetchRequest struct {
 	WaitMS   int64    `json:"wait_ms,omitempty"`
 	Slots    []int32  `json:"slots"`
 	FromSeqs []uint64 `json:"from_seqs"`
+	// Sweep is a liveness round: the leader refreshes last-seen stamps for
+	// every reported position instead of only the ones that moved.
+	Sweep bool `json:"sweep,omitempty"`
 }
 
 // MFetchResponse answers an MFetchRequest; only slots with data (or
@@ -685,6 +757,7 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 	// them re-reporting unchanged LEOs.
 	prog := e.progressPool.Get().(*progressBatch)
 	prog.follower = req.Follower
+	prog.stamp = req.Sweep
 	prog.now = time.Now()
 
 	for _, i := range order {
@@ -935,6 +1008,7 @@ func (e *Engine) syncSessions(ctx context.Context) {
 // error doubles the sleep up to maxBackoff. The leader's long-poll absorbs
 // quiet periods inside the request itself.
 func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
+	sess.lastSweep = time.Now().Add(-fetchSweepInterval) // sweep on the first round
 	backoff := time.Duration(0)
 	for {
 		if ctx.Err() != nil {
@@ -950,7 +1024,15 @@ func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
 			backoff = fetchBaseInterval
 			continue
 		}
-		_, err := e.fetchRound(ctx, sess.leader, slots)
+		// Ordinary rounds report positions and let the leader skip
+		// unchanged entries; a sweep round every fetchSweepInterval stamps
+		// liveness for everything (<= a few seconds, far inside the 10s
+		// staleness window even counting a full long-poll round).
+		sweep := time.Since(sess.lastSweep) >= fetchSweepInterval
+		if sweep {
+			sess.lastSweep = time.Now()
+		}
+		_, err := e.fetchRound(ctx, sess.leader, slots, sweep)
 		if err != nil {
 			e.logger.WithField("leader", sess.leader).WithError(err).Warn("fetch round failed")
 			// Transport/leader trouble: back off so a dead leader does not
@@ -976,7 +1058,7 @@ func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
 // fetchRound performs one multiplexed fetch: the covered slots' positions
 // ride as progress reports (FromSeq-1 == durable LEO); the leader holds the
 // request until at least one slot advances or the wait budget elapses.
-func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32) (bool, error) {
+func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, sweep bool) (bool, error) {
 	addr := e.peerAddr(leader)
 	if addr == "" {
 		return false, data.ErrNotLeader
@@ -987,7 +1069,7 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32) (
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, fetchWait+fetchSlack+5*time.Second)
 	defer cancel()
-	fr, err := e.peerMFetch(reqCtx, addr, &MFetchRequest{Follower: e.self, WaitMS: fetchWait.Milliseconds(), Slots: slots, FromSeqs: froms})
+	fr, err := e.peerMFetch(reqCtx, addr, &MFetchRequest{Follower: e.self, WaitMS: fetchWait.Milliseconds(), Slots: slots, FromSeqs: froms, Sweep: sweep})
 	if err != nil {
 		return false, err
 	}
@@ -999,14 +1081,18 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32) (
 		}
 		productive = true
 	}
-	if productive {
-		// Positions moved: report the new LEOs immediately so the leader
-		// advances HW without waiting for the next round's FromSeq piggyback.
-		prog := make([]uint64, len(slots))
-		for i, s := range slots {
-			prog[i] = e.store.LastSeqOf(s) + 1
+	if len(fr.Items) > 0 {
+		// Positions moved: report only the slots that actually advanced
+		// (a productive round on a busy leader touches tens of slots, not
+		// the full 1.4k set), so the leader advances HW immediately
+		// instead of waiting for the next round's piggyback.
+		changed := make([]int32, 0, len(fr.Items))
+		prog := make([]uint64, 0, len(fr.Items))
+		for _, it := range fr.Items {
+			changed = append(changed, it.Slot)
+			prog = append(prog, e.store.LastSeqOf(it.Slot)+1)
 		}
-		e.reportProgress(addr, slots, prog)
+		e.reportProgress(addr, changed, prog, false)
 	}
 	return productive, nil
 }
@@ -1046,10 +1132,10 @@ func countRecords(payload []byte) int {
 
 // reportProgress posts follower LEOs in bulk to a leader's peer plane (one
 // RPC per productive round, replacing the old per-slot reportLEO).
-func (e *Engine) reportProgress(addr string, slots []int32, froms []uint64) {
+func (e *Engine) reportProgress(addr string, slots []int32, froms []uint64, stamp bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = e.peerProgress(ctx, addr, e.self, slots, froms)
+	_ = e.peerProgress(ctx, addr, e.self, slots, froms, stamp)
 }
 
 // ReadProxyAddr returns the slot leader's gRPC address when this node

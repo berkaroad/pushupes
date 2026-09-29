@@ -141,7 +141,7 @@ func TestNoteReplicaProgressAdvancesHW(t *testing.T) {
 	// leader's LEO (acks=all degrades to a leader-only
 	// guarantee until the replica re-syncs, never a silent stall).
 	e.replMu.Lock()
-	e.repl[0].lastOK["node-2"] = time.Now().Add(-time.Minute)
+	e.repl[0].setLastOK("node-2", time.Now().Add(-time.Minute))
 	e.replMu.Unlock()
 	if got := e.ISR(0); len(got) != 0 {
 		t.Fatalf("ISR after staleness %v want empty", got)
@@ -418,7 +418,7 @@ func TestHandleFetchAndReplicateOverPeerPlane(t *testing.T) {
 		}
 	}
 	// drive one replica fetch round (session loop's unit of work)
-	if _, err := follower.fetchRound(context.Background(), "node-1", []int32{0}); err != nil {
+	if _, err := follower.fetchRound(context.Background(), "node-1", []int32{0}, true); err != nil {
 		t.Fatalf("fetchRound: %v", err)
 	}
 	if leo := follower.store.LastSeqOf(0); leo != 3 {

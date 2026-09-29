@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"pushupes/internal/data"
@@ -46,7 +47,9 @@ type Slot struct {
 	Dir      string
 	segments []*Segment // ordered, contiguous by seq; last one writable
 
-	seqCounter uint64 // last assigned seq (0 = empty)
+	// seqCounter is the last assigned seq (0 = empty). Written under s.mu;
+	// exposed lock-free via LastSeq/atomic for the fetch hot path.
+	seqCounter atomic.Uint64
 
 	aggVersions map[string]uint32
 	cmdIndex    map[string]uint64
@@ -64,8 +67,9 @@ type Slot struct {
 	// (see Store.WakeChan). The leader's long-poll watch selects across
 	// deadline/context/store-bus and uses these handles to decide WHICH
 	// parked slots actually moved — the bus alone would force a locked
-	// rescan of every followed slot per append.
-	wake chan struct{}
+	// rescan of every followed slot per append. Swapped under s.mu; read
+	// lock-free via Store.WakeChan.
+	wake atomic.Pointer[chan struct{}]
 	// store back-reference: advances also fire the store-wide wake bus
 	// (see Store.WakeBus). nil for standalone (test) slots.
 	store *Store
@@ -89,9 +93,10 @@ func OpenSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy) (
 		aggVersions:  make(map[string]uint32),
 		cmdIndex:     make(map[string]uint64),
 		aggSeqs:      make(map[string][]uint64),
-		wake:         make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
+	w := make(chan struct{})
+	s.wake.Store(&w)
 	paths, err := SegmentFilesOf(dir)
 	if err != nil {
 		return nil, err
@@ -131,14 +136,14 @@ func OpenSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy) (
 			return nil, err
 		}
 		s.segments = append(s.segments, seg)
-		s.seqCounter = 0
+		s.seqCounter.Store(0)
 	} else {
 		last := s.segments[len(s.segments)-1]
 		last.writable = true // resume appending where the log stopped
 		if last.RecordCnt > 0 {
-			s.seqCounter = last.LastSeq
+			s.seqCounter.Store(last.LastSeq)
 		} else {
-			s.seqCounter = last.BaseSeq - 1
+			s.seqCounter.Store(last.BaseSeq - 1)
 		}
 	}
 	return s, nil
@@ -202,11 +207,11 @@ func (s *Slot) Append(rec *data.EventRecord) (*AppendOutcome, error) {
 	if err != nil {
 		return nil, err
 	}
-	seq := s.seqCounter + 1
+	seq := s.seqCounter.Load() + 1
 	if err := seg.Append(seq, rec); err != nil {
 		return nil, err
 	}
-	s.seqCounter = seq
+	s.seqCounter.Store(seq)
 	s.indexRecordLocked(seq, rec)
 	s.pendingFlush++
 	s.advanceNotifyLocked()
@@ -226,17 +231,17 @@ func (s *Slot) AppendAtSeq(seq uint64, rec *data.EventRecord) error {
 func (s *Slot) appendAtSeq(seq uint64, rec *data.EventRecord) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if seq <= s.seqCounter {
+	if seq <= s.seqCounter.Load() {
 		if existing, err := s.readBySeqLocked(seq); err == nil && existing != nil {
 			if existing.CommandID == rec.CommandID && existing.Version == rec.Version {
 				return false, nil // already replicated
 			}
 			return false, fmt.Errorf("slot %d: seq %d diverged on replay", s.ID, seq)
 		}
-		return false, fmt.Errorf("slot %d: seq %d below counter %d", s.ID, seq, s.seqCounter)
+		return false, fmt.Errorf("slot %d: seq %d below counter %d", s.ID, seq, s.seqCounter.Load())
 	}
-	if seq != s.seqCounter+1 {
-		return false, fmt.Errorf("slot %d: seq %d not contiguous (counter %d)", s.ID, seq, s.seqCounter)
+	if seq != s.seqCounter.Load()+1 {
+		return false, fmt.Errorf("slot %d: seq %d not contiguous (counter %d)", s.ID, seq, s.seqCounter.Load())
 	}
 	seg, err := s.tail()
 	if err != nil {
@@ -245,7 +250,7 @@ func (s *Slot) appendAtSeq(seq uint64, rec *data.EventRecord) (bool, error) {
 	if err := seg.Append(seq, rec); err != nil {
 		return false, err
 	}
-	s.seqCounter = seq
+	s.seqCounter.Store(seq)
 	s.indexRecordLocked(seq, rec)
 	s.pendingFlush++
 	s.advanceNotifyLocked()
@@ -254,7 +259,7 @@ func (s *Slot) appendAtSeq(seq uint64, rec *data.EventRecord) (bool, error) {
 
 // readBySeqLocked fetches one record by seq; caller holds s.mu (read or write).
 func (s *Slot) readBySeqLocked(seq uint64) (*data.EventRecord, error) {
-	if seq == 0 || seq > s.seqCounter {
+	if seq == 0 || seq > s.seqCounter.Load() {
 		return nil, data.ErrRecordNotFound
 	}
 	for _, seg := range s.segments {
@@ -283,11 +288,17 @@ func (s *Slot) readBySeqLocked(seq uint64) (*data.EventRecord, error) {
 	return nil, data.ErrRecordNotFound
 }
 
-// LastSeq is the slot's high-end seq (LEO).
+// Wake returns the current wake handle pointer. Lock-free read; the handle
+// is swapped under s.mu on every advance (advanceNotifyLocked).
+func (s *Slot) Wake() *chan struct{} {
+	return s.wake.Load()
+}
+
+// LastSeq is the slot's high-end seq (LEO). Lock-free: the fetch hot path
+// calls it once per reported position per round; the value is written under
+// s.mu and observed eventually (appenders see their own write via the lock).
 func (s *Slot) LastSeq() uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.seqCounter
+	return s.seqCounter.Load()
 }
 
 // advanceNotifyLocked fires the store-level wake signal for this slot and
@@ -295,8 +306,9 @@ func (s *Slot) LastSeq() uint64 {
 // holding it observe the advance) and install a fresh one for the next.
 // Callers hold s.mu (write).
 func (s *Slot) advanceNotifyLocked() {
-	close(s.wake)
-	s.wake = make(chan struct{})
+	close(*s.wake.Load())
+	nw := make(chan struct{})
+	s.wake.Store(&nw)
 	if s.store != nil {
 		s.store.fireWakeBus()
 	}
@@ -310,7 +322,7 @@ func (s *Slot) advanceNotifyLocked() {
 func (s *Slot) WaitForSeq(wantSeq uint64, deadline time.Time) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for s.seqCounter < wantSeq {
+	for s.seqCounter.Load() < wantSeq {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			break
@@ -320,7 +332,7 @@ func (s *Slot) WaitForSeq(wantSeq uint64, deadline time.Time) uint64 {
 		s.cond.Wait()
 		timer.Stop()
 	}
-	return s.seqCounter
+	return s.seqCounter.Load()
 }
 
 // CurrentVersion returns the aggregate's last stored version (0 = unknown).
@@ -389,10 +401,18 @@ func (s *Slot) LastVersionOf(aggregateID string) uint32 {
 // ReadRange returns byte ranges covering records fromSeq <= seq < untilSeq
 // across segments (untilSeq 0 = to LEO). Used by replica fetch and migration.
 func (s *Slot) ReadRange(fromSeq, untilSeq uint64, maxBytes int64) ([]data.ByteRange, uint64, error) {
+	if untilSeq == 0 {
+		// Lock-free empty fast path: past the atomic LEO there is nothing
+		// to fetch, and steady followers ask for exactly that for every
+		// idle slot every round (the fetch hot path's dominant call).
+		if leo := s.seqCounter.Load(); fromSeq > leo {
+			return nil, fromSeq, nil
+		}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if untilSeq == 0 {
-		untilSeq = s.seqCounter + 1
+		untilSeq = s.seqCounter.Load() + 1
 	}
 	if fromSeq >= untilSeq {
 		return nil, fromSeq, nil

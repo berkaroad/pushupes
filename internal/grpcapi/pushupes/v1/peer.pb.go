@@ -276,8 +276,12 @@ type MFetchRequest struct {
 	// Packed parallel positions: slot[i] wanted from from_seqs[i].
 	// Scalar arrays (not messages): a session carries every followed slot
 	// each round, and per-entry FetchItem objects dominated the wire cost.
-	Slots         []int32  `protobuf:"varint,3,rep,packed,name=slots,proto3" json:"slots,omitempty"`
-	FromSeqs      []uint64 `protobuf:"varint,4,rep,packed,name=from_seqs,json=fromSeqs,proto3" json:"from_seqs,omitempty"`
+	Slots    []int32  `protobuf:"varint,3,rep,packed,name=slots,proto3" json:"slots,omitempty"`
+	FromSeqs []uint64 `protobuf:"varint,4,rep,packed,name=from_seqs,json=fromSeqs,proto3" json:"from_seqs,omitempty"`
+	// sweep marks the periodic liveness round: the leader refreshes the
+	// replica last-seen stamps for EVERY reported position. Ordinary rounds
+	// record only positions that actually moved (see progressBatch.stamp).
+	Sweep         bool `protobuf:"varint,5,opt,name=sweep,proto3" json:"sweep,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -340,6 +344,13 @@ func (x *MFetchRequest) GetFromSeqs() []uint64 {
 	return nil
 }
 
+func (x *MFetchRequest) GetSweep() bool {
+	if x != nil {
+		return x.Sweep
+	}
+	return false
+}
+
 type MFetchResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Follower      string                 `protobuf:"bytes,1,opt,name=follower,proto3" json:"follower,omitempty"`
@@ -396,8 +407,11 @@ type ReplicaProgressRequest struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	Follower string                 `protobuf:"bytes,1,opt,name=follower,proto3" json:"follower,omitempty"`
 	// Packed durable positions (from_seq = LEO+1), same shape as MFetch.
-	Slots         []int32  `protobuf:"varint,2,rep,packed,name=slots,proto3" json:"slots,omitempty"`
-	FromSeqs      []uint64 `protobuf:"varint,3,rep,packed,name=from_seqs,json=fromSeqs,proto3" json:"from_seqs,omitempty"`
+	Slots    []int32  `protobuf:"varint,2,rep,packed,name=slots,proto3" json:"slots,omitempty"`
+	FromSeqs []uint64 `protobuf:"varint,3,rep,packed,name=from_seqs,json=fromSeqs,proto3" json:"from_seqs,omitempty"`
+	// stamp: refresh last-seen for every entry (liveness), not only moved
+	// ones. False = record only positions that actually changed.
+	Stamp         bool `protobuf:"varint,4,opt,name=stamp,proto3" json:"stamp,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -451,6 +465,13 @@ func (x *ReplicaProgressRequest) GetFromSeqs() []uint64 {
 		return x.FromSeqs
 	}
 	return nil
+}
+
+func (x *ReplicaProgressRequest) GetStamp() bool {
+	if x != nil {
+		return x.Stamp
+	}
+	return false
 }
 
 type ReplicaProgressResponse struct {
@@ -887,19 +908,21 @@ const file_pushupes_v1_peer_proto_rawDesc = "" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x19\n" +
 	"\bfrom_seq\x18\x02 \x01(\x04R\afromSeq\x12\x19\n" +
 	"\bnext_seq\x18\x03 \x01(\x04R\anextSeq\x12\x18\n" +
-	"\apayload\x18\x04 \x01(\fR\apayload\"\x7f\n" +
+	"\apayload\x18\x04 \x01(\fR\apayload\"\x95\x01\n" +
 	"\rMFetchRequest\x12\x1a\n" +
 	"\bfollower\x18\x01 \x01(\tR\bfollower\x12\x17\n" +
 	"\await_ms\x18\x02 \x01(\x03R\x06waitMs\x12\x18\n" +
 	"\x05slots\x18\x03 \x03(\x05B\x02\x10\x01R\x05slots\x12\x1f\n" +
-	"\tfrom_seqs\x18\x04 \x03(\x04B\x02\x10\x01R\bfromSeqs\"Z\n" +
+	"\tfrom_seqs\x18\x04 \x03(\x04B\x02\x10\x01R\bfromSeqs\x12\x14\n" +
+	"\x05sweep\x18\x05 \x01(\bR\x05sweep\"Z\n" +
 	"\x0eMFetchResponse\x12\x1a\n" +
 	"\bfollower\x18\x01 \x01(\tR\bfollower\x12,\n" +
-	"\x05items\x18\x02 \x03(\v2\x16.pushupes.v1.FetchItemR\x05items\"o\n" +
+	"\x05items\x18\x02 \x03(\v2\x16.pushupes.v1.FetchItemR\x05items\"\x85\x01\n" +
 	"\x16ReplicaProgressRequest\x12\x1a\n" +
 	"\bfollower\x18\x01 \x01(\tR\bfollower\x12\x18\n" +
 	"\x05slots\x18\x02 \x03(\x05B\x02\x10\x01R\x05slots\x12\x1f\n" +
-	"\tfrom_seqs\x18\x03 \x03(\x04B\x02\x10\x01R\bfromSeqs\"\x19\n" +
+	"\tfrom_seqs\x18\x03 \x03(\x04B\x02\x10\x01R\bfromSeqs\x12\x14\n" +
+	"\x05stamp\x18\x04 \x01(\bR\x05stamp\"\x19\n" +
 	"\x17ReplicaProgressResponse\"R\n" +
 	"\x10ReplicateRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x10\n" +

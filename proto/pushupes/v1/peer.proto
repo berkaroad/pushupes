@@ -66,6 +66,10 @@ message MFetchRequest {
   // each round, and per-entry FetchItem objects dominated the wire cost.
   repeated int32 slots = 3 [packed = true];
   repeated uint64 from_seqs = 4 [packed = true];
+  // sweep marks the periodic liveness round: the leader refreshes the
+  // replica last-seen stamps for EVERY reported position. Ordinary rounds
+  // record only positions that actually moved (see progressBatch.stamp).
+  bool sweep = 5;
 }
 message MFetchResponse {
   string follower = 1;
@@ -77,6 +81,9 @@ message ReplicaProgressRequest {
   // Packed durable positions (from_seq = LEO+1), same shape as MFetch.
   repeated int32 slots = 2 [packed = true];
   repeated uint64 from_seqs = 3 [packed = true];
+  // stamp: refresh last-seen for every entry (liveness), not only moved
+  // ones. False = record only positions that actually changed.
+  bool stamp = 4;
 }
 message ReplicaProgressResponse {}
 

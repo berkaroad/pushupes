@@ -69,7 +69,7 @@ func (s *peerServer) Register(_ context.Context, req *pushupesv1.RegisterRequest
 }
 
 func (s *peerServer) MFetch(ctx context.Context, req *pushupesv1.MFetchRequest) (*pushupesv1.MFetchResponse, error) {
-	internal := &MFetchRequest{Follower: req.Follower, WaitMS: req.WaitMs, Slots: req.Slots, FromSeqs: req.FromSeqs}
+	internal := &MFetchRequest{Follower: req.Follower, WaitMS: req.WaitMs, Slots: req.Slots, FromSeqs: req.FromSeqs, Sweep: req.Sweep}
 	resp, err := s.e.HandleMFetchCtx(ctx, *internal)
 	if err != nil {
 		return nil, err
@@ -78,7 +78,7 @@ func (s *peerServer) MFetch(ctx context.Context, req *pushupesv1.MFetchRequest) 
 }
 
 func (s *peerServer) ReplicaProgress(_ context.Context, req *pushupesv1.ReplicaProgressRequest) (*pushupesv1.ReplicaProgressResponse, error) {
-	prog := progressBatch{follower: req.Follower, now: time.Now()}
+	prog := progressBatch{follower: req.Follower, stamp: req.Stamp, now: time.Now()}
 	for i, slot := range req.Slots {
 		if i < len(req.FromSeqs) && slot >= 0 && req.FromSeqs[i] > 0 {
 			prog.add(slot, req.FromSeqs[i]-1)
@@ -206,7 +206,7 @@ func (e *Engine) peerMFetch(ctx context.Context, addr string, req *MFetchRequest
 		return nil, err
 	}
 	presp, err := c.MFetch(ctx, &pushupesv1.MFetchRequest{
-		Follower: req.Follower, WaitMs: req.WaitMS, Slots: req.Slots, FromSeqs: req.FromSeqs,
+		Follower: req.Follower, WaitMs: req.WaitMS, Slots: req.Slots, FromSeqs: req.FromSeqs, Sweep: req.Sweep,
 	})
 	if err != nil {
 		return nil, err
@@ -223,12 +223,12 @@ func (e *Engine) peerReplicate(ctx context.Context, addr string, slot int32, seq
 	return err
 }
 
-func (e *Engine) peerProgress(ctx context.Context, addr, follower string, slots []int32, froms []uint64) error {
+func (e *Engine) peerProgress(ctx context.Context, addr, follower string, slots []int32, froms []uint64, stamp bool) error {
 	c, err := e.peerRPC(addr)
 	if err != nil {
 		return err
 	}
-	_, err = c.ReplicaProgress(ctx, &pushupesv1.ReplicaProgressRequest{Follower: follower, Slots: slots, FromSeqs: froms})
+	_, err = c.ReplicaProgress(ctx, &pushupesv1.ReplicaProgressRequest{Follower: follower, Slots: slots, FromSeqs: froms, Stamp: stamp})
 	return err
 }
 

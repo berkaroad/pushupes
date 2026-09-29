@@ -19,7 +19,7 @@ type Store struct {
 	SegmentBytes int64
 	FlushPolicy  FlushPolicy
 
-	slots []*Slot
+	slots []atomic.Pointer[Slot] // lock-free reads; mu guards lazy open/reload
 	mu    sync.RWMutex
 	stop  chan struct{}
 	done  chan struct{}
@@ -61,7 +61,7 @@ func OpenStore(dir string, slotCount int32, segmentBytes int64, flush FlushPolic
 		SlotCount:    slotCount,
 		SegmentBytes: segmentBytes,
 		FlushPolicy:  flush,
-		slots:        make([]*Slot, slotCount),
+		slots:        make([]atomic.Pointer[Slot], slotCount),
 		writes:       make([]atomic.Uint64, slotCount),
 		dirty:        map[int32]bool{},
 		stop:         make(chan struct{}),
@@ -107,10 +107,8 @@ func OpenStore(dir string, slotCount int32, segmentBytes int64, flush FlushPolic
 					errOnce.Do(func() { openErr = err })
 					continue
 				}
-				st.mu.Lock()
 				slot.store = st
-				st.slots[t.id] = slot
-				st.mu.Unlock()
+				st.slots[t.id].Store(slot)
 			}
 		}()
 	}
@@ -140,9 +138,9 @@ func (st *Store) DropSlot(slotID int32) error {
 	if slotID < 0 || slotID >= st.SlotCount {
 		return fmt.Errorf("slot %d out of range", slotID)
 	}
-	if s := st.slots[slotID]; s != nil {
+	if s := st.slots[slotID].Load(); s != nil {
 		s.Close()
-		st.slots[slotID] = nil
+		st.slots[slotID].Store(nil)
 	}
 	st.clearDirty(slotID)
 	return os.RemoveAll(st.slotDir(slotID))
@@ -156,7 +154,7 @@ func (st *Store) ReloadSlot(slotID int32) error {
 	if slotID < 0 || slotID >= st.SlotCount {
 		return fmt.Errorf("slot %d out of range", slotID)
 	}
-	if s := st.slots[slotID]; s != nil {
+	if s := st.slots[slotID].Load(); s != nil {
 		s.Close()
 	}
 	slot, err := OpenSlot(st.slotDir(slotID), slotID, st.SegmentBytes, st.FlushPolicy)
@@ -164,7 +162,7 @@ func (st *Store) ReloadSlot(slotID int32) error {
 		return err
 	}
 	slot.store = st
-	st.slots[slotID] = slot
+	st.slots[slotID].Store(slot)
 	return nil
 }
 
@@ -178,23 +176,22 @@ func (st *Store) Slot(i int32) (*Slot, error) {
 	if i < 0 || i >= st.SlotCount {
 		return nil, fmt.Errorf("slot %d out of range [0,%d)", i, st.SlotCount)
 	}
-	st.mu.RLock()
-	s := st.slots[i]
-	st.mu.RUnlock()
-	if s != nil {
+	if s := st.slots[i].Load(); s != nil {
 		return s, nil
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if st.slots[i] == nil {
+	s := st.slots[i].Load()
+	if s == nil {
 		slot, err := OpenSlot(st.slotDir(i), i, st.SegmentBytes, st.FlushPolicy)
 		if err != nil {
 			return nil, err
 		}
 		slot.store = st
-		st.slots[i] = slot
+		st.slots[i].Store(slot)
+		return slot, nil
 	}
-	return st.slots[i], nil
+	return s, nil
 }
 
 // Append routes by aggregate_id and applies the business rules.
@@ -302,9 +299,7 @@ func (st *Store) WakeChan(slotID int32) <-chan struct{} {
 	if err != nil {
 		return nil
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.wake
+	return *s.Wake()
 }
 
 // WakeBus returns the store-wide advance signal: ANY slot appending closes
@@ -396,14 +391,12 @@ func (st *Store) slotReadRange(slot *Slot, r data.ByteRange, buf []byte) error {
 
 // Flush flushes every loaded slot.
 func (st *Store) Flush() error {
-	st.mu.RLock()
 	slots := make([]*Slot, 0, len(st.slots))
-	for _, s := range st.slots {
-		if s != nil {
+	for i := range st.slots {
+		if s := st.slots[i].Load(); s != nil {
 			slots = append(slots, s)
 		}
 	}
-	st.mu.RUnlock()
 	for _, s := range slots {
 		if err := s.Flush(); err != nil {
 			return err
@@ -428,9 +421,7 @@ func (st *Store) flushLoop() {
 			}
 			st.dirtyMu.Unlock()
 			for _, id := range ids {
-				st.mu.RLock()
-				s := st.slots[id]
-				st.mu.RUnlock()
+				s := st.slots[id].Load()
 				if s == nil {
 					st.clearDirty(id)
 					continue

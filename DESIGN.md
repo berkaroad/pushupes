@@ -121,6 +121,11 @@ Body: Record*，每条记录：
     直接乘以槽数）。预算耗尽但有货的槽不 park（新句柄等不到"未来"的
     append，会空睡到 deadline），交给下一轮轮转游标。follower 侧健康
     轮（有数据或被长轮询吸收的空轮）零退避立即重发，仅传输错误退避。
+  - 记账成本 O(变化)：leader 对每轮捎带的全部位置做"比对后跳过"——LEO
+    未变的条目不写状态、不重算 HW。副本的**存活戳**（lastOK，掉出 ISR
+    的判定依据）不靠每轮全量写，而是每 ~2s 一次 **sweep 轮**（MFetch 的
+    sweep 位）为所有条目补戳，sweep 间隔远小于 stale 窗口；有数据的轮
+    只对真正推进过的槽即时补报 LEO（ReplicaProgress，不再全量重发）。
   - `acks=all`：leader 等 `seq ≤ HW` 再回 success；`acks=leader`：本地追加
     成功即返回；`acks=none`：不等响应。
   - ISR 维护：follower 在 `replica.lag.time.max` 内跟上进 ISR；
