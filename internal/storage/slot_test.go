@@ -8,7 +8,7 @@ import (
 	"pushupes/internal/data"
 )
 
-func mkRec(agg string, ver uint64, cmd string) *data.EventRecord {
+func mkRec(agg string, ver uint32, cmd string) *data.EventRecord {
 	return &data.EventRecord{
 		AggregateID: agg,
 		Version:     ver,
@@ -113,7 +113,7 @@ func TestRollAndReadAcrossSegments(t *testing.T) {
 	st, _ := newTestStore(t, 128, seg)
 
 	for i := uint64(1); i <= 300; i++ {
-		out, err := st.Append(mkRec("agg-r", i, fmt.Sprintf("cmd-%d", i)))
+		out, err := st.Append(mkRec("agg-r", uint32(i), fmt.Sprintf("cmd-%d", i)))
 		if err != nil || out.Status != data.StatusSuccess {
 			t.Fatalf("append %d: %+v %v", i, out, err)
 		}
@@ -156,7 +156,7 @@ func TestRollAndReadAcrossSegments(t *testing.T) {
 func TestReadRange(t *testing.T) {
 	st, dir := newTestStore(t, 128, 4096)
 	for i := uint64(1); i <= 300; i++ {
-		if _, err := st.Append(mkRec("agg-f", i, fmt.Sprintf("cmd-f-%d", i))); err != nil {
+		if _, err := st.Append(mkRec("agg-f", uint32(i), fmt.Sprintf("cmd-f-%d", i))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -202,7 +202,7 @@ func TestRecoveryAndTornTail(t *testing.T) {
 	}
 	slotID := st.SlotOf("agg-c")
 	for i := uint64(1); i <= 50; i++ {
-		if _, err := st.Append(mkRec("agg-c", i, fmt.Sprintf("cmd-c-%d", i))); err != nil {
+		if _, err := st.Append(mkRec("agg-c", uint32(i), fmt.Sprintf("cmd-c-%d", i))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -250,7 +250,7 @@ func TestAppendAtSeq(t *testing.T) {
 
 	// leader-style records with fixed seq
 	for i := uint64(1); i <= 10; i++ {
-		rec := mkRec("agg-rep", i, fmt.Sprintf("cmd-rep-%d", i))
+		rec := mkRec("agg-rep", uint32(i), fmt.Sprintf("cmd-rep-%d", i))
 		if err := slot.AppendAtSeq(i, rec); err != nil {
 			t.Fatalf("AppendAtSeq %d: %v", i, err)
 		}

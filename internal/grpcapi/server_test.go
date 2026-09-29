@@ -44,7 +44,7 @@ func newTestClient(t *testing.T) (pushupesv1.EventServiceClient, *storage.Store)
 	return pushupesv1.NewEventServiceClient(conn), st
 }
 
-func appendReq(agg string, ver uint64, cmd, body string) *pushupesv1.AppendRequest {
+func appendReq(agg string, ver uint32, cmd, body string) *pushupesv1.AppendRequest {
 	return &pushupesv1.AppendRequest{
 		AggregateId: agg,
 		Version:     ver,

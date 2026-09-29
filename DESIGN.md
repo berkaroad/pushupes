@@ -8,7 +8,7 @@
 ```
 EventRecord（事件流中的一条记录）
 ├── aggregate_id: string     # 聚合 ID（事件流即"同一 aggregate_id 的记录序列"）
-├── version:      uint64     # 连续版本号，从 1 开始，同聚合内严格 +1 递增
+├── version:      uint32     # 连续版本号，从 1 开始，同聚合内严格 +1 递增
 ├── unix_time:    int64      # 发生时间（Unix 秒）
 ├── command_id:   string     # 关联命令 ID（幂等键）
 └── events:       [Event]    # 事件列表
@@ -72,7 +72,7 @@ Header(20B): magic "ESWL"(4) fmtVer(1) reserved(3) slotID(4be) baseSeq(8be)
 Body: Record*，每条记录：
   recLen(4be)                        # 记录体总长
   aggLen(2be) aggregate_id
-  version(8be) unix_time(8be)
+  version(4be) unix_time(8be)
   cmdLen(2be) command_id
   eventCount(2be)
   Event*: typeLen(2be) type bodyLen(4be) body

@@ -26,7 +26,7 @@ message Event {
 // Record is one stored event-stream entry.
 message Record {
   string aggregate_id = 1;
-  uint64 version = 2;
+  uint32 version = 2;
   int64 unix_time = 3;
   string command_id = 4;
   repeated Event events = 5;
@@ -35,7 +35,7 @@ message Record {
 
 message AppendRequest {
   string aggregate_id = 1;
-  uint64 version = 2; // must be stream tail + 1
+  uint32 version = 2; // must be stream tail + 1
   int64 unix_time = 3; // 0 = server clock
   string command_id = 4; // idempotency key
   repeated Event events = 5;
@@ -52,7 +52,7 @@ message AppendResponse {
   Status status = 1;
   uint32 err_id = 2; // wire error table: 1001 conflict, 1003 MOVED, 1004 ASK...
   string message = 3;
-  uint64 current_version = 4; // set on 1001 for client self-heal
+  uint32 current_version = 4; // set on 1001 for client self-heal
   uint64 seq = 5;
   int32 slot = 6; // routing slot (authoritative even on redirects)
   string node = 7; // redirect target "host:port" for MOVED/ASK/NOT_LEADER
@@ -61,14 +61,14 @@ message AppendResponse {
 
 message ReadStreamRequest {
   string aggregate_id = 1;
-  uint64 from_version = 2; // 0 = 1
+  uint32 from_version = 2; // 0 = 1
   uint64 limit = 3; // 0 = all
 }
 
 message ReadStreamResponse {
   repeated Record records = 1;
-  uint64 next_version = 2;
-  uint64 last_version = 3;
+  uint32 next_version = 2;
+  uint32 last_version = 3;
 }
 
 message ReadByCommandRequest {

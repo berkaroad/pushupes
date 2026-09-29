@@ -25,7 +25,7 @@ func aggInSlot(t *testing.T, e *Engine, slot int32) string {
 	return ""
 }
 
-func makeRecord(agg string, version uint64, cmd string) *data.EventRecord {
+func makeRecord(agg string, version uint32, cmd string) *data.EventRecord {
 	return &data.EventRecord{
 		AggregateID: agg,
 		Version:     version,
@@ -63,7 +63,7 @@ func TestFetchPayloadRoundTrip(t *testing.T) {
 	// write 3 records into slot 0 (single-node plan: node-1 leads all)
 	aggX := aggInSlot(t, e, 0)
 	for v := uint64(1); v <= 3; v++ {
-		out, err := st.Append(makeRecord(aggX, v, fmt.Sprintf("c-%d", v)))
+		out, err := st.Append(makeRecord(aggX, uint32(v), fmt.Sprintf("c-%d", v)))
 		if err != nil || out.Status != data.StatusSuccess {
 			t.Fatalf("append v%d: %+v %v", v, out, err)
 		}
@@ -113,7 +113,7 @@ func TestNoteReplicaProgressAdvancesHW(t *testing.T) {
 	// 2 records on the leader, in the slot this node leads (0)
 	aggH := aggInSlot(t, e, 0)
 	for v := uint64(1); v <= 2; v++ {
-		if _, err := st.Append(makeRecord(aggH, v, fmt.Sprintf("h-%d", v))); err != nil {
+		if _, err := st.Append(makeRecord(aggH, uint32(v), fmt.Sprintf("h-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -275,7 +275,7 @@ func TestSnapshotFailureRollsBackSlotState(t *testing.T) {
 	// 2 records so there is content, in slot 0 which node-1 leads.
 	aggAB := aggInSlot(t, e, 0)
 	for v := uint64(1); v <= 2; v++ {
-		if _, err := st.Append(makeRecord(aggAB, v, fmt.Sprintf("ab-%d", v))); err != nil {
+		if _, err := st.Append(makeRecord(aggAB, uint32(v), fmt.Sprintf("ab-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -328,7 +328,7 @@ func TestHandleFetchAndReplicateOverPeerPlane(t *testing.T) {
 	// seed leader WAL (slot 0 is led by node-1)
 	aggE := aggInSlot(t, leader, 0)
 	for v := uint64(1); v <= 3; v++ {
-		out, _ := ldrStore.Append(makeRecord(aggE, v, fmt.Sprintf("e-%d", v)))
+		out, _ := ldrStore.Append(makeRecord(aggE, uint32(v), fmt.Sprintf("e-%d", v)))
 		if out.Status != data.StatusSuccess {
 			t.Fatalf("seed %d: %+v", v, out)
 		}

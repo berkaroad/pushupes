@@ -126,7 +126,7 @@ func appendStatus(st string) pushupesv1.AppendResponse_Status {
 	}
 }
 
-func (s *Server) fail(errID int, msg string, currentVersion uint64, slot int32, node string) *pushupesv1.AppendResponse {
+func (s *Server) fail(errID int, msg string, currentVersion uint32, slot int32, node string) *pushupesv1.AppendResponse {
 	return &pushupesv1.AppendResponse{
 		Status:         pushupesv1.AppendResponse_STATUS_FAIL,
 		ErrId:          uint32(errID),
@@ -177,7 +177,7 @@ func (s *Server) ReadStream(ctx context.Context, req *pushupesv1.ReadStreamReque
 		}
 		out.Records[i] = recordToProto(rec, sq)
 	}
-	out.NextVersion = from + uint64(len(recs))
+	out.NextVersion = from + uint32(len(recs))
 	out.LastVersion = out.NextVersion - 1
 	if len(recs) == 0 {
 		out.NextVersion, out.LastVersion = from, from-1

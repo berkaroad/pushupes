@@ -128,7 +128,7 @@ func main() {
 
 	// resume per-aggregate versions against the slot LEADER (replicas only
 	// show <=HW data; under-estimating the tail burns retries on 1001).
-	lastVers := make([]uint64, len(aggIDs))
+	lastVers := make([]uint32, len(aggIDs))
 	{
 		var bm sync.WaitGroup
 		sem := make(chan struct{}, 16)
@@ -150,7 +150,7 @@ func main() {
 	}
 	var resumeSum uint64
 	for _, v := range lastVers {
-		resumeSum += v
+		resumeSum += uint64(v)
 	}
 	fmt.Printf("resuming: %d existing records across aggregates\n", resumeSum)
 
@@ -201,7 +201,7 @@ func main() {
 			for i := w; i < len(aggIDs); i += nw {
 				targets = append(targets, aggIDs[i])
 			}
-			ver := make(map[string]uint64, len(targets))
+			ver := make(map[string]uint32, len(targets))
 			for _, t := range targets {
 				if idx := aggIndex(aggIDs, t); idx >= 0 {
 					ver[t] = lastVers[idx]
@@ -388,7 +388,7 @@ func appendWithRetry(w int, agg string, req *pushupesv1.AppendRequest,
 
 // probeVersion reports whether version k exists for one aggregate (versions
 // are contiguous from 1, so existence of k means tail >= k).
-func probeVersion(addr, agg string, k uint64) bool {
+func probeVersion(addr, agg string, k uint32) bool {
 	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	out, err := eventClient(addr).ReadStream(cctx, &pushupesv1.ReadStreamRequest{
@@ -403,11 +403,11 @@ func probeVersion(addr, agg string, k uint64) bool {
 // tailVersion finds the highest existing version of one aggregate from the
 // slot leader with exponential probe + binary search — O(log tail) one-row
 // reads, no full-stream fetch.
-func tailVersion(addr, agg string) uint64 {
+func tailVersion(addr, agg string) uint32 {
 	if !probeVersion(addr, agg, 1) {
 		return 0
 	}
-	hi := uint64(1)
+	hi := uint32(1)
 	for probeVersion(addr, agg, hi) {
 		hi *= 2
 	}

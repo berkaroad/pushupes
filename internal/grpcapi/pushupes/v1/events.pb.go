@@ -129,7 +129,7 @@ func (x *Event) GetBody() []byte {
 type Record struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	AggregateId   string                 `protobuf:"bytes,1,opt,name=aggregate_id,json=aggregateId,proto3" json:"aggregate_id,omitempty"`
-	Version       uint64                 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"`
+	Version       uint32                 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"`
 	UnixTime      int64                  `protobuf:"varint,3,opt,name=unix_time,json=unixTime,proto3" json:"unix_time,omitempty"`
 	CommandId     string                 `protobuf:"bytes,4,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
 	Events        []*Event               `protobuf:"bytes,5,rep,name=events,proto3" json:"events,omitempty"`
@@ -175,7 +175,7 @@ func (x *Record) GetAggregateId() string {
 	return ""
 }
 
-func (x *Record) GetVersion() uint64 {
+func (x *Record) GetVersion() uint32 {
 	if x != nil {
 		return x.Version
 	}
@@ -213,7 +213,7 @@ func (x *Record) GetSeq() uint64 {
 type AppendRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	AggregateId   string                 `protobuf:"bytes,1,opt,name=aggregate_id,json=aggregateId,proto3" json:"aggregate_id,omitempty"`
-	Version       uint64                 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"`                     // must be stream tail + 1
+	Version       uint32                 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"`                     // must be stream tail + 1
 	UnixTime      int64                  `protobuf:"varint,3,opt,name=unix_time,json=unixTime,proto3" json:"unix_time,omitempty"`   // 0 = server clock
 	CommandId     string                 `protobuf:"bytes,4,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"` // idempotency key
 	Events        []*Event               `protobuf:"bytes,5,rep,name=events,proto3" json:"events,omitempty"`
@@ -259,7 +259,7 @@ func (x *AppendRequest) GetAggregateId() string {
 	return ""
 }
 
-func (x *AppendRequest) GetVersion() uint64 {
+func (x *AppendRequest) GetVersion() uint32 {
 	if x != nil {
 		return x.Version
 	}
@@ -299,7 +299,7 @@ type AppendResponse struct {
 	Status         AppendResponse_Status  `protobuf:"varint,1,opt,name=status,proto3,enum=pushupes.v1.AppendResponse_Status" json:"status,omitempty"`
 	ErrId          uint32                 `protobuf:"varint,2,opt,name=err_id,json=errId,proto3" json:"err_id,omitempty"` // wire error table: 1001 conflict, 1003 MOVED, 1004 ASK...
 	Message        string                 `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
-	CurrentVersion uint64                 `protobuf:"varint,4,opt,name=current_version,json=currentVersion,proto3" json:"current_version,omitempty"` // set on 1001 for client self-heal
+	CurrentVersion uint32                 `protobuf:"varint,4,opt,name=current_version,json=currentVersion,proto3" json:"current_version,omitempty"` // set on 1001 for client self-heal
 	Seq            uint64                 `protobuf:"varint,5,opt,name=seq,proto3" json:"seq,omitempty"`
 	Slot           int32                  `protobuf:"varint,6,opt,name=slot,proto3" json:"slot,omitempty"`    // routing slot (authoritative even on redirects)
 	Node           string                 `protobuf:"bytes,7,opt,name=node,proto3" json:"node,omitempty"`     // redirect target "host:port" for MOVED/ASK/NOT_LEADER
@@ -359,7 +359,7 @@ func (x *AppendResponse) GetMessage() string {
 	return ""
 }
 
-func (x *AppendResponse) GetCurrentVersion() uint64 {
+func (x *AppendResponse) GetCurrentVersion() uint32 {
 	if x != nil {
 		return x.CurrentVersion
 	}
@@ -397,7 +397,7 @@ func (x *AppendResponse) GetRecord() *Record {
 type ReadStreamRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	AggregateId   string                 `protobuf:"bytes,1,opt,name=aggregate_id,json=aggregateId,proto3" json:"aggregate_id,omitempty"`
-	FromVersion   uint64                 `protobuf:"varint,2,opt,name=from_version,json=fromVersion,proto3" json:"from_version,omitempty"` // 0 = 1
+	FromVersion   uint32                 `protobuf:"varint,2,opt,name=from_version,json=fromVersion,proto3" json:"from_version,omitempty"` // 0 = 1
 	Limit         uint64                 `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"`                                // 0 = all
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -440,7 +440,7 @@ func (x *ReadStreamRequest) GetAggregateId() string {
 	return ""
 }
 
-func (x *ReadStreamRequest) GetFromVersion() uint64 {
+func (x *ReadStreamRequest) GetFromVersion() uint32 {
 	if x != nil {
 		return x.FromVersion
 	}
@@ -457,8 +457,8 @@ func (x *ReadStreamRequest) GetLimit() uint64 {
 type ReadStreamResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Records       []*Record              `protobuf:"bytes,1,rep,name=records,proto3" json:"records,omitempty"`
-	NextVersion   uint64                 `protobuf:"varint,2,opt,name=next_version,json=nextVersion,proto3" json:"next_version,omitempty"`
-	LastVersion   uint64                 `protobuf:"varint,3,opt,name=last_version,json=lastVersion,proto3" json:"last_version,omitempty"`
+	NextVersion   uint32                 `protobuf:"varint,2,opt,name=next_version,json=nextVersion,proto3" json:"next_version,omitempty"`
+	LastVersion   uint32                 `protobuf:"varint,3,opt,name=last_version,json=lastVersion,proto3" json:"last_version,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -500,14 +500,14 @@ func (x *ReadStreamResponse) GetRecords() []*Record {
 	return nil
 }
 
-func (x *ReadStreamResponse) GetNextVersion() uint64 {
+func (x *ReadStreamResponse) GetNextVersion() uint32 {
 	if x != nil {
 		return x.NextVersion
 	}
 	return 0
 }
 
-func (x *ReadStreamResponse) GetLastVersion() uint64 {
+func (x *ReadStreamResponse) GetLastVersion() uint32 {
 	if x != nil {
 		return x.LastVersion
 	}
@@ -628,7 +628,7 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\x04body\x18\x02 \x01(\fR\x04body\"\xbf\x01\n" +
 	"\x06Record\x12!\n" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x12\x18\n" +
-	"\aversion\x18\x02 \x01(\x04R\aversion\x12\x1b\n" +
+	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1b\n" +
 	"\tunix_time\x18\x03 \x01(\x03R\bunixTime\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x04 \x01(\tR\tcommandId\x12*\n" +
@@ -636,7 +636,7 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\x03seq\x18\x06 \x01(\x04R\x03seq\"\xc8\x01\n" +
 	"\rAppendRequest\x12!\n" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x12\x18\n" +
-	"\aversion\x18\x02 \x01(\x04R\aversion\x12\x1b\n" +
+	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1b\n" +
 	"\tunix_time\x18\x03 \x01(\x03R\bunixTime\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x04 \x01(\tR\tcommandId\x12*\n" +
@@ -646,7 +646,7 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\x06status\x18\x01 \x01(\x0e2\".pushupes.v1.AppendResponse.StatusR\x06status\x12\x15\n" +
 	"\x06err_id\x18\x02 \x01(\rR\x05errId\x12\x18\n" +
 	"\amessage\x18\x03 \x01(\tR\amessage\x12'\n" +
-	"\x0fcurrent_version\x18\x04 \x01(\x04R\x0ecurrentVersion\x12\x10\n" +
+	"\x0fcurrent_version\x18\x04 \x01(\rR\x0ecurrentVersion\x12\x10\n" +
 	"\x03seq\x18\x05 \x01(\x04R\x03seq\x12\x12\n" +
 	"\x04slot\x18\x06 \x01(\x05R\x04slot\x12\x12\n" +
 	"\x04node\x18\a \x01(\tR\x04node\x12+\n" +
@@ -658,12 +658,12 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\vSTATUS_FAIL\x10\x03\"o\n" +
 	"\x11ReadStreamRequest\x12!\n" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x12!\n" +
-	"\ffrom_version\x18\x02 \x01(\x04R\vfromVersion\x12\x14\n" +
+	"\ffrom_version\x18\x02 \x01(\rR\vfromVersion\x12\x14\n" +
 	"\x05limit\x18\x03 \x01(\x04R\x05limit\"\x89\x01\n" +
 	"\x12ReadStreamResponse\x12-\n" +
 	"\arecords\x18\x01 \x03(\v2\x13.pushupes.v1.RecordR\arecords\x12!\n" +
-	"\fnext_version\x18\x02 \x01(\x04R\vnextVersion\x12!\n" +
-	"\flast_version\x18\x03 \x01(\x04R\vlastVersion\"X\n" +
+	"\fnext_version\x18\x02 \x01(\rR\vnextVersion\x12!\n" +
+	"\flast_version\x18\x03 \x01(\rR\vlastVersion\"X\n" +
 	"\x14ReadByCommandRequest\x12!\n" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x12\x1d\n" +
 	"\n" +

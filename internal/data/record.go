@@ -34,7 +34,7 @@ type Event struct {
 // WAL of the slot that aggregate_id hashes to.
 type EventRecord struct {
 	AggregateID string
-	Version     uint64
+	Version     uint32
 	UnixTime    int64
 	CommandID   string
 	Events      []Event
@@ -45,13 +45,13 @@ type EventRecord struct {
 // Record layout (all integers big-endian):
 //
 //	recLen(4) aggLen(2) aggregate_id
-//	version(8) unix_time(8)
+//	version(4) unix_time(8)
 //	cmdLen(2) command_id
 //	eventCount(2) { typeLen(2) type bodyLen(4) body }*
 //
 // recLen covers everything after itself.
 func (r *EventRecord) EncodedSize() int {
-	n := 2 + len(r.AggregateID) + 8 + 8 + 2 + len(r.CommandID) + 2
+	n := 2 + len(r.AggregateID) + 4 + 8 + 2 + len(r.CommandID) + 2
 	for i := range r.Events {
 		n += 2 + len(r.Events[i].Type) + 4 + len(r.Events[i].Body)
 	}
@@ -102,7 +102,8 @@ func (r *EventRecord) EncodeBinary(buf []byte) []byte {
 	binary.BigEndian.PutUint32(buf[0:4], uint32(size-4))
 	putU16(&rest, uint16(len(r.AggregateID)))
 	putString(&rest, r.AggregateID)
-	rest = putU64(rest, r.Version)
+	binary.BigEndian.PutUint32(rest, r.Version)
+	rest = rest[4:]
 	rest = putU64(rest, uint64(r.UnixTime))
 	putU16(&rest, uint16(len(r.CommandID)))
 	putString(&rest, r.CommandID)
@@ -139,7 +140,7 @@ func DecodeRecord(buf []byte) (EventRecord, int, error) {
 	r.AggregateID = string(rest[:aggLen])
 	rest = rest[aggLen:]
 
-	r.Version, err = takeU64(&rest)
+	r.Version, err = takeU32(&rest)
 	if err != nil {
 		return r, 0, err
 	}
@@ -326,19 +327,6 @@ var (
 	ErrRecordNotFound = errors.New("record not found")
 )
 
-// ErrWithCurrentVersion wraps a version conflict with server state.
-type ErrWithCurrentVersion struct {
-	CurrentVersion uint64
-	Requested      uint64
-}
-
-func (e *ErrWithCurrentVersion) Error() string {
-	return fmt.Sprintf("version conflict: requested %d, current is %d", e.Requested, e.CurrentVersion)
-}
-
-// Unwrap lets errors.Is match ErrVersionConflict.
-func (e *ErrWithCurrentVersion) Unwrap() error { return ErrVersionConflict }
-
 // ---- API wire types (JSON) ------------------------------------------------
 
 // EventJSON is the JSON form of one domain event.
@@ -350,7 +338,7 @@ type EventJSON struct {
 // AppendRequest is the client append payload. Acks: "leader" (default),
 // "all", "none".
 type AppendRequest struct {
-	Version   uint64      `json:"version"`
+	Version   uint32      `json:"version"`
 	UnixTime  int64       `json:"unix_time"`
 	CommandID string      `json:"command_id"`
 	Events    []EventJSON `json:"events"`
@@ -370,7 +358,7 @@ type AppendResponse struct {
 	Status         string      `json:"status"`
 	ErrID          int         `json:"err_id,omitempty"`
 	Err            string      `json:"error,omitempty"`
-	CurrentVersion uint64      `json:"current_version,omitempty"`
+	CurrentVersion uint32      `json:"current_version,omitempty"`
 	Seq            uint64      `json:"seq,omitempty"`
 	Slot           int32       `json:"slot"`
 	Node           string      `json:"node,omitempty"`   // redirect target for MOVED/ASK/NOT_LEADER
@@ -380,7 +368,7 @@ type AppendResponse struct {
 // RecordJSON is the JSON form of an EventRecord.
 type RecordJSON struct {
 	AggregateID string      `json:"aggregate_id"`
-	Version     uint64      `json:"version"`
+	Version     uint32      `json:"version"`
 	UnixTime    int64       `json:"unix_time"`
 	CommandID   string      `json:"command_id"`
 	Events      []EventJSON `json:"events"`

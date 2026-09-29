@@ -252,7 +252,7 @@ func (st *Store) WriteCounts() []uint64 {
 // ReadAggregate reads up to limit records of one aggregate from a version,
 // capped at uptoSeq (0 = LEO). Returns records, their seqs, and the next
 // version to read.
-func (st *Store) ReadAggregate(aggregateID string, fromVersion, limit, uptoSeq uint64) ([]*data.EventRecord, []uint64, error) {
+func (st *Store) ReadAggregate(aggregateID string, fromVersion uint32, limit, uptoSeq uint64) ([]*data.EventRecord, []uint64, error) {
 	slot, err := st.Slot(st.SlotOf(aggregateID))
 	if err != nil {
 		return nil, nil, err

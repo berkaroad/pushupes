@@ -29,7 +29,7 @@ type AppendOutcome struct {
 	ErrID          int
 	Seq            uint64
 	Record         *data.EventRecord // stored record on success/exists
-	CurrentVersion uint64            // aggregate's current max version on fail
+	CurrentVersion uint32            // aggregate's current max version on fail
 }
 
 // Slot is one of the fixed 128 slots: an append-only WAL of segments plus
@@ -48,7 +48,7 @@ type Slot struct {
 
 	seqCounter uint64 // last assigned seq (0 = empty)
 
-	aggVersions map[string]uint64
+	aggVersions map[string]uint32
 	cmdIndex    map[string]uint64
 	aggSeqs     map[string][]uint64 // seqs ascending; version == index+1
 
@@ -80,7 +80,7 @@ func OpenSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy) (
 		segmentBytes: segmentBytes,
 		flush:        flush,
 		lastFlush:    time.Now(),
-		aggVersions:  make(map[string]uint64),
+		aggVersions:  make(map[string]uint32),
 		cmdIndex:     make(map[string]uint64),
 		aggSeqs:      make(map[string][]uint64),
 		wake:         make(chan struct{}),
@@ -145,7 +145,7 @@ func (s *Slot) indexRecordLocked(seq uint64, rec *data.EventRecord) {
 		s.aggVersions[rec.AggregateID] = v
 	}
 	s.cmdIndex[rec.CommandID] = seq
-	if rec.Version == uint64(len(s.aggSeqs[rec.AggregateID])+1) {
+	if rec.Version == uint32(len(s.aggSeqs[rec.AggregateID])+1) {
 		s.aggSeqs[rec.AggregateID] = append(s.aggSeqs[rec.AggregateID], seq)
 	}
 }
@@ -315,7 +315,7 @@ func (s *Slot) WaitForSeq(wantSeq uint64, deadline time.Time) uint64 {
 }
 
 // CurrentVersion returns the aggregate's last stored version (0 = unknown).
-func (s *Slot) CurrentVersion(aggregateID string) uint64 {
+func (s *Slot) CurrentVersion(aggregateID string) uint32 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.aggVersions[aggregateID]
@@ -337,19 +337,19 @@ func (s *Slot) RecordByCommand(commandID string) (*data.EventRecord, uint64, err
 // (1-based, contiguous) up to limit records or maxBytes decoded records,
 // stopping at uptoSeq (exclusive; 0 = no cap). Records at seq > uptoSeq have
 // not reached the high watermark and must not be observed.
-func (s *Slot) AggregateVersion(aggregateID string, fromVersion, limit uint64, uptoSeq uint64) ([]*data.EventRecord, []uint64, error) {
+func (s *Slot) AggregateVersion(aggregateID string, fromVersion uint32, limit, uptoSeq uint64) ([]*data.EventRecord, []uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	seqs := s.aggSeqs[aggregateID]
 	if fromVersion == 0 {
 		fromVersion = 1
 	}
-	if fromVersion > uint64(len(seqs)) {
+	if fromVersion > uint32(len(seqs)) {
 		return nil, nil, nil
 	}
 	var out []*data.EventRecord
 	var outSeqs []uint64
-	for v := fromVersion; v <= uint64(len(seqs)); v++ {
+	for v := fromVersion; v <= uint32(len(seqs)); v++ {
 		if limit > 0 && uint64(len(out)) >= limit {
 			break
 		}
@@ -371,10 +371,10 @@ func (s *Slot) AggregateVersion(aggregateID string, fromVersion, limit uint64, u
 }
 
 // LastVersionOf returns the highest stored version for an aggregate.
-func (s *Slot) LastVersionOf(aggregateID string) uint64 {
+func (s *Slot) LastVersionOf(aggregateID string) uint32 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return uint64(len(s.aggSeqs[aggregateID]))
+	return uint32(len(s.aggSeqs[aggregateID]))
 }
 
 // ReadRange returns byte ranges covering records fromSeq <= seq < untilSeq
