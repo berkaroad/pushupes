@@ -105,6 +105,12 @@ Body: Record*，每条记录：
     常驻 PeerService.MFetch 长轮询会话**（gRPC，`peer.proto`，与 Raft 共用
     peer 端口；payload 是裸 WAL 字节区间 `FetchItem.payload`，不经 base64、
     事件体不重编码、不进 Raft 日志），一次请求多槽复用、空闲轮零额外往返。
+    请求位置用 **packed 并行数组**（`slots[i]` 从 `from_seqs[i]` 起）而非
+    每槽一个消息对象——一个会话每轮携带全部跟随槽（可达数千），逐条对象
+    的构造/序列化在 `acks=all` 下主导了 CPU；响应则是**稀疏**的：只有带货
+    的槽出现在 `items` 里，空槽靠缺席表达。leader 端长轮询不 per-slot 建
+    select 分支，而是 watch 一条**全 store 唤醒总线**（任一槽 append 触发），
+    命中后对 parked 槽的各自句柄做非阻塞扫描判定"哪些槽真的动了"。
   - follower 追加到自己 WAL 后回报 LEO（批量 PeerService.ReplicaProgress）；
     leader 推进 **HW**（高水位 = ISR 内最小 LEO）。leader 端有全局
     payload 预算 + 轮转游标，防积压槽饿死。应答语义：

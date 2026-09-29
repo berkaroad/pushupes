@@ -41,7 +41,8 @@ func TestMFetchLongPollWakesOnAppend(t *testing.T) {
 		resp, err := e.HandleMFetch(MFetchRequest{
 			Follower: "node-2",
 			WaitMS:   wait.Milliseconds(),
-			Items:    []FetchItem{{Slot: 3, FromSeq: store.LastSeqOf(3) + 1}},
+			Slots:    []int32{3},
+			FromSeqs: []uint64{store.LastSeqOf(3) + 1},
 		})
 		if err != nil {
 			t.Errorf("handle: %v", err)
@@ -60,8 +61,11 @@ func TestMFetchLongPollWakesOnAppend(t *testing.T) {
 		if el := time.Since(start); el > wait/2 {
 			t.Fatalf("long-poll ignored the append wake: waited %v (deadline %v)", el, wait)
 		}
-		if resp == nil || len(resp.Items[0].Payload) == 0 {
-			t.Fatalf("wake round returned no payload: %+v", resp)
+		if resp == nil {
+			t.Fatal("wake round returned nil")
+		}
+		if it, ok := resp.Item(3); !ok || len(it.Payload) == 0 {
+			t.Fatalf("wake round returned no payload: %+v", resp.Items)
 		}
 	case <-time.After(wait + 2*time.Second):
 		t.Fatal("round never returned")
@@ -92,10 +96,10 @@ func TestMFetchBurstDrainAllWaiters(t *testing.T) {
 	e.tableMu.Unlock()
 
 	const wait = 2 * time.Second
-	items := []FetchItem{{Slot: 1, FromSeq: 1}, {Slot: 3, FromSeq: 1}, {Slot: 6, FromSeq: 1}}
 	done := make(chan *MFetchResponse, 1)
 	go func() {
-		resp, err := e.HandleMFetch(MFetchRequest{Follower: "node-2", WaitMS: wait.Milliseconds(), Items: items})
+		resp, err := e.HandleMFetch(MFetchRequest{Follower: "node-2", WaitMS: wait.Milliseconds(),
+			Slots: []int32{1, 3, 6}, FromSeqs: []uint64{1, 1, 1}})
 		if err != nil {
 			t.Errorf("handle: %v", err)
 		}

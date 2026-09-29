@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"reflect"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -36,6 +35,23 @@ type Engine struct {
 
 	// rotation cursor for the mfetch payload budget
 	fetchRot atomic.Uint64
+
+	// fetch round buffers (sync.Pool): a session round allocates its
+	// rotation order and parked set fresh every time; under acks=all the
+	// leader serves thousands of rounds per second and these were the
+	// dominant malloc traffic in the profile.
+	orderPool    sync.Pool // []int, cap >= followed slots
+	parkedPool   sync.Pool // []parkedEntry
+	progressPool sync.Pool // *progressBatch
+
+	// ownership bitmap: which slots this node leads, rebuilt only when
+	// the Raft table version advances. Per-item map lookups under the
+	// fetch hot loop (~1.4k followed slots per round) were a top CPU
+	// contributor under acks=all; a word-test per slot is free.
+	ownMu sync.Mutex
+	own   atomic.Pointer[ownership]
+	// tableGen bumps with every applied table change (holds tableMu).
+	tableGen uint64
 
 	// migration forwarding: slot -> target addr while migrating_out
 	fwdMu sync.RWMutex
@@ -113,6 +129,9 @@ func NewEngine(node *Node, store *storage.Store, self string, acksDefault string
 		failStreak:  map[string]int{},
 		acksDefault: acksDefault,
 	}
+	e.orderPool.New = func() any { return make([]int, 0, 64) }
+	e.parkedPool.New = func() any { return make([]parkedEntry, 0, 64) }
+	e.progressPool.New = func() any { return &progressBatch{} }
 	if e.logger == nil {
 		l := logrus.New()
 		l.SetLevel(logrus.WarnLevel)
@@ -131,6 +150,7 @@ func (e *Engine) ApplyCommand(cmd []byte) ([]byte, error) {
 	}
 	e.tableMu.Lock()
 	err = e.table.Apply(c)
+	e.tableGen++
 	e.tableMu.Unlock()
 	if err != nil {
 		return nil, err
@@ -155,6 +175,7 @@ func (e *Engine) RestoreState(b []byte) error {
 	}
 	e.tableMu.Lock()
 	e.table = tbl
+	e.tableGen++
 	e.tableMu.Unlock()
 	e.syncMigrationState()
 	return nil
@@ -454,16 +475,84 @@ func (e *Engine) SubmitCommand(c *Command) error { return e.submit(c) }
 // NoteReplicaProgress is called by the leader when a fetch response reports
 // a follower's LEO.
 func (e *Engine) NoteReplicaProgress(slot int32, follower string, leo uint64) {
+	e.noteReplicaProgress(slot, follower, leo, time.Now())
+}
+
+// noteReplicaProgress records one progress sample and advances the HW.
+// lastOK is always refreshed (a lagging-but-alive replica must stay in the
+// ISR), but advanceHW — a second lock + replica scan — only runs when the
+// slot's min-LEO could actually move: the LEO grew, or the replica (re-)
+// joined the in-sync set. Fetch rounds re-report hundreds of steady slots
+// every round; this is the short-circuit that makes those free.
+func (e *Engine) noteReplicaProgress(slot int32, follower string, leo uint64, now time.Time) {
 	e.replMu.Lock()
 	sr := e.repl[slot]
 	if sr == nil {
 		sr = &slotRepl{leo: map[string]uint64{}, lastOK: map[string]time.Time{}}
 		e.repl[slot] = sr
 	}
+	prev, wasFresh := sr.leo[follower], now.Sub(sr.lastOK[follower]) <= isrStaleAfter
 	sr.leo[follower] = leo
-	sr.lastOK[follower] = time.Now()
+	sr.lastOK[follower] = now
 	e.replMu.Unlock()
-	e.advanceHW(slot)
+	if leo > prev || !wasFresh {
+		e.advanceHW(slot)
+	}
+}
+
+// progressBatch accumulates per-follower slot LEOs from one fetch round and
+// applies them under a single replMu hold instead of one lock round-trip per
+// item (the leader-side hot path: thousands of items per second).
+type progressBatch struct {
+	follower string
+	slots    []int32
+	leos     []uint64
+	now      time.Time
+}
+
+func (b *progressBatch) add(slot int32, leo uint64) {
+	b.slots = append(b.slots, slot)
+	b.leos = append(b.leos, leo)
+}
+
+// reset returns the batch to a clean state for pool reuse. apply already
+// truncates the position slices; this also drops the follower/now stamps.
+func (b *progressBatch) reset() *progressBatch {
+	b.follower = ""
+	b.slots = b.slots[:0]
+	b.leos = b.leos[:0]
+	b.now = time.Time{}
+	return b
+}
+
+// apply records every sample (lastOK always refreshed, one shared timestamp),
+// then advances the HW once per slot whose in-sync min could have moved.
+func (b *progressBatch) apply(e *Engine) {
+	if len(b.slots) == 0 {
+		return
+	}
+	changed := make([]int32, 0, len(b.slots))
+	e.replMu.Lock()
+	for i, slot := range b.slots {
+		leo := b.leos[i]
+		sr := e.repl[slot]
+		if sr == nil {
+			sr = &slotRepl{leo: map[string]uint64{}, lastOK: map[string]time.Time{}}
+			e.repl[slot] = sr
+		}
+		prev, wasFresh := sr.leo[b.follower], b.now.Sub(sr.lastOK[b.follower]) <= isrStaleAfter
+		sr.leo[b.follower] = leo
+		sr.lastOK[b.follower] = b.now
+		if leo > prev || !wasFresh {
+			changed = append(changed, slot)
+		}
+	}
+	e.replMu.Unlock()
+	for _, slot := range changed {
+		e.advanceHW(slot)
+	}
+	b.slots = b.slots[:0]
+	b.leos = b.leos[:0]
 }
 
 // ---- Replica fetch protocol (data plane) -------------------------------------
@@ -473,20 +562,22 @@ func (e *Engine) NoteReplicaProgress(slot int32, follower string, leo uint64) {
 // progress report the leader records), and — on the response — the byte
 // range + concatenated payload starting at that seq.
 type FetchItem struct {
-	Slot      int32  `json:"slot"`
-	FromSeq   uint64 `json:"from_seq"`
-	NextSeq   uint64 `json:"next_seq,omitempty"` // response: first seq after the batch
-	Payload   []byte `json:"payload,omitempty"`  // response: concatenated records
-	LeaderLEO uint64 `json:"leader_leo,omitempty"`
-	LeaderHW  uint64 `json:"leader_hw,omitempty"`
+	Slot    int32  `json:"slot"`
+	FromSeq uint64 `json:"from_seq"`
+	NextSeq uint64 `json:"next_seq,omitempty"` // response: first seq after the batch
+	Payload []byte `json:"payload,omitempty"`  // response: concatenated records
 }
 
 // MFetchRequest is one session round: a follower's positions across every
-// slot led by this node, long-polled as a unit.
+// slot led by this node, long-polled as a unit. Positions are packed
+// parallel arrays (Slots[i] wanted from FromSeqs[i]): a session carries
+// every followed slot each round and per-entry message objects dominated
+// the wire and CPU cost under acks=all.
 type MFetchRequest struct {
-	Follower string      `json:"follower"`
-	WaitMS   int64       `json:"wait_ms,omitempty"`
-	Items    []FetchItem `json:"items"`
+	Follower string   `json:"follower"`
+	WaitMS   int64    `json:"wait_ms,omitempty"`
+	Slots    []int32  `json:"slots"`
+	FromSeqs []uint64 `json:"from_seqs"`
 }
 
 // MFetchResponse answers an MFetchRequest; only slots with data (or
@@ -496,59 +587,119 @@ type MFetchResponse struct {
 	Items    []FetchItem `json:"items"`
 }
 
+// Item finds the response entry for one slot (sparse responses omit empty
+// slots, so index arithmetic on Items is not meaningful).
+func (r *MFetchResponse) Item(slot int32) (FetchItem, bool) {
+	for _, it := range r.Items {
+		if it.Slot == slot {
+			return it, true
+		}
+	}
+	return FetchItem{}, false
+}
+
 // HandleMFetch serves one multiplexed fetch round on a node that leads the
 // requested slots.
 //
-//  1. Progress piggyback: every item's FromSeq-1 is the follower's durable
-//     LEO for that slot; the leader records replica progress from the
-//     request itself — no separate report round trip on idle rounds.
+//  1. Progress piggyback: every position's FromSeq-1 is the follower's
+//     durable LEO for that slot; the leader records replica progress from
+//     the request itself — no separate report round trip on idle rounds.
 //  2. Long-poll as a unit: when nothing is ready and WaitMS>0, the leader
-//     holds the request and selects across the wake channels of all
-//     requested slots (Slot.advanceNotifyLocked closes them on append),
-//     answering as soon as ANY slot advances or the budget elapses. A quiet
-//     cluster therefore pays ~1 request per leader-session per wait window,
-//     not one per slot.
+//     holds the request on the store-wide wake bus (Slot advanceNotify
+//     closes it on every append) instead of a per-slot select, and answers
+//     as soon as ANY parked slot advances or the wait budget elapses. A
+//     quiet cluster therefore pays ~1 request per leader-session per wait
+//     window, not one per slot.
 //
-// Slots this node does not lead are answered empty (failover is in flight);
-// the session retries and the table will reassign them.
+// The response is sparse: only slots that carried data appear; empty slots
+// are implied by their absence. Slots this node does not lead are answered
+// empty (failover is in flight); the session retries and the table
+// reassigns them.
 func (e *Engine) HandleMFetch(req MFetchRequest) (*MFetchResponse, error) {
 	return e.HandleMFetchCtx(context.Background(), req)
+}
+
+// parkedEntry is one slot waiting on the wake bus inside a fetch round.
+type parkedEntry struct {
+	slot int32
+	from uint64
+	h    <-chan struct{}
 }
 
 // HandleMFetchCtx serves PeerService.MFetch: one multiplexed replica fetch
 // round (all slots a follower takes from this leader, long-polled as a
 // unit). ctx cancels the long-poll (client disconnect / deadline).
 func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetchResponse, error) {
+	n := len(req.Slots)
+	if n != len(req.FromSeqs) || n > 8192 {
+		return nil, fmt.Errorf("mfetch: %d slots / %d positions invalid or over cap", n, len(req.FromSeqs))
+	}
 	t0 := time.Now()
 	defer func() {
-		e.logger.WithFields(logrus.Fields{"self": e.self, "follower": req.Follower, "items": len(req.Items),
+		e.logger.WithFields(logrus.Fields{"self": e.self, "follower": req.Follower, "items": n,
 			"ms": time.Since(t0).Milliseconds()}).Debug("mfetch round")
 	}()
-	if len(req.Items) > 8192 {
-		return nil, fmt.Errorf("mfetch: %d items exceeds cap", len(req.Items))
+	waitMS := req.WaitMS
+
+	// Round buffers come from pools; the rotation cursor keeps one slot's
+	// sustained backlog from starving the rest under the payload budget.
+	//
+	// Parking is UNBOUNDED on purpose: a capped set would leave late
+	// writes (to slots beyond the cap on an idle round) unservable until
+	// the wait deadline, and the bus re-arm would spin on the closed
+	// handle. Scanning every parked handle per bus fire is ~1.4k cheap
+	// select-defaults — far cheaper than the old reflect.Select over
+	// 1400+ cases per round.
+	order := e.orderPool.Get().([]int)
+	if cap(order) < n {
+		order = make([]int, n*2)
 	}
-	// Phase 1: record progress and try to read current data per slot.
-	// A global payload budget (with a rotating start cursor so no slot
-	// starves under sustained backlog) bounds one response's JSON size.
-	type pending struct {
-		idx  int
-		wake <-chan struct{}
-	}
-	out := &MFetchResponse{Follower: req.Follower, Items: make([]FetchItem, len(req.Items))}
-	var waiters []pending
-	starved := false
-	served := false // phase 1 found fetchable data for at least one slot
-	budget := int64(maxPayloadBytes)
-	rot := int(e.fetchRot.Add(1)) % max(1, len(req.Items))
-	order := make([]int, len(req.Items))
+	order = order[:n]
+	rot := int(e.fetchRot.Add(1)) % max(1, n)
 	for i := range order {
-		order[i] = (i + rot) % len(req.Items)
+		order[i] = (i + rot) % n
 	}
+
+	parked := e.parkedPool.Get().([]parkedEntry)[:0]
+
+	// Capture the wake bus BEFORE any slot read: an append landing
+	// between a parked slot's handle capture and the wait select would
+	// otherwise close a bus handle we never observe (the same no-lost-wake
+	// discipline as the per-slot handles). If it already fired during
+	// phase 1, the first select iteration scans immediately.
+	var bus <-chan struct{}
+	if waitMS > 0 {
+		bus = e.store.WakeBus()
+	}
+
+	// Ownership bitmap: rebuilt only when the Raft table version advances,
+	// replacing the per-round map built under tableMu.
+	own := e.ownershipSnapshot()
+
+	out := &MFetchResponse{Follower: req.Follower, Items: make([]FetchItem, 0, 64)}
+	budget := int64(maxPayloadBytes)
+	starved := false
+	served := false
+	// Progress piggyback is applied in bulk after phase 1: per-item calls
+	// took replMu (twice: note + advanceHW) per slot every round, most of
+	// them re-reporting unchanged LEOs.
+	prog := e.progressPool.Get().(*progressBatch)
+	prog.follower = req.Follower
+	prog.now = time.Now()
+
 	for _, i := range order {
-		it := req.Items[i]
-		out.Items[i] = FetchItem{Slot: it.Slot, FromSeq: it.FromSeq}
+		s, from := req.Slots[i], req.FromSeqs[i]
+		if s < 0 || int(s)>>6 >= len(own.words) || from == 0 {
+			continue
+		}
+		if own.words[s>>6]&(1<<(s&63)) == 0 {
+			continue // not led here: nothing to fetch, no progress to note
+		}
+		if req.Follower != "" && req.Follower != e.self {
+			prog.add(s, from-1)
+		}
 		if budget <= 0 {
-			// out of budget: no data this round. If the slot HAS pending
+			// Out of budget: no data this round. If the slot HAS pending
 			// data, do NOT park a fresh wake handle — the data landed
 			// before this point, so a clean handle would only fire on the
 			// NEXT append and the slot would idle until the wait deadline
@@ -556,124 +707,145 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 			// tail). The rotating cursor serves it next round; marking
 			// starved makes the response return now instead. If the slot
 			// is truly empty, park so future appends still wake the poll.
-			if req.WaitMS > 0 {
-				if p, ok := e.tableLeaderSlot(it.Slot); ok && p.Leader == e.self {
-					if e.store.LastSeqOf(it.Slot) >= it.FromSeq {
-						starved = true
-					} else {
-						waiters = append(waiters, pending{i, e.store.WakeChan(it.Slot)})
-					}
+			if waitMS > 0 {
+				h := e.store.WakeChan(s)
+				if e.store.LastSeqOf(s) >= from {
+					starved = true
+				} else {
+					parked = append(parked, parkedEntry{s, from, h})
 				}
 			}
 			continue
 		}
-		out.Items[i] = FetchItem{Slot: it.Slot, FromSeq: it.FromSeq}
-		p, ok := e.tableLeaderSlot(it.Slot)
-		if !ok || p.Leader != e.self {
-			continue
+		// Take the wake handle BEFORE the read (no-lost-wake discipline):
+		// an append landing during the read closes this handle, so the
+		// first bus scan finds it fired and re-reads. Acquiring after the
+		// read left a window that stalled the round to the full WaitMS.
+		var h <-chan struct{}
+		if waitMS > 0 {
+			h = e.store.WakeChan(s)
 		}
-		if req.Follower != "" && req.Follower != e.self && it.FromSeq > 0 {
-			e.NoteReplicaProgress(it.Slot, req.Follower, it.FromSeq-1)
-		}
-		// Take the wake handle BEFORE the read (same re-arm discipline as
-		// the wait loop): an append that lands during the read closes this
-		// handle — the first select iteration then fires immediately and
-		// re-reads. Acquiring after the read left a lost-wake window
-		// (append between read and acquire closes the *previous* handle),
-		// which stalled the round to the full WaitMS.
-		var wake <-chan struct{}
-		if req.WaitMS > 0 {
-			wake = e.store.WakeChan(it.Slot)
-		}
-		_, next, payload, err := e.store.ReadSlotBytes(it.Slot, it.FromSeq, 0, min(4<<20, budget))
+		_, next, payload, err := e.store.ReadSlotBytes(s, from, 0, min(4<<20, budget))
 		if err != nil {
+			e.orderPool.Put(order[:cap(order)])
+			e.parkedPool.Put(parked[:0])
+			e.progressPool.Put(prog.reset())
 			return nil, err
 		}
 		budget -= int64(len(payload))
-		out.Items[i].NextSeq = next
-		out.Items[i].Payload = payload
-		out.Items[i].LeaderLEO = e.store.LastSeqOf(it.Slot)
-		out.Items[i].LeaderHW = e.HW(it.Slot)
-		if len(payload) > 0 {
-			served = true
+		if len(payload) == 0 {
+			if h != nil {
+				parked = append(parked, parkedEntry{s, from, h})
+			}
+			continue // empty slot: implied absent in the sparse response
 		}
-		if len(payload) == 0 && wake != nil {
-			waiters = append(waiters, pending{i, wake})
-		}
+		served = true
+		out.Items = append(out.Items, FetchItem{Slot: s, FromSeq: from, NextSeq: next, Payload: payload})
 	}
-	if len(waiters) > 0 && req.WaitMS > 0 && !starved && !served {
-		wait := time.Duration(req.WaitMS) * time.Millisecond
+	prog.apply(e)
+	e.orderPool.Put(order[:cap(order)])
+
+	if len(parked) > 0 && waitMS > 0 && !starved && !served {
+		wait := time.Duration(waitMS) * time.Millisecond
 		if wait > fetchMaxWait {
 			wait = fetchMaxWait
 		}
 		deadline := time.After(wait)
 	waitLoop:
 		for {
-			cases := make([]reflect.SelectCase, 0, len(waiters)+2)
-			cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(deadline)})
-			cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())})
-			for _, w := range waiters {
-				cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(w.wake)})
-			}
-			chosen, _, _ := reflect.Select(cases)
-			if chosen == 0 {
-				break waitLoop // deadline: answer with whatever phase 1 found
-			}
-			if chosen == 1 {
-				return nil, ctx.Err() // client went away: stop holding the round
-			}
-			// Burst drain with a coalescing window: one wake event answers
-			// for EVERY slot that has data, not just the one that fired.
-			// A write burst scatters across slots; answering one slot per
-			// round would cost the follower one RTT per remaining slot
-			// before HW can advance (acks=all pays this on every write).
-			// The short settle lets sibling appends of the same burst land
-			// before we sweep — without it the sweep races the burst and
-			// captures only the first slot. 2ms against a multi-second
-			// fetch cadence is negligible.
-			time.Sleep(fetchBurstSettle)
-			anyData := false
-			for i := range waiters {
-				w := &waiters[i]
-				it := req.Items[w.idx]
-				select {
-				case <-w.wake:
-					// New appends since it parked: re-arm BEFORE re-reading
-					// (no-lost-wake discipline) and drain the slot.
-					w.wake = e.store.WakeChan(it.Slot)
-				default:
-					continue // no wake: stays parked for the next select round
+			// One select over THREE cases instead of one case per parked
+			// slot: the store bus aggregates every slot's advance signal,
+			// and a non-blocking scan of the parked handles finds WHICH
+			// slots moved. Rebuilding a 1400-case reflect.Select per round
+			// was a top CPU contributor under acks=all.
+			select {
+			case <-deadline:
+				break waitLoop // budget spent: answer with whatever we have
+			case <-ctx.Done():
+				e.parkedPool.Put(parked[:0])
+				e.progressPool.Put(prog.reset())
+				return nil, ctx.Err() // client went away
+			case <-bus:
+				// Burst drain with a coalescing window: one wake answers
+				// for EVERY slot that has data, not just the one that
+				// fired. A write burst scatters across slots; answering
+				// one slot per round would cost the follower one RTT per
+				// remaining slot before HW can advance (acks=all pays
+				// this on every write). The short settle lets sibling
+				// appends of the same burst land before we scan — without
+				// it the scan races the burst and captures only the first
+				// slot. 2ms against a multi-second cadence is negligible.
+				time.Sleep(fetchBurstSettle)
+				anyData := false
+				for k := range parked {
+					pe := &parked[k]
+					select {
+					case <-pe.h:
+						// New appends since it parked: re-arm BEFORE
+						// re-reading (no-lost-wake discipline).
+						pe.h = e.store.WakeChan(pe.slot)
+					default:
+						continue // this slot did not move
+					}
+					if budget <= 0 {
+						continue // out of budget: ride the next round
+					}
+					_, next, payload, err := e.store.ReadSlotBytes(pe.slot, pe.from, 0, min(4<<20, budget))
+					if err != nil {
+						e.parkedPool.Put(parked[:0])
+						e.progressPool.Put(prog.reset())
+						return nil, err
+					}
+					budget -= int64(len(payload))
+					if len(payload) == 0 {
+						continue // woke without fetchable data (e.g. gap-filled replay)
+					}
+					anyData = true
+					out.Items = append(out.Items, FetchItem{Slot: pe.slot, FromSeq: pe.from, NextSeq: next, Payload: payload})
 				}
-				if budget <= 0 {
-					continue // out of budget: ride the next round
+				if anyData {
+					break waitLoop // answer with the whole burst
 				}
-				_, next, payload, err := e.store.ReadSlotBytes(it.Slot, it.FromSeq, 0, min(int64(4<<20), budget))
-				if err != nil {
-					return nil, err
-				}
-				budget -= int64(len(payload))
-				if len(payload) == 0 {
-					continue // woke without fetchable data (e.g. client stream consumer)
-				}
-				out.Items[w.idx].NextSeq = next
-				out.Items[w.idx].Payload = payload
-				out.Items[w.idx].LeaderLEO = e.store.LastSeqOf(it.Slot)
-				out.Items[w.idx].LeaderHW = e.HW(it.Slot)
-				anyData = true
-			}
-			if anyData {
-				break waitLoop // answer with the whole burst
 			}
 		}
 	}
+	e.parkedPool.Put(parked[:0])
+	e.progressPool.Put(prog.reset())
 	return out, nil
 }
 
-func (e *Engine) tableLeaderSlot(slot int32) (*Placement, bool) {
+// ownershipSnapshot returns the bitmap of slots led by this node, rebuilt
+// only when the Raft table version advances. Rebuilding walks the 4096-
+// entry map once per table change instead of building a lookup map per
+// fetch round (thousands of rounds per second under load).
+type ownership struct {
+	gen   uint64
+	words []uint64
+}
+
+func (e *Engine) ownershipSnapshot() *ownership {
 	e.tableMu.RLock()
-	defer e.tableMu.RUnlock()
-	p, ok := e.table.Slots[slot]
-	return p, ok
+	gen := e.tableGen
+	e.tableMu.RUnlock()
+	if o := e.own.Load(); o != nil && o.gen == gen {
+		return o
+	}
+	e.ownMu.Lock()
+	defer e.ownMu.Unlock()
+	if o := e.own.Load(); o != nil && o.gen == gen {
+		return o
+	}
+	words := make([]uint64, (e.store.SlotCount+63)/64)
+	e.tableMu.RLock()
+	for s, p := range e.table.Slots {
+		if p.Leader == e.self && s >= 0 && int(s>>6) < len(words) {
+			words[s>>6] |= 1 << (s & 63)
+		}
+	}
+	e.tableMu.RUnlock()
+	o := &ownership{gen: gen, words: words}
+	e.own.Store(o)
+	return o
 }
 
 // ReplicateRecord applies a leader-assigned record on a follower (or import
@@ -809,21 +981,19 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32) (
 	if addr == "" {
 		return false, data.ErrNotLeader
 	}
-	items := make([]FetchItem, len(slots))
+	froms := make([]uint64, len(slots))
 	for i, s := range slots {
-		items[i] = FetchItem{Slot: s, FromSeq: e.store.LastSeqOf(s) + 1}
+		froms[i] = e.store.LastSeqOf(s) + 1
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, fetchWait+fetchSlack+5*time.Second)
 	defer cancel()
-	fr, err := e.peerMFetch(reqCtx, addr, &MFetchRequest{Follower: e.self, WaitMS: fetchWait.Milliseconds(), Items: items})
+	fr, err := e.peerMFetch(reqCtx, addr, &MFetchRequest{Follower: e.self, WaitMS: fetchWait.Milliseconds(), Slots: slots, FromSeqs: froms})
 	if err != nil {
 		return false, err
 	}
 	productive := false
 	for _, it := range fr.Items {
-		if len(it.Payload) == 0 {
-			continue
-		}
+		// Sparse response: every entry carries data for its slot.
 		if err := applyFetchPayload(e.store, it.Slot, it.NextSeq, it.Payload); err != nil {
 			return productive, err
 		}
@@ -832,11 +1002,11 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32) (
 	if productive {
 		// Positions moved: report the new LEOs immediately so the leader
 		// advances HW without waiting for the next round's FromSeq piggyback.
-		prog := make([]FetchItem, 0, len(slots))
-		for _, s := range slots {
-			prog = append(prog, FetchItem{Slot: s, FromSeq: e.store.LastSeqOf(s) + 1})
+		prog := make([]uint64, len(slots))
+		for i, s := range slots {
+			prog[i] = e.store.LastSeqOf(s) + 1
 		}
-		e.reportProgress(addr, prog)
+		e.reportProgress(addr, slots, prog)
 	}
 	return productive, nil
 }
@@ -876,10 +1046,10 @@ func countRecords(payload []byte) int {
 
 // reportProgress posts follower LEOs in bulk to a leader's peer plane (one
 // RPC per productive round, replacing the old per-slot reportLEO).
-func (e *Engine) reportProgress(addr string, items []FetchItem) {
+func (e *Engine) reportProgress(addr string, slots []int32, froms []uint64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = e.peerProgress(ctx, addr, e.self, items)
+	_ = e.peerProgress(ctx, addr, e.self, slots, froms)
 }
 
 // ReadProxyAddr returns the slot leader's gRPC address when this node

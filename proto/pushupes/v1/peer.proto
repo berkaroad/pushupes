@@ -47,22 +47,25 @@ message RegisterRequest {
 }
 message RegisterResponse {}
 
-// FetchItem: request entries fill slot/from_seq; response entries add
-// next_seq/payload/leader_leo/leader_hw. payload is raw concatenated WAL
-// record bytes (length-prefixed frames), never re-encoded.
+// FetchItem: response entries only (requests use packed parallel arrays in
+// MFetchRequest). ReplicaProgress reuses slot/from_seq for durable positions.
+// payload is raw concatenated WAL record bytes (length-prefixed frames),
+// never re-encoded.
 message FetchItem {
   int32 slot = 1;
   uint64 from_seq = 2;
   uint64 next_seq = 3;
   bytes payload = 4;
-  uint64 leader_leo = 5;
-  uint64 leader_hw = 6;
 }
 
 message MFetchRequest {
   string follower = 1;
   int64 wait_ms = 2;
-  repeated FetchItem items = 3;
+  // Packed parallel positions: slot[i] wanted from from_seqs[i].
+  // Scalar arrays (not messages): a session carries every followed slot
+  // each round, and per-entry FetchItem objects dominated the wire cost.
+  repeated int32 slots = 3 [packed = true];
+  repeated uint64 from_seqs = 4 [packed = true];
 }
 message MFetchResponse {
   string follower = 1;
@@ -71,7 +74,9 @@ message MFetchResponse {
 
 message ReplicaProgressRequest {
   string follower = 1;
-  repeated FetchItem items = 2; // slot/from_seq carry the durable positions
+  // Packed durable positions (from_seq = LEO+1), same shape as MFetch.
+  repeated int32 slots = 2 [packed = true];
+  repeated uint64 from_seqs = 3 [packed = true];
 }
 message ReplicaProgressResponse {}
 

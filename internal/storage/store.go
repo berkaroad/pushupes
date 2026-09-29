@@ -30,6 +30,15 @@ type Store struct {
 	dirtyMu sync.Mutex
 	dirty   map[int32]bool
 
+	// wakeBus is the store-wide advance signal: every slot's
+	// advanceNotifyLocked closes the current bus handle and installs a
+	// fresh one, so a long-poll can watch ALL slots with a SINGLE channel
+	// instead of selecting across one handle per slot. A spurious wake
+	// (another slot advanced) costs one cheap pending-slot rescan; a
+	// per-slot fan-out in the leader costs O(followed slots) per append.
+	wakeMu  sync.Mutex
+	wakeBus chan struct{}
+
 	// per-slot counters of records made durable locally (both client
 	// appends and replica/migration applies); the basis for write-rate
 	// reporting in the admin API.
@@ -57,6 +66,7 @@ func OpenStore(dir string, slotCount int32, segmentBytes int64, flush FlushPolic
 		dirty:        map[int32]bool{},
 		stop:         make(chan struct{}),
 		done:         make(chan struct{}),
+		wakeBus:      make(chan struct{}),
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -98,6 +108,7 @@ func OpenStore(dir string, slotCount int32, segmentBytes int64, flush FlushPolic
 					continue
 				}
 				st.mu.Lock()
+				slot.store = st
 				st.slots[t.id] = slot
 				st.mu.Unlock()
 			}
@@ -152,6 +163,7 @@ func (st *Store) ReloadSlot(slotID int32) error {
 	if err != nil {
 		return err
 	}
+	slot.store = st
 	st.slots[slotID] = slot
 	return nil
 }
@@ -179,6 +191,7 @@ func (st *Store) Slot(i int32) (*Slot, error) {
 		if err != nil {
 			return nil, err
 		}
+		slot.store = st
 		st.slots[i] = slot
 	}
 	return st.slots[i], nil
@@ -282,8 +295,8 @@ func (st *Store) LastSeqOf(slotID int32) uint64 {
 // WakeChan returns the current wake handle for one slot: it closes on the
 // next LEO advance (any append or replica apply). Take it *after* your last
 // read of the slot — advances from then on are caught either by a re-read or
-// by the handle firing. Used by the multi-fetch long-poll, which selects
-// across every requested slot's handle (a sync.Cond cannot be selected on).
+// by the handle firing. Used by the multi-fetch long-poll to decide WHICH
+// parked slots actually moved after the store bus fires.
 func (st *Store) WakeChan(slotID int32) <-chan struct{} {
 	s, err := st.Slot(slotID)
 	if err != nil {
@@ -292,6 +305,26 @@ func (st *Store) WakeChan(slotID int32) <-chan struct{} {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.wake
+}
+
+// WakeBus returns the store-wide advance signal: ANY slot appending closes
+// the current handle. A leader long-polling hundreds of slots selects on
+// this one channel instead of rebuilding a per-slot case set every round;
+// on a fire it non-blockingly checks the parked slots' own handles to find
+// which one moved (spurious fires for slots nobody follows cost O(parked)
+// channel reads, not O(followed) locks).
+func (st *Store) WakeBus() <-chan struct{} {
+	st.wakeMu.Lock()
+	defer st.wakeMu.Unlock()
+	return st.wakeBus
+}
+
+// fireWakeBus closes the current bus handle and installs a fresh one.
+func (st *Store) fireWakeBus() {
+	st.wakeMu.Lock()
+	close(st.wakeBus)
+	st.wakeBus = make(chan struct{})
+	st.wakeMu.Unlock()
 }
 
 // WaitForSeq blocks on one slot until its LEO reaches wantSeq or the

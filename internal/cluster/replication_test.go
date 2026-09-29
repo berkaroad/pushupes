@@ -46,15 +46,17 @@ func TestHandleFetchLeaderGuard(t *testing.T) {
 
 	// slot 1 is led by node-2 in a 2-node ring; a fetch round must answer it
 	// empty (failover in flight), while our own slot 0 is served normally.
-	resp, err := e.HandleMFetch(MFetchRequest{Items: []FetchItem{{Slot: 1, FromSeq: 1}, {Slot: 0, FromSeq: 1}}})
+	resp, err := e.HandleMFetch(MFetchRequest{Slots: []int32{1, 0}, FromSeqs: []uint64{1, 1}})
 	if err != nil {
 		t.Fatalf("mfetch: %v", err)
 	}
-	if resp.Items[0].NextSeq != 0 || len(resp.Items[0].Payload) != 0 {
-		t.Fatalf("non-led slot must be empty: %+v", resp.Items[0])
+	// Sparse response: neither slot has data (1 is not led here, 0 is
+	// empty), so neither appears — and no error either way.
+	if _, ok := resp.Item(1); ok {
+		t.Fatalf("non-led slot must be absent: %+v", resp.Items)
 	}
-	if resp.Items[1].LeaderLEO != 0 || resp.Items[1].NextSeq != 1 {
-		t.Fatalf("empty slot resp: %+v", resp.Items[1])
+	if it, ok := resp.Item(0); ok && (it.NextSeq != 0 || len(it.Payload) != 0) {
+		t.Fatalf("empty slot must not carry data: %+v", it)
 	}
 }
 
@@ -71,12 +73,13 @@ func TestFetchPayloadRoundTrip(t *testing.T) {
 			t.Fatalf("append v%d: %+v %v", v, out, err)
 		}
 	}
-	resp, err := e.HandleMFetch(MFetchRequest{Items: []FetchItem{{Slot: 0, FromSeq: 1}}})
+	resp, err := e.HandleMFetch(MFetchRequest{Slots: []int32{0}, FromSeqs: []uint64{1}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Items[0].NextSeq != 4 {
-		t.Fatalf("next_seq %d want 4", resp.Items[0].NextSeq)
+	it, ok := resp.Item(0)
+	if !ok || it.NextSeq != 4 {
+		t.Fatalf("next_seq want 4, got %+v", resp.Items)
 	}
 	// decode the payload back and replicate into a second store
 	e2, st2 := newTestEngine(t, "node-2")
@@ -85,7 +88,7 @@ func TestFetchPayloadRoundTrip(t *testing.T) {
 	// make node-2 the replica holder in its own table view
 	applyCmd(t, e2, &Command{Op: OpSlotState, Slots: []int32{0}, State: SlotStable})
 
-	rest := resp.Items[0].Payload
+	rest := it.Payload
 	seq := uint64(1)
 	for len(rest) > 0 {
 		rec, consumed, err := data.DecodeRecord(rest)

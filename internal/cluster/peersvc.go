@@ -69,7 +69,7 @@ func (s *peerServer) Register(_ context.Context, req *pushupesv1.RegisterRequest
 }
 
 func (s *peerServer) MFetch(ctx context.Context, req *pushupesv1.MFetchRequest) (*pushupesv1.MFetchResponse, error) {
-	internal := &MFetchRequest{Follower: req.Follower, WaitMS: req.WaitMs, Items: internalItems(req.Items)}
+	internal := &MFetchRequest{Follower: req.Follower, WaitMS: req.WaitMs, Slots: req.Slots, FromSeqs: req.FromSeqs}
 	resp, err := s.e.HandleMFetchCtx(ctx, *internal)
 	if err != nil {
 		return nil, err
@@ -78,11 +78,13 @@ func (s *peerServer) MFetch(ctx context.Context, req *pushupesv1.MFetchRequest) 
 }
 
 func (s *peerServer) ReplicaProgress(_ context.Context, req *pushupesv1.ReplicaProgressRequest) (*pushupesv1.ReplicaProgressResponse, error) {
-	for _, it := range req.Items {
-		if it.Slot >= 0 && it.FromSeq > 0 {
-			s.e.NoteReplicaProgress(it.Slot, req.Follower, it.FromSeq-1)
+	prog := progressBatch{follower: req.Follower, now: time.Now()}
+	for i, slot := range req.Slots {
+		if i < len(req.FromSeqs) && slot >= 0 && req.FromSeqs[i] > 0 {
+			prog.add(slot, req.FromSeqs[i]-1)
 		}
 	}
+	prog.apply(s.e)
 	return &pushupesv1.ReplicaProgressResponse{}, nil
 }
 
@@ -113,21 +115,12 @@ func (s *peerServer) TriggerSnapshot(ctx context.Context, req *pushupesv1.Trigge
 
 // ---- message conversion ------------------------------------------------------
 
-func internalItems(ps []*pushupesv1.FetchItem) []FetchItem {
-	out := make([]FetchItem, 0, len(ps))
-	for _, p := range ps {
-		out = append(out, FetchItem{Slot: p.Slot, FromSeq: p.FromSeq})
-	}
-	return out
-}
-
 // fetchItemsFromProto converts response items (all fields).
 func fetchItemsFromProto(ps []*pushupesv1.FetchItem) []FetchItem {
 	out := make([]FetchItem, 0, len(ps))
 	for _, p := range ps {
 		out = append(out, FetchItem{
-			Slot: p.Slot, FromSeq: p.FromSeq, NextSeq: p.NextSeq,
-			Payload: p.Payload, LeaderLEO: p.LeaderLeo, LeaderHW: p.LeaderHw,
+			Slot: p.Slot, FromSeq: p.FromSeq, NextSeq: p.NextSeq, Payload: p.Payload,
 		})
 	}
 	return out
@@ -137,8 +130,7 @@ func protoItems(is []FetchItem) []*pushupesv1.FetchItem {
 	out := make([]*pushupesv1.FetchItem, 0, len(is))
 	for _, it := range is {
 		out = append(out, &pushupesv1.FetchItem{
-			Slot: it.Slot, FromSeq: it.FromSeq, NextSeq: it.NextSeq,
-			Payload: it.Payload, LeaderLeo: it.LeaderLEO, LeaderHw: it.LeaderHW,
+			Slot: it.Slot, FromSeq: it.FromSeq, NextSeq: it.NextSeq, Payload: it.Payload,
 		})
 	}
 	return out
@@ -214,7 +206,7 @@ func (e *Engine) peerMFetch(ctx context.Context, addr string, req *MFetchRequest
 		return nil, err
 	}
 	presp, err := c.MFetch(ctx, &pushupesv1.MFetchRequest{
-		Follower: req.Follower, WaitMs: req.WaitMS, Items: protoItems(req.Items),
+		Follower: req.Follower, WaitMs: req.WaitMS, Slots: req.Slots, FromSeqs: req.FromSeqs,
 	})
 	if err != nil {
 		return nil, err
@@ -231,16 +223,12 @@ func (e *Engine) peerReplicate(ctx context.Context, addr string, slot int32, seq
 	return err
 }
 
-func (e *Engine) peerProgress(ctx context.Context, addr, follower string, items []FetchItem) error {
+func (e *Engine) peerProgress(ctx context.Context, addr, follower string, slots []int32, froms []uint64) error {
 	c, err := e.peerRPC(addr)
 	if err != nil {
 		return err
 	}
-	ps := make([]*pushupesv1.FetchItem, 0, len(items))
-	for _, it := range items {
-		ps = append(ps, &pushupesv1.FetchItem{Slot: it.Slot, FromSeq: it.FromSeq})
-	}
-	_, err = c.ReplicaProgress(ctx, &pushupesv1.ReplicaProgressRequest{Follower: follower, Items: ps})
+	_, err = c.ReplicaProgress(ctx, &pushupesv1.ReplicaProgressRequest{Follower: follower, Slots: slots, FromSeqs: froms})
 	return err
 }
 

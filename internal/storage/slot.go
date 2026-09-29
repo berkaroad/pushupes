@@ -60,9 +60,15 @@ type Slot struct {
 	mu sync.RWMutex
 	// cond signals seqCounter advances (single-slot long-poll wait).
 	cond *sync.Cond
-	// wake is the store-level signal channel for this slot: its current
-	// value closes on every LEO advance (see Store.WakeChan).
+	// wake is the slot's own advance signal: closed on every LEO advance
+	// (see Store.WakeChan). The leader's long-poll watch selects across
+	// deadline/context/store-bus and uses these handles to decide WHICH
+	// parked slots actually moved — the bus alone would force a locked
+	// rescan of every followed slot per append.
 	wake chan struct{}
+	// store back-reference: advances also fire the store-wide wake bus
+	// (see Store.WakeBus). nil for standalone (test) slots.
+	store *Store
 }
 
 // OpenSlot loads (or creates) the WAL for one slot directory and rebuilds
@@ -291,6 +297,9 @@ func (s *Slot) LastSeq() uint64 {
 func (s *Slot) advanceNotifyLocked() {
 	close(s.wake)
 	s.wake = make(chan struct{})
+	if s.store != nil {
+		s.store.fireWakeBus()
+	}
 	s.cond.Broadcast()
 }
 

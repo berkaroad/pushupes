@@ -197,17 +197,16 @@ func (*RegisterResponse) Descriptor() ([]byte, []int) {
 	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{3}
 }
 
-// FetchItem: request entries fill slot/from_seq; response entries add
-// next_seq/payload/leader_leo/leader_hw. payload is raw concatenated WAL
-// record bytes (length-prefixed frames), never re-encoded.
+// FetchItem: response entries only (requests use packed parallel arrays in
+// MFetchRequest). ReplicaProgress reuses slot/from_seq for durable positions.
+// payload is raw concatenated WAL record bytes (length-prefixed frames),
+// never re-encoded.
 type FetchItem struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Slot          int32                  `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
 	FromSeq       uint64                 `protobuf:"varint,2,opt,name=from_seq,json=fromSeq,proto3" json:"from_seq,omitempty"`
 	NextSeq       uint64                 `protobuf:"varint,3,opt,name=next_seq,json=nextSeq,proto3" json:"next_seq,omitempty"`
 	Payload       []byte                 `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
-	LeaderLeo     uint64                 `protobuf:"varint,5,opt,name=leader_leo,json=leaderLeo,proto3" json:"leader_leo,omitempty"`
-	LeaderHw      uint64                 `protobuf:"varint,6,opt,name=leader_hw,json=leaderHw,proto3" json:"leader_hw,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -270,25 +269,15 @@ func (x *FetchItem) GetPayload() []byte {
 	return nil
 }
 
-func (x *FetchItem) GetLeaderLeo() uint64 {
-	if x != nil {
-		return x.LeaderLeo
-	}
-	return 0
-}
-
-func (x *FetchItem) GetLeaderHw() uint64 {
-	if x != nil {
-		return x.LeaderHw
-	}
-	return 0
-}
-
 type MFetchRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Follower      string                 `protobuf:"bytes,1,opt,name=follower,proto3" json:"follower,omitempty"`
-	WaitMs        int64                  `protobuf:"varint,2,opt,name=wait_ms,json=waitMs,proto3" json:"wait_ms,omitempty"`
-	Items         []*FetchItem           `protobuf:"bytes,3,rep,name=items,proto3" json:"items,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Follower string                 `protobuf:"bytes,1,opt,name=follower,proto3" json:"follower,omitempty"`
+	WaitMs   int64                  `protobuf:"varint,2,opt,name=wait_ms,json=waitMs,proto3" json:"wait_ms,omitempty"`
+	// Packed parallel positions: slot[i] wanted from from_seqs[i].
+	// Scalar arrays (not messages): a session carries every followed slot
+	// each round, and per-entry FetchItem objects dominated the wire cost.
+	Slots         []int32  `protobuf:"varint,3,rep,packed,name=slots,proto3" json:"slots,omitempty"`
+	FromSeqs      []uint64 `protobuf:"varint,4,rep,packed,name=from_seqs,json=fromSeqs,proto3" json:"from_seqs,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -337,9 +326,16 @@ func (x *MFetchRequest) GetWaitMs() int64 {
 	return 0
 }
 
-func (x *MFetchRequest) GetItems() []*FetchItem {
+func (x *MFetchRequest) GetSlots() []int32 {
 	if x != nil {
-		return x.Items
+		return x.Slots
+	}
+	return nil
+}
+
+func (x *MFetchRequest) GetFromSeqs() []uint64 {
+	if x != nil {
+		return x.FromSeqs
 	}
 	return nil
 }
@@ -397,9 +393,11 @@ func (x *MFetchResponse) GetItems() []*FetchItem {
 }
 
 type ReplicaProgressRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Follower      string                 `protobuf:"bytes,1,opt,name=follower,proto3" json:"follower,omitempty"`
-	Items         []*FetchItem           `protobuf:"bytes,2,rep,name=items,proto3" json:"items,omitempty"` // slot/from_seq carry the durable positions
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Follower string                 `protobuf:"bytes,1,opt,name=follower,proto3" json:"follower,omitempty"`
+	// Packed durable positions (from_seq = LEO+1), same shape as MFetch.
+	Slots         []int32  `protobuf:"varint,2,rep,packed,name=slots,proto3" json:"slots,omitempty"`
+	FromSeqs      []uint64 `protobuf:"varint,3,rep,packed,name=from_seqs,json=fromSeqs,proto3" json:"from_seqs,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -441,9 +439,16 @@ func (x *ReplicaProgressRequest) GetFollower() string {
 	return ""
 }
 
-func (x *ReplicaProgressRequest) GetItems() []*FetchItem {
+func (x *ReplicaProgressRequest) GetSlots() []int32 {
 	if x != nil {
-		return x.Items
+		return x.Slots
+	}
+	return nil
+}
+
+func (x *ReplicaProgressRequest) GetFromSeqs() []uint64 {
+	if x != nil {
+		return x.FromSeqs
 	}
 	return nil
 }
@@ -877,25 +882,24 @@ const file_pushupes_v1_peer_proto_rawDesc = "" +
 	"admin_addr\x18\x02 \x01(\tR\tadminAddr\x12\x1f\n" +
 	"\vclient_addr\x18\x03 \x01(\tR\n" +
 	"clientAddr\"\x12\n" +
-	"\x10RegisterResponse\"\xab\x01\n" +
+	"\x10RegisterResponse\"o\n" +
 	"\tFetchItem\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x19\n" +
 	"\bfrom_seq\x18\x02 \x01(\x04R\afromSeq\x12\x19\n" +
 	"\bnext_seq\x18\x03 \x01(\x04R\anextSeq\x12\x18\n" +
-	"\apayload\x18\x04 \x01(\fR\apayload\x12\x1d\n" +
-	"\n" +
-	"leader_leo\x18\x05 \x01(\x04R\tleaderLeo\x12\x1b\n" +
-	"\tleader_hw\x18\x06 \x01(\x04R\bleaderHw\"r\n" +
+	"\apayload\x18\x04 \x01(\fR\apayload\"\x7f\n" +
 	"\rMFetchRequest\x12\x1a\n" +
 	"\bfollower\x18\x01 \x01(\tR\bfollower\x12\x17\n" +
-	"\await_ms\x18\x02 \x01(\x03R\x06waitMs\x12,\n" +
-	"\x05items\x18\x03 \x03(\v2\x16.pushupes.v1.FetchItemR\x05items\"Z\n" +
+	"\await_ms\x18\x02 \x01(\x03R\x06waitMs\x12\x18\n" +
+	"\x05slots\x18\x03 \x03(\x05B\x02\x10\x01R\x05slots\x12\x1f\n" +
+	"\tfrom_seqs\x18\x04 \x03(\x04B\x02\x10\x01R\bfromSeqs\"Z\n" +
 	"\x0eMFetchResponse\x12\x1a\n" +
 	"\bfollower\x18\x01 \x01(\tR\bfollower\x12,\n" +
-	"\x05items\x18\x02 \x03(\v2\x16.pushupes.v1.FetchItemR\x05items\"b\n" +
+	"\x05items\x18\x02 \x03(\v2\x16.pushupes.v1.FetchItemR\x05items\"o\n" +
 	"\x16ReplicaProgressRequest\x12\x1a\n" +
-	"\bfollower\x18\x01 \x01(\tR\bfollower\x12,\n" +
-	"\x05items\x18\x02 \x03(\v2\x16.pushupes.v1.FetchItemR\x05items\"\x19\n" +
+	"\bfollower\x18\x01 \x01(\tR\bfollower\x12\x18\n" +
+	"\x05slots\x18\x02 \x03(\x05B\x02\x10\x01R\x05slots\x12\x1f\n" +
+	"\tfrom_seqs\x18\x03 \x03(\x04B\x02\x10\x01R\bfromSeqs\"\x19\n" +
 	"\x17ReplicaProgressResponse\"R\n" +
 	"\x10ReplicateRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x10\n" +
@@ -959,30 +963,28 @@ var file_pushupes_v1_peer_proto_goTypes = []any{
 	(*TriggerSnapshotResponse)(nil), // 16: pushupes.v1.TriggerSnapshotResponse
 }
 var file_pushupes_v1_peer_proto_depIdxs = []int32{
-	4,  // 0: pushupes.v1.MFetchRequest.items:type_name -> pushupes.v1.FetchItem
-	4,  // 1: pushupes.v1.MFetchResponse.items:type_name -> pushupes.v1.FetchItem
-	4,  // 2: pushupes.v1.ReplicaProgressRequest.items:type_name -> pushupes.v1.FetchItem
-	0,  // 3: pushupes.v1.PeerService.Ping:input_type -> pushupes.v1.PingRequest
-	2,  // 4: pushupes.v1.PeerService.Register:input_type -> pushupes.v1.RegisterRequest
-	5,  // 5: pushupes.v1.PeerService.MFetch:input_type -> pushupes.v1.MFetchRequest
-	7,  // 6: pushupes.v1.PeerService.ReplicaProgress:input_type -> pushupes.v1.ReplicaProgressRequest
-	9,  // 7: pushupes.v1.PeerService.Replicate:input_type -> pushupes.v1.ReplicateRequest
-	11, // 8: pushupes.v1.PeerService.SlotLeo:input_type -> pushupes.v1.SlotLeoRequest
-	13, // 9: pushupes.v1.PeerService.PushSegments:input_type -> pushupes.v1.PushSegmentsChunk
-	15, // 10: pushupes.v1.PeerService.TriggerSnapshot:input_type -> pushupes.v1.TriggerSnapshotRequest
-	1,  // 11: pushupes.v1.PeerService.Ping:output_type -> pushupes.v1.PingResponse
-	3,  // 12: pushupes.v1.PeerService.Register:output_type -> pushupes.v1.RegisterResponse
-	6,  // 13: pushupes.v1.PeerService.MFetch:output_type -> pushupes.v1.MFetchResponse
-	8,  // 14: pushupes.v1.PeerService.ReplicaProgress:output_type -> pushupes.v1.ReplicaProgressResponse
-	10, // 15: pushupes.v1.PeerService.Replicate:output_type -> pushupes.v1.ReplicateResponse
-	12, // 16: pushupes.v1.PeerService.SlotLeo:output_type -> pushupes.v1.SlotLeoResponse
-	14, // 17: pushupes.v1.PeerService.PushSegments:output_type -> pushupes.v1.PushSegmentsResponse
-	16, // 18: pushupes.v1.PeerService.TriggerSnapshot:output_type -> pushupes.v1.TriggerSnapshotResponse
-	11, // [11:19] is the sub-list for method output_type
-	3,  // [3:11] is the sub-list for method input_type
-	3,  // [3:3] is the sub-list for extension type_name
-	3,  // [3:3] is the sub-list for extension extendee
-	0,  // [0:3] is the sub-list for field type_name
+	4,  // 0: pushupes.v1.MFetchResponse.items:type_name -> pushupes.v1.FetchItem
+	0,  // 1: pushupes.v1.PeerService.Ping:input_type -> pushupes.v1.PingRequest
+	2,  // 2: pushupes.v1.PeerService.Register:input_type -> pushupes.v1.RegisterRequest
+	5,  // 3: pushupes.v1.PeerService.MFetch:input_type -> pushupes.v1.MFetchRequest
+	7,  // 4: pushupes.v1.PeerService.ReplicaProgress:input_type -> pushupes.v1.ReplicaProgressRequest
+	9,  // 5: pushupes.v1.PeerService.Replicate:input_type -> pushupes.v1.ReplicateRequest
+	11, // 6: pushupes.v1.PeerService.SlotLeo:input_type -> pushupes.v1.SlotLeoRequest
+	13, // 7: pushupes.v1.PeerService.PushSegments:input_type -> pushupes.v1.PushSegmentsChunk
+	15, // 8: pushupes.v1.PeerService.TriggerSnapshot:input_type -> pushupes.v1.TriggerSnapshotRequest
+	1,  // 9: pushupes.v1.PeerService.Ping:output_type -> pushupes.v1.PingResponse
+	3,  // 10: pushupes.v1.PeerService.Register:output_type -> pushupes.v1.RegisterResponse
+	6,  // 11: pushupes.v1.PeerService.MFetch:output_type -> pushupes.v1.MFetchResponse
+	8,  // 12: pushupes.v1.PeerService.ReplicaProgress:output_type -> pushupes.v1.ReplicaProgressResponse
+	10, // 13: pushupes.v1.PeerService.Replicate:output_type -> pushupes.v1.ReplicateResponse
+	12, // 14: pushupes.v1.PeerService.SlotLeo:output_type -> pushupes.v1.SlotLeoResponse
+	14, // 15: pushupes.v1.PeerService.PushSegments:output_type -> pushupes.v1.PushSegmentsResponse
+	16, // 16: pushupes.v1.PeerService.TriggerSnapshot:output_type -> pushupes.v1.TriggerSnapshotResponse
+	9,  // [9:17] is the sub-list for method output_type
+	1,  // [1:9] is the sub-list for method input_type
+	1,  // [1:1] is the sub-list for extension type_name
+	1,  // [1:1] is the sub-list for extension extendee
+	0,  // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_pushupes_v1_peer_proto_init() }
