@@ -61,6 +61,9 @@ type Segment struct {
 
 	unflushed     int64
 	lastFlushTime time.Time
+
+	scatterBuf   []byte   // scratch for EncodeScatter headers
+	scatterParts [][]byte // reusable segment list handed to pwritev
 }
 
 func headerBuf(slotID int32, baseSeq uint64) []byte {
@@ -207,32 +210,49 @@ func putEncodeBuf(buf []byte) {
 	encodeBufPools[c-poolClassShift].Put(buf[:cap(buf)])
 }
 
-// writeFrame appends one already-encoded frame (recLen(4) + record) at the
-// segment tail, maintaining the sparse index. The bytes land verbatim.
-func (s *Segment) writeFrame(seq uint64, frame []byte) error {
+// framePos validates seq order, records the sparse index entry and returns the
+// offset the frame is to be written at. commitFrame must follow a successful
+// write; a failed write leaves the counters untouched (a torn tail is what
+// recovery expects to find either way).
+func (s *Segment) framePos(seq uint64) (int64, error) {
 	if !s.writable {
-		return errors.New("segment is sealed")
+		return 0, errors.New("segment is sealed")
 	}
 	want := s.BaseSeq
 	if s.RecordCnt > 0 {
 		want = s.LastSeq + 1
 	}
 	if seq != want {
-		return fmt.Errorf("segment %d: seq %d out of order (want %d)", s.BaseSeq, seq, want)
+		return 0, fmt.Errorf("segment %d: seq %d out of order (want %d)", s.BaseSeq, seq, want)
 	}
 	pos := s.sizeBytes
 	if s.RecordCnt == 0 || s.bytesSinceIndex >= indexIntervalB {
 		s.index = append(s.index, indexEntry{seq: seq, pos: pos})
 		s.bytesSinceIndex = 0
 	}
+	return pos, nil
+}
+
+// commitFrame accounts for n bytes written for seq at the segment tail.
+func (s *Segment) commitFrame(seq uint64, n int64) {
+	s.sizeBytes += n
+	s.RecordCnt++
+	s.LastSeq = seq
+	s.bytesSinceIndex += n
+	s.unflushed++
+}
+
+// writeFrame appends one already-encoded frame (recLen(4) + record) at the
+// segment tail, maintaining the sparse index. The bytes land verbatim.
+func (s *Segment) writeFrame(seq uint64, frame []byte) error {
+	pos, err := s.framePos(seq)
+	if err != nil {
+		return err
+	}
 	if _, err := s.File.WriteAt(frame, pos); err != nil {
 		return err
 	}
-	s.sizeBytes += int64(len(frame))
-	s.RecordCnt++
-	s.LastSeq = seq
-	s.bytesSinceIndex += int64(len(frame))
-	s.unflushed++
+	s.commitFrame(seq, int64(len(frame)))
 	return nil
 }
 
@@ -242,6 +262,41 @@ func (s *Segment) Append(seq uint64, rec *data.EventRecord) error {
 	err := s.writeFrame(seq, frame)
 	putEncodeBuf(frame)
 	return err
+}
+
+// AppendRecord appends rec under the given seq without assembling its whole
+// frame in memory: the fixed-width headers go into a reusable scratch buffer
+// and each event body is handed to the kernel as its own segment (pwritev), so
+// a large body is never copied on the way to the page cache. Filesystems that
+// refuse scatter/gather writes are detected once and served by the contiguous
+// path from then on — the bytes that land are identical either way.
+func (s *Segment) AppendRecord(seq uint64, rec *data.EventRecord) error {
+	pos, err := s.framePos(seq)
+	if err != nil {
+		return err
+	}
+	total := rec.EncodedSize()
+	if !scatterDisabled.Load() {
+		if len(s.scatterBuf) < rec.ScatterSize() {
+			s.scatterBuf = make([]byte, rec.ScatterSize())
+		}
+		s.scatterParts, _ = rec.EncodeScatter(s.scatterBuf, s.scatterParts)
+		switch err := pwritevAll(s.File, s.scatterParts, pos); {
+		case err == nil:
+			s.commitFrame(seq, int64(total))
+			return nil
+		case !errors.Is(err, errScatterUnsupported):
+			return err
+		}
+		scatterDisabled.Store(true) // latch: later appends skip the probe
+	}
+	frame := rec.EncodeBinary(getEncodeBuf(total))
+	defer putEncodeBuf(frame)
+	if _, err := s.File.WriteAt(frame, pos); err != nil {
+		return err
+	}
+	s.commitFrame(seq, int64(total))
+	return nil
 }
 
 // AppendFrame appends a leader-encoded frame verbatim: follower replication

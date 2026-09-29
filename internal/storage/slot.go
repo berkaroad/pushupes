@@ -218,7 +218,7 @@ func (s *Slot) Append(rec *data.EventRecord) (*AppendOutcome, error) {
 		return nil, err
 	}
 	seq := s.seqCounter.Load() + 1
-	if err := seg.Append(seq, rec); err != nil {
+	if err := seg.AppendRecord(seq, rec); err != nil {
 		return nil, err
 	}
 	s.seqCounter.Store(seq)

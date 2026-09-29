@@ -65,6 +65,16 @@ func (r *EventRecord) EncodedSize() int {
 	return 4 + n
 }
 
+// ScatterSize is the number of bytes EncodeScatter needs in its scratch
+// buffer: everything in the frame except the event bodies.
+func (r *EventRecord) ScatterSize() int {
+	n := 4 + 2 + len(r.AggregateID) + 4 + 8 + 2 + len(r.CommandID) + 2
+	for i := range r.Events {
+		n += 2 + len(r.Events[i].Type) + 4
+	}
+	return n
+}
+
 // Validate checks field-length limits and non-empty events.
 func (r *EventRecord) Validate() error {
 	if r.AggregateID == "" {
@@ -224,6 +234,54 @@ func DecodeRecord(buf []byte) (EventRecord, int, error) {
 func DecodeRecordMeta(buf []byte) (RecordMeta, int, error) {
 	_, m, n, err := scanRecord(buf, false)
 	return m, n, err
+}
+
+// EncodeScatter describes the record frame as a list of segments whose
+// concatenation is byte-identical to EncodeBinary's output, but with the event
+// bodies referenced in place instead of copied: the fixed-width headers and
+// the ids/types go into scratch. Callers that can write scattered segments
+// (pwritev) then hand a large body straight to the kernel.
+//
+// scratch must be at least ScatterSize() bytes; parts is reused (grown if
+// needed) and returned.
+func (r *EventRecord) EncodeScatter(scratch []byte, parts [][]byte) ([][]byte, int) {
+	size := r.ScatterSize()
+	if len(scratch) < size {
+		scratch = make([]byte, size)
+	}
+	buf := scratch[:size]
+	off := 0
+	binary.BigEndian.PutUint32(buf[off:], uint32(r.EncodedSize()-4))
+	off += 4
+	binary.BigEndian.PutUint16(buf[off:], uint16(len(r.AggregateID)))
+	off += 2
+	off += copy(buf[off:], r.AggregateID)
+	binary.BigEndian.PutUint32(buf[off:], r.Version)
+	off += 4
+	binary.BigEndian.PutUint64(buf[off:], uint64(r.UnixTime))
+	off += 8
+	binary.BigEndian.PutUint16(buf[off:], uint16(len(r.CommandID)))
+	off += 2
+	off += copy(buf[off:], r.CommandID)
+	binary.BigEndian.PutUint16(buf[off:], uint16(len(r.Events)))
+	off += 2
+
+	parts = parts[:0]
+	parts = append(parts, buf[:off])
+	for i := range r.Events {
+		ev := &r.Events[i]
+		hdr := off
+		binary.BigEndian.PutUint16(buf[off:], uint16(len(ev.Type)))
+		off += 2
+		off += copy(buf[off:], ev.Type)
+		binary.BigEndian.PutUint32(buf[off:], uint32(len(ev.Body)))
+		off += 4
+		parts = append(parts, buf[hdr:off])
+		if len(ev.Body) > 0 {
+			parts = append(parts, ev.Body)
+		}
+	}
+	return parts, r.EncodedSize()
 }
 
 // ---- small binary helpers -------------------------------------------------
