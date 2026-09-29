@@ -64,17 +64,23 @@ func TestGRPCAppendReadCycle(t *testing.T) {
 	if resp.Status != pushupesv1.AppendResponse_STATUS_SUCCESS || resp.Seq != 1 {
 		t.Fatalf("append1: %+v", resp)
 	}
-	if resp.Record == nil || string(resp.Record.Events[0].Body) != `{"a":1}` || resp.Record.Seq != 1 {
-		t.Fatalf("append echo record: %+v", resp.Record)
+	// Success answers status/seq only: echoing the stored record back would
+	// double the bytes on the wire for every large-bodied append.
+	if resp.Record != nil {
+		t.Fatalf("success must not echo the stored record: %+v", resp.Record)
 	}
 
-	// idempotent replay -> EXISTS with the stored record
+	// idempotent replay -> EXISTS, which does carry the stored record (the one
+	// case the caller cannot reconstruct itself).
 	resp2, err := cli.Append(ctx, appendReq("agg-1", 1, "c-1", `{"a":1}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resp2.Status != pushupesv1.AppendResponse_STATUS_EXISTS || resp2.Seq != 1 {
 		t.Fatalf("append dup: %+v", resp2)
+	}
+	if resp2.Record == nil || resp2.Record.Seq != 1 || string(resp2.Record.Events[0].Body) != `{"a":1}` {
+		t.Fatalf("exists must echo the stored record: %+v", resp2.Record)
 	}
 
 	// version skip -> FAIL 1001 + current_version for self-heal

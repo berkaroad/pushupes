@@ -196,7 +196,11 @@ Body: Record*，每条记录：
   status/writes/plan/migrate/槽 describe/healthz/pprof，**不再承载任何节点间流量**
   （原 `/internal/*` 复制/迁移端点已全部迁到 peer 面 PeerService gRPC，admin HTTP
   路由已删除）。事件 body 是任意字节，在 gRPC 面端到端裸传（proto `bytes`），
-  append 的 success/exists 回显直接挂存储记录本体（`*EventRecord`），不存在
+   **append 回显是不对称的**：`exists` 回显存储记录本体（`*EventRecord`，零
+  指针搬运；重放方唯一无法自行还原的信息），`success` 只回 status/seq/version
+  ——调用方手里就是刚发的那条记录，回显 100KiB body 等于每条 append 多付一次
+  marshal + 整包往返（实测同负载 627→762 msg/s、p50 5.69→5.09ms、每条消息
+  CPU -16%，其中还含客户端省下的一次 unmarshal）。不存在
   JSON 包装平面——旧 `{"_b64":...}` 方案会在大 body 上付出 json.Valid 全量
   校验 + base64 重建 + 解码往返的 CPU（实测 100KiB body 下占 leader CPU 一半），
   已随 HTTP 事件面退役删除。

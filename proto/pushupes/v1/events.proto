@@ -56,7 +56,7 @@ message AppendResponse {
   uint64 seq = 5;
   int32 slot = 6; // routing slot (authoritative even on redirects)
   string node = 7; // redirect target "host:port" for MOVED/ASK/NOT_LEADER
-  Record record = 8; // set on SUCCESS/EXISTS
+  Record record = 8; // set on STATUS_EXISTS only (the stored duplicate)
 }
 
 message ReadStreamRequest {

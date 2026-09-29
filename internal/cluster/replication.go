@@ -361,7 +361,10 @@ func (e *Engine) localAppend(slot int32, rec *data.EventRecord, acks string) (*d
 			return resp, nil
 		}
 	}
-	resp.Record = out.Record // success: the record just stored, verbatim
+	// Success carries status/seq only: the caller already holds the record it
+	// sent, and echoing a 100KiB body back doubled the bytes on the wire per
+	// append (see DESIGN.md §6). EXISTS still returns the stored record, which
+	// is the one case where the caller cannot know it.
 	return resp, nil
 }
 

@@ -303,7 +303,7 @@ type AppendResponse struct {
 	Seq            uint64                 `protobuf:"varint,5,opt,name=seq,proto3" json:"seq,omitempty"`
 	Slot           int32                  `protobuf:"varint,6,opt,name=slot,proto3" json:"slot,omitempty"`    // routing slot (authoritative even on redirects)
 	Node           string                 `protobuf:"bytes,7,opt,name=node,proto3" json:"node,omitempty"`     // redirect target "host:port" for MOVED/ASK/NOT_LEADER
-	Record         *Record                `protobuf:"bytes,8,opt,name=record,proto3" json:"record,omitempty"` // set on SUCCESS/EXISTS
+	Record         *Record                `protobuf:"bytes,8,opt,name=record,proto3" json:"record,omitempty"` // set on STATUS_EXISTS only (the stored duplicate)
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
