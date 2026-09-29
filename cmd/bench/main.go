@@ -65,13 +65,13 @@ func main() {
 	aggs := flag.Int("aggs", 100, "number of aggregate ids")
 	dur := flag.Duration("duration", 10*time.Second, "sustained write duration")
 	connsFlag := flag.Int("conns", 16, "workers (aggregates are partitioned across them)")
-	size := flag.Int("size", 1024, "event body bytes (must be <= 1024)")
+	size := flag.Int("size", 1024, "event body bytes (must be <= 1024 * 1024)")
 	acks := flag.String("acks", "leader", "acks: leader|all|none")
 	reportEvery := flag.Duration("report", time.Second, "live report interval")
 	flag.Parse()
 
-	if *size > 1024 {
-		fmt.Println("size must stay within 1 KiB per event body")
+	if *size > 1024*1024 {
+		fmt.Println("size must stay within 1 MiB per event body")
 		os.Exit(2)
 	}
 	adminList := splitAddrs(*nodes)
