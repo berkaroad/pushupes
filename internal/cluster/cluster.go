@@ -2,7 +2,7 @@
 // replicates the slot assignment table, a leader-follower data plane that
 // replicates slot WALs by seq-based fetch, and hot slot migration.
 //
-// The split mirrors DeadliftMQ: consensus carries only metadata; event data
+// The split: consensus carries only metadata; event data
 // travels over a dedicated replication protocol and never through the Raft log.
 package cluster
 
@@ -90,9 +90,9 @@ type Node struct {
 	logger      *logrus.Entry
 }
 
-// NewNode starts (or joins) a Raft node. The second return value is the
-// registration listener demuxed off the peer port — the caller should hand
-// it to Engine.ServeRegistrations.
+// NewNode starts (or joins) a Raft node. The second return value is
+// the gRPC listener demuxed off the peer port (HTTP/2 preface 'P') —
+// the caller hands it to Engine.ServePeer.
 func NewNode(cfg Config, applier Applier, logger *logrus.Entry) (*Node, net.Listener, error) {
 	cfg.withDefaults()
 	if cfg.NodeID == "" || cfg.PeerAddr == "" || cfg.DataDir == "" {
@@ -115,8 +115,10 @@ func NewNode(cfg Config, applier Applier, logger *logrus.Entry) (*Node, net.List
 	if advertise.IP == nil || advertise.IP.IsUnspecified() {
 		return nil, nil, fmt.Errorf("cluster: peer addr %q is not advertisable", cfg.PeerAddr)
 	}
-	// The peer port carries BOTH raft transport traffic and data-plane
-	// address registrations, demuxed by the first byte of each connection.
+	// The peer port carries BOTH raft transport traffic and the
+	// inter-node PeerService gRPC plane, demuxed by the first byte of
+	// each connection ('P' = HTTP/2 preface goes to gRPC, the rest to
+	// raft — see peer_mux.go).
 	mux, err := newPeerMux(HostPort(cfg.PeerAddr), advertise)
 	if err != nil {
 		return nil, nil, err
@@ -160,7 +162,7 @@ func NewNode(cfg Config, applier Applier, logger *logrus.Entry) (*Node, net.List
 	if !hasState && !cfg.Bootstrap {
 		n.startAutoJoin()
 	}
-	return n, &registrations{mux: mux}, nil
+	return n, mux.GRPCListener(), nil
 }
 
 func raftConfiguration(self string, peers []Peer) raft.Configuration {
@@ -236,21 +238,6 @@ func (n *Node) Apply(cmd []byte) ([]byte, error) {
 
 // IsLeader reports whether this node holds the Raft leadership (controller).
 func (n *Node) IsLeader() bool { return n.raft.State() == raft.Leader }
-
-// LeaderAdminAddr returns the admin address of the Raft leader (controller),
-// resolved from the peer list.
-func (n *Node) LeaderAdminAddr() string {
-	_, addr := n.raft.LeaderWithID()
-	for _, p := range n.cfg.Peers {
-		if string(addr) == p.ID || string(addr) == HostPort(p.PeerAddr) {
-			return p.AdminAddr
-		}
-	}
-	if string(addr) == HostPort(n.cfg.PeerAddr) || string(addr) == n.cfg.NodeID {
-		return n.cfg.AdminAddr
-	}
-	return NormalizeAddr(string(addr))
-}
 
 // LeaderID returns the Raft leader node id.
 func (n *Node) LeaderID() string {

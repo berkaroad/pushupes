@@ -75,7 +75,7 @@ func TestMFetchLongPollWakesOnAppend(t *testing.T) {
 // first fired slot only and made the follower pay one round trip per
 // remaining slot (RTT x slots of HW lag under acks=all). Note this is
 // the idle→burst path: with data present at request time phase 1 answers
-// immediately (Kafka fetch semantics), so no waiters park at all.
+// immediately (fetch answers with whatever it has), so no waiters park at all.
 func TestMFetchBurstDrainAllWaiters(t *testing.T) {
 	dir := t.TempDir()
 	store, err := storage.OpenStore(dir, 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})

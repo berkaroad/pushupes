@@ -1,12 +1,8 @@
 package cluster
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -80,8 +76,8 @@ func (e *Engine) StartMigration(ctx context.Context, slot int32, toNode string) 
 		return err
 	}
 
-	// step 2: the source streams its sealed segments.
-	srcAddr := e.adminAddr(from)
+	// step 2: the source streams its sealed segments (peer plane).
+	srcAddr := e.peerAddr(from)
 	if srcAddr == "" {
 		e.rollbackMigration(slot)
 		return fmt.Errorf("no address for source %s", from)
@@ -112,28 +108,15 @@ func (e *Engine) StartMigration(ctx context.Context, slot int32, toNode string) 
 	return nil
 }
 
-// snapshotTo asks the source to push sealed segments; when we ARE the source
-// it pushes directly to the target.
+// snapshotTo asks the source to push sealed segments over the peer plane;
+// when we ARE the source it pushes directly to the target.
 func (e *Engine) snapshotTo(ctx context.Context, srcAddr string, slot int32, toNode string) error {
-	if srcAddr == e.node.cfg.AdminAddr {
+	if srcAddr == e.node.cfg.PeerAddr {
 		return e.pushSealedSegments(ctx, slot, toNode)
 	}
-	b, _ := json.Marshal(map[string]any{"slot": slot, "to_node": toNode})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, HTTPURL(srcAddr, "/internal/migrate/snapshot"), bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := e.httpC.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
-	}
-	return nil
+	sctx, cancel := context.WithTimeout(ctx, peerRPCTimeout)
+	defer cancel()
+	return e.peerTriggerSnapshot(sctx, srcAddr, slot, toNode)
 }
 
 // pushSealedSegments streams all sealed segments of a slot to the target.
@@ -155,22 +138,9 @@ func (e *Engine) pushSealedSegments(ctx context.Context, slot int32, toNode stri
 		}
 		req.Segments = append(req.Segments, SegmentFile{Name: filepath.Base(seg.Path), Payload: b})
 	}
-	b, _ := json.Marshal(req)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, HTTPURL(e.adminAddr(toNode), "/internal/migrate/segments"), bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := e.httpC.Do(httpReq)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
-	}
-	return nil
+	sctx, cancel := context.WithTimeout(ctx, peerRPCTimeout)
+	defer cancel()
+	return e.peerPushSegments(sctx, e.peerAddr(toNode), req)
 }
 
 // awaitCaughtUp polls the target's LEO until it reaches the source's LEO.
@@ -178,11 +148,11 @@ func (e *Engine) pushSealedSegments(ctx context.Context, slot int32, toNode stri
 func (e *Engine) awaitCaughtUp(ctx context.Context, from, toNode string, slot int32) error {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		srcLEO, err := e.remoteLEO(ctx, e.adminAddr(from), slot)
+		srcLEO, err := e.remoteLEO(ctx, e.peerAddr(from), slot)
 		if err != nil {
 			return err
 		}
-		tgtLEO, err := e.remoteLEO(ctx, e.adminAddr(toNode), slot)
+		tgtLEO, err := e.remoteLEO(ctx, e.peerAddr(toNode), slot)
 		if err != nil {
 			return err
 		}
@@ -227,32 +197,11 @@ func (e *Engine) rollbackMigration(slot int32) {
 	_ = e.submit(&Command{Op: OpSlotState, Slots: []int32{slot}, State: SlotStable})
 }
 
-// remoteLEO asks a peer for its LEO of a slot.
+// remoteLEO asks a peer for its LEO of a slot over the peer plane.
 func (e *Engine) remoteLEO(ctx context.Context, addr string, slot int32) (uint64, error) {
-	if addr == "" {
-		return 0, fmt.Errorf("no address for slot %d probe", slot)
-	}
-	b, _ := json.Marshal(map[string]any{"slot": slot})
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, HTTPURL(addr, "/internal/leo"), bytes.NewReader(b))
-	if err != nil {
-		return 0, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := e.httpC.Do(httpReq)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("leo probe status %d", resp.StatusCode)
-	}
-	var out struct {
-		LEO uint64 `json:"leo"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return 0, err
-	}
-	return out.LEO, nil
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return e.peerLeo(cctx, addr, slot)
 }
 
 // scheduleDropAfter cleans up the old source copy after retention (step 6).

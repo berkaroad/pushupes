@@ -2,11 +2,7 @@ package cluster
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -136,7 +132,7 @@ func TestNoteReplicaProgressAdvancesHW(t *testing.T) {
 		t.Fatalf("ISR %v want [node-2]", got)
 	}
 	// stale replica leaves ISR; with ISR={leader} only, the HW follows the
-	// leader's LEO — Kafka semantics (acks=all degrades to a leader-only
+	// leader's LEO (acks=all degrades to a leader-only
 	// guarantee until the replica re-syncs, never a silent stall).
 	e.replMu.Lock()
 	e.repl[0].lastOK["node-2"] = time.Now().Add(-time.Minute)
@@ -293,8 +289,8 @@ func TestSnapshotFailureRollsBackSlotState(t *testing.T) {
 	}
 
 	// A write during the window is served by the source and forwarded; the
-	// dead target makes the forward fail and the engine must abort the slot.
-	e.httpC = &http.Client{Timeout: 2 * time.Second}
+	// dead target (nothing listening) makes the forward fail fast and the
+	// engine must abort the slot.
 	_, err := e.SubmitAppend(context.Background(), makeRecord(aggAB, 3, "ab-3"), "leader")
 	if err == nil {
 		t.Fatal("expected forward failure")
@@ -314,54 +310,18 @@ func TestSnapshotFailureRollsBackSlotState(t *testing.T) {
 	}
 }
 
-func TestHandleFetchAndReplicateOverHTTP(t *testing.T) {
-	// Wire two engines through httptest to prove the internal endpoints
-	// actually drive replication end to end (fetch + LEO report).
+func TestHandleFetchAndReplicateOverPeerPlane(t *testing.T) {
+	// Wire two engines through the real PeerService gRPC plane (over the
+	// peer-port mux demux) to prove replication end to end: fetch round,
+	// WAL replay on the follower, LEO report advancing leader HW.
 	leader, ldrStore := newTestEngine(t, "node-1")
 	join(t, leader, "node-1", "127.0.0.1:1")
 	join(t, leader, "node-2", "127.0.0.1:2")
 	applyCmd(t, leader, &Command{Op: OpPlanSlots})
-	ldrMux := http.NewServeMux()
-	ldrMux.HandleFunc("POST /internal/mfetch", func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := io.ReadAll(r.Body)
-		req, err := DecodeMRequest(raw)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		resp, err := leader.HandleMFetch(*req)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusForbidden)
-			return
-		}
-		w.Write(EncodeMResponse(resp))
-	})
-	ldrMux.HandleFunc("POST /internal/replica-progress", func(w http.ResponseWriter, r *http.Request) {
-		var p struct {
-			Follower string      `json:"follower"`
-			Slot     int32       `json:"slot"`
-			LEO      uint64      `json:"leo"`
-			Items    []FetchItem `json:"items"`
-		}
-		json.NewDecoder(r.Body).Decode(&p)
-		if len(p.Items) > 0 {
-			for _, it := range p.Items {
-				if it.FromSeq > 0 {
-					leader.NoteReplicaProgress(it.Slot, p.Follower, it.FromSeq-1)
-				}
-			}
-		} else {
-			leader.NoteReplicaProgress(p.Slot, p.Follower, p.LEO)
-		}
-		w.WriteHeader(http.StatusOK)
-	})
-	ts := httptest.NewServer(ldrMux)
-	defer ts.Close()
-	// rewrite node-1 peer addr to the test server
-	applyCmd(t, leader, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-1", PeerAddr: "x", AdminAddr: strings.TrimPrefix(ts.URL, "http://")}})
+	addr := newPeerHarness(t, leader)
 
 	follower, _ := newTestEngine(t, "node-2")
-	join(t, follower, "node-1", strings.TrimPrefix(ts.URL, "http://"))
+	join(t, follower, "node-1", addr)
 	join(t, follower, "node-2", "127.0.0.1:2")
 	applyCmd(t, follower, &Command{Op: OpPlanSlots})
 

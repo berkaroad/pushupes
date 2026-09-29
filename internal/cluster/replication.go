@@ -1,13 +1,9 @@
 package cluster
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"reflect"
 	"sort"
 	"sync"
@@ -24,14 +20,14 @@ import (
 // (replicated through Raft via the Applier interface), routes client appends
 // to slot leaders, runs the follower fetch loop, and tracks ISR/high
 // watermark per slot. Event data never enters Raft — it is replicated by
-// seq-based fetch exactly like DeadliftMQ/Kafka.
+// a dedicated seq-based fetch protocol.
 type Engine struct {
 	node    *Node
 	store   *storage.Store
 	table   *Table
 	tableMu sync.RWMutex
 	logger  *logrus.Entry
-	httpC   *http.Client
+	peers   *peerClient // cached PeerService connections, keyed by peer addr
 	self    string
 
 	// replication bookkeeping per slot, only meaningful on slot leaders
@@ -68,7 +64,7 @@ type slotRepl struct {
 }
 
 // fetchSession is one follower's multiplexed fetch loop against one slot
-// leader: a single goroutine long-polls /internal/mfetch carrying the
+// leader: a single goroutine long-polls PeerService.MFetch carrying the
 // follower positions of every slot this node replicates from that leader.
 // One session per leader => O(nodes) connections instead of O(followed slots).
 type fetchSession struct {
@@ -106,17 +102,11 @@ func NewEngine(node *Node, store *storage.Store, self string, acksDefault string
 		self:   self,
 		table:  NewTable(store.SlotCount, 2),
 		logger: logger,
-		httpC: &http.Client{
-			Timeout: 15 * time.Second,
-			// Long-poll keeps one live fetch per followed slot (~64) against
-			// the same leader; the default 2 idle conns per host would close
-			// and re-dial the rest every response (load-time churn).
-			Transport: &http.Transport{
-				MaxIdleConns:        2048,
-				MaxIdleConnsPerHost: 1024,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		},
+		// One HTTP/2 connection per leader carries every multiplexed
+		// long-poll fetch round plus progress/replication/leo probes —
+		// gRPC multiplexes them over the single cached conn (the old HTTP
+		// transport needed a large idle-conn pool to avoid re-dial churn).
+		peers:       newPeerClient(),
 		repl:        map[int32]*slotRepl{},
 		fwd:         map[int32]string{},
 		sessions:    map[string]*fetchSession{},
@@ -229,7 +219,7 @@ func (e *Engine) SubmitAppend(ctx context.Context, rec *data.EventRecord, acks s
 		// fast path: the command already landed during an earlier attempt
 		switch {
 		case resp.Status == data.StatusSuccess && resp.Seq > 0:
-			if ferr := e.forwardTo(ctx, e.adminAddr(p.MigratingTo), slot, resp.Seq, rec); ferr != nil {
+			if ferr := e.forwardTo(ctx, e.peerAddr(p.MigratingTo), slot, resp.Seq, rec); ferr != nil {
 				e.logger.WithError(ferr).WithField("slot", slot).Warn("migration forward failed, rollback slot state")
 				e.rollbackMigration(slot)
 				return nil, ferr
@@ -245,7 +235,7 @@ func (e *Engine) SubmitAppend(ctx context.Context, rec *data.EventRecord, acks s
 			for _, ev := range resp.Record.Events {
 				stored.Events = append(stored.Events, data.Event{Type: ev.Type, Body: ev.Body})
 			}
-			if ferr := e.forwardTo(ctx, e.adminAddr(p.MigratingTo), slot, resp.Seq, stored); ferr != nil {
+			if ferr := e.forwardTo(ctx, e.peerAddr(p.MigratingTo), slot, resp.Seq, stored); ferr != nil {
 				e.logger.WithError(ferr).WithField("slot", slot).Warn("migration exists-forward failed")
 				e.rollbackMigration(slot)
 				return nil, ferr
@@ -279,14 +269,6 @@ type RedirectError struct {
 
 func (r *RedirectError) Error() string {
 	return fmt.Sprintf("redirect kind=%d node=%s addr=%s", r.Kind, r.Node, r.Addr)
-}
-
-// adminAddr is the admin/inter-node HTTP address used for replication,
-// migration forwards and liveness probes.
-func (e *Engine) adminAddr(nodeID string) string {
-	e.tableMu.RLock()
-	defer e.tableMu.RUnlock()
-	return e.table.Peers[nodeID].AdminAddr
 }
 
 // clientAddr is the client-facing data-plane address of a peer: the
@@ -335,31 +317,12 @@ func (e *Engine) localAppend(slot int32, rec *data.EventRecord, acks string) (*d
 // the migration target's WAL. Idempotent: the target ignores records it
 // already has at that seq (e.g. replicated earlier via ordinary fetch).
 func (e *Engine) forwardTo(ctx context.Context, toAddr string, slot int32, seq uint64, rec *data.EventRecord) error {
-	if toAddr == "" {
-		return fmt.Errorf("forward: no address for migration target")
-	}
-	payload := rec.EncodeBinary(nil)
-	body, _ := json.Marshal(map[string]any{
-		"slot": slot, "seq": seq, "payload": payload,
-	})
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, HTTPURL(toAddr, "/internal/replicate"), bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := e.httpC.Do(httpReq)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("forward seq %d: status %d: %s", seq, resp.StatusCode, string(raw))
-	}
-	return nil
+	// peer plane: one Replicate RPC carries the raw encoded record (the
+	// old HTTP round-trip base64-wrapped it inside JSON).
+	return e.peerReplicate(ctx, toAddr, slot, seq, rec.EncodeBinary(nil))
 }
 
-// HandleReplicate serves /internal/replicate: a migration forwarding push.
+// HandleReplicate serves PeerService.Replicate: a migration forwarding push.
 // The payload is a single encoded record to be appended at a fixed seq.
 func (e *Engine) HandleReplicate(slot int32, seq uint64, payload []byte) error {
 	rec, consumed, err := data.DecodeRecord(payload)
@@ -443,7 +406,7 @@ func (e *Engine) advanceHW(slot int32) {
 			continue
 		}
 		if !sr.lastOK[node].After(cutoff) {
-			continue // out of ISR: excluded from HW like Kafka
+			continue // out of ISR: excluded from HW computation
 		}
 		if l := sr.leo[node]; l < minLEO {
 			minLEO = l
@@ -549,6 +512,13 @@ type MFetchResponse struct {
 // Slots this node does not lead are answered empty (failover is in flight);
 // the session retries and the table will reassign them.
 func (e *Engine) HandleMFetch(req MFetchRequest) (*MFetchResponse, error) {
+	return e.HandleMFetchCtx(context.Background(), req)
+}
+
+// HandleMFetchCtx serves PeerService.MFetch: one multiplexed replica fetch
+// round (all slots a follower takes from this leader, long-polled as a
+// unit). ctx cancels the long-poll (client disconnect / deadline).
+func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetchResponse, error) {
 	t0 := time.Now()
 	defer func() {
 		e.logger.WithFields(logrus.Fields{"self": e.self, "follower": req.Follower, "items": len(req.Items),
@@ -639,14 +609,18 @@ func (e *Engine) HandleMFetch(req MFetchRequest) (*MFetchResponse, error) {
 		deadline := time.After(wait)
 	waitLoop:
 		for {
-			cases := make([]reflect.SelectCase, 0, len(waiters)+1)
+			cases := make([]reflect.SelectCase, 0, len(waiters)+2)
 			cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(deadline)})
+			cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())})
 			for _, w := range waiters {
 				cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(w.wake)})
 			}
 			chosen, _, _ := reflect.Select(cases)
 			if chosen == 0 {
 				break waitLoop // deadline: answer with whatever phase 1 found
+			}
+			if chosen == 1 {
+				return nil, ctx.Err() // client went away: stop holding the round
 			}
 			// Burst drain with a coalescing window: one wake event answers
 			// for EVERY slot that has data, not just the one that fired.
@@ -718,7 +692,7 @@ func (e *Engine) ReplicateRecord(slot int32, seq uint64, payload []byte) error {
 // ---- Multiplexed replication sessions ----------------------------------------
 //
 // replicaLoop maintains one fetchSession per slot leader this node follows.
-// Each session long-polls /internal/mfetch with the follower position of
+// Each session long-polls PeerService.MFetch with the follower position of
 // every slot it covers (progress reports ride inside the same request), so a
 // node following 2731 slots over 2 leaders holds 2 connections, not 2731.
 
@@ -831,7 +805,7 @@ func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
 // ride as progress reports (FromSeq-1 == durable LEO); the leader holds the
 // request until at least one slot advances or the wait budget elapses.
 func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32) (bool, error) {
-	addr := e.adminAddr(leader)
+	addr := e.peerAddr(leader)
 	if addr == "" {
 		return false, data.ErrNotLeader
 	}
@@ -839,27 +813,9 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32) (
 	for i, s := range slots {
 		items[i] = FetchItem{Slot: s, FromSeq: e.store.LastSeqOf(s) + 1}
 	}
-	body := EncodeMRequest(&MFetchRequest{Follower: e.self, WaitMS: fetchWait.Milliseconds(), Items: items})
 	reqCtx, cancel := context.WithTimeout(ctx, fetchWait+fetchSlack+5*time.Second)
 	defer cancel()
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, HTTPURL(addr, "/internal/mfetch"), bytes.NewReader(body))
-	if err != nil {
-		return false, err
-	}
-	httpReq.Header.Set("Content-Type", "application/octet-stream")
-	httpResp, err := e.httpC.Do(httpReq)
-	if err != nil {
-		return false, err
-	}
-	defer httpResp.Body.Close()
-	raw, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return false, err
-	}
-	if httpResp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("mfetch %d: %s", httpResp.StatusCode, string(raw))
-	}
-	fr, err := DecodeMResponse(raw)
+	fr, err := e.peerMFetch(reqCtx, addr, &MFetchRequest{Follower: e.self, WaitMS: fetchWait.Milliseconds(), Items: items})
 	if err != nil {
 		return false, err
 	}
@@ -918,21 +874,12 @@ func countRecords(payload []byte) int {
 	return n
 }
 
-// reportProgress posts follower LEOs in bulk to a leader (one request per
-// productive round, replacing the old per-slot reportLEO).
+// reportProgress posts follower LEOs in bulk to a leader's peer plane (one
+// RPC per productive round, replacing the old per-slot reportLEO).
 func (e *Engine) reportProgress(addr string, items []FetchItem) {
-	body, _ := json.Marshal(map[string]any{"follower": e.self, "items": items})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, HTTPURL(addr, "/internal/replica-progress"), bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if resp, err := e.httpC.Do(httpReq); err == nil {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-	}
+	_ = e.peerProgress(ctx, addr, e.self, items)
 }
 
 // ReadProxyAddr returns the slot leader's gRPC address when this node
@@ -1011,17 +958,17 @@ func (e *Engine) RunController(ctx context.Context) {
 		} else if len(tbl.Slots) < int(tbl.SlotCount) || tableReplicaShortfall(tbl) {
 			e.submit(&Command{Op: OpReplanSlots})
 		}
-		// 3) liveness sweep: probe peers; fail a peer over only after
-		// several consecutive misses so a booting node is not evicted.
+		// 3) liveness sweep: probe peers over the peer plane; fail a peer
+		// over only after several consecutive misses so a booting node is
+		// not evicted.
 		for id, p := range tbl.Peers {
-			if id == e.self || p.AdminAddr == "" {
-				// unregistered peers are not probed: no admin address is
-				// known yet (its announcer is still booting); membership is
-				// owned by the raft configuration, not by liveness.
+			if id == e.self || p.PeerAddr == "" {
+				// peers without a peer address are not probed: membership
+				// is owned by the raft configuration, not by liveness.
 				continue
 			}
 			e.failMu.Lock()
-			if !e.alive(p.AdminAddr) {
+			if !e.alive(p.PeerAddr) {
 				e.failStreak[id]++
 				if e.failStreak[id] >= livenessFailThreshold {
 					e.loggerf("peer %s unreachable (%d consecutive probes), failing slots over", id, e.failStreak[id])
@@ -1036,20 +983,11 @@ func (e *Engine) RunController(ctx context.Context) {
 	}
 }
 
-// alive probes a peer's health endpoint.
+// alive probes a peer over the peer plane (PeerService.Ping).
 func (e *Engine) alive(addr string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), peerPingTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, HTTPURL(addr, "/healthz"), nil)
-	if err != nil {
-		return false
-	}
-	resp, err := e.httpC.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+	return e.peerPing(ctx, addr) == nil
 }
 
 // submit commits a command through Raft.

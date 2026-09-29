@@ -26,10 +26,11 @@ func applyCmd(t *testing.T, e *Engine, c *Command) {
 	}
 }
 
-func join(t *testing.T, e *Engine, id, http string) {
-	// tests treat the HTTP and gRPC addrs as one value; redirect assertions
-	// follow whichever plane the code under test consults.
-	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: id, PeerAddr: id + ":r", AdminAddr: http, ClientAddr: http}})
+func join(t *testing.T, e *Engine, id, addr string) {
+	// tests treat all three plane addresses as one value; peer-plane
+	// dials (fetch/forward/probe) follow whichever address the code under
+	// test consults.
+	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: id, PeerAddr: addr, AdminAddr: addr, ClientAddr: addr}})
 }
 
 func TestPlanSlotsDistribution(t *testing.T) {

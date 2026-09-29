@@ -1,7 +1,7 @@
 # PushupES 设计文档
 
-面向 CQRS 框架的领域事件流存储服务。只追加（append-only）、高可用、高性能。
-架构参考 DeadliftMQ：Raft 只复制元数据，事件数据走 leader→follower 专用拉取协议。
+面向 CQRS 框架的领域事件流存储服务。只追加（append-only）、高可用、
+高性能。分层原则：Raft 只复制元数据，事件数据走 leader→follower 专用拉取协议。
 
 ## 1. 数据模型
 
@@ -78,23 +78,23 @@ Body: Record*，每条记录：
   Event*: typeLen(2be) type bodyLen(4be) body
 ```
 
-- **段名即 baseSeq**（Kafka/DeadliftMQ 段命名法）：整段可独立滚动、拷贝、删除。
+- **段名即 baseSeq**：整段可独立滚动、拷贝、删除。
 - **稀疏索引**：每 4KiB 记一个 `seq→(段文件, 偏移)` 内存索引，常驻 footprint
   与数据量解耦；按 version 读聚合时经聚合索引定位 seq 区间，再二分稀疏索引。
 - **重启恢复**：加载各 slot 段列表 → 从最后一段 `scanBody` 顺序扫尾，
   重建三个内存索引与 seq 计数器；**不设独立 meta.json**（避免元数据与 WAL
-  双写不一致的竞态，这是 DeadliftMQ 已验证的做法）。
+  双写不一致的竞态）。
 - 崩溃尾部撕裂：扫描遇不完整记录即在完整边界截断。
 - **刷盘策略**：flush.policy 可配（每 N 条 / 每 T 毫秒 fsync；默认组提交
   依赖页缓存）；`acks=all` 时等 ISR 高水位而非本地 fsync。
 
-## 4. 高可用（参考 DeadliftMQ 复制设计）
+## 4. 高可用（复制设计）
 
-分层与 DeadliftMQ 完全一致：
+分层结构：
 
 - **控制面（Raft）**：hashicorp/raft 集群只复制元数据——
   slot 分配表（`slot → {leader, replicas[], epoch, state}`）、集群成员、
-  节点数据面地址（`OpRegister`，见 §6 peer 面）。FSM 模型照搬 DeadliftMQ：
+  节点数据面地址（`OpRegister`，见 §6 peer 面）。FSM 模型：
   `Applier` 接口 + 快照/恢复（快照为二进制表编码 `table_bin.go`，4096 槽
   ~350KB JSON → 几 KB）。成员集合由 Raft 配置唯一决定；路由表里每个成员
   同时记 `PeerAddr/AdminAddr/ClientAddr` 三个地址。
@@ -102,13 +102,12 @@ Body: Record*，每条记录：
   - 客户端把 `Append` 发给槽 leader 的 gRPC client 面；leader 追加本地
     WAL 得到 seq。
   - follower 把「我作为副本跟随的槽」按 leader 分组，**每个 leader 一条
-    常驻 mfetch 长轮询会话**（`POST /internal/mfetch`，手写二进制帧
-    `mfetch_bin.go`：magic "MFES"+varint，payload 是裸 WAL 字节区间，
-    不经 base64、事件体不重编码、不进 Raft 日志），一次请求多槽复用、
-    空闲轮零额外往返。
-  - follower 追加到自己 WAL 后回报 LEO（批量 `replica-progress`）；
+    常驻 PeerService.MFetch 长轮询会话**（gRPC，`peer.proto`，与 Raft 共用
+    peer 端口；payload 是裸 WAL 字节区间 `FetchItem.payload`，不经 base64、
+    事件体不重编码、不进 Raft 日志），一次请求多槽复用、空闲轮零额外往返。
+  - follower 追加到自己 WAL 后回报 LEO（批量 PeerService.ReplicaProgress）；
     leader 推进 **HW**（高水位 = ISR 内最小 LEO）。leader 端有全局
-    payload 预算 + 轮转游标，防积压槽饿死。应答语义对齐 Kafka fetch：
+    payload 预算 + 轮转游标，防积压槽饿死。应答语义：
     **请求到达即有货的槽立即随响应返回（有货即答，不长轮询滞留）**，
     全空才 park 进长轮询；park 后任一槽被 append 唤醒时做 **burst
     drain**——短暂合并窗口内扫全部 waiter，一次响应带走本轮所有有货
@@ -118,16 +117,16 @@ Body: Record*，每条记录：
     轮（有数据或被长轮询吸收的空轮）零退避立即重发，仅传输错误退避。
   - `acks=all`：leader 等 `seq ≤ HW` 再回 success；`acks=leader`：本地追加
     成功即返回；`acks=none`：不等响应。
-  - ISR 维护同 Kafka：follower 在 `replica.lag.time.max` 内跟上进 ISR；
+  - ISR 维护：follower 在 `replica.lag.time.max` 内跟上进 ISR；
     掉出后按自己 LEO 重新追。
-- **故障切换**：controller（Raft leader）每 1s 经 admin 面 `/healthz` 探活，
+- **故障切换**：controller（Raft leader）每 1s 经 peer 面 `PeerService.Ping` 探活，
   连续 3 次失败判定失联 → 从剩余 ISR 副本为该节点名下所有槽重选 leader
-  （epoch+1，经 Raft 提交）→ 客户端收到 MOVED 重定向。未注册（admin 地址
-  为空）的 peer 不参与探活，避免启动竞态误杀。`election_mode=leader`
+  （epoch+1，经 Raft 提交）→ 客户端收到 MOVED 重定向。无 peer 地址
+  （PeerAddr 为空）的 peer 不参与探活，避免启动竞态误杀。`election_mode=leader`
   （默认）：原 preferred leader 恢复后自动回切，减少抖动。
 - **默认拓扑**：`replica_count=2`（每槽 1 leader + 1 follower，散布不同
   节点），`slot_count=4096`（可配置）。3 节点以上时副本环按
-  `slot % N` 起、向前取 `replica_count` 个节点（DeadliftMQ 同款策略）。
+  `slot % N` 起、向前取 `replica_count` 个节点。
   新成员加入只做增量补位（`replan_slots` 填未分配槽/补足副本），不扰动
   有数据的槽。
 
@@ -142,14 +141,14 @@ Body: Record*，每条记录：
 
 1. **准备**：controller 经 Raft 把 `slot → T` 写入 T 分配表（state=importing），
    S 置 state=migrating。
-2. **快照拷贝**：S 上该槽所有**已封段**（非活动段）整文件 HTTP 流式拷到 T
-   （`POST /internal/migrate/segments`；T 校验每段 header 的
-   magic/slotID/baseSeq）。
-3. **增量追平**：T 从 `lastCopiedSeq+1` 起用与复制相同的 mfetch 协议向 S 拉
-   增量记录；迁移协调者轮询双端 LEO（`POST /internal/leo`）直到
+2. **快照拷贝**：S 上该槽所有**已封段**（非活动段）经 `PeerService.PushSegments`
+   整文件 gRPC 流式拷到 T（`FetchItem`/`SegmentFile.payload` 为原始 bytes，
+   无 base64/JSON 层；T 校验每段 header 的 magic/slotID/baseSeq）。
+3. **增量追平**：T 从 `lastCopiedSeq+1` 起用与复制相同的 PeerService.MFetch
+   协议向 S 拉增量记录；迁移协调者轮询双端 LEO（`PeerService.SlotLeo`）直到
    `T.leo >= S.leo`（超时 30s 回滚）。期间写请求仍由 S 正常处理。
-4. **写转发窗口**：S 对该槽新写入**同步转发** T 落盘（seq 以 S 为准，T 按
-   相同 seq 追加），直到 S 侧无积压。窗口毫秒级，对客户端只是该槽写延迟
+4. **写转发窗口**：S 对该槽新写入经 `PeerService.Replicate` **同步转发** T 落盘
+   （seq 以 S 为准，T 按相同 seq 追加），直到 S 侧无积压。窗口毫秒级，对客户端只是该槽写延迟
    微增。
 5. **切换提交**：controller 经 Raft 原子更新分配表：`slot leader=T,
    epoch+1, state=stable`；S 置 `backing-up`。
@@ -176,14 +175,14 @@ Body: Record*，每条记录：
   Peer 同时记 PeerAddr/AdminAddr/ClientAddr），客户端据此重连。本节点既无槽又无副本
   时，服务端向 leader 的 client 面代理转发（`ReadProxyAddr` 返回 leader
   client 地址）。
-- **admin 面（HTTP，默认 `-admin http://127.0.0.1:8091`，`PUSHUPES_ADMIN`）**：节点间复制/迁移与管理，
-  **不再暴露事件读写接口**（原 `/v1/streams/*` 的 append/events/by-command
-  与 `/internal/append` 已移除）。`/debug/pprof/*` 也挂在此面（不设独立
-  pprof 端口）。事件 body 若是合法 JSON 原样透传，否则经
+- **admin 面（HTTP，默认 `-admin http://127.0.0.1:8091`，`PUSHUPES_ADMIN`）**：**仅管理**——
+  status/writes/plan/migrate/槽 describe/healthz/pprof，**不再承载任何节点间流量**
+  （原 `/internal/*` 复制/迁移端点已全部迁到 peer 面 PeerService gRPC，admin HTTP
+  路由已删除）。事件 body 若是合法 JSON 原样透传，否则经
   `{"_b64":"..."}` 包装（`data.DecodeBodyJSON` 精确还原，见 record.go）。
-- **peer 面（Raft，默认 `-peer http://127.0.0.1:8391`，`PUSHUPES_PEER`）**：复制槽位分配表等元数据，并承载**数据面地址注册协议**。**运维只配这一个端口**：`-peers` 主格式 `node-id=http://ip:peerport`（或裸 `ip:peerport`，地址兼作节点 id）。**地址统一规范：存储/路由表/status JSON 中所有 admin/client/peer 地址都带 scheme——未写协议默认补 `http://`，显式协议以传入为准；TCP 拨号（listen/dial/gRPC/Raft transport）前再剥掉 scheme**（`cluster.NormalizeAddr`/`HostPort`）。admin/client 地址不配置，由各节点自报进路由表：
-  - peer 端口上是复用监听器（`peerMux`，实现 raft.StreamLayer）：按连接**首字节 `P`** 把注册流量与 Raft 流量分流（Raft 线上协议首字节是版本号 0，永不冲突；分流时消费的字节经 replayConn 回填给 Raft）。
-  - leader 收到注册后提交 `OpRegister`（就地修补路由表中该成员的 `AdminAddr/ClientAddr`，不新增成员——成员集合仍由 Raft 配置决定）；follower 收到则转发给 leader 的 peer 地址。
+- **peer 面（Raft + PeerService gRPC，默认 `-peer http://127.0.0.1:8391`，`PUSHUPES_PEER`）**：复制槽位分配表等元数据（Raft），并承载**全部节点间数据面**——副本拉取、LEO 上报/探活、迁移快照/段拷贝/写转发/LEO 追平、地址注册协议（proto3 契约 `proto/pushupes/v1/peer.proto`，`pushupes.v1.PeerService`，服务端 `peersvc.go`）。**运维只配这一个端口**：`-peers` 主格式 `node-id=http://ip:peerport`（或裸 `ip:peerport`，地址兼作节点 id）。**地址统一规范：存储/路由表/status JSON 中所有 admin/client/peer 地址都带 scheme——未写协议默认补 `http://`，显式协议以传入为准；TCP 拨号（listen/dial/gRPC/Raft transport）前再剥掉 scheme**（`cluster.NormalizeAddr`/`HostPort`）。admin/client 地址不配置，由各节点自报进路由表：
+  - peer 端口上是复用监听器（`peerMux`/`peer_mux.go`，实现 raft.StreamLayer）：按连接**首字节 `P`**（HTTP/2 client preface `"PRI ..."` 以 `P` 开头）把 PeerService gRPC 流量与 Raft 流量分流（Raft 线上协议首字节是版本号 0，永不冲突；两路都经 `replayConn` 回填被 peek 消费的字节）。gRPC 服务端由 `Engine.ServePeer` 挂在该分流 listener 上，peer 面与 Raft 从此共用一个端口、一套 gRPC 语义（HTTP/2 多路复用，每对节点一条缓存连接 `peerClient`，keepalive 10s，服务端放宽 enforcement）。
+  - leader 收到注册 RPC 后提交 `OpRegister`（就地修补路由表中该成员的 `AdminAddr/ClientAddr`，不新增成员——成员集合仍由 Raft 配置决定）；follower 收到则转发给 leader 的 peer 地址。
   - announcer 幂等周期重试（启动期 1s，收敛后转 10s 心跳），任意启动顺序都能收敛；节点换端口重启也会被自报值修补。
   - 旧多端口格式 `id:peerport:adminport:clientport` / `id:host:peerport:adminport:clientport` 仍兼容（作为静态种子，注册落地后以自报值为准）。
 
@@ -192,13 +191,18 @@ gRPC  EventService/Append         写入：幂等(command_id)/版本(+1)/acks，
 gRPC  EventService/ReadStream     范围查询（≤HW 语义）
 gRPC  EventService/ReadByCommand  command_id 幂等探针
 
-GET  /v1/slots/{slot}/describe                 # 槽状态/seq/HW/大小（管理）
-POST /internal/mfetch                          # 副本拉取（二进制帧，长轮询，多槽复用）
-POST /internal/replicate                       # 迁移写转发（同 seq 落盘）
-POST /internal/leo                             # 查询节点某槽 LEO（迁移追平判定，见 §5 步骤3+4）
-POST /internal/replica-progress                # 副本 LEO 上报（批量）
-POST /internal/migrate/segments                # 迁移段拷贝（整段文件流）
-POST /internal/migrate/snapshot                # 迁移快照
+# ---- peer 面（PeerService gRPC，与 Raft 同端口，proto/pushupes/v1/peer.proto）----
+gRPC  PeerService/MFetch          副本拉取（长轮询，多槽复用，payload=裸 WAL 字节）
+gRPC  PeerService/ReplicaProgress 副本 LEO 上报（批量）
+gRPC  PeerService/Replicate       迁移写转发（同 seq 落盘）
+gRPC  PeerService/SlotLeo         查询节点某槽 LEO（迁移追平判定，见 §5 步骤3+4）
+gRPC  PeerService/PushSegments    迁移段拷贝（整段文件，原始 bytes）
+gRPC  PeerService/TriggerSnapshot 迁移快照（源端向目标推封段）
+gRPC  PeerService/Ping            探活（controller 故障切换）
+gRPC  PeerService/Register        数据面地址自报（OpRegister 提交/转发）
+
+# ---- admin 面（HTTP，仅管理）----
+GET  /admin/slots/{slot}/describe              # 槽状态/seq/HW/大小（管理）
 GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（含 client_addr）
 GET  /admin/writes                             # 每槽 durable 计数（前端速率轮询）
 POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移
@@ -212,8 +216,9 @@ GET  /healthz
 
 - **顺序追加 + 页缓存**：写路径 = memcpy 进段缓冲 + write()；fsync 交给
   flush 策略/acks 语义，组提交合并（dirty 集合定向刷盘，不遍历全槽）。
-- **二进制协议面**：复制 mfetch 手写二进制帧（payload 为裸 WAL 字节区间，
-  不经 base64/重编码）；客户端事件面 gRPC protobuf，body 原始 bytes。
+- **二进制协议面**：节点间流量全部 PeerService gRPC（protobuf 二进制帧，
+  `FetchItem.payload`/`SegmentFile.payload` 为裸 WAL 字节区间，不经
+  base64/重编码）；客户端事件面 gRPC protobuf，body 原始 bytes。
   路由表快照同为二进制编码（字符串字典 + varint + gzip）。
   **sendfile 零拷贝已实测否决**：payload ~40-64KiB、需用户态解码过滤、
   Go netpoller 非阻塞 fd——三个收益条件全不满足；syscall 优化走减少
@@ -256,25 +261,26 @@ pushupes/
 │   │                          #   追加、幂等/版本校验、恢复、字节区间读
 │   ├── segment.go  slot.go  store.go
 ├── internal/cluster/          # 控制面 cluster.go+fsm.go（Raft/分配表/路由表二进制编码
-│   │                          #   table_bin.go），数据面 replication.go（mfetch 会话/ISR/HW）
-│   │                          #   + mfetch_bin.go（二进制帧），migration.go（六步热迁移），
-│   │                          #   register.go（peer 端口注册协议：地址自报+peerMux 分流）
-├── internal/api/              # handler.go（内部复制/迁移/管理/pprof），server.go
-├── internal/grpcapi/          # gRPC 数据面：server.go（Append/ReadStream/ReadByCommand）
-└── proto/pushupes/v1/         # events.proto 客户端契约（buf 生成至 internal/grpcapi）
+│   │                          #   table_bin.go），数据面 replication.go（PeerService 会话/ISR/HW）
+│   │                          #   + peersvc.go（PeerService gRPC 服务端/客户端）+ peer.proto 生成码，
+│   │                          #   peer_mux.go（peer 端口首字节分流 Raft/gRPC），
+│   │                          #   migration.go（六步热迁移），register.go（地址自报 announcer+RPC）
+├── internal/api/              # handler.go（仅管理：status/writes/plan/migrate/describe/pprof），server.go
+├── internal/grpcapi/          # gRPC 客户端数据面：server.go（Append/ReadStream/ReadByCommand）
+└── proto/pushupes/v1/         # events.proto 客户端契约 + peer.proto 节点间契约（buf 生成至 internal/grpcapi）
 ```
 
-## 10. 与 DeadliftMQ 的设计对比
+## 10. 设计要点小结
 
-| 特性 | DeadliftMQ | PushupES |
-|------|-----------|------------|
-| 基本单元 | Topic + Partition | 固定 4096 Slot（哈希分区） |
-| 路由 | topic/partition 显式 | CRC16(aggregate_id) % 4096 |
-| 存储格式 | Kafka Record Batch 原样落盘 | 自定义 Record 二进制（append-only WAL） |
-| 分段/索引 | 256MiB 段 + 4KiB 稀疏索引 | 同 |
-| 共识层 | Raft 只复制元数据 | Raft 只复制 slot 分配表/epoch/节点地址注册 |
-| 客户端协议 | Kafka wire protocol | gRPC EventService（事件读写唯一入口） |
-| 数据复制 | Follower Fetch（Kafka 协议） | mfetch 会话（HTTP 二进制帧，seq 坐标，多槽复用长轮询） |
-| ISR/HW | Kafka 语义 | 同 |
-| 再平衡 | 分区重分配 | 槽位热迁移（快照+增量+转发窗口） |
-| 幂等 | 生产者序列（PID/seq） | command_id 槽内索引 |
+| 维度 | PushupES 选型 |
+|------|------------|
+| 基本单元 | 固定 4096 Slot（哈希分区） |
+| 路由 | CRC16(aggregate_id) % 4096 |
+| 存储格式 | 自定义 Record 二进制（append-only WAL，段名即 baseSeq） |
+| 分段/索引 | 256MiB 段 + 4KiB 稀疏索引（常驻） |
+| 共识层 | Raft 只复制元数据：slot 分配表/epoch/节点地址注册 |
+| 客户端协议 | gRPC EventService（事件读写唯一入口） |
+| 数据复制 | PeerService.MFetch 会话（gRPC/HTTP2 与 Raft 同端口，seq 坐标，多槽复用长轮询，有货即答） |
+| 可靠性语义 | ISR + HW（`acks=all` 等 seq≤HW） |
+| 再平衡 | 槽位热迁移（快照+增量+转发窗口，六步不停写） |
+| 幂等 | command_id 槽内索引 |

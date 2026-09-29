@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package pushupes.v1;
+
+option go_package = "pushupes/internal/grpcapi/pushupes/v1;pushupesv1";
+
+// PeerService is the inter-node data plane. It is served on the SAME port
+// as the Raft transport (the peer port): the connection demux routes the
+// HTTP/2 preface (first byte 'P') here and every other first byte to
+// Raft. All node-to-node communication — replication fetch, LEO progress,
+// migration forwarding/segments/snapshot, liveness probing and address
+// registration — rides this one gRPC surface; the admin port is
+// management-only.
+service PeerService {
+  // Ping is the liveness probe (controller failover).
+  rpc Ping(PingRequest) returns (PingResponse);
+  // Register announces a node's admin/client addresses into the routing
+  // table (leader commits an OpRegister; non-leaders relay).
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  // MFetch is the multiplexed replica fetch: every slot this follower
+  // copies from the serving leader is one item; the call long-polls when
+  // everything is empty (wait_ms budget, server-held).
+  rpc MFetch(MFetchRequest) returns (MFetchResponse);
+  // ReplicaProgress reports follower LEOs in bulk after a productive round.
+  rpc ReplicaProgress(ReplicaProgressRequest) returns (ReplicaProgressResponse);
+  // Replicate pushes one leader-assigned record to the migration target
+  // during the forwarding window (idempotent at seq).
+  rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
+  // SlotLeo answers a single slot's log end offset (migration catch-up).
+  rpc SlotLeo(SlotLeoRequest) returns (SlotLeoResponse);
+  // PushSegments streams sealed WAL segments of a slot into the importing
+  // node (migration snapshot step; messages are whole files).
+  rpc PushSegments(PushSegmentsRequest) returns (PushSegmentsResponse);
+  // TriggerSnapshot asks this node, as migration source, to push its
+  // sealed segments of a slot to the target.
+  rpc TriggerSnapshot(TriggerSnapshotRequest) returns (TriggerSnapshotResponse);
+}
+
+message PingRequest {}
+message PingResponse { string node = 1; }
+
+message RegisterRequest {
+  string id = 1;
+  string admin_addr = 2;  // management HTTP base (scheme carried)
+  string client_addr = 3; // client-facing gRPC base (scheme carried)
+}
+message RegisterResponse {}
+
+// FetchItem: request entries fill slot/from_seq; response entries add
+// next_seq/payload/leader_leo/leader_hw. payload is raw concatenated WAL
+// record bytes (length-prefixed frames), never re-encoded.
+message FetchItem {
+  int32 slot = 1;
+  uint64 from_seq = 2;
+  uint64 next_seq = 3;
+  bytes payload = 4;
+  uint64 leader_leo = 5;
+  uint64 leader_hw = 6;
+}
+
+message MFetchRequest {
+  string follower = 1;
+  int64 wait_ms = 2;
+  repeated FetchItem items = 3;
+}
+message MFetchResponse {
+  string follower = 1;
+  repeated FetchItem items = 2;
+}
+
+message ReplicaProgressRequest {
+  string follower = 1;
+  repeated FetchItem items = 2; // slot/from_seq carry the durable positions
+}
+message ReplicaProgressResponse {}
+
+message ReplicateRequest {
+  int32 slot = 1;
+  uint64 seq = 2;
+  bytes payload = 3; // one encoded record
+}
+message ReplicateResponse {}
+
+message SlotLeoRequest { int32 slot = 1; }
+message SlotLeoResponse { uint64 leo = 1; }
+
+message SegmentFile {
+  string name = 1;
+  bytes payload = 2; // full WAL segment file
+}
+message PushSegmentsRequest {
+  int32 slot = 1;
+  repeated SegmentFile segments = 2;
+}
+message PushSegmentsResponse {}
+
+message TriggerSnapshotRequest {
+  int32 slot = 1;
+  string to_node = 2;
+}
+message TriggerSnapshotResponse {}

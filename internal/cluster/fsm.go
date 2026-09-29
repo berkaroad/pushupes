@@ -17,7 +17,7 @@ type ApplyResult struct {
 
 // FSM replicates only cluster metadata (the slot assignment table and the
 // peer directory). Event data never enters the Raft log — it flows over the
-// pull-based fetch protocol (see replication.go), like DeadliftMQ.
+// pull-based fetch protocol (see replication.go).
 type FSM struct {
 	applier Applier
 	logger  *logrus.Entry

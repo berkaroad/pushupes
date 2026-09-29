@@ -21,7 +21,7 @@ export async function fetchNodeWrites(addr: string): Promise<{ writes: number[] 
 }
 
 export async function describeSlot(slot: number, node: string): Promise<SlotDescribe> {
-  const { data } = await http.get(`/v1/slots/${slot}/describe`, { baseURL: nodeApi(node) })
+  const { data } = await http.get(`/admin/slots/${slot}/describe`, { baseURL: nodeApi(node) })
   return data
 }
 

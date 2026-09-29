@@ -23,16 +23,13 @@ func NormalizeAddr(addr string) string {
 }
 
 // HostPort strips the scheme for TCP-level use (net.Listen, net.Dial,
-// grpc dial, raft transport).
+// grpc dial, raft transport). There are no HTTP calls between nodes
+// anymore (all node-to-node traffic is PeerService gRPC on the peer port),
+// so nothing here builds URLs — operators' http:// notation is pure
+// configuration sugar consumed by NormalizeAddr.
 func HostPort(addr string) string {
 	if i := strings.Index(addr, "://"); i >= 0 {
 		return addr[i+3:]
 	}
 	return addr
-}
-
-// HTTPURL builds a request URL from a possibly-schemeless address,
-// defaulting to http:// (lenient for tests and internal callers).
-func HTTPURL(addr, path string) string {
-	return NormalizeAddr(addr) + path
 }

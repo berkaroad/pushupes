@@ -89,7 +89,7 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slot
 	// hand it to NewNode and wire the node back in.
 	eng := cluster.NewEngine(nil, store, nodeID, acksDefault, logger)
 
-	node, regLn, err := cluster.NewNode(cluster.Config{
+	node, peerGRPC, err := cluster.NewNode(cluster.Config{
 		NodeID:     nodeID,
 		PeerAddr:   peerAddr,
 		AdminAddr:  adminAddr,
@@ -102,7 +102,7 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slot
 		return fmt.Errorf("raft node: %w", err)
 	}
 	defer node.Close()
-	defer regLn.Close()
+	defer eng.ClosePeers()
 	eng.SetNode(node)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -111,10 +111,12 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slot
 	// Background replica fetch + controller reconcile loops.
 	eng.Start(ctx)
 
-	// Data-plane address self-discovery: serve registrations on the peer
-	// port (demuxed from raft traffic) and announce our own admin/client
-	// addresses until they land in the routing table.
-	go eng.ServeRegistrations(regLn)
+	// Data-plane address self-discovery + inter-node plane: PeerService
+	// (gRPC) is served on the peer port beside Raft (demuxed by first
+	// byte); announce our admin/client addresses until they land in the
+	// routing table.
+	peerSrv := eng.ServePeer(peerGRPC)
+	defer peerSrv.Stop()
 	go eng.NewRegisterAnnouncer().Run(ctx)
 
 	srv := api.NewServer(cluster.HostPort(adminAddr), api.New(eng, store), logger)

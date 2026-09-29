@@ -103,8 +103,8 @@ func (t *Table) ReplicasOf(slot int32) []string {
 	return p.Replicas
 }
 
-// PlanSlots spreads all slots over the given nodes (Kafka-style walking
-// assignment): slot s prefers node s%N and takes the next replicaFactor
+// PlanSlots spreads all slots over the given nodes (walking assignment):
+// slot s prefers node s%N and takes the next replicaFactor
 // nodes forward. replicaFactor 0 or >N means all nodes.
 func PlanSlots(nodes []string, slotCount int32, replicaFactor int) map[int32]*Placement {
 	out := make(map[int32]*Placement, slotCount)
