@@ -10,6 +10,7 @@ import (
 	"time"
 
 	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
+	"pushupes/internal/lease"
 	"pushupes/internal/storage"
 )
 
@@ -327,73 +328,83 @@ func (e *Engine) writeSegments(recv chunkSource) error {
 			abort()
 			return err
 		}
-		if !seenSlot {
-			slot, seenSlot = chunk.Slot, true
-			dir = e.store.SlotDir(slot)
-			if err := os.MkdirAll(dir, 0o755); err != nil {
+		// The chunk's bytes alias the receive buffer (the peer codec hands them
+		// over without copying), so the lease must outlive the writes and be
+		// released on every exit path out of this iteration.
+		if cerr := func() error {
+			defer lease.Release(chunk)
+			if !seenSlot {
+				slot, seenSlot = chunk.Slot, true
+				dir = e.store.SlotDir(slot)
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					abort()
+					return err
+				}
+			} else if chunk.Slot != slot {
 				abort()
-				return err
+				return fmt.Errorf("snapshot stream: slot %d != %d", chunk.Slot, slot)
 			}
-		} else if chunk.Slot != slot {
-			abort()
-			return fmt.Errorf("snapshot stream: slot %d != %d", chunk.Slot, slot)
-		}
 
-		if chunk.Name != "" { // descriptor: a new file begins
-			if err := finalize(); err != nil {
-				abort()
-				return err
+			if chunk.Name != "" { // descriptor: a new file begins
+				if err := finalize(); err != nil {
+					abort()
+					return err
+				}
+				path = filepath.Join(dir, filepath.Base(chunk.Name))
+				tmpPath = path + ".tmp"
+				want, got, hdrGot, hdrOK = chunk.Size, 0, 0, false
+				if st, err := os.Stat(path); err == nil && st.Size() == int64(chunk.Size) {
+					cur = nil // duplicate: drain this file's chunks untouched
+					return nil
+				}
+				cur, err = os.Create(tmpPath)
+				if err != nil {
+					abort()
+					return err
+				}
 			}
-			path = filepath.Join(dir, filepath.Base(chunk.Name))
-			tmpPath = path + ".tmp"
-			want, got, hdrGot, hdrOK = chunk.Size, 0, 0, false
-			if st, err := os.Stat(path); err == nil && st.Size() == int64(chunk.Size) {
-				cur = nil // duplicate: drain this file's chunks untouched
-				continue
+			if cur == nil || len(chunk.Data) == 0 {
+				return nil // draining a duplicate
 			}
-			cur, err = os.Create(tmpPath)
-			if err != nil {
-				abort()
-				return err
-			}
-		}
-		if cur == nil || len(chunk.Data) == 0 {
-			continue // draining a duplicate
-		}
-		data := chunk.Data
+			data := chunk.Data
 
-		// assemble + validate the WAL header before the first write
-		if !hdrOK {
-			n := copy(hdr[hdrGot:], data)
-			hdrGot += n
-			data = data[n:]
-			if hdrGot < storage.WALHeaderLen {
-				continue // header split across chunks: accumulate
+			// assemble + validate the WAL header before the first write
+			if !hdrOK {
+				n := copy(hdr[hdrGot:], data)
+				hdrGot += n
+				data = data[n:]
+				if hdrGot < storage.WALHeaderLen {
+					return nil // header split across chunks: accumulate
+				}
+				slotID, err := storage.HeaderSlotID(hdr[:])
+				if err != nil {
+					abort()
+					return fmt.Errorf("segment %s: %w", filepath.Base(path), err)
+				}
+				if slotID != slot {
+					abort()
+					return fmt.Errorf("segment %s: header slot %d != %d", filepath.Base(path), slotID, slot)
+				}
+				hdrOK = true
+				if _, err := cur.Write(hdr[:]); err != nil {
+					abort()
+					return err
+				}
+				got += storage.WALHeaderLen
 			}
-			slotID, err := storage.HeaderSlotID(hdr[:])
-			if err != nil {
-				abort()
-				return fmt.Errorf("segment %s: %w", filepath.Base(path), err)
+			if len(data) == 0 {
+				return nil
 			}
-			if slotID != slot {
-				abort()
-				return fmt.Errorf("segment %s: header slot %d != %d", filepath.Base(path), slotID, slot)
-			}
-			hdrOK = true
-			if _, err := cur.Write(hdr[:]); err != nil {
+			if _, err := cur.Write(data); err != nil {
 				abort()
 				return err
 			}
-			got += storage.WALHeaderLen
-		}
-		if len(data) == 0 {
-			continue
-		}
-		if _, err := cur.Write(data); err != nil {
+			got += uint64(len(data))
+			return nil
+		}(); cerr != nil {
 			abort()
-			return err
+			return cerr
 		}
-		got += uint64(len(data))
 	}
 	if err := finalize(); err != nil {
 		abort()

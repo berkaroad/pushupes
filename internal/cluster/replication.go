@@ -1063,10 +1063,14 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, fetchWait+fetchSlack+5*time.Second)
 	defer cancel()
-	fr, err := e.peerMFetch(reqCtx, addr, &MFetchRequest{Follower: e.self, WaitMS: fetchWait.Milliseconds(), Slots: slots, FromSeqs: froms, Sweep: sweep})
+	fr, release, err := e.peerMFetch(reqCtx, addr, &MFetchRequest{Follower: e.self, WaitMS: fetchWait.Milliseconds(), Slots: slots, FromSeqs: froms, Sweep: sweep})
 	if err != nil {
 		return false, err
 	}
+	// The payloads alias the response's receive buffer; releasing the lease
+	// returns that buffer to the pool, so it must happen after the round has
+	// written everything it took.
+	defer release()
 	productive := false
 	for _, it := range fr.Items {
 		// Sparse response: every entry carries data for its slot.

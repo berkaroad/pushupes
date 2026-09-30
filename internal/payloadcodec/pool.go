@@ -1,4 +1,4 @@
-package grpcapi
+package payloadcodec
 
 import (
 	"math/bits"
@@ -25,11 +25,15 @@ type payloadBufferPool struct {
 	pools []sync.Pool
 }
 
-// InstallPayloadBufferPool replaces gRPC's default buffer pool. It must run
-// while the process is still initializing (before any client or server exists),
-// which is what main does it for.
-func InstallPayloadBufferPool() {
-	experimental.SetDefaultBufferPool(newPayloadBufferPool())
+// grpcBufPool is the process-wide buffer pool: gRPC's default pool for codec and
+// transport buffers, and the pool this package's codec borrows from.
+var grpcBufPool = newPayloadBufferPool()
+
+// InstallBufferPool replaces gRPC's default buffer pool. It must run while the
+// process is still initializing (before any client or server exists), which is
+// what main does it for.
+func InstallBufferPool() {
+	experimental.SetDefaultBufferPool(grpcBufPool)
 }
 
 func newPayloadBufferPool() *payloadBufferPool {

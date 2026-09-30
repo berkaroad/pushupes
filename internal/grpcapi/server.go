@@ -20,6 +20,7 @@ import (
 	"pushupes/internal/cluster"
 	"pushupes/internal/data"
 	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
+	"pushupes/internal/lease"
 	"pushupes/internal/storage"
 )
 
@@ -68,6 +69,9 @@ func (s *Server) leaderClient(addr string) (pushupesv1.EventServiceClient, error
 // ---- Append -----------------------------------------------------------------
 
 func (s *Server) Append(ctx context.Context, req *pushupesv1.AppendRequest) (*pushupesv1.AppendResponse, error) {
+	// The codec aliases the event bodies into the receive buffer: the lease
+	// covers this handler, which is where the bytes reach the WAL.
+	defer lease.Release(req)
 	if req.AggregateId == "" || req.CommandId == "" || len(req.Events) == 0 {
 		return s.fail(data.ErrIDBadRequest, "aggregate_id, command_id and at least one event are required", 0, 0, ""), nil
 	}

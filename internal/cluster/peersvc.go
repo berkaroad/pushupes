@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 
 	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
+	"pushupes/internal/lease"
 )
 
 const (
@@ -89,6 +90,9 @@ func (s *peerServer) ReplicaProgress(_ context.Context, req *pushupesv1.ReplicaP
 }
 
 func (s *peerServer) Replicate(_ context.Context, req *pushupesv1.ReplicateRequest) (*pushupesv1.ReplicateResponse, error) {
+	// req.Payload aliases the receive buffer until the lease is released, which
+	// has to be after the append it feeds.
+	defer lease.Release(req)
 	if err := s.e.HandleReplicate(req.Slot, req.Seq, req.Payload); err != nil {
 		return nil, err
 	}
@@ -200,18 +204,21 @@ func (e *Engine) peerRPC(addr string) (pushupesv1.PeerServiceClient, error) {
 	return e.peers.client(addr)
 }
 
-func (e *Engine) peerMFetch(ctx context.Context, addr string, req *MFetchRequest) (*MFetchResponse, error) {
+func (e *Engine) peerMFetch(ctx context.Context, addr string, req *MFetchRequest) (*MFetchResponse, func(), error) {
 	c, err := e.peerRPC(addr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	presp, err := c.MFetch(ctx, &pushupesv1.MFetchRequest{
 		Follower: req.Follower, WaitMs: req.WaitMS, Slots: req.Slots, FromSeqs: req.FromSeqs, Sweep: req.Sweep,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &MFetchResponse{Follower: presp.Follower, Items: fetchItemsFromProto(presp.Items)}, nil
+	// The items' payloads alias presp's receive buffer, so the lease has to be
+	// released by the caller once the payloads have been written to the WAL.
+	release := func() { lease.Release(presp) }
+	return &MFetchResponse{Follower: presp.Follower, Items: fetchItemsFromProto(presp.Items)}, release, nil
 }
 
 func (e *Engine) peerReplicate(ctx context.Context, addr string, slot int32, seq uint64, payload []byte) error {

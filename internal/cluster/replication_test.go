@@ -13,6 +13,8 @@ import (
 
 	"pushupes/internal/data"
 	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
+	"pushupes/internal/lease"
+	"pushupes/internal/payloadcodec"
 	"pushupes/internal/storage"
 )
 
@@ -396,6 +398,11 @@ func TestSnapshotFailureRollsBackSlotState(t *testing.T) {
 }
 
 func TestHandleFetchAndReplicateOverPeerPlane(t *testing.T) {
+	// The payload codec is installed here too, so this exercises the production
+	// decode path — including the receive-buffer leases the follower takes on
+	// fetched payloads and releases once they are written.
+	payloadcodec.InstallCodec()
+	leasesBefore := lease.Outstanding()
 	// Wire two engines through the real PeerService gRPC plane (over the
 	// peer-port mux demux) to prove replication end to end: fetch round,
 	// WAL replay on the follower, LEO report advancing leader HW.
@@ -449,6 +456,9 @@ func TestHandleFetchAndReplicateOverPeerPlane(t *testing.T) {
 	}
 	if _, n, err := data.DecodeRecordMeta(got); err != nil || n <= 0 {
 		t.Fatalf("follower payload does not start with a valid frame: n=%d err=%v", n, err)
+	}
+	if got := lease.Outstanding(); got != leasesBefore {
+		t.Fatalf("%d receive-buffer leases left outstanding after the fetch round", got-leasesBefore)
 	}
 	_ = storage.WALHeaderLen
 }

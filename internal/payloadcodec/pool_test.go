@@ -1,4 +1,4 @@
-package grpcapi
+package payloadcodec
 
 import "testing"
 

@@ -26,6 +26,7 @@ import (
 	"google.golang.org/grpc"
 
 	"pushupes/internal/grpcapi"
+	"pushupes/internal/payloadcodec"
 )
 
 func main() {
@@ -48,9 +49,11 @@ func main() {
 
 	// gRPC's stock buffer pool zeroes every buffer it hands out and its size
 	// classes are too sparse for event payloads (a 100KiB message would take a
-	// 1MiB buffer and pay a 1MiB memclr). Install ours before anything creates
-	// a client or server — gRPC requires the setter to run at init time.
-	grpcapi.InstallPayloadBufferPool()
+	// 1MiB buffer and pay a 1MiB memclr). Our codec then keeps the large bytes
+	// fields out of the copy path in both directions. Both must be installed
+	// before anything creates a client or server.
+	payloadcodec.InstallBufferPool()
+	payloadcodec.InstallCodec()
 
 	base := logrus.New()
 	base.SetLevel(logrus.InfoLevel)

@@ -12,6 +12,8 @@ import (
 
 	"pushupes/internal/cluster"
 	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
+	"pushupes/internal/lease"
+	"pushupes/internal/payloadcodec"
 	"pushupes/internal/storage"
 )
 
@@ -54,6 +56,12 @@ func appendReq(agg string, ver uint32, cmd, body string) *pushupesv1.AppendReque
 }
 
 func TestGRPCAppendReadCycle(t *testing.T) {
+	// Run the cycle through the production codec, which aliases the request's
+	// event bodies into the receive buffer and holds a lease on it for the
+	// duration of the handler.
+	payloadcodec.InstallCodec()
+	leasesBefore := lease.Outstanding()
+
 	cli, _ := newTestClient(t)
 	ctx := context.Background()
 
@@ -143,6 +151,10 @@ func TestGRPCAppendReadCycle(t *testing.T) {
 	nf, err := cli.ReadByCommand(ctx, &pushupesv1.ReadByCommandRequest{AggregateId: "agg-1", CommandId: "missing"})
 	if err != nil || nf.Found || nf.Record != nil {
 		t.Fatalf("by-command miss: %+v %v", nf, err)
+	}
+
+	if got := lease.Outstanding(); got != leasesBefore {
+		t.Fatalf("%d receive-buffer leases left outstanding after the append cycle", got-leasesBefore)
 	}
 }
 
