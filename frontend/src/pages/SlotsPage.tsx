@@ -203,6 +203,16 @@ export default function SlotsPage() {
     return out
   }
 
+  // The slot's leader admin address ('' when the table has no leader for it).
+  const leaderAdminAddr = (slot: number): string => {
+    const st = statusRef.current
+    const p = st?.slots[String(slot)]
+    return (p && st ? st.peers[p.leader]?.admin_addr : undefined) ?? ''
+  }
+
+  // placementOf narrows the optional placement for the drawer's render.
+  const placementOf = (d?: SlotDescribe): Placement | null => d?.placement ?? null
+
   const openStreams = async (slot: number) => {
     setStreamQuery('')
     const addrs = streamAddrs(slot)
@@ -260,25 +270,25 @@ export default function SlotsPage() {
   const openDetail = async (slot: number) => {
     setRateSeries([])
     setDetail({ slot, addr: '', loading: true })
-    // Ask the nodes that hold the slot, leader first: describe answers with
-    // the answering node's own numbers (see fetchSlotDescribe).
-    const addrs = streamAddrs(slot)
-    let lastErr = ''
-    for (const addr of addrs) {
-      try {
-        const d = await fetchSlotDescribe(addr, slot)
-        setDetail({ slot, addr, data: d, loading: false })
-        return
-      } catch (e: any) {
-        lastErr = e?.response?.data?.error ?? e?.message ?? String(e)
-      }
+    // Always the slot's leader: describe answers with the asked node's own
+    // numbers, and the leader is the only node with the whole picture (it
+    // tracks HW from replica progress). A replica would answer with its own,
+    // possibly lagging copy.
+    const addr = leaderAdminAddr(slot)
+    if (!addr) {
+      setDetail(null)
+      setErr(`slot ${slot} 详情读取失败：status 里没有该槽的 leader 地址`)
+      return
     }
-    setDetail(null)
-    setErr(`slot ${slot} 详情读取失败：${lastErr || 'status 里没有该槽的 placement'}`)
+    try {
+      const d = await fetchSlotDescribe(addr, slot)
+      setDetail({ slot, addr, data: d, loading: false })
+    } catch (e: any) {
+      setDetail(null)
+      setErr(`slot ${slot} 详情读取失败：${e?.response?.data?.error ?? e?.message ?? String(e)}`)
+    }
   }
 
-  const roleLabel = (role?: string) =>
-    role === 'leader' ? 'leader（主）' : role === 'replica' ? 'replica（副本）' : role === 'none' ? 'none（非主非副本）' : '-'
 
   const doMigrate = async () => {
     if (!migrate) return
@@ -374,23 +384,23 @@ export default function SlotsPage() {
         {detail?.loading ? <Typography.Text>加载中…</Typography.Text> : null}
         {detail?.data ? (
           <Descriptions column={1} bordered size="small">
-            <Descriptions.Item label="数据来源节点">
-              {detail.data.node ?? detail.addr}（{roleLabel(detail.data.role)}）
+            <Descriptions.Item label="Replicas">
+              {placementOf(detail.data)
+                ? placementOf(detail.data)!.replicas.map((n) => (n === placementOf(detail.data)!.leader
+                  ? <Tag key={n} color="gold">{n}</Tag>
+                  : <Tag key={n}>{n}</Tag>))
+                : '-'}
             </Descriptions.Item>
-            <Descriptions.Item label="本节点已加载">
-              {detail.data.loaded ? '是' : '否（未开槽，数字均为 0）'}
-            </Descriptions.Item>
-            <Descriptions.Item label="Leader">{detail.data.placement?.leader ?? '-'}</Descriptions.Item>
-            <Descriptions.Item label="Replicas">{detail.data.placement?.replicas.join(', ') ?? '-'}</Descriptions.Item>
             <Descriptions.Item label="State">
-              {detail.data.placement ? <Tag color={stateColor[detail.data.placement.state]}>{detail.data.placement.state}</Tag> : '-'}
+              {placementOf(detail.data) ? <Tag color={stateColor[placementOf(detail.data)!.state]}>{placementOf(detail.data)!.state}</Tag> : '-'}
             </Descriptions.Item>
-            <Descriptions.Item label="Epoch">{detail.data.placement?.epoch ?? '-'}</Descriptions.Item>
+            <Descriptions.Item label="Epoch">{placementOf(detail.data)?.epoch ?? '-'}</Descriptions.Item>
             <Descriptions.Item label="HW">{detail.data.hw}</Descriptions.Item>
             <Descriptions.Item label="LastSeq">{detail.data.last_seq}</Descriptions.Item>
-            <Descriptions.Item label="ISR">{detail.data.isr?.join(', ') ?? '-'}</Descriptions.Item>
             <Descriptions.Item label="Segments">{detail.data.segments}</Descriptions.Item>
-            <Descriptions.Item label="总字节">{detail.data.total_bytes}</Descriptions.Item>
+            <Descriptions.Item label="总字节">
+              <span title={`${detail.data.total_bytes} 字节`}>{humanBytes(detail.data.total_bytes)}</span>
+            </Descriptions.Item>
           </Descriptions>
         ) : null}
         {detail?.data ? (
