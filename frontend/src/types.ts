@@ -42,3 +42,32 @@ export interface SlotDescribe {
   segments: number
   total_bytes: number
 }
+
+export interface SlotStream {
+  aggregate_id: string
+  version: number
+}
+
+// Slot event-stream page: answered out of the node's in-memory slot index
+// (aggregate id + latest version), so no WAL file is read. `loaded:false`
+// means this node has not opened the slot — opening it would walk every
+// segment of it — so the caller asks a node that holds it instead.
+export interface SlotStreams {
+  node?: string
+  slot: number
+  loaded: boolean
+  total: number
+  streams: SlotStream[]
+  next_after: string
+}
+
+// One node's per-slot poll answer: durable counters (diffed into write
+// rates) plus gauges — WAL bytes on disk and event-stream count per slot.
+// A slot this node has not loaded reads as 0 in both gauge arrays.
+export interface NodeWrites {
+  node?: string
+  slot_count?: number
+  writes: number[]
+  bytes?: number[]
+  streams?: number[]
+}

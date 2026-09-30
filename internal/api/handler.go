@@ -43,6 +43,7 @@ func New(eng *cluster.Engine, store *storage.Store) *Server {
 	s.mux.HandleFunc("GET /admin/cluster/status", s.handleClusterStatus)
 	s.mux.HandleFunc("GET /admin/writes", s.handleWrites)
 	s.mux.HandleFunc("GET /admin/slots/{slot}/describe", s.handleSlotDescribe)
+	s.mux.HandleFunc("GET /admin/slots/{slot}/streams", s.handleSlotStreams)
 	s.mux.HandleFunc("POST /admin/slots/{slot}/migrate", s.handleMigrate)
 	s.mux.HandleFunc("POST /admin/cluster/plan", s.handlePlan)
 
@@ -105,6 +106,43 @@ func (s *Server) handleSlotDescribe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleSlotStreams lists a slot's event streams — aggregate id plus the
+// version of its latest committed record — out of the slot's in-memory index.
+// The index is built when the slot is opened, from record frame heads only
+// (data.DecodeRecordMeta), so answering reads no WAL file at all; a slot this
+// node has never opened is reported as loaded=false instead of being opened
+// here, which would walk every segment of it (storage.StreamPage has the
+// reasoning). Pages are cursor walked: ?after=<aggregate_id>&limit=<n>.
+func (s *Server) handleSlotStreams(w http.ResponseWriter, r *http.Request) {
+	slot, err := strconv.ParseInt(r.PathValue("slot"), 10, 32)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "bad slot")
+		return
+	}
+	limit := storage.DefaultStreamPage
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 || n > storage.MaxStreamPage {
+			writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "bad limit")
+			return
+		}
+		limit = n
+	}
+	page, err := s.Store.StreamPage(int32(slot), r.URL.Query().Get("after"), limit)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, data.ErrIDBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"node":       s.Engine.Self(),
+		"slot":       page.Slot,
+		"loaded":     page.Loaded,
+		"total":      page.Total,
+		"streams":    page.Streams,
+		"next_after": page.NextAfter,
+	})
+}
+
 // ---- admin ---------------------------------------------------------------------
 
 func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
@@ -121,15 +159,23 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleWrites is the light-rate poll target: just the per-slot durable
-// counters (the array the console diffs every 2s), without the 4096-entry
-// slot table that rides /admin/cluster/status. Clients that poll rates
-// already hold the table from the slower status refresh.
+// handleWrites is the light per-slot poll target, without the 4096-entry slot
+// table that rides /admin/cluster/status: the durable counters the console
+// diffs every 2s to derive write rates, plus the per-slot gauges it shows as
+// columns (WAL bytes, event stream count). Clients that poll it already hold
+// the table from the slower status refresh.
 func (s *Server) handleWrites(w http.ResponseWriter, r *http.Request) {
+	bytesOnDisk, streams := s.Store.SlotGauges()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"node":       s.Engine.Self(),
 		"slot_count": s.Store.SlotCount,
 		"writes":     s.Engine.WriteCounts(),
+		// Console gauges, one entry per slot id: WAL bytes on disk and event
+		// stream count. A slot this node has not loaded reads as zero instead
+		// of being opened (that would scan every segment of it) — the console
+		// takes the answer from whichever node holds the slot.
+		"bytes":   bytesOnDisk,
+		"streams": streams,
 	})
 }
 

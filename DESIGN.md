@@ -228,13 +228,27 @@ gRPC  PeerService/Register        数据面地址自报（OpRegister 提交/转�
 # ---- admin 面（HTTP，仅管理）----
 GET  /admin/slots/{slot}/describe              # 槽状态/seq/HW/大小（管理）
 GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（含 client_addr）
-GET  /admin/writes                             # 每槽 durable 计数（前端速率轮询）
+GET  /admin/writes                             # 每槽 durable 计数 + 槽内总字节/事件流数量（前端轮询）
+GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本，仅内存索引，不读 WAL）
 POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移
 POST /admin/cluster/plan                       # 触发重新规划
 GET  /healthz
 ```
 
 读语义只暴露 `seq ≤ HW` 的记录（投影不读未达高水位的数据，防脏读回滚）。
+
+槽位事件流列表（`/admin/slots/{slot}/streams`）回答的是**槽内索引**：每条事件流的
+聚合 id + 最新版本号。索引在开槽时只解析记录的**帧头**（`data.DecodeRecordMeta`：
+聚合 id/版本/长度，event body 既不拷贝也不解码；与 follower 帧落盘同一套 walk），
+因此取列表**不读任何 WAL 文件**。本节点未打开过的槽返回 `loaded:false` 而不是现开
+——开槽意味着遍历该槽的全部分段（正是该接口要避免的全文件扫描），交给持有该槽的
+节点（leader/副本，前端按 placement 选 admin 地址）回答；分页用
+`?after=<aggregate_id>` 游标顺序游走，一页只材料化 limit 条（有界堆选，内存
+O(limit)，与槽内聚合数无关），单次响应上限 `MaxStreamPage=1000`，默认
+`DefaultStreamPage=200`。**槽位列表的总字节/事件流数量走同一套「不开槽」口径**：
+`GET /admin/writes` 在 durable 计数之外再回两条按槽下标对齐的数组 `bytes[]`/`streams[]`
+（已加载槽的真实值，未加载槽读 0 而不去开它——开槽就是遍历该槽全部分段），前端
+沿用已有的 2s 轮询取「占有该槽的节点中口径最大的那个」作答，不额外发请求。
 
 ## 7. 高性能要点
 
