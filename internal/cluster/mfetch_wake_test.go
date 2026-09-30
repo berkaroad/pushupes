@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -80,6 +81,9 @@ func TestMFetchLongPollWakesOnAppend(t *testing.T) {
 // remaining slot (RTT x slots of HW lag under acks=all). Note this is
 // the idle→burst path: with data present at request time phase 1 answers
 // immediately (fetch answers with whatever it has), so no waiters park at all.
+// One wake must answer for every slot that has data, not just the slot that
+// fired: a write burst scatters across slots, and answering one slot per round
+// costs the follower an RTT per remaining slot before HW can advance.
 func TestMFetchBurstDrainAllWaiters(t *testing.T) {
 	dir := t.TempDir()
 	store, err := storage.OpenStore(dir, 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
@@ -95,40 +99,105 @@ func TestMFetchBurstDrainAllWaiters(t *testing.T) {
 	}
 	e.tableMu.Unlock()
 
-	const wait = 2 * time.Second
-	done := make(chan *MFetchResponse, 1)
-	go func() {
-		resp, err := e.HandleMFetch(MFetchRequest{Follower: "node-2", WaitMS: wait.Milliseconds(),
-			Slots: []int32{1, 3, 6}, FromSeqs: []uint64{1, 1, 1}})
-		if err != nil {
-			t.Errorf("handle: %v", err)
+	slots := []int32{1, 3, 6}
+	// Create the slots' WALs first: a slot's first Append is what builds its
+	// directory and segment, and that costs milliseconds — enough for the burst
+	// to outrun the coalescing window, which is not what this test is about. An
+	// empty slot parks the follower just the same (no records, nothing to send).
+	for _, s := range slots {
+		if _, err := store.Slot(s); err != nil {
+			t.Fatal(err)
 		}
-		done <- resp
-	}()
-
-	time.Sleep(150 * time.Millisecond) // all three slots now park as waiters
-	// Burst: append into ALL three parked slots back-to-back. The first
-	// close wakes the poll; the settle window lets the rest land before
-	// the sweep, so one response drains them all.
-	for _, want := range []int32{1, 3, 6} {
-		appendOne(t, store, aggInSlot(t, e, want), "burst-cmd")
 	}
 
-	select {
-	case resp := <-done:
-		if resp == nil {
-			t.Fatal("nil response")
+	const wait = 2 * time.Second
+	// The coalescing window is 2ms by design (it delays acks=all, so it cannot be
+	// widened), and whether three appends land inside it depends on the machine,
+	// not on the code under test. So burst a few times and require the property
+	// to hold at least once: an implementation that answers one slot per wake
+	// never coalesces, a correct one does as soon as the burst fits the window.
+	// Each round asks only for data past what it already has, so the follower
+	// still parks instead of answering from what it has.
+	var best map[int32]bool
+	var diag []string
+	leos := func() []uint64 {
+		var out []uint64
+		for _, s := range slots {
+			sl, err := store.SlotIfLoaded(s)
+			if err != nil || sl == nil {
+				out = append(out, 0)
+				continue
+			}
+			out = append(out, sl.LastSeq())
 		}
-		got := map[int32]bool{}
-		for _, it := range resp.Items {
-			if len(it.Payload) > 0 {
-				got[it.Slot] = true
+		return out
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		froms := make([]uint64, 0, len(slots))
+		for _, s := range slots {
+			sl, err := store.SlotIfLoaded(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var leo uint64
+			if sl != nil {
+				leo = sl.LastSeq()
+			}
+			froms = append(froms, leo+1)
+		}
+		before := leos()
+		done := make(chan *MFetchResponse, 1)
+		go func() {
+			resp, err := e.HandleMFetch(MFetchRequest{Follower: "node-2", WaitMS: wait.Milliseconds(),
+				Slots: slots, FromSeqs: froms})
+			if err != nil {
+				t.Errorf("handle: %v", err)
+			}
+			done <- resp
+		}()
+
+		time.Sleep(150 * time.Millisecond) // all three slots now park as waiters
+		// Burst: append into ALL three parked slots back-to-back. The first
+		// close wakes the poll; the settle window lets the rest land before the
+		// sweep, so one response drains them all.
+		for _, want := range slots {
+			// A real new record per round: the store dedupes by command id and
+			// only counts a contiguous next version, so repeating either would
+			// append nothing and the follower would wait out its whole deadline.
+			agg := aggInSlot(t, e, want)
+			sl, err := store.SlotIfLoaded(want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var v uint32 = 1
+			if sl != nil {
+				v = sl.LastVersionOf(agg) + 1
+			}
+			if _, err := store.Append(makeRecord(agg, v, fmt.Sprintf("burst-%d-%d", attempt, want))); err != nil {
+				t.Fatal(err)
 			}
 		}
-		if len(got) < 2 {
-			t.Fatalf("burst drain regressed: one wake must answer for every ready slot (got=%v)", got)
+
+		select {
+		case resp := <-done:
+			if resp == nil {
+				t.Fatal("nil response")
+			}
+			got := map[int32]bool{}
+			for _, it := range resp.Items {
+				if len(it.Payload) > 0 {
+					got[it.Slot] = true
+				}
+			}
+			if len(got) >= 2 {
+				return // one wake answered for several ready slots
+			}
+			best = got
+			diag = append(diag, fmt.Sprintf("round %d: wanted from=%v parked-with=%v got=%v leo_before=%v leo_after=%v",
+				attempt, froms, before, got, before, leos()))
+		case <-time.After(wait + 2*time.Second):
+			t.Fatal("no response at all")
 		}
-	case <-time.After(wait + 2*time.Second):
-		t.Fatal("no response at all")
 	}
+	t.Fatalf("burst drain regressed: one wake must answer for every ready slot (got=%v in 5 bursts)\n%v", best, diag)
 }

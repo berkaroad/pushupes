@@ -143,21 +143,29 @@ func TestEncodeBufPool(t *testing.T) {
 	if got := getEncodeBuf(1000); len(got) != 1000 || cap(got) < 1000 {
 		t.Fatalf("getEncodeBuf(1000): len=%d cap=%d", len(got), cap(got))
 	}
-	// Reuse: same size class should hand the same backing array back.
-	first := getEncodeBuf(64 << 10)
-	putEncodeBuf(first)
-	reused := false
-	for i := 0; i < 32; i++ {
-		again := getEncodeBuf(64 << 10)
-		if &again[0] == &first[0] {
-			reused = true
-			putEncodeBuf(again)
-			break
+	// Reuse is deliberately NOT asserted by identity: whether a pooled buffer
+	// comes back is the runtime's business, not this code's. A GC may drop pooled
+	// objects; sync.Pool's per-P private slot is only visible to the P that stored
+	// it; and under -race the probe below fails even with the collector stopped,
+	// one P and the thread locked, while it passes in plain builds. What this
+	// test owns is the class contract putEncodeBuf and getEncodeBuf agree on:
+	// exactly the requested length, capacity a power-of-two pool class (or exactly
+	// the request when it is over the biggest class). Retention is what the
+	// encode benchmarks observe.
+	for _, tc := range []struct{ n, wantLen, wantCap int }{
+		{1, 1, 1 << 13},
+		{30, 30, 1 << 13},
+		{8 << 10, 8 << 10, 1 << 13},
+		{64 << 10, 64 << 10, 1 << 16},
+		{100 << 10, 100 << 10, 1 << 17},
+		{1 << 20, 1 << 20, 1 << 20},
+		{3 << 20, 3 << 20, 3 << 20}, // over the biggest class: bypasses the pool
+	} {
+		b := getEncodeBuf(tc.n)
+		if len(b) != tc.wantLen || cap(b) != tc.wantCap {
+			t.Fatalf("getEncodeBuf(%d): len=%d cap=%d, want len=%d cap=%d", tc.n, len(b), cap(b), tc.wantLen, tc.wantCap)
 		}
-		putEncodeBuf(again)
-	}
-	if !reused {
-		t.Fatal("64KiB encode buffers are not being recycled")
+		putEncodeBuf(b)
 	}
 	// Oversized records bypass the pool entirely.
 	huge := getEncodeBuf(3 << 20)
