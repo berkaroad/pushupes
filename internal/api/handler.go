@@ -81,25 +81,59 @@ type gzipWriter struct {
 
 func (g *gzipWriter) Write(b []byte) (int, error) { return g.gz.Write(b) }
 
+// handleSlotDescribe answers with THIS node's view of one slot. Every number is
+// local, which is why the response says which node answered and what role it
+// plays: hw/isr only exist on the slot's leader (they are tracked from the
+// replica progress reports it receives), and last_seq/segments/total_bytes come
+// from the local copy of the slot. The console therefore asks the holder (leader
+// first) rather than whichever node it happens to be proxied to.
+//
+// The slot is deliberately NOT opened here: Slot() creates the directory on a
+// node that does not hold the slot and walks every segment of it, and a read-only
+// view has no business doing either. A cold slot reports loaded=false with
+// zeroed numbers instead.
 func (s *Server) handleSlotDescribe(w http.ResponseWriter, r *http.Request) {
 	slot, err := strconv.ParseInt(r.PathValue("slot"), 10, 32)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "bad slot")
 		return
 	}
-	sl, err := s.Store.Slot(int32(slot))
+	sl, err := s.Store.SlotIfLoaded(int32(slot))
 	if err != nil {
 		writeErr(w, http.StatusNotFound, data.ErrIDBadRequest, err.Error())
 		return
 	}
 	tbl := s.Engine.TableSnapshot()
 	p := tbl.Slots[int32(slot)]
+	self := s.Engine.Self()
+	role := "none"
+	switch {
+	case p.Leader == self:
+		role = "leader"
+	default:
+		for _, rep := range p.Replicas {
+			if rep == self {
+				role = "replica"
+				break
+			}
+		}
+	}
+	var lastSeq, totalBytes int64
+	var segments int
+	if sl != nil {
+		lastSeq = int64(sl.LastSeq())
+		segments = sl.SegmentCount()
+		totalBytes = sl.TotalSize()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"slot":        slot,
-		"last_seq":    sl.LastSeq(),
+		"node":        self,
+		"role":        role,
+		"loaded":      sl != nil,
+		"last_seq":    lastSeq,
 		"hw":          s.Engine.HW(int32(slot)),
-		"segments":    sl.SegmentCount(),
-		"total_bytes": sl.TotalSize(),
+		"segments":    segments,
+		"total_bytes": totalBytes,
 		"placement":   p,
 		"isr":         s.Engine.ISR(int32(slot)),
 		"writes":      s.Store.WriteCount(int32(slot)),

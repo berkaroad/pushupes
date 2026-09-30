@@ -33,8 +33,16 @@ export interface ClusterStatus {
 
 
 
+// SlotDescribe is one node's view of a slot: every number is local, so the
+// response says which node answered and what role it plays. hw/isr only exist
+// on the leader (it tracks them from replica progress reports); a node that has
+// not loaded the slot reports loaded:false with zeroed numbers instead of
+// opening it.
 export interface SlotDescribe {
   slot: number
+  node?: string
+  role?: 'leader' | 'replica' | 'none'
+  loaded?: boolean
   placement: Placement | null
   hw: number
   last_seq: number

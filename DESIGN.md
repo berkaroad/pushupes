@@ -226,7 +226,7 @@ gRPC  PeerService/Ping            探活（controller 故障切换）
 gRPC  PeerService/Register        数据面地址自报（OpRegister 提交/转发）
 
 # ---- admin 面（HTTP，仅管理）----
-GET  /admin/slots/{slot}/describe              # 槽状态/seq/HW/大小（管理）
+GET  /admin/slots/{slot}/describe              # 本节点视角的槽状态/seq/HW/大小（不代开槽，带 node/role/loaded）
 GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（含 client_addr）
 GET  /admin/writes                             # 每槽 durable 计数 + 槽内总字节/事件流数量（前端轮询）
 GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本，仅内存索引，不读 WAL）
@@ -245,7 +245,15 @@ GET  /healthz
 节点（leader/副本，前端按 placement 选 admin 地址）回答；分页用
 `?after=<aggregate_id>` 游标顺序游走，一页只材料化 limit 条（有界堆选，内存
 O(limit)，与槽内聚合数无关），单次响应上限 `MaxStreamPage=1000`，默认
-`DefaultStreamPage=200`。**槽位列表的总字节/事件流数量走同一套「不开槽」口径**：
+`DefaultStreamPage=200`。
+
+`/admin/slots/{slot}/describe` 回的是**被问到那个节点自己的视角**：`hw`/`isr` 只有槽
+leader 才有（它从副本进度上报里维护，`isr` 列的是**在同步的副本**，不含 leader 自己），
+`last_seq`/`segments`/`total_bytes` 来自该节点本地的槽副本，因此响应带
+`node`/`role`(leader|replica|none)/`loaded`，控制台按 placement **先问 leader 再问副本**
+（旧实现在控制台代理到的那个节点上问，非持有节点自然回 0/空）。该接口**不代开槽**：
+`Store.Slot()` 会在不持有该槽的节点上建出目录并遍历其全部分段，只读视图两者都不该做，
+未加载的槽回 `loaded:false` + 零值。**槽位列表的总字节/事件流数量走同一套「不开槽」口径**：
 `GET /admin/writes` 在 durable 计数之外再回两条按槽下标对齐的数组 `bytes[]`/`streams[]`
 （已加载槽的真实值，未加载槽读 0 而不去开它——开槽就是遍历该槽全部分段），前端
 沿用已有的 2s 轮询取「占有该槽的节点中口径最大的那个」作答，不额外发请求：槽位表列出

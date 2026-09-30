@@ -194,6 +194,18 @@ func (st *Store) Slot(i int32) (*Slot, error) {
 	return s, nil
 }
 
+// SlotIfLoaded returns the slot if this node already has it open, and nil when
+// it is cold. Unlike Slot() it never opens one, so it neither creates the slot
+// directory nor walks the segments it holds — the accessor for read-only admin
+// views (a console listing slots must not materialise them on whatever node it
+// happens to ask).
+func (st *Store) SlotIfLoaded(i int32) (*Slot, error) {
+	if i < 0 || i >= st.SlotCount {
+		return nil, fmt.Errorf("slot %d out of range [0,%d)", i, st.SlotCount)
+	}
+	return st.slots[i].Load(), nil
+}
+
 // Append routes by aggregate_id and applies the business rules.
 func (st *Store) Append(rec *data.EventRecord) (*AppendOutcome, error) {
 	slotID := st.SlotOf(rec.AggregateID)

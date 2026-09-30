@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Button, Descriptions, Drawer, Form, Input, Modal, Select, Space, Table, Tag, Typography } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import type { ClusterStatus, NodeWrites, Placement, SlotDescribe, SlotStream, SlotStreams } from '../types'
-import { describeSlot, fetchNodeWrites, fetchSlotStreams, getClusterStatus, migrateSlot } from '../api'
+import { fetchNodeWrites, fetchSlotDescribe, fetchSlotStreams, getClusterStatus, migrateSlot } from '../api'
 import { RATE_POINTS, RateChart, type RatePoint } from '../RateChart'
 
 const RATE_POLL_MS = 2000
@@ -46,7 +46,7 @@ export default function SlotsPage() {
   const [err, setErr] = useState<string | null>(null)
   const [filterState, setFilterState] = useState<string>('all')
   const [filterLeader, setFilterLeader] = useState<string>('all')
-  const [detail, setDetail] = useState<{ slot: number; data?: SlotDescribe; loading: boolean } | null>(null)
+  const [detail, setDetail] = useState<{ slot: number; addr: string; data?: SlotDescribe; loading: boolean } | null>(null)
   const [migrate, setMigrate] = useState<{ slot: number; placement: Placement } | null>(null)
   const [mForm] = Form.useForm<{ to_node: string }>()
   const [mBusy, setMBusy] = useState(false)
@@ -125,18 +125,28 @@ export default function SlotsPage() {
 
   useEffect(() => {
     const slot = detail?.slot
-    if (slot === undefined) return
+    const addr = detail?.addr
+    if (slot === undefined || !addr) return
     let last: { at: number; counter: number } | null = null
     const tick = async () => {
+      // Field table: re-read the slot from the node that answered, so HW /
+      // LastSeq / 总字节 track the writes instead of freezing at open time.
+      try {
+        const d = await fetchSlotDescribe(addr, slot)
+        setDetail((cur) => (cur && cur.slot === slot ? { ...cur, data: d } : cur))
+      } catch {
+        /* keep the last answer: a transient failure should not blank the view */
+      }
+      // Chart: the slot leader's durable counter (replica counters include
+      // replication applies and would double count).
       const st = statusRef.current
       const p = st?.slots[String(slot)]
-      if (!st || !p) return
-      const addrs = [p.leader, ...p.replicas]
-        .map((id) => st.peers[id]?.admin_addr)
+      const addrs = [p?.leader, ...(p?.replicas ?? [])]
+        .map((id) => (st && id ? st.peers[id]?.admin_addr : undefined))
         .filter((a): a is string => !!a)
-      for (const addr of addrs) {
+      for (const a of addrs) {
         try {
-          const m = await fetchNodeWrites(addr)
+          const m = await fetchNodeWrites(a)
           const counter = m.writes?.[slot]
           if (counter === undefined) continue
           const now = Date.now()
@@ -157,7 +167,7 @@ export default function SlotsPage() {
     tick()
     const id = setInterval(tick, RATE_POLL_MS)
     return () => clearInterval(id)
-  }, [detail?.slot])
+  }, [detail?.slot, detail?.addr])
 
   const rows = useMemo(() => {
     if (!status) return []
@@ -249,15 +259,26 @@ export default function SlotsPage() {
 
   const openDetail = async (slot: number) => {
     setRateSeries([])
-    setDetail({ slot, loading: true })
-    try {
-      const d = await describeSlot(slot, '')
-      setDetail({ slot, data: d, loading: false })
-    } catch (e: any) {
-      setDetail(null)
-      setErr(`slot ${slot} describe 失败：${e?.message ?? e}`)
+    setDetail({ slot, addr: '', loading: true })
+    // Ask the nodes that hold the slot, leader first: describe answers with
+    // the answering node's own numbers (see fetchSlotDescribe).
+    const addrs = streamAddrs(slot)
+    let lastErr = ''
+    for (const addr of addrs) {
+      try {
+        const d = await fetchSlotDescribe(addr, slot)
+        setDetail({ slot, addr, data: d, loading: false })
+        return
+      } catch (e: any) {
+        lastErr = e?.response?.data?.error ?? e?.message ?? String(e)
+      }
     }
+    setDetail(null)
+    setErr(`slot ${slot} 详情读取失败：${lastErr || 'status 里没有该槽的 placement'}`)
   }
+
+  const roleLabel = (role?: string) =>
+    role === 'leader' ? 'leader（主）' : role === 'replica' ? 'replica（副本）' : role === 'none' ? 'none（非主非副本）' : '-'
 
   const doMigrate = async () => {
     if (!migrate) return
@@ -353,6 +374,12 @@ export default function SlotsPage() {
         {detail?.loading ? <Typography.Text>加载中…</Typography.Text> : null}
         {detail?.data ? (
           <Descriptions column={1} bordered size="small">
+            <Descriptions.Item label="数据来源节点">
+              {detail.data.node ?? detail.addr}（{roleLabel(detail.data.role)}）
+            </Descriptions.Item>
+            <Descriptions.Item label="本节点已加载">
+              {detail.data.loaded ? '是' : '否（未开槽，数字均为 0）'}
+            </Descriptions.Item>
             <Descriptions.Item label="Leader">{detail.data.placement?.leader ?? '-'}</Descriptions.Item>
             <Descriptions.Item label="Replicas">{detail.data.placement?.replicas.join(', ') ?? '-'}</Descriptions.Item>
             <Descriptions.Item label="State">

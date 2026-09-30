@@ -40,8 +40,13 @@ export async function fetchSlotStreams(
   return data
 }
 
-export async function describeSlot(slot: number, node: string): Promise<SlotDescribe> {
-  const { data } = await http.get(`/admin/slots/${slot}/describe`, { baseURL: nodeApi(node) })
+// fetchSlotDescribe reads one slot's view from a SPECIFIC node: every number
+// in it is local (hw/isr only exist on the leader, last_seq/size come from that
+// node's copy of the slot), so the console asks the slot's holder — leader
+// first, then its replicas — instead of whichever node it is proxied to.
+export async function fetchSlotDescribe(addr: string, slot: number): Promise<SlotDescribe> {
+  const base = addr.includes('://') ? addr : `http://${addr}`
+  const { data } = await axios.get<SlotDescribe>(`${base}/admin/slots/${slot}/describe`, { timeout: 8000 })
   return data
 }
 

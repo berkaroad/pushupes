@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"os"
 	"testing"
 
 	"pushupes/internal/data"
@@ -278,5 +279,45 @@ func TestSlotGaugesReportLoadedSlotsOnly(t *testing.T) {
 	}
 	if s := st.slots[cold].Load(); s != nil {
 		t.Fatal("gauges opened a cold slot")
+	}
+}
+
+// SlotIfLoaded is the admin view's accessor: it must answer without opening a
+// slot (no directory creation, no segment walk) and still reject bad ids.
+func TestSlotIfLoadedNeverOpens(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStore(dir, 16, DefaultSegmentBytes, FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	slot := int32(4)
+	sl, err := st.SlotIfLoaded(slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sl != nil {
+		t.Fatal("cold slot came back loaded")
+	}
+	if _, err := os.Stat(st.slotDir(slot)); !os.IsNotExist(err) {
+		t.Fatalf("reading a cold slot created %s (err=%v)", st.slotDir(slot), err)
+	}
+
+	// Once a slot is open (here by writing to it), the accessor sees it.
+	appendVersion(t, st, aggInSlotForTest(t, st, slot), 1, "peek-1")
+	sl, err = st.SlotIfLoaded(slot)
+	if err != nil || sl == nil {
+		t.Fatalf("loaded slot not visible: %v %v", sl, err)
+	}
+	if sl.LastSeq() != 1 {
+		t.Fatalf("last seq %d, want 1", sl.LastSeq())
+	}
+
+	if _, err := st.SlotIfLoaded(-1); err == nil {
+		t.Fatal("negative slot accepted")
+	}
+	if _, err := st.SlotIfLoaded(st.SlotCount); err == nil {
+		t.Fatal("out-of-range slot accepted")
 	}
 }
