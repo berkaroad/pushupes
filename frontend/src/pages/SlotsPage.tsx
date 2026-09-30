@@ -3,6 +3,7 @@ import { Alert, Button, Descriptions, Drawer, Form, Input, Modal, Select, Space,
 import type { ColumnsType } from 'antd/es/table'
 import type { ClusterStatus, NodeWrites, Placement, SlotDescribe, SlotStream, SlotStreams } from '../types'
 import { describeSlot, fetchNodeWrites, fetchSlotStreams, getClusterStatus, migrateSlot } from '../api'
+import { RATE_POINTS, RateChart, type RatePoint } from '../RateChart'
 
 const RATE_POLL_MS = 2000
 
@@ -49,20 +50,20 @@ export default function SlotsPage() {
   const [migrate, setMigrate] = useState<{ slot: number; placement: Placement } | null>(null)
   const [mForm] = Form.useForm<{ to_node: string }>()
   const [mBusy, setMBusy] = useState(false)
-  // per-slot live write rate (evt/s), derived by diffing every node's
-  // durable write counters between polls and summing across replicas
-  const [rates, setRates] = useState<Record<number, number>>({})
   // slot event streams (aggregate id + latest version). The listing is served
   // from a node's in-memory slot index — no WAL file is read — so we ask the
   // nodes that hold the slot (leader, then replicas) and keep the first that
   // actually has it open.
   const [streams, setStreams] = useState<StreamDrawer | null>(null)
   const [streamQuery, setStreamQuery] = useState('')
-  // per-slot gauges for the 总字节 / 事件流数量 columns, taken from the same
-  // /admin/writes poll as the rates (no extra request): the node holding the
-  // slot answers with real numbers, nodes that have not loaded it report 0.
-  const [gauges, setGauges] = useState<Record<number, { bytes: number; streams: number }>>({})
-  const prevWrites = useRef<{ at: number; perNode: Record<string, NodeWrites> } | null>(null)
+  // write-rate history of the slot the detail drawer has open (evts/sec per 2s
+  // sample); sampled from the slot's leader counter, replicas count their
+  // replication applies too and would double count.
+  const [rateSeries, setRateSeries] = useState<RatePoint[]>([])
+  // per-slot WAL bytes for the 总字节 column, taken from the same /admin/writes
+  // poll as the counters (no extra request): the node holding the slot answers
+  // with real numbers, a node that has not loaded it reports 0.
+  const [slotBytes, setSlotBytes] = useState<Record<number, number>>({})
   const statusRef = useRef<ClusterStatus | null>(null)
 
   const refresh = useCallback(async () => {
@@ -78,12 +79,10 @@ export default function SlotsPage() {
 
   useEffect(() => { refresh() }, [refresh])
 
-  // Rate poller: uses the cached table (leaders/peers) and polls each
-  // peer's /admin/writes — counters only (~33KB gz to a few KB), instead of
-  // re-fetching the full 4096-slot status every 2s. A slot's client write
-  // rate is its LEADER's counter delta (replica counters include
-  // replication apply, which would double count); fall back to the largest
-  // replica delta when the leader is unreachable.
+  // Gauge poller: uses the cached table (leaders/peers) and polls each peer's
+  // /admin/writes — per-slot counters and gauges only, instead of re-fetching
+  // the full 4096-slot status every 2s. The write rate is no longer a column:
+  // the detail drawer samples the opened slot's own counter (see below).
   useEffect(() => {
     let stop = false
     const tick = async () => {
@@ -97,59 +96,68 @@ export default function SlotsPage() {
         results.forEach((r, i) => {
           if (r.status === 'fulfilled' && r.value.writes) perNode[addrs[i]] = r.value
         })
-        const now = Date.now()
-        const prev = prevWrites.current
-        prevWrites.current = { at: now, perNode }
-        if (!prev) return
-        const dt = (now - prev.at) / 1000
-        if (dt <= 0) return
-        const next: Record<number, number> = {}
         const idToAddr: Record<string, string> = {}
         for (const p of Object.values(st.peers)) idToAddr[p.id] = p.admin_addr
-        for (const [slotStr, p] of Object.entries(st.slots)) {
-          const s = Number(slotStr)
-          const deltas: number[] = []
-          const push = (addr?: string) => {
-            if (!addr) return
-            const cur = perNode[addr]?.writes
-            const old = prev.perNode[addr]?.writes
-            if (cur && old && s < cur.length && s < old.length && cur[s] >= old[s]) {
-              deltas.push((cur[s] - old[s]) / dt)
-            }
-          }
-          push(idToAddr[p.leader])
-          if (deltas.length === 0) for (const r of p.replicas) push(idToAddr[r])
-          if (deltas.length > 0) {
-            const v = Math.max(...deltas)
-            if (v > 0) next[s] = v
-          }
-        }
-        setRates(next)
 
-        // Gauges: take the largest on-disk footprint reported for the slot
-        // (leader or replica, whichever has flushed more) together with that
-        // node's stream count. Absent everywhere means nothing to show.
-        const g: Record<number, { bytes: number; streams: number }> = {}
+        // 总字节: the largest on-disk footprint reported for the slot (leader
+        // or replica, whichever has flushed more). Absent everywhere means
+        // nothing to show.
+        const g: Record<number, number> = {}
         for (const [slotStr, p] of Object.entries(st.slots)) {
           const s = Number(slotStr)
-          let best: { bytes: number; streams: number } | null = null
+          let best = 0
           for (const addr of [idToAddr[p.leader], ...p.replicas.map((r) => idToAddr[r])]) {
             const m = addr ? perNode[addr] : undefined
             if (!m?.bytes || s >= m.bytes.length) continue
-            const cand = { bytes: m.bytes[s] ?? 0, streams: m.streams?.[s] ?? 0 }
-            if (!best || cand.bytes >= best.bytes) best = cand
+            if (m.bytes[s] > best) best = m.bytes[s]
           }
-          if (best && best.bytes > 0) g[s] = best
+          if (best > 0) g[s] = best
         }
-        setGauges(g)
+        setSlotBytes(g)
       } catch {
-        /* poll failure: keep last rates */
+        /* poll failure: keep the last gauges */
       }
     }
     tick()
     const t = setInterval(tick, RATE_POLL_MS)
     return () => { stop = true; clearInterval(t) }
   }, [])
+
+  useEffect(() => {
+    const slot = detail?.slot
+    if (slot === undefined) return
+    let last: { at: number; counter: number } | null = null
+    const tick = async () => {
+      const st = statusRef.current
+      const p = st?.slots[String(slot)]
+      if (!st || !p) return
+      const addrs = [p.leader, ...p.replicas]
+        .map((id) => st.peers[id]?.admin_addr)
+        .filter((a): a is string => !!a)
+      for (const addr of addrs) {
+        try {
+          const m = await fetchNodeWrites(addr)
+          const counter = m.writes?.[slot]
+          if (counter === undefined) continue
+          const now = Date.now()
+          if (last && counter >= last.counter) {
+            const dt = (now - last.at) / 1000
+            if (dt > 0) {
+              const v = (counter - last.counter) / dt
+              setRateSeries((prev) => [...prev, { t: now, v }].slice(-RATE_POINTS))
+            }
+          }
+          last = { at: now, counter }
+          return
+        } catch {
+          /* holder unreachable: try the next one */
+        }
+      }
+    }
+    tick()
+    const id = setInterval(tick, RATE_POLL_MS)
+    return () => clearInterval(id)
+  }, [detail?.slot])
 
   const rows = useMemo(() => {
     if (!status) return []
@@ -240,6 +248,7 @@ export default function SlotsPage() {
   }
 
   const openDetail = async (slot: number) => {
+    setRateSeries([])
     setDetail({ slot, loading: true })
     try {
       const d = await describeSlot(slot, '')
@@ -278,44 +287,22 @@ export default function SlotsPage() {
       filters: Object.keys(stateColor).map((k) => ({ text: k, value: k })),
       sorter: (a, b) => a.state.localeCompare(b.state),
     },
-    { title: 'Leader', dataIndex: 'leader', width: 120, sorter: (a, b) => a.leader.localeCompare(b.leader) },
     {
+      // The replication set carries the role: the leader's tag is the coloured
+      // one (border + fill), no legend needed.
       title: 'Replicas', dataIndex: 'replicas',
-      render: (v: string[]) => v.map((n) => <Tag key={n}>{n}</Tag>),
+      render: (v: string[], r) =>
+        v.map((n) => (n === r.leader
+          ? <Tag key={n} color="gold">{n}</Tag>
+          : <Tag key={n}>{n}</Tag>)),
     },
-    { title: 'Epoch', dataIndex: 'epoch', width: 80, sorter: (a, b) => a.epoch - b.epoch },
     {
       title: '总字节', key: 'bytes', width: 110,
-      sorter: (a, b) => (gauges[a.slot]?.bytes ?? 0) - (gauges[b.slot]?.bytes ?? 0),
+      sorter: (a, b) => (slotBytes[a.slot] ?? 0) - (slotBytes[b.slot] ?? 0),
       render: (_, r) => {
-        const v = gauges[r.slot]?.bytes
+        const v = slotBytes[r.slot]
         if (!v) return <Typography.Text type="secondary">-</Typography.Text>
         return <span title={`${v} 字节`}>{humanBytes(v)}</span>
-      },
-    },
-    {
-      title: '事件流数量', key: 'streams', width: 120,
-      sorter: (a, b) => (gauges[a.slot]?.streams ?? 0) - (gauges[b.slot]?.streams ?? 0),
-      render: (_, r) => {
-        const v = gauges[r.slot]?.streams
-        if (v === undefined) return <Typography.Text type="secondary">-</Typography.Text>
-        return <span title={`${v} 条事件流`}>{v.toLocaleString()}</span>
-      },
-    },
-    {
-      title: (
-        <div style={{ lineHeight: 1.35 }}>
-          写入速率
-          <br />
-          <span style={{ fontSize: 12, color: 'rgba(128,128,128,.75)' }}>（evt/sec）</span>
-        </div>
-      ),
-      key: 'rate', width: 110,
-      sorter: (a, b) => (rates[a.slot] ?? 0) - (rates[b.slot] ?? 0),
-      render: (_, r) => {
-        const v = rates[r.slot]
-        if (!v || v <= 0) return <Typography.Text type="secondary">0</Typography.Text>
-        return <Tag color={v >= 100 ? 'processing' : 'default'}>{v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(0)}</Tag>
       },
     },
     {
@@ -378,6 +365,12 @@ export default function SlotsPage() {
             <Descriptions.Item label="Segments">{detail.data.segments}</Descriptions.Item>
             <Descriptions.Item label="总字节">{detail.data.total_bytes}</Descriptions.Item>
           </Descriptions>
+        ) : null}
+        {detail?.data ? (
+          <div style={{ marginTop: 16 }}>
+            <Typography.Text strong>写入速率</Typography.Text>
+            <RateChart points={rateSeries} />
+          </div>
         ) : null}
       </Drawer>
 

@@ -65,6 +65,38 @@ try {
   console.log(`  (live probe skipped: ${e?.message ?? e})`)
 }
 
+// The drawer's rate chart is a plain SVG: render it with two points and check
+// the polyline is there, then with one point and check the sampling hint.
+const { RateChart } = await vite.ssrLoadModule('/src/RateChart.tsx')
+const chart = renderToString(
+  React.createElement(ConfigProvider, { theme: { algorithm: theme.defaultAlgorithm } },
+    React.createElement(RateChart, { points: [{ t: 1, v: 10 }, { t: 2, v: 30 }, { t: 3, v: 20 }, { t: 4, v: 4 }] })),
+)
+assert('rate chart draws a polyline', chart.includes('<polyline') && chart.includes('峰值'))
+assert('rate chart scales points', (chart.match(/[0-9]+\.[0-9],[0-9]+\.[0-9]/g) ?? []).length >= 3)
+const chartEmpty = renderToString(
+  React.createElement(ConfigProvider, { theme: { algorithm: theme.defaultAlgorithm } },
+    React.createElement(RateChart, { points: [{ t: 1, v: 0 }] })),
+)
+assert('rate chart asks for samples while collecting', chartEmpty.includes('采集中'))
+// axes: x = sample time points, y = evts/sec
+assert('rate chart labels the y axis in evts/sec', chart.includes('evts/sec'))
+assert('rate chart ticks the y axis from 0 to the peak', chart.includes('>0<') && chart.includes('>30<'))
+assert('rate chart ticks the x axis with sample times', (chart.match(/\d{2}:\d{2}:\d{2}/g) ?? []).length >= 2)
+assert('rate chart names both axes', chart.includes('横轴：时间点') && chart.includes('纵轴：evts/sec'))
+// each caption item sits on its own line (five secondary text lines)
+// the three numbers are the eye-catcher: primary-coloured, labels stay secondary
+assert('rate chart paints caption values in the primary colour',
+  /color:#1677ff/.test(chart) && (chart.match(/color:#1677ff/g) ?? []).length >= 4)
+assert('rate chart caption lines are separate',
+  (chart.match(/ant-typography-secondary/g) ?? []).length >= 6 &&
+  ['横轴：', '纵轴：', '最新 ', '峰值 ', '平均 ', '样本 '].every((k, i, arr) => chart.includes(k) && arr.indexOf(k) === i))
+// 平均 sits between 峰值 and 样本 and is the mean of the samples (10/30/20/4 -> 16,
+// a value no other line shows: peak 30, last 4, y ticks 0/15/30)
+assert('rate chart reports the window average',
+  chart.indexOf('峰值 ') < chart.indexOf('平均 ') && chart.indexOf('平均 ') < chart.indexOf('样本 ') &&
+  chart.includes('>16<'))
+
 let failed = 0
 for (const [name, ok] of checks) {
   if (!ok) failed++
