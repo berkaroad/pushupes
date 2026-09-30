@@ -31,17 +31,18 @@ func TestSegIndexRoundTripAndDamage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	load, err := loadSegIndex(dir, slotID, base, -1, -1)
+	load, err := openSegIndex(dir, slotID, base, -1, -1)
 	if err != nil || load == nil {
 		t.Fatalf("load: %v load=%v", err, load)
 	}
-	if len(load.entries) != 300 {
-		t.Fatalf("loaded %d entries, want 300", len(load.entries))
+	if load.Count() != 300 {
+		t.Fatalf("loaded %d entries, want 300", load.Count())
 	}
 	if len(load.sparse) != 5 {
 		t.Fatalf("loaded %d sparse entries, want 5", len(load.sparse))
 	}
-	for i, e := range load.entries {
+	for i := 0; i < load.Count(); i++ {
+		e, _ := load.Entry(i)
 		if e.seq != base+uint64(i) {
 			t.Fatalf("entry %d: seq %d", i, e.seq)
 		}
@@ -69,24 +70,24 @@ func TestSegIndexRoundTripAndDamage(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	load2, err := loadSegIndex(dir, slotID, base, -1, -1)
+	load2, err := openSegIndex(dir, slotID, base, -1, -1)
 	if err != nil || load2 == nil {
 		t.Fatalf("damaged load: %v %v", err, load2)
 	}
-	if len(load2.entries) != 256 {
-		t.Fatalf("damaged load kept %d entries, want the first block's 256", len(load2.entries))
+	if load2.Count() != 256 {
+		t.Fatalf("damaged load kept %d entries, want the first block's 256", load2.Count())
 	}
 	if segIndexDamaged.Load() == 0 {
 		t.Fatal("damage was not counted")
 	}
 
 	// A different slot must not be served this index.
-	if l, err := loadSegIndex(dir, slotID+1, base, -1, -1); err != nil || l != nil {
+	if l, err := openSegIndex(dir, slotID+1, base, -1, -1); err != nil || l != nil {
 		t.Fatalf("slot mismatch: %v %v", err, l)
 	}
 	// Entries beyond what the WAL holds are dropped.
-	capped, err := loadSegIndex(dir, slotID, base, 10, -1)
-	if err != nil || capped == nil || len(capped.entries) != 10 {
+	capped, err := openSegIndex(dir, slotID, base, 10, -1)
+	if err != nil || capped == nil || capped.Count() != 10 {
 		t.Fatalf("cap: %v %v", err, capped)
 	}
 
@@ -105,11 +106,12 @@ func TestSegIndexRoundTripAndDamage(t *testing.T) {
 	if err := w2.close(); err != nil {
 		t.Fatal(err)
 	}
-	load3, err := loadSegIndex(dir, slotID, base, -1, -1)
-	if err != nil || load3 == nil || len(load3.entries) != 300 {
+	load3, err := openSegIndex(dir, slotID, base, -1, -1)
+	if err != nil || load3 == nil || load3.Count() != 300 {
 		t.Fatalf("after repair: %v %v", err, load3)
 	}
-	for i, e := range load3.entries {
+	for i := 0; i < load3.Count(); i++ {
+		e, _ := load3.Entry(i)
 		if e.seq != base+uint64(i) {
 			t.Fatalf("repaired entry %d: seq %d", i, e.seq)
 		}

@@ -68,10 +68,48 @@ type segIndexEntry struct {
 	version uint32
 }
 
-// segIndexLoad is what a valid index file yielded.
+// segIndexLoad is what a valid index file yielded. The per-record metadata is
+// not copied out: it stays in the loader's recycled buffer and is read one entry
+// at a time through Entry, which resolves each aggregate id from the segment
+// dictionary. Materializing it allocated 123M x 40 bytes on a 31 GiB load — the
+// last large allocator once the buffers themselves were pooled.
 type segIndexLoad struct {
-	entries []segIndexEntry // records, in WAL order; coverage = len(entries)
-	sparse  []indexEntry    // seq -> file offset, ascending
+	flat    idxFlat
+	ids     map[uint32]string // segment dictionary: dictID -> aggregate id
+	base    uint64            // the segment's base seq
+	sparse  []indexEntry      // seq -> file offset, ascending
+	release func()
+}
+
+// Count is the number of records the index covers.
+func (l *segIndexLoad) Count() int { return l.flat.count }
+
+// Entry returns the metadata the index holds for record i, in WAL order. It is
+// false only if the entry names a dictionary id the segment does not have, which
+// openSegIndex rules out before handing the load over.
+func (l *segIndexLoad) Entry(i int) (segIndexEntry, bool) {
+	raw := l.flat.at(i)
+	id, ok := l.ids[binary.BigEndian.Uint32(raw[12:16])]
+	if !ok {
+		return segIndexEntry{}, false
+	}
+	return segIndexEntry{
+		hash:    binary.BigEndian.Uint64(raw[0:8]),
+		seq:     l.base + uint64(binary.BigEndian.Uint32(raw[8:12])),
+		aggID:   id,
+		version: binary.BigEndian.Uint32(raw[16:20]),
+	}, true
+}
+
+// Release hands the buffer back to the pool. Call it once the entries have been
+// applied: after that the load's entries must not be read again. It is safe to
+// call more than once.
+func (l *segIndexLoad) Release() {
+	if l == nil || l.release == nil {
+		return
+	}
+	l.release()
+	l.release = nil
 }
 
 func segIdxPath(dir string, baseSeq uint64) string {
@@ -142,13 +180,17 @@ type segIndexWriter struct {
 // replayed records rewrite exactly the entries that were lost.
 func openSegIndexWriter(dir string, slotID int32, baseSeq uint64) (*segIndexWriter, error) {
 	w := &segIndexWriter{dir: dir, slotID: slotID, baseSeq: baseSeq, dictIDs: map[string]uint32{}}
-	load, err := loadSegIndex(dir, slotID, baseSeq, -1, -1)
+	load, err := openSegIndex(dir, slotID, baseSeq, -1, -1)
 	if err != nil {
 		return nil, err
 	}
 	if load != nil {
-		w.idxOff = int64(blockBytes(len(load.entries)))
+		// Resuming only needs where the existing blocks end, so the entries are
+		// never walked: reopening the index of every loaded segment used to
+		// materialize them just to take their length.
+		w.idxOff = int64(blockBytes(load.Count()))
 		w.spxOff = int64(blockBytes16(len(load.sparse)))
+		load.Release()
 	}
 	if w.agx, err = openAppendFile(segAgxPath(dir, baseSeq), segAgxMagic, slotID, baseSeq); err != nil {
 		return nil, err
@@ -442,7 +484,7 @@ func (w *segIndexWriter) broken() bool { return w != nil && w.err != nil }
 // absent, damaged or not trustworthy — the caller then walks the WAL. maxSeq
 // and maxPos cap the result at what the WAL actually holds (a torn tail or a
 // truncated segment must not leave the index pointing beyond the end).
-func loadSegIndex(dir string, slotID int32, baseSeq uint64, maxEntries int, maxPos int64) (*segIndexLoad, error) {
+func openSegIndex(dir string, slotID int32, baseSeq uint64, maxEntries int, maxPos int64) (*segIndexLoad, error) {
 	dict, _, err := loadSegDict(dir, slotID, baseSeq)
 	if err != nil {
 		return nil, err
@@ -454,49 +496,38 @@ func loadSegIndex(dir string, slotID int32, baseSeq uint64, maxEntries int, maxP
 	for _, d := range dict {
 		byID[d.dictID] = d.id
 	}
-
 	entries, damaged, release, err := loadIdxEntries(segIdxPath(dir, baseSeq), segIdxMagic, slotID, baseSeq, segIdxEntryBytes, maxEntries)
 	if err != nil {
 		return nil, err
 	}
-	defer release()
 	if damaged {
 		segIndexDamaged.Add(1)
 	}
 	segIndexUsed.Add(1)
-	// The entry count is known before the first append, so size the slice once
-	// instead of letting it double: 123M entries at ~40 bytes per entry doubled
-	// away 12.7 GB of the 21.5 GB this load allocated.
-	load := &segIndexLoad{entries: make([]segIndexEntry, 0, entries.count)}
+	// Sweep the dictionary references over the whole buffer before any of it is
+	// applied: an entry naming an id the segment does not have voids the index,
+	// and half an index applied is worse than none. The sweep allocates nothing.
 	for i := 0; i < entries.count; i++ {
-		raw := entries.at(i)
-		dictID := binary.BigEndian.Uint32(raw[12:16])
-		id, ok := byID[dictID]
-		if !ok {
-			// An entry referencing an id that is not in the dictionary means
-			// the pair is not consistent: distrust the whole thing.
+		if _, ok := byID[binary.BigEndian.Uint32(entries.at(i)[12:16])]; !ok {
+			release()
 			segIndexDamaged.Add(1)
 			return nil, nil
 		}
-		load.entries = append(load.entries, segIndexEntry{
-			hash:    binary.BigEndian.Uint64(raw[0:8]),
-			seq:     baseSeq + uint64(binary.BigEndian.Uint32(raw[8:12])),
-			aggID:   id,
-			version: binary.BigEndian.Uint32(raw[16:20]),
-		})
 	}
-	if len(load.entries) == 0 && maxEntries > 0 {
+	if entries.count == 0 && maxEntries > 0 {
+		release()
 		return nil, nil // an empty index for a non-empty segment is no index
 	}
 	sparse, spxDamaged, spxRelease, err := loadIdxEntries(segSpxPath(dir, baseSeq), segSpxMagic, slotID, baseSeq, segSpxEntryBytes, -1)
 	if err != nil {
+		release()
 		return nil, err
 	}
 	defer spxRelease()
 	if spxDamaged {
 		segIndexDamaged.Add(1)
 	}
-	load.sparse = make([]indexEntry, 0, sparse.count)
+	out := make([]indexEntry, 0, sparse.count)
 	for i := 0; i < sparse.count; i++ {
 		raw := sparse.at(i)
 		seq := binary.BigEndian.Uint64(raw[0:8])
@@ -504,9 +535,9 @@ func loadSegIndex(dir string, slotID int32, baseSeq uint64, maxEntries int, maxP
 		if maxPos >= 0 && pos >= maxPos {
 			break
 		}
-		load.sparse = append(load.sparse, indexEntry{seq: seq, pos: pos})
+		out = append(out, indexEntry{seq: seq, pos: pos})
 	}
-	return load, nil
+	return &segIndexLoad{flat: entries, ids: byID, base: baseSeq, sparse: out, release: release}, nil
 }
 
 // idxFlat is a whole index file's validated prefix in one buffer, entries dense

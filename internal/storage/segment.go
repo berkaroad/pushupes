@@ -778,18 +778,20 @@ func LoadSegmentIndexed(path, dir string) (*Segment, *segIndexLoad, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	load, err := loadSegIndex(dir, s.SlotID, s.BaseSeq, -1, s.sizeBytes)
+	load, err := openSegIndex(dir, s.SlotID, s.BaseSeq, -1, s.sizeBytes)
 	if err != nil {
 		s.File.Close()
 		return nil, nil, err
 	}
 	if load == nil || len(load.sparse) == 0 {
+		load.Release()
 		s.File.Close()
 		return nil, nil, nil
 	}
 	last := load.sparse[len(load.sparse)-1]
 	if last.seq < s.BaseSeq || last.pos < int64(s.dataStart) || last.pos >= s.sizeBytes {
 		// The index points outside the file: distrust it, let the caller walk.
+		load.Release()
 		s.File.Close()
 		segIndexDamaged.Add(1)
 		return nil, nil, nil
@@ -799,13 +801,15 @@ func LoadSegmentIndexed(path, dir string) (*Segment, *segIndexLoad, error) {
 	s.LastSeq = last.seq - 1
 	s.bytesSinceIndex = 0
 	if err := s.walkAndIndex(last.seq, last.pos); err != nil {
+		load.Release()
 		s.File.Close()
 		return nil, nil, err
 	}
-	if cnt := int(s.RecordCnt); len(load.entries) > cnt {
+	if cnt := int(s.RecordCnt); load.Count() > cnt {
 		// The WAL holds fewer records than the index claims (a truncated
-		// segment): keep only what exists.
-		load.entries = load.entries[:cnt]
+		// segment): keep only what exists. The entries are dense, so the count
+		// alone bounds them.
+		load.flat.count = cnt
 		segIndexDamaged.Add(1)
 	}
 	return s, load, nil

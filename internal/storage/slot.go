@@ -174,7 +174,14 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 			if load != nil {
 				// The index holds the metadata for these records; no frame is
 				// touched for them.
-				for _, e := range load.entries {
+				// One entry at a time out of the loader's buffer: the index of a
+				// 262k record segment is never materialized, so a start does not
+				// hold 40 bytes per record per segment.
+				for i := 0; i < load.Count(); i++ {
+					e, ok := load.Entry(i)
+					if !ok {
+						break // openSegIndex validated every entry first
+					}
 					s.indexMetaLocked(e.seq, data.RecordMeta{
 						AggregateID: e.aggID,
 						Version:     e.version,
@@ -182,7 +189,8 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 					})
 				}
 				segIndexUsed.Add(1)
-				from = seg.BaseSeq + uint64(len(load.entries))
+				from = seg.BaseSeq + uint64(load.Count())
+				load.Release()
 			}
 			// Startup indexes every segment (that is the repair); while running,
 			// only a tail that already has an index keeps writing it, and a
