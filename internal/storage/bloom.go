@@ -134,7 +134,11 @@ func (s *bloomSet) entries() int {
 // encode writes the set as: count(4) then per filter k(1) pad(3) words(8) then
 // the bit words, all covered by a trailing CRC.
 func (s *bloomSet) encode() []byte {
-	size := 4 + 4
+	// The filter count is the only header field the walk below writes, so the
+	// buffer is sized from offset 4: an extra reserved word here used to shift
+	// the trailing CRC four bytes early, and the decoder (reading it from the
+	// last four bytes) saw zeros and rejected every filter ever written.
+	size := 4
 	for _, f := range s.filters {
 		size += 12 + len(f.bits)*8
 	}
