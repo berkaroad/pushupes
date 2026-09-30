@@ -27,6 +27,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 )
 
@@ -454,16 +455,21 @@ func loadSegIndex(dir string, slotID int32, baseSeq uint64, maxEntries int, maxP
 		byID[d.dictID] = d.id
 	}
 
-	entries, damaged, err := loadIdxEntries(segIdxPath(dir, baseSeq), segIdxMagic, slotID, baseSeq, segIdxEntryBytes, maxEntries)
+	entries, damaged, release, err := loadIdxEntries(segIdxPath(dir, baseSeq), segIdxMagic, slotID, baseSeq, segIdxEntryBytes, maxEntries)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	if damaged {
 		segIndexDamaged.Add(1)
 	}
 	segIndexUsed.Add(1)
-	load := &segIndexLoad{}
-	for _, raw := range entries {
+	// The entry count is known before the first append, so size the slice once
+	// instead of letting it double: 123M entries at ~40 bytes per entry doubled
+	// away 12.7 GB of the 21.5 GB this load allocated.
+	load := &segIndexLoad{entries: make([]segIndexEntry, 0, entries.count)}
+	for i := 0; i < entries.count; i++ {
+		raw := entries.at(i)
 		dictID := binary.BigEndian.Uint32(raw[12:16])
 		id, ok := byID[dictID]
 		if !ok {
@@ -482,14 +488,17 @@ func loadSegIndex(dir string, slotID int32, baseSeq uint64, maxEntries int, maxP
 	if len(load.entries) == 0 && maxEntries > 0 {
 		return nil, nil // an empty index for a non-empty segment is no index
 	}
-	sparse, spxDamaged, err := loadIdxEntries(segSpxPath(dir, baseSeq), segSpxMagic, slotID, baseSeq, segSpxEntryBytes, -1)
+	sparse, spxDamaged, spxRelease, err := loadIdxEntries(segSpxPath(dir, baseSeq), segSpxMagic, slotID, baseSeq, segSpxEntryBytes, -1)
 	if err != nil {
 		return nil, err
 	}
+	defer spxRelease()
 	if spxDamaged {
 		segIndexDamaged.Add(1)
 	}
-	for _, raw := range sparse {
+	load.sparse = make([]indexEntry, 0, sparse.count)
+	for i := 0; i < sparse.count; i++ {
+		raw := sparse.at(i)
 		seq := binary.BigEndian.Uint64(raw[0:8])
 		pos := int64(binary.BigEndian.Uint64(raw[8:16]))
 		if maxPos >= 0 && pos >= maxPos {
@@ -500,60 +509,117 @@ func loadSegIndex(dir string, slotID int32, baseSeq uint64, maxEntries int, maxP
 	return load, nil
 }
 
+// idxFlat is a whole index file's validated prefix in one buffer, entries dense
+// at a fixed stride: entry i is buf[i*stride:(i+1)*stride]. The [][]byte this
+// replaces allocated a slice header per entry — 262k of them for one segment —
+// which on a 31 GiB load meant 8.8 GB of garbage to say the same thing.
+type idxFlat struct {
+	buf    []byte
+	stride int
+	count  int
+}
+
+func (f idxFlat) at(i int) []byte { return f.buf[i*f.stride : (i+1)*f.stride] }
+
+// flatBufPool recycles those buffers: segments load one after another, so a
+// single buffer per size serves the whole load instead of a fresh 5 MiB per
+// segment (471 segments on the 31 GiB node).
+var flatBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 1<<20); return &b }}
+
 // loadIdxEntries reads the longest CRC-validated prefix of a block file. A
 // damaged (second return) file is not an error: the validated prefix is still
-// usable and the caller replays the rest from the WAL.
-func loadIdxEntries(path, magic string, slotID int32, baseSeq uint64, entryBytes int, maxEntries int) ([][]byte, bool, error) {
+// usable and the caller replays the rest from the WAL. The third return lends
+// the buffer back to the pool and must be called once the entries are consumed.
+func loadIdxEntries(path, magic string, slotID int32, baseSeq uint64, entryBytes int, maxEntries int) (idxFlat, bool, func(), error) {
+	noop := func() {}
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, false, nil
+			return idxFlat{}, false, noop, nil
 		}
-		return nil, false, err
+		return idxFlat{}, false, noop, err
 	}
 	defer f.Close()
 	h := make([]byte, segIdxHeaderBytes)
 	if err := readAtFull(f, h, 0); err != nil {
-		return nil, true, nil
+		return idxFlat{}, true, noop, nil
 	}
 	if !checkSegIdxHeader(h, magic, slotID, baseSeq) {
-		return nil, true, nil
+		return idxFlat{}, true, noop, nil
 	}
 	st, err := f.Stat()
 	if err != nil {
-		return nil, false, err
+		return idxFlat{}, false, noop, err
 	}
 	size := st.Size()
-	var out [][]byte
+	// One recycled buffer holds the whole file. Each block is read at the tail
+	// of it (CRC + entry count + entries) and, once validated, its payload is
+	// moved down over that six byte header, so the entries end up dense and the
+	// caller indexes them as buf[i*entryBytes:].
+	bufp := flatBufPool.Get().(*[]byte)
+	buf := (*bufp)[:0]
+	// Size it once: the file length bounds the dense result, so the block reads
+	// below never have to grow (growing per block copied the whole prefix every
+	// time — O(n^2), and 460 GiB of garbage on the 31 GiB node).
+	want := int(size) // an upper bound: the dense result drops the block headers
+	if maxEntries > 0 && maxEntries*entryBytes < want {
+		want = maxEntries*entryBytes + segIdxBlockHead*(maxEntries/segIdxBlockHead+1)
+	}
+	if cap(buf) < want {
+		buf = make([]byte, 0, want)
+	}
+	release := func() {
+		if cap(buf) > 32<<20 { // do not pin a huge buffer in the pool
+			return
+		}
+		*bufp = buf[:0]
+		flatBufPool.Put(bufp)
+	}
+	damaged := func() (idxFlat, bool, func(), error) {
+		return idxFlat{buf: buf, stride: entryBytes, count: len(buf) / entryBytes}, true, release, nil
+	}
+	var head [segIdxBlockHead]byte
 	for off := int64(segIdxHeaderBytes); off < size; {
 		if size-off < int64(segIdxBlockHead) {
-			return out, true, nil
+			return damaged()
 		}
-		head := make([]byte, segIdxBlockHead)
-		if err := readAtFull(f, head, off); err != nil {
-			return out, false, err
+		if err := readAtFull(f, head[:], off); err != nil {
+			return idxFlat{}, false, release, err
 		}
 		count := int(binary.BigEndian.Uint16(head[4:6]))
 		payload := int64(count) * int64(entryBytes)
 		if count <= 0 || off+int64(segIdxBlockHead)+payload > size {
-			return out, true, nil // torn block: valid prefix only
+			return damaged() // torn block: valid prefix only
 		}
-		buf := make([]byte, int64(segIdxBlockHead)+payload)
-		if err := readAtFull(f, buf, off); err != nil {
-			return out, false, err
+		if maxEntries > 0 && len(buf)/entryBytes >= maxEntries {
+			break
 		}
-		if crc32.Checksum(buf[4:], segIdxCRC) != binary.BigEndian.Uint32(buf[0:4]) {
-			return out, true, nil
+		start := len(buf)
+		end := start + segIdxBlockHead + int(payload)
+		if cap(buf) < end {
+			grown := make([]byte, end)
+			copy(grown, buf)
+			buf = grown
 		}
-		for i := int64(0); i < payload; i += int64(entryBytes) {
-			out = append(out, buf[segIdxBlockHead+i:segIdxBlockHead+i+int64(entryBytes)])
+		buf = buf[:end]
+		if err := readAtFull(f, buf[start:], off); err != nil {
+			return idxFlat{}, false, release, err
 		}
-		if maxEntries > 0 && len(out) >= maxEntries {
-			return out[:maxEntries], false, nil
+		if crc32.Checksum(buf[start+4:end], segIdxCRC) != binary.BigEndian.Uint32(buf[start:start+4]) {
+			buf = buf[:start]
+			return damaged()
 		}
+		n := int(binary.BigEndian.Uint16(buf[start+4 : start+6]))
+		copy(buf[start:], buf[start+segIdxBlockHead:end])
+		buf = buf[:start+n*entryBytes]
 		off += int64(segIdxBlockHead) + payload
 	}
-	return out, false, nil
+	if maxEntries > 0 {
+		if n := len(buf) / entryBytes; n > maxEntries {
+			buf = buf[:maxEntries*entryBytes]
+		}
+	}
+	return idxFlat{buf: buf, stride: entryBytes, count: len(buf) / entryBytes}, false, release, nil
 }
 
 // readAtFull reads exactly len(buf) bytes at off (a short read is an error).
