@@ -40,9 +40,11 @@ type Engine struct {
 	// rotation order and parked set fresh every time; under acks=all the
 	// leader serves thousands of rounds per second and these were the
 	// dominant malloc traffic in the profile.
-	orderPool    sync.Pool // []int, cap >= followed slots
-	parkedPool   sync.Pool // []parkedEntry
-	progressPool sync.Pool // *progressBatch
+	orderPool        sync.Pool // []int, cap >= followed slots
+	parkedPool       sync.Pool // []parkedEntry
+	progressPool     sync.Pool // *progressBatch
+	scanPool         sync.Pool // *fetchScan (per-position "has data" + wake handle)
+	fetchScratchPool sync.Pool // *fetchScratch (per-round positions + report)
 
 	// ownership bitmap: which slots this node leads, rebuilt only when
 	// the Raft table version advances. Per-item map lookups under the
@@ -172,6 +174,8 @@ func NewEngine(node *Node, store *storage.Store, self string, acksDefault string
 	e.orderPool.New = func() any { return make([]int, 0, 64) }
 	e.parkedPool.New = func() any { return make([]parkedEntry, 0, 64) }
 	e.progressPool.New = func() any { return &progressBatch{} }
+	e.scanPool.New = func() any { return &fetchScan{} }
+	e.fetchScratchPool.New = func() any { return &fetchScratch{} }
 	if e.logger == nil {
 		l := logrus.New()
 		l.SetLevel(logrus.WarnLevel)
@@ -685,6 +689,65 @@ func (e *Engine) HandleMFetch(req MFetchRequest) (*MFetchResponse, error) {
 	return e.HandleMFetchCtx(context.Background(), req)
 }
 
+// fetchScratch holds the follower's per-round slices: the reported positions
+// (one per followed slot, ~11KB at 4096 slots) and the progress report of a
+// productive round. Both were allocated fresh every round — hundreds of rounds
+// a second per followed leader — and both are dead as soon as the round's RPC
+// returns, so one goroutine (the session loop) reuses them.
+type fetchScratch struct {
+	froms   []uint64
+	changed []int32
+	leos    []uint64
+}
+
+func (f *fetchScratch) reset() *fetchScratch {
+	f.froms, f.changed, f.leos = f.froms[:0], f.changed[:0], f.leos[:0]
+	return f
+}
+
+func sizedU64(b []uint64, n int) []uint64 {
+	if cap(b) < n {
+		return make([]uint64, n)
+	}
+	return b[:n]
+}
+
+func sizedI32(b []int32, n int) []int32 {
+	if cap(b) < n {
+		return make([]int32, n)
+	}
+	return b[:n]
+}
+
+// fetchScan is one round's per-position answers from Store.ScanFetchState:
+// whether the slot has data for the follower, and the wake handle to park on.
+type fetchScan struct {
+	slots []int32
+	moved []bool
+	wakes []<-chan struct{}
+}
+
+func (f *fetchScan) resize(n int) {
+	if cap(f.moved) < n {
+		f.moved = make([]bool, n*2)
+	}
+	if cap(f.wakes) < n {
+		f.wakes = make([]<-chan struct{}, n*2)
+	}
+	f.moved = f.moved[:n]
+	f.wakes = f.wakes[:n]
+}
+
+// reset clears the wake handles before the buffer goes back to the pool, so a
+// recycled scan does not keep a store's channels alive.
+func (f *fetchScan) reset() *fetchScan {
+	for i := range f.wakes {
+		f.wakes[i] = nil
+	}
+	f.moved, f.wakes = f.moved[:0], f.wakes[:0]
+	return f
+}
+
 // parkedEntry is one slot waiting on the wake bus inside a fetch round.
 type parkedEntry struct {
 	slot int32
@@ -742,6 +805,15 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 	// replacing the per-round map built under tableMu.
 	own := e.ownershipSnapshot()
 
+	// One batched scan for the whole round: per reported position it answers
+	// "has data" and hands back the wake handle to park on. Asking the store
+	// slot by slot cost two calls per slot and a read call even for the ~1300
+	// empty ones, which at fetch-round rates is the leader's largest block of
+	// own CPU at small body sizes.
+	scan := e.scanPool.Get().(*fetchScan)
+	scan.resize(n)
+	e.store.ScanFetchState(req.Slots, req.FromSeqs, scan.moved, scan.wakes)
+
 	out := &MFetchResponse{Follower: req.Follower, Items: make([]FetchItem, 0, 64)}
 	budget := int64(maxPayloadBytes)
 	starved := false
@@ -765,6 +837,14 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 		if req.Follower != "" && req.Follower != e.self {
 			prog.add(s, from-1)
 		}
+		// The scan captured the wake handle before it read the position
+		// (no-lost-wake discipline): an append landing in between closes
+		// that handle, so the parked wait fires at once instead of sleeping
+		// to the deadline. Without a long poll there is nothing to park on.
+		var h <-chan struct{}
+		if waitMS > 0 {
+			h = scan.wakes[i]
+		}
 		if budget <= 0 {
 			// Out of budget: no data this round. If the slot HAS pending
 			// data, do NOT park a fresh wake handle — the data landed
@@ -775,8 +855,7 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 			// starved makes the response return now instead. If the slot
 			// is truly empty, park so future appends still wake the poll.
 			if waitMS > 0 {
-				h := e.store.WakeChan(s)
-				if e.store.LastSeqOf(s) >= from {
+				if scan.moved[i] {
 					starved = true
 				} else {
 					parked = append(parked, parkedEntry{s, from, h})
@@ -784,32 +863,35 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 			}
 			continue
 		}
-		// Take the wake handle BEFORE the read (no-lost-wake discipline):
-		// an append landing during the read closes this handle, so the
-		// first bus scan finds it fired and re-reads. Acquiring after the
-		// read left a window that stalled the round to the full WaitMS.
-		var h <-chan struct{}
-		if waitMS > 0 {
-			h = e.store.WakeChan(s)
-		}
-		_, next, payload, err := e.store.ReadSlotBytes(s, from, 0, min(4<<20, budget))
-		if err != nil {
-			e.orderPool.Put(order[:cap(order)])
-			e.parkedPool.Put(parked[:0])
-			e.progressPool.Put(prog.reset())
-			return nil, err
-		}
-		budget -= int64(len(payload))
-		if len(payload) == 0 {
+		if !scan.moved[i] {
 			if h != nil {
 				parked = append(parked, parkedEntry{s, from, h})
 			}
 			continue // empty slot: implied absent in the sparse response
 		}
+		_, next, payload, err := e.store.ReadSlotBytes(s, from, 0, min(4<<20, budget))
+		if err != nil {
+			e.scanPool.Put(scan.reset())
+			e.orderPool.Put(order[:cap(order)])
+			e.parkedPool.Put(parked[:0])
+			e.progressPool.Put(prog.reset())
+			return nil, err
+		}
+		if len(payload) == 0 {
+			// The scan saw data but the read came back empty (a range
+			// trimmed between the two): park like an empty slot rather
+			// than answering with an empty item.
+			if h != nil {
+				parked = append(parked, parkedEntry{s, from, h})
+			}
+			continue
+		}
+		budget -= int64(len(payload))
 		served = true
 		out.Items = append(out.Items, FetchItem{Slot: s, FromSeq: from, NextSeq: next, Payload: payload})
 	}
 	prog.apply(e)
+	e.scanPool.Put(scan.reset())
 	e.orderPool.Put(order[:cap(order)])
 
 	if len(parked) > 0 && waitMS > 0 && !starved && !served {
@@ -829,6 +911,7 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 			case <-deadline:
 				break waitLoop // budget spent: answer with whatever we have
 			case <-ctx.Done():
+				e.scanPool.Put(scan.reset())
 				e.parkedPool.Put(parked[:0])
 				e.progressPool.Put(prog.reset())
 				return nil, ctx.Err() // client went away
@@ -1057,7 +1140,10 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 	if addr == "" {
 		return false, data.ErrNotLeader
 	}
-	froms := make([]uint64, len(slots))
+	scr := e.fetchScratchPool.Get().(*fetchScratch)
+	defer e.fetchScratchPool.Put(scr.reset())
+	froms := sizedU64(scr.froms, len(slots))
+	scr.froms = froms
 	for i, s := range slots {
 		froms[i] = e.store.LastSeqOf(s) + 1
 	}
@@ -1084,13 +1170,16 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 		// (a productive round on a busy leader touches tens of slots, not
 		// the full 1.4k set), so the leader advances HW immediately
 		// instead of waiting for the next round's piggyback.
-		changed := make([]int32, 0, len(fr.Items))
-		prog := make([]uint64, 0, len(fr.Items))
+		changed := sizedI32(scr.changed, len(fr.Items))[:0]
+		leos := sizedU64(scr.leos, len(fr.Items))[:0]
 		for _, it := range fr.Items {
 			changed = append(changed, it.Slot)
-			prog = append(prog, e.store.LastSeqOf(it.Slot)+1)
+			leos = append(leos, e.store.LastSeqOf(it.Slot)+1)
 		}
-		e.reportProgress(addr, changed, prog, false)
+		// The report is a synchronous unary call, so the slices can go back to
+		// the scratch right after it: the message is already on the wire.
+		e.reportProgress(addr, changed, leos, false)
+		scr.changed, scr.leos = changed[:0], leos[:0]
 	}
 	return productive, nil
 }
