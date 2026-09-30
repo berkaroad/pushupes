@@ -49,7 +49,17 @@ type Store struct {
 // missing ones lazily on first write. Recovery is parallel: each slot's WAL
 // scan is independent, and with 4096 slots a serial scan would dominate
 // cold start (one disk walk + index rebuild per slot).
+// OpenStore opens (or creates) the store, repairing each slot's segment
+// indexes on the way: a start is where an index that is missing, stale or
+// damaged is rewritten. A running node never re-indexes history.
 func OpenStore(dir string, slotCount int32, segmentBytes int64, flush FlushPolicy) (*Store, error) {
+	return openStoreMode(dir, slotCount, segmentBytes, flush, slotOpenLoadAndRepair)
+}
+
+// openStoreMode is OpenStore with an explicit index mode; slotOpenLoad is what
+// a reload or a lazy slot open uses (it never writes an index for an existing
+// segment).
+func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushPolicy, mode slotOpenMode) (*Store, error) {
 	if slotCount <= 0 {
 		slotCount = data.DefaultSlotCount
 	}
@@ -102,7 +112,7 @@ func OpenStore(dir string, slotCount int32, segmentBytes int64, flush FlushPolic
 		go func() {
 			defer wg.Done()
 			for t := range ch {
-				slot, err := OpenSlot(t.path, t.id, segmentBytes, flush)
+				slot, err := openSlot(t.path, t.id, segmentBytes, flush, mode)
 				if err != nil {
 					errOnce.Do(func() { openErr = err })
 					continue

@@ -78,7 +78,30 @@ type Slot struct {
 
 // OpenSlot loads (or creates) the WAL for one slot directory and rebuilds
 // indexes by scanning every segment body.
+// slotOpenMode says what opening a slot may do to its index files. Repairing
+// an index is startup work: a running node records what happens, it does not
+// re-index history — that belongs to the next start.
+type slotOpenMode int
+
+const (
+	slotOpenLoad slotOpenMode = iota
+	slotOpenLoadAndRepair
+)
+
+// OpenSlot opens a slot for a running node: an existing index is loaded and
+// continued, a missing one is left alone.
 func OpenSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy) (*Slot, error) {
+	return openSlot(dir, slotID, segmentBytes, flush, slotOpenLoad)
+}
+
+// OpenSlotRepairing opens a slot at process startup, where a segment without a
+// usable index is walked and then indexed. That is what makes later starts
+// cheap without re-indexing while the node serves traffic.
+func OpenSlotRepairing(dir string, slotID int32, segmentBytes int64, flush FlushPolicy) (*Slot, error) {
+	return openSlot(dir, slotID, segmentBytes, flush, slotOpenLoadAndRepair)
+}
+
+func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, mode slotOpenMode) (*Slot, error) {
 	if segmentBytes <= 0 {
 		segmentBytes = DefaultSegmentBytes
 	}
@@ -101,10 +124,18 @@ func OpenSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy) (
 		return nil, err
 	}
 	var expected uint64 = 1
-	for _, p := range paths {
-		seg, err := LoadSegment(p)
+	for i, p := range paths {
+		isTail := i == len(paths)-1
+		// Recovery order of preference: the segment's index, then a walk.
+		seg, load, err := LoadSegmentIndexed(p, dir)
 		if err != nil {
 			return nil, fmt.Errorf("slot %d load %s: %w", slotID, p, err)
+		}
+		if seg == nil {
+			segIndexUnusable.Add(1)
+			if seg, err = LoadSegment(p); err != nil {
+				return nil, fmt.Errorf("slot %d load %s: %w", slotID, p, err)
+			}
 		}
 		if seg.SlotID != slotID {
 			seg.Close()
@@ -115,18 +146,64 @@ func OpenSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy) (
 			return nil, fmt.Errorf("slot %d: %s seq gap (base %d, expected %d)", slotID, p, seg.BaseSeq, expected)
 		}
 		if seg.RecordCnt > 0 {
-			// Index rebuild: walk the frame headers only — the maps need the
-			// aggregate, version and command id, never the bodies.
-			if err := seg.ScanHeaders(seg.BaseSeq, func(seq uint64, meta data.RecordMeta) bool {
-				s.indexMetaLocked(seq, meta)
-				return true
-			}); err != nil {
-				seg.Close()
-				return nil, fmt.Errorf("slot %d scan %s: %w", slotID, p, err)
+			from := seg.BaseSeq
+			if load != nil {
+				// The index holds the metadata for these records; no frame is
+				// touched for them.
+				for _, e := range load.entries {
+					s.indexMetaLocked(e.seq, data.RecordMeta{
+						AggregateID: e.aggID,
+						Version:     e.version,
+						CommandHash: e.hash,
+					})
+				}
+				segIndexUsed.Add(1)
+				from = seg.BaseSeq + uint64(len(load.entries))
+			}
+			// Startup indexes every segment (that is the repair); while running,
+			// only a tail that already has an index keeps writing it, and a
+			// missing one is left to the next start.
+			if mode == slotOpenLoadAndRepair || (isTail && load != nil) {
+				_ = seg.openIndexWriter()
+			}
+			// Everything past the index coverage is replayed from the frames
+			// (usually nothing, at most one index block).
+			if from <= seg.LastSeq {
+				if err := seg.ScanHeaders(from, func(seq uint64, meta data.RecordMeta) bool {
+					s.indexMetaLocked(seq, meta)
+					seg.IndexRecord(seq, meta)
+					return true
+				}); err != nil {
+					seg.Close()
+					return nil, fmt.Errorf("slot %d scan %s: %w", slotID, p, err)
+				}
+				segIndexReplayed.Add(seg.LastSeq - from + 1)
+			}
+			if load == nil && mode == slotOpenLoadAndRepair && seg.idx != nil {
+				// Startup: leave the walked segment with a complete index
+				// (sparse positions come from the walk, entries from the scan
+				// above), so the next start does not walk it again.
+				seg.indexSparseFromMemory()
+				if err := seg.idx.flush(); err != nil {
+					seg.Close()
+					return nil, fmt.Errorf("slot %d index %s: %w", slotID, p, err)
+				}
+				segIndexBuilt.Add(1)
 			}
 			expected = seg.LastSeq + 1
+		} else if mode == slotOpenLoadAndRepair || (isTail && load != nil) {
+			// An empty segment (a header-only file from an earlier start) has
+			// nothing to index, but it does need the index files so records
+			// appended to it later extend them instead of being replayed by the
+			// next start.
+			_ = seg.openIndexWriter()
 		}
 		seg.Seal() // history segments sealed; the tail is unsealed below
+		if !isTail && mode == slotOpenLoadAndRepair {
+			// Sealed history is never appended to again: its index is complete,
+			// so give back the handle.
+			_ = seg.indexFlushAndClose()
+		}
 		s.segments = append(s.segments, seg)
 	}
 	// The writable tail: reopen the last loaded segment, or create one.
@@ -186,6 +263,10 @@ func (s *Slot) tail() (*Segment, error) {
 	if seg.SizeBytes() >= s.segmentBytes {
 		seg.Seal()
 		if err := seg.Flush(); err != nil {
+			return nil, err
+		}
+		// The sealed segment's index is complete: make it durable and stop.
+		if err := seg.indexFlushAndClose(); err != nil {
 			return nil, err
 		}
 		next, err := CreateSegment(s.Dir, s.ID, seg.LastSeq+1)
@@ -283,6 +364,11 @@ func (s *Slot) appendAtSeq(seq uint64, rec *data.EventRecord) (bool, error) {
 	}
 	s.seqCounter.Store(seq)
 	s.indexRecordLocked(seq, rec)
+	seg.IndexRecord(seq, data.RecordMeta{
+		AggregateID: rec.AggregateID,
+		Version:     rec.Version,
+		CommandHash: data.HashCommandID(rec.CommandID),
+	})
 	s.pendingFlush++
 	s.advanceNotifyLocked()
 	return true, nil
@@ -330,6 +416,7 @@ func (s *Slot) appendFrameAtSeq(seq uint64, frame []byte) (bool, error) {
 	}
 	s.seqCounter.Store(seq)
 	s.indexMetaLocked(seq, meta)
+	seg.IndexRecord(seq, meta)
 	s.pendingFlush++
 	s.advanceNotifyLocked()
 	return true, nil

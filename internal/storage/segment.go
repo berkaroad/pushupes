@@ -64,6 +64,8 @@ type Segment struct {
 
 	scatterBuf   []byte   // scratch for EncodeScatter headers
 	scatterParts [][]byte // reusable segment list handed to pwritev
+
+	idx *segIndexWriter // index files (see segidx.go); nil when none
 }
 
 func headerBuf(slotID int32, baseSeq uint64) []byte {
@@ -108,7 +110,7 @@ func CreateSegment(dir string, slotID int32, baseSeq uint64) (*Segment, error) {
 		f.Close()
 		return nil, err
 	}
-	return &Segment{
+	seg := &Segment{
 		SlotID:        slotID,
 		BaseSeq:       baseSeq,
 		Path:          path,
@@ -117,7 +119,11 @@ func CreateSegment(dir string, slotID int32, baseSeq uint64) (*Segment, error) {
 		sizeBytes:     WALHeaderLen,
 		writable:      true,
 		lastFlushTime: time.Now(),
-	}, nil
+	}
+	// Best effort: a segment without an index is still a correct segment, the
+	// next startup writes the index after walking it.
+	_ = seg.openIndexWriter()
+	return seg, nil
 }
 
 func segmentName(baseSeq uint64) string {
@@ -240,6 +246,14 @@ func (s *Segment) commitFrame(seq uint64, n int64) {
 	s.LastSeq = seq
 	s.bytesSinceIndex += n
 	s.unflushed++
+	// Index the frame only now that it landed: framePos runs before the write,
+	// and a sparse entry for a frame that never reached the file would point
+	// past the data on the next load.
+	if s.idx != nil {
+		if last := len(s.index) - 1; last >= 0 && s.index[last].seq == seq {
+			s.idx.addSparse(seq, s.index[last].pos)
+		}
+	}
 }
 
 // writeFrame appends one already-encoded frame (recLen(4) + record) at the
@@ -313,6 +327,12 @@ func (s *Segment) Flush() error {
 	}
 	if err := s.File.Sync(); err != nil {
 		return err
+	}
+	if s.idx != nil {
+		// Push the buffered entries out; no fsync — the index is allowed to lag
+		// the WAL, and startup replays whatever it missed.
+		s.idx.flushBlock()
+		s.idx.flushSparse()
 	}
 	s.unflushed = 0
 	s.lastFlushTime = time.Now()
@@ -549,6 +569,7 @@ func (s *Segment) rebuildIndex(limit int64) error {
 	if err := s.File.Truncate(limit); err != nil {
 		return err
 	}
+	defer func() {}()
 	s.sizeBytes = limit
 	s.index = s.index[:0]
 	s.bytesSinceIndex = 0
@@ -575,6 +596,12 @@ func (s *Segment) rebuildIndex(limit int64) error {
 		s.LastSeq = seq
 		off += 4 + recLen
 		seq++
+	}
+	if s.idx != nil {
+		// The WAL shrank: the index must stop promising records that are gone.
+		if err := s.idx.truncateToSeq(s.LastSeq, s.index); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -687,18 +714,28 @@ func LoadSegment(path string) (*Segment, error) {
 	if err != nil {
 		return nil, err
 	}
-	// One windowed pass: it both finds the last complete record (a torn tail is
-	// truncated) and rebuilds the sparse index, without a pread per record.
-	w := newFrameWalker(s.File, int64(s.dataStart), s.sizeBytes)
-	var seq uint64 = s.BaseSeq
+	if err := s.walkAndIndex(s.BaseSeq, int64(s.dataStart)); err != nil {
+		s.File.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// walkAndIndex accounts records from a frame position to the end of the file:
+// one windowed pass that finds the last complete record (a torn tail is
+// truncated), counts records and rebuilds the sparse index, without a pread per
+// record. It is what a full recovery uses, and what resumes a segment from the
+// last position its index knows.
+func (s *Segment) walkAndIndex(fromSeq uint64, fromPos int64) error {
+	w := newFrameWalker(s.File, fromPos, s.sizeBytes)
+	seq := fromSeq
 	for {
 		frame, off, err := w.next()
 		if err == errShortTail || err == errBadRecordLen {
 			break // torn tail: truncate at the last complete record
 		}
 		if err != nil {
-			s.File.Close()
-			return nil, err
+			return err
 		}
 		if s.RecordCnt == 0 || s.bytesSinceIndex >= indexIntervalB {
 			s.index = append(s.index, indexEntry{seq: seq, pos: off})
@@ -712,27 +749,123 @@ func LoadSegment(path string) (*Segment, error) {
 	if limit := w.lastComplete(); limit != s.sizeBytes {
 		// torn tail: truncate to the last complete record
 		if err := s.File.Truncate(limit); err != nil {
-			s.File.Close()
-			return nil, err
+			return err
 		}
 		s.sizeBytes = limit
-	}
-	return s, nil
-}
-
-// Close releases the file handle.
-func (s *Segment) Close() error {
-	if s.File != nil {
-		err := s.File.Close()
-		s.File = nil
-		return err
 	}
 	return nil
 }
 
-// Remove deletes the segment file.
+// LoadSegmentIndexed restores a segment from its index files. The sparse index
+// gives the last frame position it knows, and one walk from there to the end of
+// the file settles the record count, the last seq and any torn tail — so the
+// pass is bounded by one index interval, not by the segment's size. It returns
+// (nil, nil, nil) when no usable index is present, leaving the caller to walk.
+func LoadSegmentIndexed(path, dir string) (*Segment, *segIndexLoad, error) {
+	s, err := OpenSegment(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	load, err := loadSegIndex(dir, s.SlotID, s.BaseSeq, -1, s.sizeBytes)
+	if err != nil {
+		s.File.Close()
+		return nil, nil, err
+	}
+	if load == nil || len(load.sparse) == 0 {
+		s.File.Close()
+		return nil, nil, nil
+	}
+	last := load.sparse[len(load.sparse)-1]
+	if last.seq < s.BaseSeq || last.pos < int64(s.dataStart) || last.pos >= s.sizeBytes {
+		// The index points outside the file: distrust it, let the caller walk.
+		s.File.Close()
+		segIndexDamaged.Add(1)
+		return nil, nil, nil
+	}
+	s.index = load.sparse
+	s.RecordCnt = int64(last.seq - s.BaseSeq) // the record at last.pos is counted by the walk
+	s.LastSeq = last.seq - 1
+	s.bytesSinceIndex = 0
+	if err := s.walkAndIndex(last.seq, last.pos); err != nil {
+		s.File.Close()
+		return nil, nil, err
+	}
+	if cnt := int(s.RecordCnt); len(load.entries) > cnt {
+		// The WAL holds fewer records than the index claims (a truncated
+		// segment): keep only what exists.
+		load.entries = load.entries[:cnt]
+		segIndexDamaged.Add(1)
+	}
+	return s, load, nil
+}
+
+// indexSparseFromMemory feeds the segment's in-memory sparse index into its
+// index files. Used when a walked segment is indexed at startup, where the walk
+// already produced the positions.
+func (s *Segment) indexSparseFromMemory() {
+	if s.idx == nil {
+		return
+	}
+	for _, e := range s.index {
+		s.idx.addSparse(e.seq, e.pos)
+	}
+}
+
+// IndexRecord adds one stored record to the segment's index (no-op when the
+// segment has none, and when indexing has been given up on).
+func (s *Segment) IndexRecord(seq uint64, m data.RecordMeta) {
+	if s.idx == nil {
+		return
+	}
+	s.idx.add(m.CommandHash, seq, m.AggregateID, m.Version)
+}
+
+// openIndexWriter starts (or resumes) this segment's index. Failure leaves the
+// segment without one: the WAL stays authoritative and the next startup writes
+// the index, so this never blocks writes.
+func (s *Segment) openIndexWriter() error {
+	if s.idx != nil {
+		return nil
+	}
+	w, err := openSegIndexWriter(filepath.Dir(s.Path), s.SlotID, s.BaseSeq)
+	if err != nil {
+		segIndexUnusable.Add(1)
+		return err
+	}
+	s.idx = w
+	return nil
+}
+
+// indexFlushAndClose makes the index durable and stops indexing this segment
+// (a sealed segment keeps its index; a new segment gets its own).
+func (s *Segment) indexFlushAndClose() error {
+	if s.idx == nil {
+		return nil
+	}
+	err := s.idx.close()
+	s.idx = nil
+	return err
+}
+
+// Close makes the index durable and releases both file handles.
+func (s *Segment) Close() error {
+	err := s.indexFlushAndClose()
+	if s.File != nil {
+		if cerr := s.File.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+		s.File = nil
+	}
+	return err
+}
+
+// Remove deletes the segment and its index files.
 func (s *Segment) Remove() error {
 	s.Close()
+	dir := filepath.Dir(s.Path)
+	for _, p := range []string{segIdxPath(dir, s.BaseSeq), segAgxPath(dir, s.BaseSeq), segSpxPath(dir, s.BaseSeq)} {
+		_ = os.Remove(p)
+	}
 	return os.Remove(s.Path)
 }
 

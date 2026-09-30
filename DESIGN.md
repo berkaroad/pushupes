@@ -272,6 +272,19 @@ leader 才有（它从副本进度上报里维护，`isr` 列的是**在同步�
   需要精确比对时用 `data.CommandIDBytes(frame)` 从帧里取 id（这是罕见的重放路径）。
   同一份 31GiB 数据：堆 inuse 3.7~4.3GiB → **1.42GiB**，`OpenStore` 38.7~80.9s →
   **20.0~26.0s**，节点启动到可服务 29.3s → **18.6s**，稳态 RSS 3.88 → **2.08GiB**。
+- **段索引文件（Phase 2，已落地）**：每段三个**追加式**派生文件（与 WAL 同目录同名前缀，
+  `internal/storage/segidx.go`）：`<baseSeq>.idx`（header 32B + 块 `crc32c(4) + n×20B`，
+  entry = command hash(8) seqOff(4) dictID(4) version(4)）、`<baseSeq>.agx`（段内聚合字典，
+  新增聚合即 sync）、`<baseSeq>.spx`（稀疏 seq→pos，16B/条）。**不变式**：索引是派生数据，
+  只加载 CRC 验证通过的最长前缀，其余从 WAL 重放；缺、坏、滞后一律退化为全量帧头扫描
+  （= 索引出现前的行为），因此正确性不依赖索引。恢复时用 `.spx` 最后位置续走到文件尾
+  （≤ 一个稀疏间隔）定出段长/条数，entry 数用 WAL 实际条数封顶（截断过的段不会凭空多出记录）。
+  **策略**：`OpenStore` 启动时把「缺失/损坏/滞后」的段补齐索引（`OpenSlotRepairing`）；
+  运行期（`ReloadSlot`、懒加载 `Slot()`、迁移推来的段）只加载、绝不补建，缺索引的段留给下次启动
+  ——即「启动补建、运行期维持现状」。**代价**：索引约 20B/条 ≈ 数据 **2.2%**（31GiB → 724MB）。
+  实测同一 31GiB 数据集（补建前清空索引）：冷启动 27.6s（遍历 + 补建，堆 1353MiB/sys 1978MiB）
+  → 热启动 **9.7s**（堆 1353MiB 不变）；两次启动逐槽 `last_seq == Σversion` 均精确。
+  热启动剩余开销主要是把 3250 万条索引载入内存结构（Phase 3 的目标）。
 - **聚合索引：一份目录 + 定长分块 arena**（原「`map[string]uint32` 版本表 +
   `map[string][]uint64` seq 表」）：现在每槽 `aggs map[string]aggEntry`（版本 + 该聚合
   在 arena 里的 (off,n)）与 `seqChunks [][]uint64`（每块 1024 条 = 8KiB，`i>>10`/`i&1023`
