@@ -1,0 +1,81 @@
+package storage
+
+import (
+	"os"
+	"testing"
+
+	"pushupes/internal/data"
+)
+
+// The on-disk aggregate index must map (aggregate, version) to the seq of the
+// record holding it, and must never serve a file it cannot validate.
+func TestSegAggIndexRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	seg := &Segment{SlotID: 3, BaseSeq: 100, Path: dir + "/0000000000000100.wal"}
+	if err := os.WriteFile(seg.Path, make([]byte, 64), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	aggA := "agg-a"
+	aggB := "agg-b"
+	lists := []segAggList{
+		{hash: data.HashCommandID(aggA), firstVer: 7, firstOrd: 3, pairs: []uint32{3, 4096, 5, 8192, 9, 12288}},
+		{hash: data.HashCommandID(aggB), firstVer: 1, firstOrd: 0, pairs: []uint32{0, 1024, 2, 2048}},
+	}
+	if err := writeSegAggIndex(seg, lists); err != nil {
+		t.Fatal(err)
+	}
+	ix, err := openSegAggIndex(dir, 3, 100)
+	if err != nil || ix == nil {
+		t.Fatalf("open: %v %v", ix, err)
+	}
+	if !ix.Valid() {
+		t.Fatal("fresh index does not validate")
+	}
+	defer ix.Close()
+
+	// version -> record: entry.firstVer is the first version and firstOrd the
+	// ordinal of that record, so index i covers version firstVer+i, offset
+	// offs[i], and seq baseSeq+firstOrd+i.
+	var firstVer, firstOrd uint32
+	gotOrd, gotOff := uint32(0), uint32(0)
+	found := ix.Lookup(data.HashCommandID(aggA), func(e segAggEntry) bool {
+		firstVer, firstOrd = e.firstVer, e.firstOrd
+		ord, off, ok := ix.Pair(e, 1) // the second record of the entry
+		if !ok {
+			return false
+		}
+		gotOrd, gotOff = ord, off
+		return true
+	})
+	if !found || firstVer != 7 || firstOrd != 3 || gotOrd != 5 || gotOff != 8192 {
+		t.Fatalf("lookup: found=%v firstVer=%d firstOrd=%d ord=%d off=%d", found, firstVer, firstOrd, gotOrd, gotOff)
+	}
+	if _, _, ok := ix.Pair(segAggEntry{count: 2}, 2); ok {
+		t.Fatal("out of range pair reported")
+	}
+	// A missing aggregate must come back empty, not wrong.
+	if ix.Lookup(data.HashCommandID("nope"), func(segAggEntry) bool { return true }) {
+		t.Fatal("missing aggregate reported present")
+	}
+	// A different slot must not be served this file.
+	if other, err := openSegAggIndex(dir, 4, 100); err != nil || other != nil {
+		t.Fatalf("slot mismatch: %v %v", other, err)
+	}
+	// A damaged byte must fail validation rather than be trusted.
+	f, err := os.OpenFile(segAidxPath(dir, 100), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{0xFF}, int64(segAidxHeaderByte)+4); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	ix2, err := openSegAggIndex(dir, 3, 100)
+	if err != nil || ix2 == nil {
+		t.Fatalf("reopen: %v %v", ix2, err)
+	}
+	if ix2.Valid() {
+		t.Fatal("damage was not detected")
+	}
+	ix2.Close()
+}

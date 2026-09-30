@@ -29,10 +29,16 @@ import (
 // Segments are contiguous: the next segment's baseSeq is this segment's last
 // seq + 1, which is what lets scans track seq incrementally.
 const (
-	WALMagic       = "ESWL"
-	WALFormatVer   = int8(1)
-	WALHeaderLen   = 20
-	indexIntervalB = int64(4096) // sparse index: one entry per ~4KiB
+	WALMagic     = "ESWL"
+	WALFormatVer = int8(1)
+	WALHeaderLen = 20
+	// indexIntervalB is how sparsely seq -> file offset is remembered in memory
+	// and in the segment's .spx file. It is a seek hint: a lookup lands at the
+	// nearest earlier entry and walks forward, so a coarser interval costs at
+	// most one interval of frames per seek and buys back the memory the fine
+	// 4 KiB grid used to hold (0.33% of the data, 101 MiB of a 439 MiB heap at
+	// 31 GiB).
+	indexIntervalB = int64(1 << 20) // one entry per ~1MiB
 )
 
 // DefaultSegmentBytes is the 256MiB roll threshold from the design.
@@ -66,6 +72,12 @@ type Segment struct {
 	scatterParts [][]byte // reusable segment list handed to pwritev
 
 	idx *segIndexWriter // index files (see segidx.go); nil when none
+
+	// aggIx caches this segment's opened aggregate index (segaidx.go). Without
+	// it a versioned read of sealed history re-opens and re-reads the directory
+	// once per version, which is the difference between ~0.1ms and ~1.5ms.
+	// Guarded by the slot's mutex, like every other segment field.
+	aggIx *segAggIndex
 }
 
 func headerBuf(slotID int32, baseSeq uint64) []byte {
@@ -862,6 +874,10 @@ func (s *Segment) Close() error {
 // Remove deletes the segment and its index files.
 func (s *Segment) Remove() error {
 	s.Close()
+	if s.aggIx != nil {
+		_ = s.aggIx.Close()
+		s.aggIx = nil
+	}
 	dir := filepath.Dir(s.Path)
 	for _, p := range []string{segIdxPath(dir, s.BaseSeq), segAgxPath(dir, s.BaseSeq), segSpxPath(dir, s.BaseSeq)} {
 		_ = os.Remove(p)

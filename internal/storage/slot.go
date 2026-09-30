@@ -1,9 +1,12 @@
 package storage
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,7 +40,7 @@ type AppendOutcome struct {
 // three in-memory indexes:
 //
 //	aggs:     aggregate_id -> latest version + seq range in the arena (rule 2)
-//	cmdIndex: command_id hash -> seq of its record     (rule 1, idempotency)
+//	blms:     command_id hash bloom filter              (rule 1, idempotency)
 //	seqChunks: every aggregate's seqs, dense and chunked (range reads by version)
 //
 // All writes are serialised by the slot lock; seq is the slot-global record
@@ -51,10 +54,13 @@ type Slot struct {
 	// exposed lock-free via LastSeq/atomic for the fetch hot path.
 	seqCounter atomic.Uint64
 
-	aggs      map[string]aggEntry // aggregate directory (see slotaggs.go)
-	cmdIndex  cmdTable
-	seqChunks [][]uint64 // arena: each aggregate's seqs, ascending
-	seqLen    int        // total seqs in the arena
+	aggs map[string]aggEntry // aggregate directory (see slotaggs.go)
+	blms *bloomSet
+	// blmsMark is where the newest segment's filters start in blms.filters;
+	// blmsSkipInsert suppresses inserts while a segment whose filter comes off
+	// disk has its metadata applied.
+	blmsMark       int
+	blmsSkipInsert bool
 
 	segmentBytes int64
 	flush        FlushPolicy
@@ -115,6 +121,7 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 		flush:        flush,
 		lastFlush:    time.Now(),
 		aggs:         make(map[string]aggEntry),
+		blms:         &bloomSet{},
 	}
 	s.cond = sync.NewCond(&s.mu)
 	w := make(chan struct{})
@@ -144,6 +151,23 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 		if seg.BaseSeq != expected {
 			seg.Close()
 			return nil, fmt.Errorf("slot %d: %s seq gap (base %d, expected %d)", slotID, p, seg.BaseSeq, expected)
+		}
+		s.blmsMark = len(s.blms.filters)
+		var segIdx *segCmdIndex
+		if !isTail && seg.RecordCnt > 0 {
+			// A sealed segment's command bloom either comes off its index file
+			// or is rebuilt at startup from the records indexed just below.
+			ix, ierr := openSegCmdIndex(s.Dir, s.ID, seg.BaseSeq)
+			if ierr != nil {
+				seg.Close()
+				return nil, fmt.Errorf("slot %d command index %s: %w", slotID, p, ierr)
+			}
+			if ix != nil && ix.Bloom() != nil && ix.Valid() {
+				segIdx = ix
+				s.blmsSkipInsert = true
+			} else if ix != nil {
+				ix.Close()
+			}
 		}
 		if seg.RecordCnt > 0 {
 			from := seg.BaseSeq
@@ -191,7 +215,32 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 				segIndexBuilt.Add(1)
 			}
 			expected = seg.LastSeq + 1
-		} else if mode == slotOpenLoadAndRepair || (isTail && load != nil) {
+		}
+		switch {
+		case segIdx != nil:
+			s.blms.filters = append(s.blms.filters, segIdx.Bloom().filters...)
+			segIdx.Close()
+			s.blmsSkipInsert = false
+		case !isTail && seg.RecordCnt > 0:
+			// No usable bloom for a sealed segment. Rebuilding it needs the
+			// records just indexed, which is startup work; running, the set is
+			// marked incomplete so it never claims a command is absent.
+			s.blmsSkipInsert = false
+			if mode == slotOpenLoadAndRepair {
+				if err := writeSegCmdIndex(seg, s.blms.filters[s.blmsMark:]); err != nil {
+					segIndexUnusable.Add(1)
+					s.blms.unsafe = true
+				} else {
+					segCmdBuilt.Add(1)
+				}
+			} else {
+				segIndexUnusable.Add(1)
+				s.blms.unsafe = true
+			}
+		default:
+			s.blmsSkipInsert = false
+		}
+		if mode == slotOpenLoadAndRepair || (isTail && load != nil) {
 			// An empty segment (a header-only file from an earlier start) has
 			// nothing to index, but it does need the index files so records
 			// appended to it later extend them instead of being replayed by the
@@ -203,6 +252,27 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 			// Sealed history is never appended to again: its index is complete,
 			// so give back the handle.
 			_ = seg.indexFlushAndClose()
+			// Move the segment's per-aggregate seqs out of memory. The index
+			// that keeps them readable is written first (a start is where
+			// indexes are written; running, the seqs stay in memory instead).
+			if seg.RecordCnt > 0 {
+				need := true
+				if ix, err := openSegAggIndex(s.Dir, s.ID, seg.BaseSeq); err == nil && ix != nil {
+					need = !ix.Valid()
+					ix.Close()
+				}
+				if need {
+					if err := s.sealAggSeqsLocked(seg); err != nil {
+						segIndexUnusable.Add(1)
+					} else {
+						segAggBuilt.Add(1)
+					}
+				} else {
+					// The index is there: the seqs it covers need not stay in
+					// memory just because loading the segment rebuilt them.
+					s.dropSealedSeqsLocked(seg)
+				}
+			}
 		}
 		s.segments = append(s.segments, seg)
 	}
@@ -243,15 +313,13 @@ func (s *Slot) indexMetaLocked(seq uint64, m data.RecordMeta) {
 	if m.Version > e.version {
 		e.version = m.Version
 	}
-	s.cmdIndex.put(m.CommandHash, seq)
+	if !s.blmsSkipInsert {
+		s.blms.insert(m.CommandHash)
+	}
 	// Only a contiguous append extends the aggregate's seq range; a record
 	// arriving out of order still updates its version, exactly as before.
-	if m.Version == uint32(e.n+1) {
-		if e.n == 0 {
-			e.off = s.seqLen
-		}
-		s.appendSeqLocked(seq)
-		e.n++
+	if m.Version == uint32(e.sealedN+e.n+1) {
+		e.appendSeq(seq)
 	}
 	s.aggs[m.AggregateID] = e
 }
@@ -268,6 +336,18 @@ func (s *Slot) tail() (*Segment, error) {
 		// The sealed segment's index is complete: make it durable and stop.
 		if err := seg.indexFlushAndClose(); err != nil {
 			return nil, err
+		}
+		// Sort its commands by hash into <baseSeq>.cidx, the on-disk side of
+		// the command lookup. Best effort: a segment without it is still
+		// correct, and the next start writes it.
+		if err := writeSegCmdIndex(seg, s.blms.filters[s.blmsMark:]); err != nil {
+			segIndexUnusable.Add(1)
+		}
+		s.blmsMark = len(s.blms.filters)
+		// Its per-aggregate seqs move to disk: sealed seqs never change again,
+		// and they are what the in-memory arena would otherwise keep forever.
+		if err := s.sealAggSeqsLocked(seg); err != nil {
+			segIndexUnusable.Add(1) // seqs stay in memory: correct, just heavier
 		}
 		next, err := CreateSegment(s.Dir, s.ID, seg.LastSeq+1)
 		if err != nil {
@@ -287,26 +367,19 @@ func (s *Slot) Append(rec *data.EventRecord) (*AppendOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Rule 1: idempotency by command_id within the slot. The index holds
-	// hashes only, so a candidate is confirmed against the record it points at
-	// — the record the EXISTS answer returns anyway.
-	var stored *data.EventRecord
-	seq, found, err := s.cmdIndex.lookup(data.HashCommandID(rec.CommandID), func(seq uint64) (bool, error) {
-		got, err := s.readBySeqLocked(seq)
-		if err != nil || got == nil {
-			return false, err
+	// Rule 1: idempotency by command_id within the slot. The bloom filter
+	// answers "definitely not stored" without touching anything; only a "maybe"
+	// costs a lookup, and a candidate is always confirmed against the record it
+	// points at — the record the EXISTS answer returns anyway.
+	hash := data.HashCommandID(rec.CommandID)
+	if s.blms.maybe(hash) {
+		stored, seq, found, err := s.lookupCommandLocked(rec.CommandID, hash)
+		if err != nil {
+			return nil, err
 		}
-		if got.CommandID != rec.CommandID {
-			return false, nil // a different command sharing the hash
+		if found {
+			return &AppendOutcome{Status: data.StatusExists, Seq: seq, Record: stored}, nil
 		}
-		stored = got
-		return true, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	if found {
-		return &AppendOutcome{Status: data.StatusExists, Seq: seq, Record: stored}, nil
 	}
 
 	// Rule 2: version must be exactly current+1 (or 1 for a new aggregate).
@@ -319,12 +392,17 @@ func (s *Slot) Append(rec *data.EventRecord) (*AppendOutcome, error) {
 	if err != nil {
 		return nil, err
 	}
-	seq = s.seqCounter.Load() + 1
+	seq := s.seqCounter.Load() + 1
 	if err := seg.AppendRecord(seq, rec); err != nil {
 		return nil, err
 	}
 	s.seqCounter.Store(seq)
 	s.indexRecordLocked(seq, rec)
+	seg.IndexRecord(seq, data.RecordMeta{
+		AggregateID: rec.AggregateID,
+		Version:     rec.Version,
+		CommandHash: data.HashCommandID(rec.CommandID),
+	})
 	s.pendingFlush++
 	s.advanceNotifyLocked()
 	return &AppendOutcome{Status: data.StatusSuccess, Seq: seq, Record: rec}, nil
@@ -422,6 +500,157 @@ func (s *Slot) appendFrameAtSeq(seq uint64, frame []byte) (bool, error) {
 	return true, nil
 }
 
+// aggHash hashes an aggregate id for the segment aggregate index. It is the
+// same FNV-1a string hash the command ids use: both are only ever used as a
+// bucket selector whose candidates are confirmed against a stored record.
+func aggHash(aggregateID string) uint64 { return data.HashCommandID(aggregateID) }
+
+// sealAggSeqsLocked writes the sealed segment's part of every aggregate's seq
+// list to <baseSeq>.aidx and only then drops those seqs from the arena. An
+// all-or-nothing move: on failure the seqs stay in memory, which costs memory
+// but cannot lose a lookup.
+func (s *Slot) sealAggSeqsLocked(seg *Segment) error {
+	if err := s.writeSegAggSeqsLocked(seg); err != nil {
+		return err
+	}
+	s.dropSealedSeqsLocked(seg)
+	return nil
+}
+
+// writeSegAggSeqsLocked writes the sealed segment's part of every aggregate's
+// seq list to <baseSeq>.aidx, so that nothing is dropped before it is on disk.
+// Caller holds s.mu.
+func (s *Slot) writeSegAggSeqsLocked(seg *Segment) error {
+	if seg.RecordCnt == 0 {
+		return nil
+	}
+	// Each record's byte offset inside the segment, addressed by its ordinal in
+	// it: one frame walk over the sealed segment (the same walk the command index
+	// needs) turns an aggregate's seqs into offsets, so a sealed read is one
+	// pread instead of a walk from the nearest sparse hint — which at 1 MiB
+	// granularity is about a thousand frames, and cost a millisecond per record.
+	ents, err := collectSegCmdEntries(seg)
+	if err != nil || len(ents) == 0 {
+		return errSegAggNoOffsets // seqs stay in memory; the next start retries
+	}
+	offs := make([]uint32, seg.RecordCnt)
+	for _, e := range ents {
+		if ord := e.seq - seg.BaseSeq; int64(ord) < seg.RecordCnt {
+			offs[ord] = uint32(e.off)
+		}
+	}
+	var lists []segAggList
+	for id, e := range s.aggs {
+		if e.n == 0 {
+			continue
+		}
+		// The aggregate's list is ascending, so the sealed prefix is a binary
+		// search, and seq-baseSeq is the record's ordinal in the segment.
+		k := sort.Search(e.n, func(i int) bool { return e.seqAt(i) > seg.LastSeq })
+		if k == 0 {
+			continue
+		}
+		first := e.seqAt(0)
+		if first < seg.BaseSeq {
+			continue
+		}
+		pairs := make([]uint32, 0, k*2)
+		ok := true
+		for i := 0; i < k; i++ {
+			ord := e.seqAt(i) - seg.BaseSeq
+			if int64(ord) >= seg.RecordCnt || offs[ord] == 0 {
+				ok = false
+				break
+			}
+			pairs = append(pairs, uint32(ord), offs[ord])
+		}
+		if !ok {
+			continue
+		}
+		lists = append(lists, segAggList{
+			hash:     aggHash(id),
+			firstVer: uint32(e.sealedN + 1),
+			firstOrd: uint32(first - seg.BaseSeq),
+			pairs:    pairs,
+		})
+	}
+	if len(lists) == 0 {
+		return nil
+	}
+	if seg.aggIx != nil { // the file is about to be rewritten
+		_ = seg.aggIx.Close()
+		seg.aggIx = nil
+	}
+	return writeSegAggIndex(seg, lists)
+}
+
+// dropSealedSeqsLocked removes the sealed segment's seqs from the arena, now
+// that they are readable from its aggregate index. It runs at seal and again at
+// every start: a restart must not rebuild in memory what the disk already holds.
+func (s *Slot) dropSealedSeqsLocked(seg *Segment) {
+	for id, e := range s.aggs {
+		if e.n == 0 {
+			continue
+		}
+		k := sort.Search(e.n, func(i int) bool { return e.seqAt(i) > seg.LastSeq })
+		if k == 0 {
+			continue
+		}
+		e.dropFirst(k)
+		e.sealedN += k
+		s.aggs[id] = e
+	}
+}
+
+// sealedVersionSeqLocked resolves version v of an aggregate that lives in a
+// sealed segment: newest segment first, its aggregate index locates the entry
+// covering v, and a candidate is confirmed against the record it points at.
+// Caller holds s.mu.
+func (s *Slot) sealedVersionSeqLocked(aggregateID string, v uint32) (uint64, *data.EventRecord, error) {
+	var buf [4 << 10]byte
+	hash := aggHash(aggregateID)
+	for i := len(s.segments) - 1; i >= 0; i-- {
+		seg := s.segments[i]
+		if seg.RecordCnt == 0 {
+			continue
+		}
+		ix := seg.aggIx
+		if ix == nil {
+			opened, err := openSegAggIndex(s.Dir, s.ID, seg.BaseSeq)
+			if err != nil {
+				return 0, nil, err
+			}
+			if opened == nil {
+				continue // no index for this segment: nothing to search
+			}
+			ix, seg.aggIx = opened, opened
+		}
+		var seq uint64
+		var hit *data.EventRecord
+		found := ix.Lookup(hash, func(e segAggEntry) bool {
+			if v < e.firstVer || v >= e.firstVer+e.count {
+				return false
+			}
+			ord, off, ok := ix.Pair(e, int(v-e.firstVer))
+			if !ok {
+				return false
+			}
+			rec, _, rerr := readRecordAt(seg.File, int64(off), buf[:])
+			if rerr != nil || rec.AggregateID != aggregateID || rec.Version != v {
+				return false
+			}
+			seq, hit = seg.BaseSeq+uint64(ord), &rec
+			return true
+		})
+		if found {
+			return seq, hit, nil
+		}
+	}
+	return 0, nil, errAggSeqNotFound
+}
+
+var errAggSeqNotFound = errors.New("aggregate version not found in the sealed indexes")
+
 // readBySeqLocked fetches one record by seq; caller holds s.mu (read or write).
 func (s *Slot) readBySeqLocked(seq uint64) (*data.EventRecord, error) {
 	if seq == 0 || seq > s.seqCounter.Load() {
@@ -510,30 +739,124 @@ func (s *Slot) CurrentVersion(aggregateID string) uint32 {
 // RecordByCommand looks a record up by its idempotency key. The index stores
 // hashes, so a hit is confirmed by the record's own command id.
 func (s *Slot) RecordByCommand(commandID string) (*data.EventRecord, uint64, error) {
+	hash := data.HashCommandID(commandID)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	var rec *data.EventRecord
-	seq, found, err := s.cmdIndex.lookup(data.HashCommandID(commandID), func(seq uint64) (bool, error) {
-		got, err := s.readBySeqLocked(seq)
-		if err != nil || got == nil {
-			return false, err
-		}
-		if got.CommandID != commandID {
-			return false, nil
-		}
-		rec = got
-		return true, nil
-	})
+	if !s.blms.maybe(hash) {
+		return nil, 0, nil // definitely not stored
+	}
+	rec, seq, found, err := s.lookupCommandLocked(commandID, hash)
 	if err != nil || !found {
 		return nil, 0, err
 	}
 	return rec, seq, nil
 }
 
-// AggregateVersion reads records of one aggregate starting at a version
-// (1-based, contiguous) up to limit records or maxBytes decoded records,
-// stopping at uptoSeq (exclusive; 0 = no cap). Records at seq > uptoSeq have
-// not reached the high watermark and must not be observed.
+// lookupCommandLocked finds a stored command: the sealed segments' sorted
+// command indexes (newest first), then the writable segment, whose own index is
+// still in write order and therefore scanned. Every candidate is confirmed
+// against the record it points at, so a hash collision or a damaged index can
+// only cost time. Caller holds s.mu.
+func (s *Slot) lookupCommandLocked(commandID string, hash uint64) (*data.EventRecord, uint64, bool, error) {
+	if commandID == "" {
+		return nil, 0, false, nil
+	}
+	var buf [4 << 10]byte
+	for i := len(s.segments) - 1; i >= 0; i-- {
+		seg := s.segments[i]
+		if seg.RecordCnt == 0 {
+			continue
+		}
+		if seg.Writable() {
+			rec, seq, err := s.lookupTailCommandLocked(seg, commandID, hash, buf[:])
+			if err != nil || rec != nil {
+				return rec, seq, rec != nil, err
+			}
+			continue
+		}
+		ix, err := openSegCmdIndex(s.Dir, s.ID, seg.BaseSeq)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		if ix == nil {
+			continue // no index for this segment: nothing to search
+		}
+		var hit *data.EventRecord
+		var hitSeq uint64
+		found, err := ix.LookupCmd(uint32(hash>>32), func(e segCmdEntry) bool {
+			got, _, rerr := readRecordAt(seg.File, e.off, buf[:])
+			if rerr != nil || got.CommandID != commandID {
+				return false
+			}
+			r := got
+			hit, hitSeq = &r, e.seq
+			return true
+		})
+		ix.Close()
+		if err != nil {
+			return nil, 0, false, err
+		}
+		if found {
+			return hit, hitSeq, true, nil
+		}
+	}
+	return nil, 0, false, nil
+}
+
+// lookupTailCommandLocked searches the writable segment, whose command index is
+// still in write order: it flushes whatever the writer buffers, scans that
+// segment's entries and confirms each candidate against the record at its seq.
+// Caller holds s.mu.
+func (s *Slot) lookupTailCommandLocked(seg *Segment, commandID string, hash uint64, buf []byte) (*data.EventRecord, uint64, error) {
+	if seg.idx != nil {
+		seg.idx.flushBlock() // entries still buffered are not on disk yet
+	}
+	var hit *data.EventRecord
+	var hitSeq uint64
+	sawEntries := false
+	err := scanIdxEntries(segIdxPath(s.Dir, seg.BaseSeq), segIdxMagic, s.ID, seg.BaseSeq, segIdxEntryBytes, func(raw []byte) bool {
+		sawEntries = true
+		if binary.BigEndian.Uint64(raw[0:8]) != hash {
+			return true // keep scanning
+		}
+		seq := seg.BaseSeq + uint64(binary.BigEndian.Uint32(raw[8:12]))
+		got, err := s.readBySeqLocked(seq)
+		if err != nil || got == nil || got.CommandID != commandID {
+			return true
+		}
+		hit, hitSeq = got, seq
+		return false
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	if hit != nil || sawEntries || seg.idx != nil {
+		return hit, hitSeq, nil
+	}
+	// The writable segment has records but no index file at all (deleted, or
+	// data written before the index existed). Walking its frame headers keeps
+	// the answer correct; a start writes the missing index and the walk stops
+	// being needed.
+	segIndexUnusable.Add(1)
+	err = seg.ScanHeaders(seg.BaseSeq, func(seq uint64, meta data.RecordMeta) bool {
+		if meta.CommandHash != hash {
+			return true
+		}
+		got, rerr := s.readBySeqLocked(seq)
+		if rerr != nil || got == nil || got.CommandID != commandID {
+			return true
+		}
+		hit, hitSeq = got, seq
+		return false
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return hit, hitSeq, nil
+}
+
+// Wake returns the current wake handle pointer. Lock-free read; the handle
+// is swapped under s.mu on every advance (advanceNotifyLocked).
 func (s *Slot) AggregateVersion(aggregateID string, fromVersion uint32, limit, uptoSeq uint64) ([]*data.EventRecord, []uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -541,22 +864,42 @@ func (s *Slot) AggregateVersion(aggregateID string, fromVersion uint32, limit, u
 	if fromVersion == 0 {
 		fromVersion = 1
 	}
-	if fromVersion > uint32(e.n) {
+	total := uint32(e.sealedN) + uint32(e.n)
+	if fromVersion > total {
 		return nil, nil, nil
 	}
+	// Versions up to sealedN live in the sealed segments' aggregate indexes, the
+	// rest in the arena. Reading the newest versions — the hot path — never
+	// touches the disk either way.
+	liveFirst := uint32(e.sealedN) + 1
 	var out []*data.EventRecord
 	var outSeqs []uint64
-	for v := fromVersion; v <= uint32(e.n); v++ {
+	for v := fromVersion; v <= total; v++ {
 		if limit > 0 && uint64(len(out)) >= limit {
 			break
 		}
-		seq := s.seqAtLocked(e.off + int(v-1))
+		var (
+			seq uint64
+			rec *data.EventRecord
+		)
+		if v >= liveFirst {
+			seq = e.seqAt(int(v - liveFirst))
+		} else {
+			got, gotRec, err := s.sealedVersionSeqLocked(aggregateID, v)
+			if err != nil {
+				return out, outSeqs, err
+			}
+			seq, rec = got, gotRec
+		}
 		if uptoSeq > 0 && seq > uptoSeq {
 			break
 		}
-		rec, err := s.readBySeqLocked(seq)
-		if err != nil {
-			return out, outSeqs, err
+		var err error
+		if rec == nil {
+			rec, err = s.readBySeqLocked(seq)
+			if err != nil {
+				return out, outSeqs, err
+			}
 		}
 		if rec == nil {
 			return out, outSeqs, fmt.Errorf("slot %d: index/seq %d desync", s.ID, seq)
@@ -571,7 +914,8 @@ func (s *Slot) AggregateVersion(aggregateID string, fromVersion uint32, limit, u
 func (s *Slot) LastVersionOf(aggregateID string) uint32 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return uint32(s.aggs[aggregateID].n)
+	e := s.aggs[aggregateID]
+	return uint32(e.sealedN + e.n)
 }
 
 // ReadRange returns byte ranges covering records fromSeq <= seq < untilSeq

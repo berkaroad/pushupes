@@ -55,6 +55,8 @@ var (
 	segIndexBuilt    atomic.Uint64 // segments whose index was written at startup
 	segIndexReplayed atomic.Uint64 // records replayed past the index coverage
 	segIndexUnusable atomic.Uint64 // segments that had to be walked (no index)
+	segCmdBuilt      atomic.Uint64 // sealed command indexes written at startup
+	segAggBuilt      atomic.Uint64 // sealed aggregate indexes written at startup
 )
 
 // segIndexEntry is one record's index entry.
@@ -94,7 +96,15 @@ func segIdxHeaderBuf(magic string, slotID int32, baseSeq uint64) []byte {
 
 // checkSegIdxHeader validates magic, version, slot and base seq.
 func checkSegIdxHeader(h []byte, magic string, slotID int32, baseSeq uint64) bool {
-	if len(h) < segIdxHeaderBytes || string(h[:4]) != magic || h[4] != 1 {
+	return checkSegIdxHeaderVer(h, 1, magic, slotID, baseSeq)
+}
+
+// checkSegIdxHeaderVer is checkSegIdxHeader with an explicit format version: the
+// aggregate index bumped its version when the seq list became per-aggregate, so
+// files written by the older, wrong layout are rejected and rewritten instead of
+// trusted (a CRC cannot tell that a value is the wrong seq).
+func checkSegIdxHeaderVer(h []byte, ver byte, magic string, slotID int32, baseSeq uint64) bool {
+	if len(h) < segIdxHeaderBytes || string(h[:4]) != magic || h[4] != ver {
 		return false
 	}
 	if int32(binary.BigEndian.Uint32(h[8:12])) != slotID {
@@ -212,18 +222,30 @@ func openAppendFile(path, magic string, slotID int32, baseSeq uint64) (*os.File,
 	return f, nil
 }
 
-// blockBytes is the on-disk size of the first n record entries (blocks of at
-// most segIdxBlockMax entries, each block prefixed with its CRC).
+// A block is [crc32c(4)][count(2)][count * entryBytes]: the entry count is on
+// disk, so a reader never infers block boundaries from the remaining file size
+// (blocks can be any size, and several small ones may sit side by side).
+const segIdxBlockHead = 6
+
+// blockBytes is the on-disk size of the first n record entries.
 func blockBytes(n int) int {
 	full := n / segIdxBlockMax
 	rem := n % segIdxBlockMax
-	return full*(segIdxBlockMax*segIdxEntryBytes+4) + rem*segIdxEntryBytes + boolInt(rem > 0)*4
+	total := full * (segIdxBlockHead + segIdxBlockMax*segIdxEntryBytes)
+	if rem > 0 {
+		total += segIdxBlockHead + rem*segIdxEntryBytes
+	}
+	return total
 }
 
 func blockBytes16(n int) int {
 	full := n / segIdxBlockMax
 	rem := n % segIdxBlockMax
-	return full*(segIdxBlockMax*segSpxEntryBytes+4) + rem*segSpxEntryBytes + boolInt(rem > 0)*4
+	total := full * (segIdxBlockHead + segIdxBlockMax*segSpxEntryBytes)
+	if rem > 0 {
+		total += segIdxBlockHead + rem*segSpxEntryBytes
+	}
+	return total
 }
 
 func boolInt(b bool) int {
@@ -304,9 +326,10 @@ func (w *segIndexWriter) flushBlock() {
 	if w.err != nil || len(w.block) == 0 {
 		return
 	}
-	buf := make([]byte, 4+len(w.block))
-	binary.BigEndian.PutUint32(buf[0:4], crc32.Checksum(w.block, segIdxCRC))
-	copy(buf[4:], w.block)
+	buf := make([]byte, segIdxBlockHead+len(w.block))
+	binary.BigEndian.PutUint16(buf[4:6], uint16(len(w.block)/segIdxEntryBytes))
+	copy(buf[6:], w.block)
+	binary.BigEndian.PutUint32(buf[0:4], crc32.Checksum(buf[4:], segIdxCRC))
 	if _, err := w.idx.WriteAt(buf, w.idxOff+segIdxHeaderBytes); err != nil {
 		w.err = err
 		return
@@ -319,9 +342,10 @@ func (w *segIndexWriter) flushSparse() {
 	if w.err != nil || len(w.sparse) == 0 {
 		return
 	}
-	buf := make([]byte, 4+len(w.sparse))
-	binary.BigEndian.PutUint32(buf[0:4], crc32.Checksum(w.sparse, segIdxCRC))
-	copy(buf[4:], w.sparse)
+	buf := make([]byte, segIdxBlockHead+len(w.sparse))
+	binary.BigEndian.PutUint16(buf[4:6], uint16(len(w.sparse)/segSpxEntryBytes))
+	copy(buf[6:], w.sparse)
+	binary.BigEndian.PutUint32(buf[0:4], crc32.Checksum(buf[4:], segIdxCRC))
 	if _, err := w.spx.WriteAt(buf, w.spxOff+segIdxHeaderBytes); err != nil {
 		w.err = err
 		return
@@ -397,9 +421,10 @@ func (w *segIndexWriter) truncateToSeq(lastSeq uint64, sparse []indexEntry) erro
 	w.sparse = w.sparse[:0]
 	w.spxOff = 0
 	if len(kept) > 0 {
-		buf := make([]byte, 4+len(kept))
-		binary.BigEndian.PutUint32(buf[0:4], crc32.Checksum(kept, segIdxCRC))
-		copy(buf[4:], kept)
+		buf := make([]byte, segIdxBlockHead+len(kept))
+		binary.BigEndian.PutUint16(buf[4:6], uint16(len(kept)/segSpxEntryBytes))
+		copy(buf[6:], kept)
+		binary.BigEndian.PutUint32(buf[0:4], crc32.Checksum(buf[4:], segIdxCRC))
 		if _, err := w.spx.WriteAt(buf, segIdxHeaderBytes); err != nil {
 			return err
 		}
@@ -500,38 +525,33 @@ func loadIdxEntries(path, magic string, slotID int32, baseSeq uint64, entryBytes
 	}
 	size := st.Size()
 	var out [][]byte
-	off := int64(segIdxHeaderBytes)
-	for off < size {
-		remaining := size - off
-		if remaining < 4 {
+	for off := int64(segIdxHeaderBytes); off < size; {
+		if size-off < int64(segIdxBlockHead) {
 			return out, true, nil
 		}
-		payload := int64(segIdxBlockMax * entryBytes)
-		if remaining-4 < payload {
-			payload = remaining - 4
+		head := make([]byte, segIdxBlockHead)
+		if err := readAtFull(f, head, off); err != nil {
+			return out, false, err
 		}
-		if payload%int64(entryBytes) != 0 {
-			// A torn block leaves a partial entry: valid prefix only.
-			payload -= payload % int64(entryBytes)
-			if payload == 0 {
-				return out, true, nil
-			}
+		count := int(binary.BigEndian.Uint16(head[4:6]))
+		payload := int64(count) * int64(entryBytes)
+		if count <= 0 || off+int64(segIdxBlockHead)+payload > size {
+			return out, true, nil // torn block: valid prefix only
 		}
-		buf := make([]byte, 4+payload)
+		buf := make([]byte, int64(segIdxBlockHead)+payload)
 		if err := readAtFull(f, buf, off); err != nil {
 			return out, false, err
 		}
-		want := binary.BigEndian.Uint32(buf[0:4])
-		if crc32.Checksum(buf[4:], segIdxCRC) != want {
+		if crc32.Checksum(buf[4:], segIdxCRC) != binary.BigEndian.Uint32(buf[0:4]) {
 			return out, true, nil
 		}
 		for i := int64(0); i < payload; i += int64(entryBytes) {
-			out = append(out, buf[4+i:4+i+int64(entryBytes)])
+			out = append(out, buf[segIdxBlockHead+i:segIdxBlockHead+i+int64(entryBytes)])
 		}
 		if maxEntries > 0 && len(out) >= maxEntries {
 			return out[:maxEntries], false, nil
 		}
-		off += 4 + payload
+		off += int64(segIdxBlockHead) + payload
 	}
 	return out, false, nil
 }
@@ -543,6 +563,60 @@ func readAtFull(f *os.File, buf []byte, off int64) error {
 		return fmt.Errorf("short read: %d/%d", n, len(buf))
 	}
 	return err
+}
+
+// scanIdxEntries walks a block file's entries in order, calling fn for each
+// until fn returns false. A damaged block ends the walk: only the validated
+// prefix is ever handed out.
+func scanIdxEntries(path, magic string, slotID int32, baseSeq uint64, entryBytes int, fn func(raw []byte) bool) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+	h := make([]byte, segIdxHeaderBytes)
+	if err := readAtFull(f, h, 0); err != nil {
+		return nil
+	}
+	if !checkSegIdxHeader(h, magic, slotID, baseSeq) {
+		return nil
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	size := st.Size()
+	for off := int64(segIdxHeaderBytes); off < size; {
+		if size-off < int64(segIdxBlockHead) {
+			return nil
+		}
+		head := make([]byte, segIdxBlockHead)
+		if err := readAtFull(f, head, off); err != nil {
+			return err
+		}
+		count := int(binary.BigEndian.Uint16(head[4:6]))
+		payload := int64(count) * int64(entryBytes)
+		if count <= 0 || off+int64(segIdxBlockHead)+payload > size {
+			return nil
+		}
+		buf := make([]byte, int64(segIdxBlockHead)+payload)
+		if err := readAtFull(f, buf, off); err != nil {
+			return err
+		}
+		if crc32.Checksum(buf[4:], segIdxCRC) != binary.BigEndian.Uint32(buf[0:4]) {
+			return nil
+		}
+		for i := int64(0); i < payload; i += int64(entryBytes) {
+			if !fn(buf[segIdxBlockHead+i : segIdxBlockHead+i+int64(entryBytes)]) {
+				return nil
+			}
+		}
+		off += int64(segIdxBlockHead) + payload
+	}
+	return nil
 }
 
 // segDictEntry is one aggregate dictionary entry.

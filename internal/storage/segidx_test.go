@@ -65,7 +65,7 @@ func TestSegIndexRoundTripAndDamage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.WriteAt([]byte{0xFF}, segIdxHeaderBytes+5124+8); err != nil {
+	if _, err := f.WriteAt([]byte{0xFF}, segIdxHeaderBytes+(segIdxBlockHead+segIdxBlockMax*segIdxEntryBytes)+7); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
@@ -96,8 +96,8 @@ func TestSegIndexRoundTripAndDamage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if w2.idxOff != int64(256*segIdxEntryBytes+4) {
-		t.Fatalf("reopen offset %d, want the validated prefix %d", w2.idxOff, 256*segIdxEntryBytes+4)
+	if w2.idxOff != int64(blockBytes(256)) {
+		t.Fatalf("reopen offset %d, want the validated prefix %d", w2.idxOff, blockBytes(256))
 	}
 	for i := 256; i < 300; i++ {
 		w2.add(0xAAAA0000_0000_0000+uint64(i), base+uint64(i), fmt.Sprintf("agg-%d", i%2), uint32(i%3+1))
