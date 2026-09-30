@@ -45,8 +45,11 @@ func TestAppendFrameAtSeqLandsLeaderBytes(t *testing.T) {
 	}
 
 	// Indexes were rebuilt from frame metadata alone.
-	if cur := slot.aggVersions["agg-frame"]; cur != n {
-		t.Fatalf("aggVersions=%d want %d", cur, n)
+	if cur := slot.CurrentVersion("agg-frame"); cur != n {
+		t.Fatalf("CurrentVersion=%d want %d", cur, n)
+	}
+	if back := slot.LastVersionOf("agg-frame"); back != n {
+		t.Fatalf("LastVersionOf=%d want %d", back, n)
 	}
 	// The command index keeps hashes; a lookup confirms against the record.
 	if rec, seq, err := slot.RecordByCommand("cmd-frame-4"); err != nil || rec == nil || seq != 4 {

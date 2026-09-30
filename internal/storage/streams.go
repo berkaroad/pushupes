@@ -37,7 +37,7 @@ type StreamList struct {
 func (s *Slot) StreamCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.aggVersions)
+	return len(s.aggs)
 }
 
 // SlotGauges returns per-slot console gauges indexed by slot id: bytes of WAL
@@ -103,15 +103,15 @@ func (st *Store) StreamPage(slotID int32, after string, limit int) (StreamList, 
 // console walk the whole slot in pages.
 func (s *Slot) streamPage(after string, limit int, out *StreamList) {
 	s.mu.RLock()
-	out.Total = len(s.aggVersions)
+	out.Total = len(s.aggs)
 	h := make(streamHeap, 0, limit)
 	more := false
-	for id, v := range s.aggVersions {
+	for id, e := range s.aggs {
 		if id <= after {
 			continue
 		}
 		if len(h) < limit {
-			h = append(h, StreamVersion{AggregateID: id, Version: v})
+			h = append(h, StreamVersion{AggregateID: id, Version: e.version})
 			if len(h) == limit {
 				heap.Init(&h)
 			}
@@ -119,7 +119,7 @@ func (s *Slot) streamPage(after string, limit int, out *StreamList) {
 		}
 		// Full page: keep the smallest ids, remember that the page is cut.
 		if id < h[0].AggregateID {
-			h[0] = StreamVersion{AggregateID: id, Version: v}
+			h[0] = StreamVersion{AggregateID: id, Version: e.version}
 			heap.Fix(&h, 0)
 		}
 		more = true

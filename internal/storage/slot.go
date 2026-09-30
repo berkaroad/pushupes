@@ -36,9 +36,9 @@ type AppendOutcome struct {
 // Slot is one of the fixed 128 slots: an append-only WAL of segments plus
 // three in-memory indexes:
 //
-//	aggVersions: aggregate_id -> last committed version (rule 2)
-//	cmdIndex:    command_id  -> seq of its record      (rule 1, idempotency)
-//	aggSeqs:     aggregate_id -> ordered seqs           (range reads by version)
+//	aggs:     aggregate_id -> latest version + seq range in the arena (rule 2)
+//	cmdIndex: command_id hash -> seq of its record     (rule 1, idempotency)
+//	seqChunks: every aggregate's seqs, dense and chunked (range reads by version)
 //
 // All writes are serialised by the slot lock; seq is the slot-global record
 // sequence, dense from 1.
@@ -51,9 +51,10 @@ type Slot struct {
 	// exposed lock-free via LastSeq/atomic for the fetch hot path.
 	seqCounter atomic.Uint64
 
-	aggVersions map[string]uint32
-	cmdIndex    cmdTable
-	aggSeqs     map[string][]uint64 // seqs ascending; version == index+1
+	aggs      map[string]aggEntry // aggregate directory (see slotaggs.go)
+	cmdIndex  cmdTable
+	seqChunks [][]uint64 // arena: each aggregate's seqs, ascending
+	seqLen    int        // total seqs in the arena
 
 	segmentBytes int64
 	flush        FlushPolicy
@@ -90,8 +91,7 @@ func OpenSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy) (
 		segmentBytes: segmentBytes,
 		flush:        flush,
 		lastFlush:    time.Now(),
-		aggVersions:  make(map[string]uint32),
-		aggSeqs:      make(map[string][]uint64),
+		aggs:         make(map[string]aggEntry),
 	}
 	s.cond = sync.NewCond(&s.mu)
 	w := make(chan struct{})
@@ -162,13 +162,21 @@ func (s *Slot) indexRecordLocked(seq uint64, rec *data.EventRecord) {
 // indexMetaLocked indexes a record from its header alone — the replicated
 // path never materialises event bodies, so it indexes from RecordMeta.
 func (s *Slot) indexMetaLocked(seq uint64, m data.RecordMeta) {
-	if m.Version > s.aggVersions[m.AggregateID] {
-		s.aggVersions[m.AggregateID] = m.Version
+	e := s.aggs[m.AggregateID]
+	if m.Version > e.version {
+		e.version = m.Version
 	}
 	s.cmdIndex.put(m.CommandHash, seq)
-	if m.Version == uint32(len(s.aggSeqs[m.AggregateID])+1) {
-		s.aggSeqs[m.AggregateID] = append(s.aggSeqs[m.AggregateID], seq)
+	// Only a contiguous append extends the aggregate's seq range; a record
+	// arriving out of order still updates its version, exactly as before.
+	if m.Version == uint32(e.n+1) {
+		if e.n == 0 {
+			e.off = s.seqLen
+		}
+		s.appendSeqLocked(seq)
+		e.n++
 	}
+	s.aggs[m.AggregateID] = e
 }
 
 // tail returns the writable segment, rolling a new one when it passed the
@@ -221,7 +229,7 @@ func (s *Slot) Append(rec *data.EventRecord) (*AppendOutcome, error) {
 	}
 
 	// Rule 2: version must be exactly current+1 (or 1 for a new aggregate).
-	cur := s.aggVersions[rec.AggregateID]
+	cur := s.aggs[rec.AggregateID].version
 	if rec.Version != cur+1 {
 		return &AppendOutcome{Status: data.StatusFail, ErrID: data.ErrIDVersionConflict, CurrentVersion: cur}, nil
 	}
@@ -409,7 +417,7 @@ func (s *Slot) WaitForSeq(wantSeq uint64, deadline time.Time) uint64 {
 func (s *Slot) CurrentVersion(aggregateID string) uint32 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.aggVersions[aggregateID]
+	return s.aggs[aggregateID].version
 }
 
 // RecordByCommand looks a record up by its idempotency key. The index stores
@@ -442,20 +450,20 @@ func (s *Slot) RecordByCommand(commandID string) (*data.EventRecord, uint64, err
 func (s *Slot) AggregateVersion(aggregateID string, fromVersion uint32, limit, uptoSeq uint64) ([]*data.EventRecord, []uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	seqs := s.aggSeqs[aggregateID]
+	e := s.aggs[aggregateID]
 	if fromVersion == 0 {
 		fromVersion = 1
 	}
-	if fromVersion > uint32(len(seqs)) {
+	if fromVersion > uint32(e.n) {
 		return nil, nil, nil
 	}
 	var out []*data.EventRecord
 	var outSeqs []uint64
-	for v := fromVersion; v <= uint32(len(seqs)); v++ {
+	for v := fromVersion; v <= uint32(e.n); v++ {
 		if limit > 0 && uint64(len(out)) >= limit {
 			break
 		}
-		seq := seqs[v-1]
+		seq := s.seqAtLocked(e.off + int(v-1))
 		if uptoSeq > 0 && seq > uptoSeq {
 			break
 		}
@@ -476,7 +484,7 @@ func (s *Slot) AggregateVersion(aggregateID string, fromVersion uint32, limit, u
 func (s *Slot) LastVersionOf(aggregateID string) uint32 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return uint32(len(s.aggSeqs[aggregateID]))
+	return uint32(s.aggs[aggregateID].n)
 }
 
 // ReadRange returns byte ranges covering records fromSeq <= seq < untilSeq
