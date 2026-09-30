@@ -52,7 +52,7 @@ type Slot struct {
 	seqCounter atomic.Uint64
 
 	aggVersions map[string]uint32
-	cmdIndex    map[string]uint64
+	cmdIndex    cmdTable
 	aggSeqs     map[string][]uint64 // seqs ascending; version == index+1
 
 	segmentBytes int64
@@ -91,7 +91,6 @@ func OpenSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy) (
 		flush:        flush,
 		lastFlush:    time.Now(),
 		aggVersions:  make(map[string]uint32),
-		cmdIndex:     make(map[string]uint64),
 		aggSeqs:      make(map[string][]uint64),
 	}
 	s.cond = sync.NewCond(&s.mu)
@@ -156,7 +155,7 @@ func (s *Slot) indexRecordLocked(seq uint64, rec *data.EventRecord) {
 	s.indexMetaLocked(seq, data.RecordMeta{
 		AggregateID: rec.AggregateID,
 		Version:     rec.Version,
-		CommandID:   rec.CommandID,
+		CommandHash: data.HashCommandID(rec.CommandID),
 	})
 }
 
@@ -166,7 +165,7 @@ func (s *Slot) indexMetaLocked(seq uint64, m data.RecordMeta) {
 	if m.Version > s.aggVersions[m.AggregateID] {
 		s.aggVersions[m.AggregateID] = m.Version
 	}
-	s.cmdIndex[m.CommandID] = seq
+	s.cmdIndex.put(m.CommandHash, seq)
 	if m.Version == uint32(len(s.aggSeqs[m.AggregateID])+1) {
 		s.aggSeqs[m.AggregateID] = append(s.aggSeqs[m.AggregateID], seq)
 	}
@@ -199,12 +198,25 @@ func (s *Slot) Append(rec *data.EventRecord) (*AppendOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Rule 1: idempotency by command_id within the slot.
-	if seq, ok := s.cmdIndex[rec.CommandID]; ok {
-		stored, err := s.readBySeqLocked(seq)
-		if err != nil {
-			return nil, err
+	// Rule 1: idempotency by command_id within the slot. The index holds
+	// hashes only, so a candidate is confirmed against the record it points at
+	// — the record the EXISTS answer returns anyway.
+	var stored *data.EventRecord
+	seq, found, err := s.cmdIndex.lookup(data.HashCommandID(rec.CommandID), func(seq uint64) (bool, error) {
+		got, err := s.readBySeqLocked(seq)
+		if err != nil || got == nil {
+			return false, err
 		}
+		if got.CommandID != rec.CommandID {
+			return false, nil // a different command sharing the hash
+		}
+		stored = got
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if found {
 		return &AppendOutcome{Status: data.StatusExists, Seq: seq, Record: stored}, nil
 	}
 
@@ -218,7 +230,7 @@ func (s *Slot) Append(rec *data.EventRecord) (*AppendOutcome, error) {
 	if err != nil {
 		return nil, err
 	}
-	seq := s.seqCounter.Load() + 1
+	seq = s.seqCounter.Load() + 1
 	if err := seg.AppendRecord(seq, rec); err != nil {
 		return nil, err
 	}
@@ -287,7 +299,11 @@ func (s *Slot) appendFrameAtSeq(seq uint64, frame []byte) (bool, error) {
 	defer s.mu.Unlock()
 	if seq <= s.seqCounter.Load() {
 		if existing, err := s.readBySeqLocked(seq); err == nil && existing != nil {
-			if existing.CommandID == meta.CommandID && existing.Version == meta.Version {
+			// The header-only metadata keeps just the command hash, so confirm
+			// the frame is that very record by reading its command id (this is
+			// the replay path; a mismatch is a real divergence).
+			cmd, cerr := data.CommandIDBytes(frame)
+			if cerr == nil && existing.CommandID == string(cmd) && existing.Version == meta.Version {
 				return false, nil // already replicated
 			}
 			return false, fmt.Errorf("slot %d: seq %d diverged on replay", s.ID, seq)
@@ -396,16 +412,27 @@ func (s *Slot) CurrentVersion(aggregateID string) uint32 {
 	return s.aggVersions[aggregateID]
 }
 
-// RecordByCommand looks a record up by its idempotency key.
+// RecordByCommand looks a record up by its idempotency key. The index stores
+// hashes, so a hit is confirmed by the record's own command id.
 func (s *Slot) RecordByCommand(commandID string) (*data.EventRecord, uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	seq, ok := s.cmdIndex[commandID]
-	if !ok {
-		return nil, 0, nil
+	var rec *data.EventRecord
+	seq, found, err := s.cmdIndex.lookup(data.HashCommandID(commandID), func(seq uint64) (bool, error) {
+		got, err := s.readBySeqLocked(seq)
+		if err != nil || got == nil {
+			return false, err
+		}
+		if got.CommandID != commandID {
+			return false, nil
+		}
+		rec = got
+		return true, nil
+	})
+	if err != nil || !found {
+		return nil, 0, err
 	}
-	rec, err := s.readBySeqLocked(seq)
-	return rec, seq, err
+	return rec, seq, nil
 }
 
 // AggregateVersion reads records of one aggregate starting at a version

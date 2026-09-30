@@ -68,11 +68,11 @@ func TestScanHeadersMatchesFullScan(t *testing.T) {
 		seq     uint64
 		agg     string
 		version uint32
-		cmd     string
+		cmdHash uint64
 	}
 	var want []row
 	if err := segFull.ScanFrom(segFull.BaseSeq, func(seq uint64, rec *data.EventRecord) bool {
-		want = append(want, row{seq, rec.AggregateID, rec.Version, rec.CommandID})
+		want = append(want, row{seq, rec.AggregateID, rec.Version, data.HashCommandID(rec.CommandID)})
 		return true
 	}); err != nil {
 		t.Fatal(err)
@@ -85,7 +85,7 @@ func TestScanHeadersMatchesFullScan(t *testing.T) {
 	}
 	var got []row
 	if err := segMeta.ScanHeaders(segMeta.BaseSeq, func(seq uint64, meta data.RecordMeta) bool {
-		got = append(got, row{seq, meta.AggregateID, meta.Version, meta.CommandID})
+		got = append(got, row{seq, meta.AggregateID, meta.Version, meta.CommandHash})
 		return true
 	}); err != nil {
 		t.Fatal(err)

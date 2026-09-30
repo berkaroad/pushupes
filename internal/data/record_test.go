@@ -33,7 +33,7 @@ func TestDecodeRecordMetaMatchesFullDecode(t *testing.T) {
 		t.Fatalf("consumed = %d/%d want %d", n1, n2, len(frame))
 	}
 	if meta.AggregateID != full.AggregateID || meta.Version != full.Version ||
-		meta.UnixTime != full.UnixTime || meta.CommandID != full.CommandID {
+		meta.UnixTime != full.UnixTime || meta.CommandHash != HashCommandID(full.CommandID) {
 		t.Fatalf("meta %+v does not match record %+v", meta, full)
 	}
 }
@@ -95,7 +95,7 @@ func TestDecodeRecordCopiesBodies(t *testing.T) {
 	if !bytes.Equal(got.Events[0].Body, orig) {
 		t.Fatal("decoded body aliases the frame buffer")
 	}
-	if meta.AggregateID != "agg-1" || meta.CommandID != "cmd-1" || meta.Version != 7 {
+	if meta.AggregateID != "agg-1" || meta.CommandHash != HashCommandID("cmd-1") || meta.Version != 7 {
 		t.Fatalf("meta aliases the frame buffer: %+v", meta)
 	}
 }

@@ -40,11 +40,77 @@ type EventRecord struct {
 
 // RecordMeta is the header portion of an encoded record frame: exactly the
 // fields the WAL indexes need, with no event bodies retained.
+//
+// It carries the command id as a hash rather than the string: the slot index
+// keeps one entry per record (tens of millions on a large node) and needs the
+// id only to find a record, which it then reads and checks against the real id.
+// Materialising a string per record at recovery time is exactly the allocation
+// this avoids.
 type RecordMeta struct {
 	AggregateID string
 	Version     uint32
 	UnixTime    int64
-	CommandID   string
+	CommandHash uint64
+}
+
+// FNV-1a: small, no allocation, and stable enough for an index whose hits are
+// verified against the record they point to.
+const (
+	fnvOffset64 = 14695981039346656037
+	fnvPrime64  = 1099511628211
+)
+
+func hashCommandBytes(b []byte) uint64 {
+	h := uint64(fnvOffset64)
+	for _, c := range b {
+		h ^= uint64(c)
+		h *= fnvPrime64
+	}
+	return h
+}
+
+// HashCommandID hashes a command id the same way the frame decoder does, so a
+// request's id can be looked up in the slot index without building anything.
+func HashCommandID(id string) uint64 {
+	h := uint64(fnvOffset64)
+	for i := 0; i < len(id); i++ {
+		h ^= uint64(id[i])
+		h *= fnvPrime64
+	}
+	return h
+}
+
+// CommandIDBytes returns the command id of an encoded record frame without
+// decoding or copying anything else. The slice aliases frame (do not retain
+// it); it exists so the replication path can confirm that a replayed frame
+// really is the record already stored at that seq, given that the header-only
+// metadata keeps just the hash.
+func CommandIDBytes(frame []byte) ([]byte, error) {
+	rest := frame
+	if len(rest) < 4 {
+		return nil, errors.New("truncated record frame")
+	}
+	recLen := int(binary.BigEndian.Uint32(rest[:4]))
+	rest = rest[4:]
+	if len(rest) < recLen {
+		return nil, errors.New("truncated record frame")
+	}
+	rest = rest[:recLen]
+	if len(rest) < 2 {
+		return nil, errors.New("truncated record header")
+	}
+	aggLen := int(binary.BigEndian.Uint16(rest[:2]))
+	rest = rest[2:]
+	if len(rest) < aggLen+4+8+2 {
+		return nil, errors.New("truncated record header")
+	}
+	rest = rest[aggLen+4+8:]
+	cmdLen := int(binary.BigEndian.Uint16(rest[:2]))
+	rest = rest[2:]
+	if len(rest) < cmdLen {
+		return nil, errors.New("truncated command_id")
+	}
+	return rest[:cmdLen], nil
 }
 
 // ---- Binary encoding ------------------------------------------------------
@@ -178,7 +244,10 @@ func scanRecord(buf []byte, withBodies bool) (EventRecord, RecordMeta, int, erro
 	if int(cmdLen) > MaxCommandIDLen || len(rest) < int(cmdLen) {
 		return r, m, 0, errors.New("truncated command_id")
 	}
-	m.CommandID = string(rest[:cmdLen])
+	m.CommandHash = hashCommandBytes(rest[:cmdLen])
+	if withBodies {
+		r.CommandID = string(rest[:cmdLen])
+	}
 	rest = rest[cmdLen:]
 
 	count, err := takeU16(&rest)
@@ -188,7 +257,7 @@ func scanRecord(buf []byte, withBodies bool) (EventRecord, RecordMeta, int, erro
 	if int(count) > MaxEventsPerRec {
 		return r, m, 0, fmt.Errorf("event count %d exceeds max %d", count, MaxEventsPerRec)
 	}
-	r.AggregateID, r.Version, r.UnixTime, r.CommandID = m.AggregateID, m.Version, m.UnixTime, m.CommandID
+	r.AggregateID, r.Version, r.UnixTime = m.AggregateID, m.Version, m.UnixTime
 	if withBodies {
 		r.Events = make([]Event, 0, count)
 	}

@@ -48,8 +48,12 @@ func TestAppendFrameAtSeqLandsLeaderBytes(t *testing.T) {
 	if cur := slot.aggVersions["agg-frame"]; cur != n {
 		t.Fatalf("aggVersions=%d want %d", cur, n)
 	}
-	if seq, ok := slot.cmdIndex["cmd-frame-4"]; !ok || seq != 4 {
-		t.Fatalf("cmdIndex[cmd-frame-4]=%d,%v want 4,true", seq, ok)
+	// The command index keeps hashes; a lookup confirms against the record.
+	if rec, seq, err := slot.RecordByCommand("cmd-frame-4"); err != nil || rec == nil || seq != 4 {
+		t.Fatalf("RecordByCommand(cmd-frame-4)=%v,%d,%v want the record at seq 4", rec, seq, err)
+	}
+	if rec, _, err := slot.RecordByCommand("cmd-not-there"); err != nil || rec != nil {
+		t.Fatalf("RecordByCommand(cmd-not-there)=%v,%v want nil,nil", rec, err)
 	}
 
 	// Idempotent replay of the same frame is a no-op...

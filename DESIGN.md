@@ -261,6 +261,18 @@ leader 才有（它从副本进度上报里维护，`isr` 列的是**在同步�
 
 ## 7. 高性能要点
 
+- **command 幂等索引是定长哈希表，不是字符串 map**：每槽的「command_id → seq」索引
+  在大节点上是**每条记录一项**（30GiB 量级 = 数千万项），字符串 key 的 map 会连
+  id 本体、bucket、GC 元数据一起常驻（实测 31GiB/3250 万条：堆 4.4GiB，其中该项
+  占绝大部分）。现在 `cmdTable` 是两条扁平 `uint64` 数组（hash→seq，16B/项、
+  装载因子 7/10、按需翻倍重哈希），**不存 id 字符串**：命中后读该 seq 的记录并比对
+  真实 command_id 才认（EXISTS 回显本来就要读这条记录，by-command 查询也是），所以
+  哈希碰撞只会加长探测链、不会误判；帧头元数据（`RecordMeta`）因此只带
+  `CommandHash`（FNV-1a，`data.HashCommandID`/`HashCommandBytes`），复制落盘路径
+  需要精确比对时用 `data.CommandIDBytes(frame)` 从帧里取 id（这是罕见的重放路径）。
+  同一份 31GiB 数据：堆 inuse 3.7~4.3GiB → **1.42GiB**，`OpenStore` 38.7~80.9s →
+  **20.0~26.0s**，节点启动到可服务 29.3s → **18.6s**，稳态 RSS 3.88 → **2.08GiB**。
+
 - **顺序追加 + 页缓存**：写路径 = memcpy 进段缓冲 + write()；fsync 交给
   flush 策略/acks 语义，组提交合并（dirty 集合定向刷盘，不遍历全槽）。
 - **二进制协议面**：节点间流量全部 PeerService gRPC（protobuf 二进制帧，
