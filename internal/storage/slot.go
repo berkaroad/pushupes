@@ -116,9 +116,10 @@ func OpenSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy) (
 			return nil, fmt.Errorf("slot %d: %s seq gap (base %d, expected %d)", slotID, p, seg.BaseSeq, expected)
 		}
 		if seg.RecordCnt > 0 {
-			// index rebuild: walk records to populate the metadata maps
-			if err := seg.ScanFrom(seg.BaseSeq, func(seq uint64, rec *data.EventRecord) bool {
-				s.indexRecordLocked(seq, rec)
+			// Index rebuild: walk the frame headers only — the maps need the
+			// aggregate, version and command id, never the bodies.
+			if err := seg.ScanHeaders(seg.BaseSeq, func(seq uint64, meta data.RecordMeta) bool {
+				s.indexMetaLocked(seq, meta)
 				return true
 			}); err != nil {
 				seg.Close()

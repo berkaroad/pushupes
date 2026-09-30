@@ -275,7 +275,13 @@ leader 才有（它从副本进度上报里维护，`isr` 列的是**在同步�
 - **写不放大**：一条记录只在槽 WAL 落一次；副本走日志拉取而非双写。
 - **锁竞争**：slot 级锁把热点聚合关进单槽（热点从"锁全库"降为"锁
   1/4096"）；读路径短临界区 RWMutex。
-- **启动恢复并行化**：OpenStore 两阶段（先扫目录再 worker 池并行开槽）。
+- **启动恢复并行化**：OpenStore 两阶段（先扫目录再 worker 池并行开槽）；每个分段的
+  恢复是**一次窗口读（1MiB `frameWalker`）的帧头遍历**——同一次遍历里找尾部完整边界
+  （撕裂尾截断）并重建稀疏索引，随后 `Segment.ScanHeaders`+`data.DecodeRecordMeta`
+  再按帧头重建聚合/command 索引（body 既不拷贝也不解码）。**不要退回「每条记录一次
+  pread」**：31GiB / 3250 万记录下，旧实现的 `LoadSegment`（每记录 1 次 4 字节 pread
+  找边界）+ `ScanFrom`（每记录 2 次 pread 解整帧）≈ 9700 万次 syscall，占启动 CPU 的
+  45%（实测 OpenStore 96.0s → 36.5s，节点启动到可服务 92.9s → 29.3s）。
 
 ## 8. 配置默认值
 

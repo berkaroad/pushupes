@@ -406,6 +406,44 @@ func (s *Segment) ScanFrom(fromSeq uint64, fn func(uint64, *data.EventRecord) bo
 	return nil
 }
 
+// ScanHeaders walks this segment's records from fromSeq in one windowed pass,
+// handing out frame-header metadata only (data.DecodeRecordMeta: seq,
+// aggregate, version, command id — event bodies are neither copied nor
+// decoded). The index rebuild uses this instead of the full-record ScanFrom:
+// at 30 GiB the old path spent its time on per-record preads and on the
+// EventRecord/Events allocations it then threw away.
+func (s *Segment) ScanHeaders(fromSeq uint64, fn func(uint64, data.RecordMeta) bool) error {
+	if s.RecordCnt == 0 || fromSeq > s.LastSeq {
+		return nil
+	}
+	if fromSeq < s.BaseSeq {
+		fromSeq = s.BaseSeq
+	}
+	pos := s.indexPos(fromSeq)
+	seq := s.indexSeqAt(pos)
+	if pos >= s.sizeBytes {
+		return nil
+	}
+	w := newFrameWalker(s.File, pos, s.sizeBytes)
+	for w.pos < s.sizeBytes {
+		frame, _, err := w.next()
+		if err != nil {
+			return err // LoadSegment validated the segment: no torn tail here
+		}
+		if seq >= fromSeq {
+			meta, _, err := data.DecodeRecordMeta(frame)
+			if err != nil {
+				return fmt.Errorf("segment %s seq %d: %w", s.Path, seq, err)
+			}
+			if !fn(seq, meta) {
+				return nil
+			}
+		}
+		seq++
+	}
+	return nil
+}
+
 // ReadRange returns contiguous byte ranges (for zero-copy fetch/migration)
 // covering records with fromSeq <= seq < untilSeq. total bytes capped by
 // maxBytes (the last record that crosses the cap is skipped, not truncated).
@@ -543,51 +581,141 @@ func (s *Segment) rebuildIndex(limit int64) error {
 
 // LoadSegment opens a segment and rebuilds its sparse index, scanning and
 // truncating any torn tail at the end of the file.
+// minRecordLen / maxRecordLen bound a plausible frame length prefix; anything
+// else is a torn tail (the same bounds the per-record readers use).
+const (
+	minRecordLen = 30
+	maxRecordLen = 64 << 20
+)
+
+var (
+	errShortTail    = errors.New("storage: record runs past the end of the segment")
+	errBadRecordLen = errors.New("storage: implausible record length")
+)
+
+// frameWalker streams one segment's frames through a reused window: one pread
+// per window instead of one per record. That matters at scale — a 30 GiB node
+// holds tens of millions of records, and the per-record preads in the recovery
+// walks (LoadSegment's boundary scan plus the index rebuild) cost more than the
+// bytes themselves did.
+type frameWalker struct {
+	f    *os.File
+	pos  int64 // file offset of the next unparsed frame
+	end  int64 // segment size
+	buf  []byte
+	base int64 // file offset of buf[0]
+	n    int   // valid bytes in buf
+	done int64 // end offset of the last complete frame
+}
+
+const frameWindow = 1 << 20
+
+func newFrameWalker(f *os.File, from, end int64) *frameWalker {
+	return &frameWalker{f: f, pos: from, end: end, buf: make([]byte, frameWindow), done: from}
+}
+
+// lastComplete is the offset just past the last whole frame seen.
+func (w *frameWalker) lastComplete() int64 { return w.done }
+
+// refill reads a window starting at the next unparsed frame. It reports false
+// when the file has nothing more to give (the reader is then at EOF).
+func (w *frameWalker) refill() bool {
+	n, err := w.f.ReadAt(w.buf, w.pos)
+	w.base, w.n = w.pos, n
+	if n > 0 {
+		return true
+	}
+	_ = err
+	return false
+}
+
+// next returns the next complete frame (valid until the next call, except for
+// frames larger than the window, which come back in their own slice), its file
+// offset, or an error: errShortTail / errBadRecordLen mark a torn tail, which
+// LoadSegment truncates.
+func (w *frameWalker) next() ([]byte, int64, error) {
+	for w.pos < w.end {
+		if w.pos < w.base || w.pos >= w.base+int64(w.n) {
+			if !w.refill() {
+				return nil, 0, errShortTail
+			}
+			continue
+		}
+		start := int(w.pos - w.base)
+		avail := w.n - start
+		if avail < 4 {
+			if !w.refill() || w.n < 4 {
+				return nil, 0, errShortTail
+			}
+			continue
+		}
+		recLen := int(binary.BigEndian.Uint32(w.buf[start:]))
+		if recLen < minRecordLen || recLen > maxRecordLen {
+			return nil, 0, errBadRecordLen
+		}
+		need := int64(4 + recLen)
+		if need > int64(len(w.buf)) {
+			// A frame bigger than the window: read it on its own.
+			frame := make([]byte, need)
+			if _, err := w.f.ReadAt(frame, w.pos); err != nil {
+				return nil, 0, errShortTail
+			}
+			off := w.pos
+			w.pos += need
+			w.done = w.pos
+			return frame, off, nil
+		}
+		if int64(avail) < need {
+			// Try to get the whole frame into the window; if the file ends
+			// first, the frame is torn.
+			if !w.refill() || w.n < 4+recLen {
+				return nil, 0, errShortTail
+			}
+			continue
+		}
+		off := w.pos
+		frame := w.buf[start : start+int(need)]
+		w.pos += need
+		w.done = w.pos
+		return frame, off, nil
+	}
+	return nil, 0, errShortTail
+}
+
 func LoadSegment(path string) (*Segment, error) {
 	s, err := OpenSegment(path)
 	if err != nil {
 		return nil, err
 	}
-	// find the last complete record boundary
-	limit := int64(s.dataStart)
-	buf := make([]byte, 4)
-	off := int64(s.dataStart)
-	for off < s.sizeBytes {
-		if _, err := s.File.ReadAt(buf, off); err != nil {
-			break
+	// One windowed pass: it both finds the last complete record (a torn tail is
+	// truncated) and rebuilds the sparse index, without a pread per record.
+	w := newFrameWalker(s.File, int64(s.dataStart), s.sizeBytes)
+	var seq uint64 = s.BaseSeq
+	for {
+		frame, off, err := w.next()
+		if err == errShortTail || err == errBadRecordLen {
+			break // torn tail: truncate at the last complete record
 		}
-		recLen := int64(binary.BigEndian.Uint32(buf))
-		if recLen < 30 || recLen > 64<<20 || off+4+recLen > s.sizeBytes {
-			break
+		if err != nil {
+			s.File.Close()
+			return nil, err
 		}
-		off += 4 + recLen
-		limit = off
+		if s.RecordCnt == 0 || s.bytesSinceIndex >= indexIntervalB {
+			s.index = append(s.index, indexEntry{seq: seq, pos: off})
+			s.bytesSinceIndex = 0
+		}
+		s.bytesSinceIndex += int64(len(frame))
+		s.RecordCnt++
+		s.LastSeq = seq
+		seq++
 	}
-	if limit != s.sizeBytes {
+	if limit := w.lastComplete(); limit != s.sizeBytes {
 		// torn tail: truncate to the last complete record
 		if err := s.File.Truncate(limit); err != nil {
 			s.File.Close()
 			return nil, err
 		}
 		s.sizeBytes = limit
-	}
-	off = s.dataStart
-	var seq uint64 = s.BaseSeq
-	for off < s.sizeBytes {
-		if _, err := s.File.ReadAt(buf, off); err != nil {
-			s.File.Close()
-			return nil, err
-		}
-		recLen := int64(binary.BigEndian.Uint32(buf))
-		if s.RecordCnt == 0 || s.bytesSinceIndex >= indexIntervalB {
-			s.index = append(s.index, indexEntry{seq: seq, pos: off})
-			s.bytesSinceIndex = 0
-		}
-		s.bytesSinceIndex += 4 + recLen
-		s.RecordCnt++
-		s.LastSeq = seq
-		off += 4 + recLen
-		seq++
 	}
 	return s, nil
 }
