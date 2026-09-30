@@ -321,6 +321,56 @@ func (st *Store) WakeChan(slotID int32) <-chan struct{} {
 	return *s.Wake()
 }
 
+// ScanFetchState answers a whole batch of follower positions in one call:
+// moved[i] reports whether slots[i] holds anything at or beyond froms[i], and
+// wakes[i] is the handle to park on. It exists because a fetch session reports
+// EVERY slot it follows (thousands) every round, and per-slot accessors put two
+// method calls, error paths and a lock-free lookup between the loop and the two
+// atomic loads it actually needs.
+//
+// The handle is read before the position (no-lost-wake discipline): an append
+// landing in between closes the handle handed back here, so the caller's wait
+// fires immediately rather than sleeping to the deadline. Slots that this node
+// does not have read as "no data, no wake".
+func (st *Store) ScanFetchState(slots []int32, froms []uint64, moved []bool, wakes []<-chan struct{}) {
+	n := len(slots)
+	if len(froms) < n {
+		n = len(froms)
+	}
+	if len(moved) < n {
+		n = len(moved)
+	}
+	if len(wakes) < n {
+		n = len(wakes)
+	}
+	for i := 0; i < n; i++ {
+		s := slots[i]
+		if s < 0 || int(s) >= len(st.slots) {
+			moved[i], wakes[i] = false, nil
+			continue
+		}
+		sp := st.slots[s].Load()
+		if sp == nil {
+			// Slots are opened lazily: a position report for a slot this node
+			// has never written must still yield a wake handle, or the caller
+			// would park nothing and poll in a hot loop. This is the cold path
+			// (once per slot); every later round reads the loaded pointer.
+			var err error
+			if sp, err = st.Slot(s); err != nil {
+				moved[i], wakes[i] = false, nil
+				continue
+			}
+		}
+		h := sp.wake.Load()
+		if h != nil {
+			wakes[i] = *h
+		} else {
+			wakes[i] = nil
+		}
+		moved[i] = sp.seqCounter.Load() >= froms[i]
+	}
+}
+
 // WakeBus returns the store-wide advance signal: ANY slot appending closes
 // the current handle. A leader long-polling hundreds of slots selects on
 // this one channel instead of rebuilding a per-slot case set every round;
