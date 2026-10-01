@@ -131,14 +131,19 @@ func PlanSlots(nodes []string, slotCount int32, replicaFactor int) map[int32]*Pl
 // Command ops. Commands are JSON-encoded and applied identically on every
 // node, so all tables converge. Data never appears here — only metadata.
 const (
-	OpJoinNode    = "join_node"    // add a peer to the directory
-	OpLeaveNode   = "leave_node"   // remove a peer (also drops it from replicas)
-	OpPlanSlots   = "plan_slots"   // (re)spread all slots over current members
-	OpLeaderMove  = "leader_move"  // explicit leader change for some slots (migration commit)
-	OpSlotState   = "slot_state"   // migration state transition for one slot
-	OpConfig      = "config"       // replica factor / slot count at bootstrap
-	OpReplanSlots = "replan_slots" // only plan slots that are still unassigned
-	OpRegister    = "register"     // patch a peer's self-announced admin/client addrs
+	OpJoinNode       = "join_node"        // add a peer to the directory
+	OpLeaveNode      = "leave_node"       // remove a peer (also drops it from replicas)
+	OpPlanSlots      = "plan_slots"       // (re)spread all slots over current members
+	OpLeaderMove     = "leader_move"      // explicit leader change for some slots (migration commit)
+	OpSlotState      = "slot_state"       // migration state transition for one slot
+	OpConfig         = "config"           // replica factor / slot count at bootstrap
+	OpReplanSlots    = "replan_slots"     // only plan slots that are still unassigned
+	OpRegister       = "register"         // patch a peer's self-announced admin/client addrs
+	OpSlotAddReplica = "slot_add_replica" // add one member to a slot's replica set
+	// OpSlotRemoveReplica removes one member from a slot's replica set
+	// (reclaim a surplus copy, e.g. the former source of a committed
+	// migration). Non-leader only: dropping the leader would strand the slot.
+	OpSlotRemoveReplica = "slot_remove_replica"
 )
 
 // Command is one replicated metadata mutation.
@@ -266,6 +271,63 @@ func (t *Table) Apply(c *Command) error {
 			if !found {
 				p.Replicas = append(p.Replicas, c.NewLeader)
 			}
+		}
+	case OpSlotAddReplica:
+		// Join a member to a slot's replica set (the node then follows the
+		// slot over the ordinary fetch protocol, exactly like a replica a
+		// later `replan_slots` top-up would have added). A migration to a
+		// node outside the replica set stages this first: the snapshot and
+		// catch-up steps only work against a node that follows the slot.
+		if c.NodeID == "" {
+			return fmt.Errorf("slot_add_replica: missing node")
+		}
+		for _, s := range c.Slots {
+			p, ok := t.Slots[s]
+			if !ok {
+				return fmt.Errorf("slot_add_replica: unknown slot %d", s)
+			}
+			found := false
+			for _, r := range p.Replicas {
+				if r == c.NodeID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				p.Replicas = append(p.Replicas, c.NodeID)
+			}
+		}
+	case OpSlotRemoveReplica:
+		// Reclaim one member from a slot's replica set — the mirror of
+		// slot_add_replica. The branch is a deterministic, idempotent
+		// function of the current state (it is replayed on every node and
+		// may be retried): an absent member is a no-op, and replaying after
+		// a successful removal does nothing. Only the named slot changes,
+		// and neither leader nor epoch move — dropping a non-leader replica
+		// is not a leadership change. The leader is never removable: a slot
+		// without a writer cannot accept appends.
+		if c.NodeID == "" {
+			return fmt.Errorf("slot_remove_replica: missing node")
+		}
+		for _, s := range c.Slots {
+			p, ok := t.Slots[s]
+			if !ok {
+				return fmt.Errorf("slot_remove_replica: unknown slot %d", s)
+			}
+			if p.Leader == c.NodeID {
+				return fmt.Errorf("slot_remove_replica: %s leads slot %d", c.NodeID, s)
+			}
+			found := false
+			for _, r := range p.Replicas {
+				if r == c.NodeID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue // not a replica: nothing to do, no error
+			}
+			p.Replicas = removeString(p.Replicas, c.NodeID)
 		}
 	case OpSlotState:
 		for _, s := range c.Slots {

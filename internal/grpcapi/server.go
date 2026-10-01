@@ -167,9 +167,19 @@ func (s *Server) ReadStream(ctx context.Context, req *pushupesv1.ReadStreamReque
 		})
 	}
 
-	hw := s.engine.HW(slot)
-	if hw == 0 {
-		hw = s.store.LastSeqOf(slot) // unreplicated/leader: read your own writes
+	// A leader owns its log: it reads up to its own durable LEO. Bounding a
+	// leader read by the replication high watermark would hide records it has
+	// already accepted — and, under acks=all, already acknowledged — because
+	// the HW can lag the LEO whenever a replica falls behind, turning a
+	// complete stream into a SILENT short read. Only a replica, whose view is
+	// by contract <= HW, keeps the watermark bound; a replica with no
+	// watermark state of its own reads its local LEO (read your own writes).
+	hw := uint64(0)
+	if !s.engine.Leads(slot) {
+		hw = s.engine.HW(slot)
+		if hw == 0 {
+			hw = s.store.LastSeqOf(slot)
+		}
 	}
 	recs, seqs, err := s.store.ReadAggregate(req.AggregateId, from, req.Limit, hw)
 	if err != nil {

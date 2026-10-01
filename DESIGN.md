@@ -169,8 +169,23 @@ Body: Record*，每条记录：
    微增。
 5. **切换提交**：controller 经 Raft 原子更新分配表：`slot leader=T,
    epoch+1, state=stable`；S 置 `backing-up`。
-6. **清理**：S 确认新 epoch 生效后隔离本地槽数据（保留到
-   `migration.retention` 到期防回滚），置 stable。
+6. **清理**：S 在**观察到自己在表里离开该槽的副本集**（既不是 leader、也不在
+   `replicas` 里）之后才**在本地**开始倒计时（源节点自己起表，不由控制器计时——控制器既
+   不持有那份副本，也不该为一次可能回滚的迁移启动保留期）；倒计时到期即 `DropSlot` 删除
+   本地那份副本。起表条件是**副本集成员资格的丢失**，不是"当过迁移源"：
+   - **集外迁移**（目标不在副本集）：T 先被加进副本集（集合变成 factor+1），leader 切到 T
+     后由回收步骤（`OpSlotRemoveReplica`）把 S 移出集合 —— S 这才真正变成多余副本，起表；
+   - **集内迁移**（目标本来就在副本集里）：没有任何成员被移除，S 仍是 RF 的一部分，**不起表、
+     不置灰、数据永不删** —— 这也是"谁当过迁移源"式判断会误伤的场景。
+   每次成员资格丢失都起一张**全新的**表（重新计时）；上一轮的调度一律作废，绝不复用旧到期时刻
+   （复用会把新一轮的副本在旧窗口到点时立刻删掉，即"延迟删除失效/变成立即删除"）。
+   时长 = `-drop-after`（默认 30s，`0` 取默认值，负数启动即报错）；**没有关闭选项**：
+   前源节点的那份副本是死重量，长期留在盘上会把节点写满。倒计时期间该调度对
+   admin 面可见（`/admin/writes` 的 `dropping[]`、`/admin/slots/{slot}/describe` 的
+   `pending_drop_at`），控制台据此把该副本置灰（它已不在 `replicas` 里，因此渲染在副本集旁边）。
+   若期间该槽又回到本节点名下（回滚、故障切换或又被加回副本集），丢弃调度、保留数据；
+   到期时还会**再查一次表**，成员/leader 的副本一律不删。
+   倒计时只存在于内存：进程重启即丢失，副本保留（等下一轮迁移或人工回收），**重启绝不删数据**。
 
 客户端路由：
 
@@ -228,10 +243,11 @@ gRPC  PeerService/Register        数据面地址自报（OpRegister 提交/转�
 # ---- admin 面（HTTP，仅管理）----
 GET  /admin/slots/{slot}/describe              # 本节点视角的槽状态/seq/HW/大小（不代开槽，带 node/role/loaded）
 GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（含 client_addr）
-GET  /admin/writes                             # 每槽 durable 计数 + 槽内总字节/事件流数量（前端轮询）
+GET  /admin/writes                             # 每槽 durable 计数 + 槽内总字节/事件流数量 + 本节点待清理副本（前端轮询）
 GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本，仅内存索引，不读 WAL）
-POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移
-POST /admin/cluster/plan                       # 触发重新规划
+POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移（控制器专属，必须发到 Raft leader 的 admin 地址）
+POST /admin/slots/{slot}/remove-replica {node} # 回收副本集里的一个成员（控制器专属，同上）
+POST /admin/cluster/plan                       # 触发重新规划（控制器专属，同上）
 GET  /healthz
 ```
 
@@ -258,6 +274,22 @@ leader 才有（它从副本进度上报里维护，`isr` 列的是**在同步�
 （已加载槽的真实值，未加载槽读 0 而不去开它——开槽就是遍历该槽全部分段），前端
 沿用已有的 2s 轮询取「占有该槽的节点中口径最大的那个」作答，不额外发请求：槽位表列出
 `总字节` 一列（事件流数量不进列，改在「事件流」抽屉里看；接口两条数组都保留）。
+
+**控制器专属写命令（migrate / remove-replica / plan）必须直接发到 Raft leader 的
+admin 地址**：admin 面**不做**任何到 leader 的转发（节点间流量统一走 peer 面），follower
+收到这类命令一律**拒绝**（HTTP 425 + `err_id=1005`，响应里带 `controller`（节点 id）与
+`controller_admin_addr`，文案写明「请直接发到该 admin 地址」）。前端读 `/admin/cluster/status`
+的 `raft.leader` → `peers[id].admin_addr` 得到目标地址（status 本来就在轮询，零额外请求）；
+若「读表到发出请求」之间 leader 变更（响应为 1005），**重读一次 status 换新 controller
+重试一次**，仍失败则报可读错误（`withController`，见 `frontend/src/api.ts`）。
+
+**待清理副本口径**：`GET /admin/writes` 的 `dropping[]` 与本节点视角的
+`/admin/slots/{slot}/describe` 的 `pending_drop_at` 都按槽下标对齐，`0` = 无；非 0 为该
+**本节点**执行自动清理（`DropSlot`）的 unix 秒。两个字段都是**节点自己的视角**（只有持有
+那份待清理副本的节点知道），所以前端按节点聚合：`dropping[slot] > 0` 的那个节点在
+「Replicas」列与详情抽屉里置灰（弱化样式用主题 token，light/dark 都可读），未上报的节点
+不标记。**置灰完全由后端这两个字段驱动，前端不做任何"谁当过迁移源"式的推断**；而后端只对
+**已离开副本集**的那份多余副本上报，所以仍在副本集里的成员永远不置灰、也永远不删。
 
 ## 7. 高性能要点
 
@@ -326,6 +358,9 @@ segment_bytes   = 268435456    # 默认 256MiB；须为 64MiB 的整数倍，最
 replica_count   = 2
 election_mode   = leader       # preferred leader 自动回切
 flush.policy    = 每 1000 条或 5s（可关闭为纯页缓存）
+drop_after      = 30s          # 迁移后前源节点本地副本的保留期，到期自动 DropSlot
+                              # -drop-after / PUSHUPES_DROP_AFTER：正数=该时长，0=默认 30s，
+                              # 负数启动即报错；没有关闭选项（留着会把节点写满）
 acks_default    = leader
 admin_addr      = http://127.0.0.1:8091   # -admin / PUSHUPES_ADMIN（含 pprof）
 client_addr     = http://127.0.0.1:8591   # -client / PUSHUPES_CLIENT（gRPC）

@@ -46,7 +46,9 @@ func main() {
 		acksDefault = flag.String("acks", "leader", "default acks for appends: leader or all")
 		flushN      = flag.Int64("flush-messages", 1000, "fsync every N records (0 disables)")
 		flushD      = flag.Duration("flush-interval", 5*time.Second, "fsync every interval (0 disables)")
-		bootstrap   = flag.Bool("bootstrap", false, "form a new cluster from -peers when no Raft state exists")
+		dropAfter   = flag.Duration("drop-after", envDurationOr("PUSHUPES_DROP_AFTER", cluster.DefaultDropRetention),
+			"post-migration retention: how long the FORMER SOURCE keeps its local copy of a migrated slot before dropping it (positive = that window, 0 = the default 30s; negative is rejected; the cleanup cannot be disabled — env PUSHUPES_DROP_AFTER)")
+		bootstrap = flag.Bool("bootstrap", false, "form a new cluster from -peers when no Raft state exists")
 	)
 	// -segment-bytes takes a size, not just a byte count: 268435456 or 256MiB.
 	flag.Var(&segmentB, "segment-bytes", "WAL segment roll `size` (bytes, or a suffix like 256MiB/1GiB); a multiple of 64MiB, at most 2GiB")
@@ -64,12 +66,12 @@ func main() {
 	base.SetLevel(logrus.InfoLevel)
 	logger := logrus.NewEntry(base).WithField("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, slotCount, *replication, int64(segmentB), *acksDefault, *flushN, *flushD, *bootstrap, logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, slotCount, *replication, int64(segmentB), *acksDefault, *flushN, *flushD, *dropAfter, *bootstrap, logger); err != nil {
 		logger.WithError(err).Fatal("pushupes exited with error")
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slotCount, replicationFactor int, segmentBytes int64, acksDefault string, flushN int64, flushD time.Duration, bootstrap bool, logger *logrus.Entry) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slotCount, replicationFactor int, segmentBytes int64, acksDefault string, flushN int64, flushD, dropAfter time.Duration, bootstrap bool, logger *logrus.Entry) error {
 	// Canonical form for every stored address: scheme required. A bare
 	// host:port gets the default "http://" prefix; an explicit protocol
 	// is honoured as passed. TCP-level uses (listen/dial) strip it again.
@@ -83,6 +85,14 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slot
 	if err := storage.ValidateSegmentBytes(segmentBytes); err != nil {
 		return err
 	}
+	// Post-migration retention: 0 means "the default", a negative window is
+	// rejected here (fail fast). There is no way to switch the cleanup off.
+	dropRetention, err := cluster.ResolveDropRetention(dropAfter)
+	if err != nil {
+		return err
+	}
+	logger.WithField("drop_after", dropRetention.String()).
+		Info("post-migration cleanup: the former source drops its local copy after this retention")
 	store, err := storage.OpenStore(dataDir, int32(slotCount), segmentBytes, storage.FlushPolicy{
 		IntervalMessages: flushN,
 		Interval:         flushD,
@@ -105,6 +115,7 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slot
 	// node to submit commands. Build the engine first with a nil node, then
 	// hand it to NewNode and wire the node back in.
 	eng := cluster.NewEngine(nil, store, nodeID, acksDefault, logger)
+	eng.SetDropRetention(dropRetention)
 
 	node, peerGRPC, err := cluster.NewNode(cluster.Config{
 		NodeID:     nodeID,
@@ -271,6 +282,23 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// envDurationOr reads a Go duration (30s, 2m, 1h) from the environment,
+// falling back to def. A malformed value is fatal instead of silently falling
+// back to the default: an operator typo in a knob that decides when data gets
+// deleted must not be hidden.
+func envDurationOr(k string, def time.Duration) time.Duration {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid %s=%q: %v (want a duration like 30s, 2m, 0 to disable)\n", k, v, err)
+		os.Exit(2)
+	}
+	return d
 }
 
 // byteSize is a flag.Value for -segment-bytes: it accepts a plain byte count

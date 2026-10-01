@@ -45,6 +45,7 @@ func New(eng *cluster.Engine, store *storage.Store) *Server {
 	s.mux.HandleFunc("GET /admin/slots/{slot}/describe", s.handleSlotDescribe)
 	s.mux.HandleFunc("GET /admin/slots/{slot}/streams", s.handleSlotStreams)
 	s.mux.HandleFunc("POST /admin/slots/{slot}/migrate", s.handleMigrate)
+	s.mux.HandleFunc("POST /admin/slots/{slot}/remove-replica", s.handleRemoveReplica)
 	s.mux.HandleFunc("POST /admin/cluster/plan", s.handlePlan)
 
 	return s
@@ -126,6 +127,14 @@ func (s *Server) handleSlotDescribe(w http.ResponseWriter, r *http.Request) {
 		segments = sl.SegmentCount()
 		totalBytes = sl.TotalSize()
 	}
+	// pending_drop_at: 0, or the unix second at which THIS node will
+	// automatically drop its local copy of the slot (the post-migration
+	// retention window). The copy is no longer part of the slot's replica
+	// set, so it is surplus data waiting to be cleaned up.
+	pendingDropAt := int64(0)
+	if t, ok := s.Engine.PendingDrop(int32(slot)); ok {
+		pendingDropAt = t.Unix()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"slot":        slot,
 		"node":        self,
@@ -138,6 +147,9 @@ func (s *Server) handleSlotDescribe(w http.ResponseWriter, r *http.Request) {
 		"placement":   p,
 		"isr":         s.Engine.ISR(int32(slot)),
 		"writes":      s.Store.WriteCount(int32(slot)),
+		// A non-zero value means this node has queued the automatic
+		// post-migration cleanup of its local copy of the slot.
+		"pending_drop_at": pendingDropAt,
 	})
 }
 
@@ -211,9 +223,19 @@ func (s *Server) handleWrites(w http.ResponseWriter, r *http.Request) {
 		// takes the answer from whichever node holds the slot.
 		"bytes":   bytesOnDisk,
 		"streams": streams,
+		// Post-migration cleanup queue of THIS node: 0, or the unix second at
+		// which this node's local copy of the slot is due to be dropped. It is
+		// per-node by nature (only the node holding the copy knows), so the
+		// console asks every node and marks the replica whose copy is on its
+		// way out. Same shape as bytes/streams.
+		"dropping": s.Engine.PendingDrops(),
 	})
 }
 
+// handleMigrate stages a hot migration. It is a controller-only (Raft leader)
+// command: a follower refuses it with the controller's identity instead of
+// forwarding, so the console reads status, takes the controller's admin
+// address and posts here directly.
 func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	slot, err := strconv.ParseInt(r.PathValue("slot"), 10, 32)
 	if err != nil {
@@ -230,17 +252,57 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60_000_000_000) // 60s
 	defer cancel()
 	if err := s.Engine.StartMigration(ctx, int32(slot), req.ToNode); err != nil {
+		if refuseNotController(w, err) {
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, 0, err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 }
 
-// handlePlan triggers an initial/rebalanced slot plan (controller only).
+// handleRemoveReplica reclaims one member from a slot's replica set — the
+// counterpart of the admission handleMigrate performs for a target outside the
+// set. A committed migration now reclaims its own surplus former-source copy
+// automatically, so this endpoint is the OPERATOR-facing tool kept for manual
+// cleanup: it is the fallback when an automatic reclaim could not run, the
+// rollback for a staged admission, and the remedy for any other surplus.
+// Like handleMigrate it is a controller-only command, so it must
+// be posted to the Raft leader; a follower refuses it with the controller's
+// node id and admin address instead of forwarding it. Its error codes match
+// handleMigrate's. The
+// removed node's local copy is deliberately NOT deleted — an operator drops it.
+func (s *Server) handleRemoveReplica(w http.ResponseWriter, r *http.Request) {
+	slot, err := strconv.ParseInt(r.PathValue("slot"), 10, 32)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "bad slot")
+		return
+	}
+	var req struct {
+		Node string `json:"node"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Node == "" {
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "node required")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30_000_000_000) // 30s
+	defer cancel()
+	if err := s.Engine.RemoveReplica(ctx, int32(slot), req.Node); err != nil {
+		if refuseNotController(w, err) {
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, 0, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// handlePlan triggers an initial/rebalanced slot plan (controller only). A
+// follower refuses with the controller's node id and admin address (the client
+// retries there) rather than forwarding it.
 func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	if err := s.Engine.SubmitCommand(&cluster.Command{Op: cluster.OpPlanSlots}); err != nil {
-		if errors.Is(err, cluster.ErrNotLeader) {
-			writeErr(w, http.StatusTooEarly, data.ErrIDNotLeader, "not controller")
+		if refuseNotController(w, err) {
 			return
 		}
 		writeErr(w, http.StatusInternalServerError, 0, err.Error())
@@ -275,4 +337,25 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeErr(w http.ResponseWriter, code, errID int, msg string) {
 	writeJSON(w, code, map[string]any{"error": msg, "err_id": errID})
+}
+
+// refuseNotController renders a controller-only command that a FOLLOWER
+// refused, and reports whether it handled the error. Nothing is forwarded: the
+// response instead says which node is the controller — its node id and admin
+// address — so the caller can retry the command directly against it. The two
+// extra fields are the machine-readable form of the same fact (a client should
+// not have to parse the prose to find the node to retry on); the status code
+// matches the one handlePlan has always used for this case.
+func refuseNotController(w http.ResponseWriter, err error) bool {
+	var nc *cluster.NotControllerError
+	if !errors.As(err, &nc) {
+		return false
+	}
+	writeJSON(w, http.StatusTooEarly, map[string]any{
+		"error":                 nc.Error(),
+		"err_id":                data.ErrIDNotLeader,
+		"controller":            nc.LeaderID,
+		"controller_admin_addr": nc.AdminAddr,
+	})
+	return true
 }

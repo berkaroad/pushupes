@@ -239,9 +239,14 @@ func (n *Node) Apply(cmd []byte) ([]byte, error) {
 // IsLeader reports whether this node holds the Raft leadership (controller).
 func (n *Node) IsLeader() bool { return n.raft.State() == raft.Leader }
 
-// LeaderID returns the Raft leader node id.
+// LeaderID returns the Raft leader (controller) node id — the id the slot
+// table and the peer directory are keyed by.
+//
+// LeaderWithID returns (address, ServerID): the id is the SECOND value. The
+// address is a transport detail (host:port of the peer plane), so taking the
+// first value would hand back an address where an id is expected.
 func (n *Node) LeaderID() string {
-	id, _ := n.raft.LeaderWithID()
+	_, id := n.raft.LeaderWithID()
 	return string(id)
 }
 

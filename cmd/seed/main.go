@@ -27,7 +27,7 @@ func main() {
 	admin := flag.String("admin", "127.0.0.1:8091", "one admin addr of the cluster")
 	slot := flag.Int("slot", 0, "target slot id")
 	mib := flag.Int("mib", 100, "approx bytes to write, in MiB")
-	acks := flag.String("acks", "leader", "leader|all|none")
+	acks := flag.String("acks", "leader", "leader or all")
 	conns := flag.Int("conns", 8, "parallel aggregates")
 	flag.Parse()
 

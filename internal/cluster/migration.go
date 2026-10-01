@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
 
@@ -36,12 +37,17 @@ const snapshotStreamTimeout = 10 * time.Minute
 //	3 catch-up: target pulls the remainder over the replica fetch protocol
 //	4 forward:  state-driven in SubmitAppend (migrating_out makes writes land on both)
 //	5 commit:   leader_move to target via Raft (epoch+1)
-//	6 cleanup:  old source copy dropped after a retention delay
+//	6 reclaim:  surplus replica (the former source) dropped from the set
+//	7 cleanup:  the former source drops its own copy after a retention delay
+//	            (the source arms that countdown itself, once it observes the
+//	            commit below — see localdrop.go)
 //
-// Only the controller runs this; data transfer is direct source<->target.
+// Only the controller runs this; data transfer is direct source<->target. A
+// non-controller refuses with a *NotControllerError naming the controller
+// (node id + admin address) — it never forwards the command to the leader.
 func (e *Engine) StartMigration(ctx context.Context, slot int32, toNode string) error {
-	if !e.node.IsLeader() {
-		return ErrNotLeader
+	if err := e.controllerGuard(); err != nil {
+		return err
 	}
 	e.tableMu.RLock()
 	p, ok := e.table.Slots[slot]
@@ -56,8 +62,13 @@ func (e *Engine) StartMigration(ctx context.Context, slot int32, toNode string) 
 	if _, ok := e.TableSnapshot().Peers[toNode]; !ok {
 		return fmt.Errorf("unknown target node %q", toNode)
 	}
-	// target must already hold a replica copy (else this is a move, not a
-	// balance); for replica_count>=2 the placement guarantees that.
+	// A target that is not a replica yet has no copy to catch up from and no
+	// fetch session covering the slot, so the snapshot/catch-up steps below
+	// (which are driven by the target pulling from the source) cannot work.
+	// Join it to the replica set first: from that moment it behaves exactly
+	// like a replica that joined late — it follows the slot and pulls the
+	// remainder over the same fetch protocol — and the six steps proceed
+	// unchanged.
 	inSet := false
 	for _, r := range p.Replicas {
 		if r == toNode {
@@ -65,7 +76,14 @@ func (e *Engine) StartMigration(ctx context.Context, slot int32, toNode string) 
 		}
 	}
 	if !inSet {
-		return fmt.Errorf("target %s is not a replica of slot %d", toNode, slot)
+		if err := e.submit(&Command{Op: OpSlotAddReplica, Slots: []int32{slot}, NodeID: toNode}); err != nil {
+			return fmt.Errorf("add target replica: %w", err)
+		}
+		e.logger.WithFields(map[string]any{"slot": slot, "target": toNode, "op": OpSlotAddReplica}).
+			Info("migration step 1/3: target joined the replica set")
+	} else {
+		e.logger.WithFields(map[string]any{"slot": slot, "target": toNode}).
+			Info("migration step 1/3: target already a replica (no admission needed)")
 	}
 
 	// step 1
@@ -101,10 +119,181 @@ func (e *Engine) StartMigration(ctx context.Context, slot int32, toNode string) 
 	if err := e.awaitApplied(ctx, 5*time.Second); err != nil {
 		return err
 	}
+	epoch := int64(0)
+	if p, ok := e.TableSnapshot().Slots[slot]; ok {
+		epoch = p.Epoch
+	}
+	e.logger.WithFields(map[string]any{"slot": slot, "leader": toNode, "epoch": epoch, "op": OpLeaderMove}).
+		Info("migration step 2/3: leader moved to the target")
 
-	// step 6
-	go e.scheduleDropAfter(ctx, slot, from, 10*time.Minute)
+	// step 6: reclaim the surplus copy the admission step created. Admitting
+	// an out-of-set target grew the replica set to factor+1; now that the
+	// target leads and has caught up (awaitCaughtUp above), shrink the set
+	// back to the configured factor. Runs strictly AFTER the leader move: the
+	// source must never be dropped while it is still the slot's writer.
+	// Best effort — see reclaimSurplusReplica.
+	e.reclaimSurplusReplica(slot, from, toNode)
+
+	// step 7: the former source drops its own copy. That countdown is NOT
+	// started here: the source node starts it the moment it observes this
+	// commit in the replicated table (slot stable, it no longer leads the
+	// slot) — see syncMigrationState/localdrop.go. Scheduling it from the
+	// controller would (a) ignore who actually holds the copy and (b) risk
+	// starting the retention for a migration that has not committed yet.
 	e.logger.WithFields(map[string]any{"slot": slot, "from": from, "to": toNode}).Info("Slot migration committed")
+	return nil
+}
+
+// reclaimSurplusReplica shrinks a slot's replica set back to the configured
+// replica factor after a migration admitted a target that was outside the set.
+//
+// Admitting such a target grows the set to factor+1 — that admission is the
+// precondition of the snapshot/catch-up steps — so a committed migration would
+// otherwise leave the slot one replica too many until an operator ran the
+// manual remove-replica admin endpoint. The surplus is reclaimed right here,
+// through the same command the manual endpoint submits (OpSlotRemoveReplica),
+// so the table stays the single source of truth and neither leader nor epoch
+// move.
+//
+// The former source is the preferred candidate: it holds a full copy but no
+// longer leads. The current leader and the migration target are never removed,
+// and a set already at the factor is left alone — only a set strictly larger
+// than the factor is touched.
+//
+// Best effort by design: the migration is already committed, so a failed
+// reclaim must NOT fail it. It logs and leaves the extra replica in place; a
+// later migration or the manual remove-replica endpoint can still reclaim it.
+// Nothing here deletes the removed node's on-disk copy.
+func (e *Engine) reclaimSurplusReplica(slot int32, from, toNode string) {
+	for {
+		tbl := e.TableSnapshot()
+		p, ok := tbl.Slots[slot]
+		if !ok {
+			return // unknown slot: nothing to reclaim
+		}
+		if p.State != SlotStable {
+			return // a migration still owns this placement; it reclaims on commit
+		}
+		if len(p.Replicas) <= tbl.Replicas {
+			e.logger.WithFields(map[string]any{"slot": slot, "factor": tbl.Replicas}).
+				Info("migration step 3/3: no surplus replica (set already at the factor)")
+			return
+		}
+		node := surplusReplica(p, from, toNode)
+		if node == "" {
+			// Over the factor, yet no member is eligible (every one is the
+			// leader or the target): leave it to the operator rather than guess.
+			e.logger.WithFields(map[string]any{"slot": slot, "from": from, "to": toNode}).
+				Warn("migration step 3/3: set is over the factor but no replica is eligible for reclaim")
+			return
+		}
+		if err := e.RemoveReplica(context.Background(), slot, node); err != nil {
+			e.logger.WithError(err).WithFields(map[string]any{
+				"slot": slot, "node": node, "from": from, "to": toNode, "op": OpSlotRemoveReplica,
+			}).Warn("migration step 3/3: surplus replica reclaim failed; leaving it in the set (migration stays committed)")
+			return
+		}
+		e.logger.WithFields(map[string]any{
+			"slot": slot, "node": node, "from": from, "factor": tbl.Replicas, "op": OpSlotRemoveReplica,
+		}).Info("migration step 3/3: source replica reclaimed (set back at the factor)")
+	}
+}
+
+// surplusReplica picks the member to drop from an oversized replica set: the
+// migration source first, then any other non-leader, non-target member (sorted,
+// so every node replaying the table agrees on the choice). Empty means none is
+// eligible.
+func surplusReplica(p *Placement, from, toNode string) string {
+	if from != "" && from != p.Leader && from != toNode && replicaListHas(p.Replicas, from) {
+		return from
+	}
+	rest := make([]string, 0, len(p.Replicas))
+	for _, r := range p.Replicas {
+		if r != p.Leader && r != toNode {
+			rest = append(rest, r)
+		}
+	}
+	if len(rest) == 0 {
+		return ""
+	}
+	sort.Strings(rest)
+	return rest[0]
+}
+
+// replicaListHas reports whether a replica list contains a node.
+func replicaListHas(list []string, id string) bool {
+	for _, v := range list {
+		if v == id {
+			return true
+		}
+	}
+	return false
+}
+
+// RemoveReplica reclaims one member from a slot's replica set — the mirror of
+// the target admission StartMigration performs when a migration targets a node
+// outside the replica set.
+//
+// A committed migration now reclaims its own surplus copy (see
+// reclaimSurplusReplica), so this entry point is the OPERATOR's tool: it backs
+// the manual `POST /admin/slots/{slot}/remove-replica` endpoint and is the
+// fallback when an automatic reclaim could not run (e.g. the controller
+// restarted between commit and reclaim) or when a slot carries a surplus for
+// any other reason. It is also the rollback for a staged target admission.
+//
+// It is a controller-only command (the table is Raft-replicated), so it must
+// run on the Raft leader. The submitter-side guards below turn a bad request
+// into a readable error BEFORE anything is committed; the committed command
+// itself stays a deterministic, idempotent function of the table (Table.Apply /
+// OpSlotRemoveReplica):
+//
+//   - the slot must be stable (a migration in flight owns its placement),
+//   - the node must be a known member and currently a replica of the slot,
+//   - it must not be the slot's leader (that would strand the slot),
+//   - at least one replica must remain.
+//
+// Removing a node from the metadata does NOT touch that node's on-disk data:
+// dropping the local copy is the operator's call.
+func (e *Engine) RemoveReplica(ctx context.Context, slot int32, node string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Controller-only, and never forwarded: a follower refuses with a
+	// *NotControllerError that names the controller (node id + admin
+	// address) so the caller can retry against it directly.
+	if err := e.controllerGuard(); err != nil {
+		return err
+	}
+	tbl := e.TableSnapshot()
+	p, ok := tbl.Slots[slot]
+	if !ok {
+		return fmt.Errorf("slot %d unassigned", slot)
+	}
+	if p.State != SlotStable {
+		return fmt.Errorf("slot %d is not stable (%s)", slot, p.State)
+	}
+	if _, ok := tbl.Peers[node]; !ok {
+		return fmt.Errorf("unknown node %q", node)
+	}
+	inSet := false
+	for _, r := range p.Replicas {
+		if r == node {
+			inSet = true
+			break
+		}
+	}
+	if !inSet {
+		return fmt.Errorf("node %s is not a replica of slot %d", node, slot)
+	}
+	if p.Leader == node {
+		return fmt.Errorf("node %s leads slot %d; move the leader before removing it", node, slot)
+	}
+	if len(p.Replicas) <= 1 {
+		return fmt.Errorf("slot %d would lose its last replica", slot)
+	}
+	if err := e.submit(&Command{Op: OpSlotRemoveReplica, Slots: []int32{slot}, NodeID: node}); err != nil {
+		return fmt.Errorf("remove replica: %w", err)
+	}
 	return nil
 }
 
@@ -240,31 +429,6 @@ func (e *Engine) remoteLEO(ctx context.Context, addr string, slot int32) (uint64
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	return e.peerLeo(cctx, addr, slot)
-}
-
-// scheduleDropAfter cleans up the old source copy after retention (step 6).
-// Only the former source node performs the drop, and only if the committed
-// table no longer assigns the slot to it.
-func (e *Engine) scheduleDropAfter(ctx context.Context, slot int32, from string, delay time.Duration) {
-	if from != e.self {
-		return
-	}
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(delay):
-	}
-	e.tableMu.RLock()
-	p, ok := e.table.Slots[slot]
-	e.tableMu.RUnlock()
-	if ok && p.Leader == e.self {
-		return // we own it again (e.g. later failover); keep the data
-	}
-	if err := e.store.DropSlot(slot); err != nil {
-		e.logger.WithError(err).WithField("slot", slot).Warn("post-migration drop failed")
-	} else {
-		e.logger.WithField("slot", slot).Info("Post-migration source copy dropped")
-	}
 }
 
 // ---- Target-side handlers (invoked from the peer gRPC server) -----------------

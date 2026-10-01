@@ -69,6 +69,18 @@ type Engine struct {
 	failMu     sync.Mutex
 	failStreak map[string]int
 
+	// post-migration local cleanup: slots whose local copy this node is
+	// scheduled to drop after the retention window (slot -> schedule), plus
+	// this node's replica-set membership as of the previous table walk (the
+	// transition member -> not-a-member is what arms a countdown). Exposed to
+	// the admin plane so the console can show which copy of a slot is on its
+	// way out. See localdrop.go.
+	dropMu       sync.Mutex
+	dropAfter    time.Duration
+	dropGen      uint64
+	pendingDrops map[int32]pendingDrop
+	replicaOf    map[int32]bool
+
 	acksDefault string
 }
 
@@ -170,6 +182,9 @@ func NewEngine(node *Node, store *storage.Store, self string, acksDefault string
 		sessions:    map[string]*fetchSession{},
 		failStreak:  map[string]int{},
 		acksDefault: acksDefault,
+		// post-migration cleanup: the former source keeps its copy for this
+		// long once it sees the hand-over committed (-drop-after).
+		dropAfter: DefaultDropRetention,
 	}
 	e.orderPool.New = func() any { return make([]int, 0, 64) }
 	e.parkedPool.New = func() any { return make([]parkedEntry, 0, 64) }
@@ -241,19 +256,64 @@ func (e *Engine) TableSnapshot() *Table {
 // SlotOf routes an aggregate to its slot.
 func (e *Engine) SlotOf(aggregateID string) int32 { return e.store.SlotOf(aggregateID) }
 
-// syncMigrationState refreshes the forwarding map from the table.
+// syncMigrationState refreshes the write-forwarding map from the table and
+// drives the post-migration cleanup countdown (localdrop.go).
+//
+// The countdown follows REPLICA-SET MEMBERSHIP, not the migration itself: this
+// node arms one for a slot exactly when a table change takes it OUT of that
+// slot's replica set while it holds a local copy. That is the only moment a
+// copy becomes surplus, and it makes both directions right:
+//
+//   - an out-of-set migration admits the target (set at factor+1) and the
+//     post-commit reclaim removes the former source — the source leaves the
+//     set, so its countdown starts here;
+//   - an in-set leader hand-over removes nobody: the former source stays a
+//     replica (still part of the RF), so nothing is armed, no "queued" state
+//     is published and no data is ever dropped for it;
+//   - a slot this node is back on (rollback, a later failover, a re-join)
+//     cancels any schedule it has: the data is kept.
+//
+// The opposite (arming on the hand-over commit) is what produced both reported
+// symptoms: a node that was still a replica of the slot had its copy deleted
+// after the retention, and — because a schedule armed by an earlier hand-over
+// was silently reused — a later hand-over's copy could be deleted the moment
+// the earlier window expired, i.e. "immediately".
 func (e *Engine) syncMigrationState() {
+	prev := e.replicaSnapshot()
+
 	e.tableMu.RLock()
 	fwd := make(map[int32]string, 4)
+	member := make(map[int32]bool, len(e.table.Slots))
+	var surplus []int32 // left the replica set while holding a copy: arm a countdown
 	for s, p := range e.table.Slots {
 		if p.State == SlotMigratingOut && p.MigratingTo != "" {
 			fwd[s] = p.MigratingTo
 		}
+		inSet := replicaListHas(p.Replicas, e.self)
+		if inSet {
+			member[s] = true
+		}
+		if prev[s] && !inSet {
+			surplus = append(surplus, s)
+		}
 	}
 	e.tableMu.RUnlock()
+
+	e.setReplicaMembership(member)
 	e.fwdMu.Lock()
 	e.fwd = fwd
 	e.fwdMu.Unlock()
+
+	// A copy this node is on again is not surplus: cancel whatever was queued
+	// for it (the pending map holds at most a handful of slots).
+	for _, s := range e.pendingSlotIDs() {
+		if e.onSlot(s) {
+			e.cancelPendingDrop(s)
+		}
+	}
+	for _, s := range surplus {
+		e.startDropCountdown(s)
+	}
 }
 
 // SubmitAppend routes a client append to the slot leader (executing locally
@@ -493,6 +553,21 @@ func (e *Engine) HW(slot int32) uint64 {
 	return 0
 }
 
+// Leads reports whether this node currently leads the slot. Read handlers use
+// it to decide whether a read may be capped at the replication high watermark:
+// a LEADER owns its log and must be able to read its own writes (the HW is a
+// follower-visibility bound), so capping there would hide acknowledged records.
+func (e *Engine) Leads(slot int32) bool {
+	if slot < 0 {
+		return false
+	}
+	o := e.ownershipSnapshot()
+	if int(slot>>6) >= len(o.words) {
+		return false
+	}
+	return o.words[slot>>6]&(1<<(slot&63)) != 0
+}
+
 // Self returns this node's id.
 func (e *Engine) Self() string { return e.self }
 
@@ -508,7 +583,9 @@ func (e *Engine) RaftStats() map[string]any {
 func (e *Engine) ISR(slot int32) []string { return e.isr(slot) }
 
 // SubmitCommand is the exported Raft submission entry point (admin triggers
-// like OpPlanSlots).
+// like the slot re-plan). It is controller-only: on a follower it refuses with
+// a *NotControllerError naming the controller (node id + admin address) —
+// nothing is forwarded to the leader.
 func (e *Engine) SubmitCommand(c *Command) error { return e.submit(c) }
 
 // NoteReplicaProgress is called by the leader when a fetch response reports
@@ -1333,10 +1410,13 @@ func (e *Engine) alive(addr string) bool {
 	return e.peerPing(ctx, addr) == nil
 }
 
-// submit commits a command through Raft.
+// submit commits a command through Raft. Every command submission funnels
+// through here, so this is also the single place that enforces "controller
+// commands run on the controller": a follower refuses with a
+// *NotControllerError (which names the controller) instead of forwarding.
 func (e *Engine) submit(c *Command) error {
-	if !e.node.IsLeader() {
-		return ErrNotLeader
+	if err := e.controllerGuard(); err != nil {
+		return err
 	}
 	_, err := e.node.Apply(c.Encode())
 	return err
