@@ -4,8 +4,18 @@ import type { ColumnsType } from 'antd/es/table'
 import type { ClusterStatus, NodeWrites, Placement, SlotDescribe, SlotStream, SlotStreams } from '../types'
 import { fetchNodeWrites, fetchSlotDescribe, fetchSlotStreams, getClusterStatus, migrateSlot } from '../api'
 import { RATE_POINTS, RateChart, type RatePoint } from '../RateChart'
+import { ReplicaTags, dropHint } from '../ReplicaTags'
 
 const RATE_POLL_MS = 2000
+
+// surplusCopies lists the nodes that reported a queued cleanup for a slot but
+// are no longer part of its replica set: they are the copies the console must
+// show weakened NEXT TO the set. The backend never queues a copy a slot still
+// counts on, so a node that is still a member never shows up here.
+function surplusCopies(replicas: string[], dropAt?: Record<string, number>): string[] {
+  if (!dropAt) return []
+  return Object.keys(dropAt).filter((n) => !replicas.includes(n))
+}
 
 // One slot's event-stream listing, as shown in the drawer: which node
 // answered, whether that node had the slot open at all, and the pages loaded
@@ -64,6 +74,11 @@ export default function SlotsPage() {
   // poll as the counters (no extra request): the node holding the slot answers
   // with real numbers, a node that has not loaded it reports 0.
   const [slotBytes, setSlotBytes] = useState<Record<number, number>>({})
+  // Per-slot post-migration cleanup queue, node id -> unix second the node
+  // drops its own copy at. Filled from the same per-node poll as the counters
+  // and gauges above: each node reports only its OWN queue, so a node that did
+  // not answer simply leaves its replicas unmarked.
+  const [dropAt, setDropAt] = useState<Record<number, Record<string, number>>>({})
   const statusRef = useRef<ClusterStatus | null>(null)
 
   const refresh = useCallback(async () => {
@@ -98,6 +113,8 @@ export default function SlotsPage() {
         })
         const idToAddr: Record<string, string> = {}
         for (const p of Object.values(st.peers)) idToAddr[p.id] = p.admin_addr
+        const addrToId: Record<string, string> = {}
+        for (const p of Object.values(st.peers)) if (p.admin_addr) addrToId[p.admin_addr] = p.id
 
         // 总字节: the largest on-disk footprint reported for the slot (leader
         // or replica, whichever has flushed more). Absent everywhere means
@@ -114,6 +131,19 @@ export default function SlotsPage() {
           if (best > 0) g[s] = best
         }
         setSlotBytes(g)
+
+        // Cleanup queue: each node reports its own per-slot drop deadlines, so
+        // the marking is per (slot, node). Only nodes that answered contribute;
+        // a node that did not is simply not marked.
+        const dd: Record<number, Record<string, number>> = {}
+        for (const [addr, m] of Object.entries(perNode)) {
+          const id = addrToId[addr]
+          if (!id || !m.dropping) continue
+          m.dropping.forEach((at, s) => {
+            if (at > 0) dd[s] = { ...(dd[s] ?? {}), [id]: at }
+          })
+        }
+        setDropAt(dd)
       } catch {
         /* poll failure: keep the last gauges */
       }
@@ -295,7 +325,13 @@ export default function SlotsPage() {
     const { to_node } = await mForm.validateFields()
     setMBusy(true)
     try {
-      await migrateSlot(migrate.slot, to_node, '')
+      // A migration is a controller-only (Raft leader) command, and the
+      // console's /api proxy may be fronting a follower — a follower refuses
+      // instead of forwarding. migrateSlot resolves the controller's admin
+      // address from the status table the console already holds (no extra
+      // request) and retries once against a freshly read table if the leader
+      // moved between the read and the request.
+      await migrateSlot(migrate.slot, to_node, statusRef.current)
       setMigrate(null)
       refresh()
     } catch (e: any) {
@@ -320,12 +356,15 @@ export default function SlotsPage() {
     },
     {
       // The replication set carries the role: the leader's tag is the coloured
-      // one (border + fill), no legend needed.
+      // one (border + fill), no legend needed. A copy of the slot queued for
+      // automatic cleanup after a migration is weakened — its copy is on its
+      // way out (hover for the expected time). Only a copy that has LEFT the
+      // replica set is ever queued, so it is rendered next to the set rather
+      // than inside it: a member never gets weakened.
       title: 'Replicas', dataIndex: 'replicas',
       render: (v: string[], r) =>
-        v.map((n) => (n === r.leader
-          ? <Tag key={n} color="gold">{n}</Tag>
-          : <Tag key={n}>{n}</Tag>)),
+        <ReplicaTags replicas={v} leader={r.leader} dropAt={dropAt[r.slot]}
+          surplus={surplusCopies(v, dropAt[r.slot])} />,
     },
     {
       title: '总字节', key: 'bytes', width: 110,
@@ -386,9 +425,25 @@ export default function SlotsPage() {
           <Descriptions column={1} bordered size="small">
             <Descriptions.Item label="Replicas">
               {placementOf(detail.data)
-                ? placementOf(detail.data)!.replicas.map((n) => (n === placementOf(detail.data)!.leader
-                  ? <Tag key={n} color="gold">{n}</Tag>
-                  : <Tag key={n}>{n}</Tag>))
+                ? (() => {
+                    const p = placementOf(detail.data)!
+                    // the set, plus any copy of this slot queued for cleanup
+                    // that has already left it: the backend never queues a copy
+                    // the slot still counts on, so a member cannot appear here.
+                    const queued = surplusCopies(p.replicas, dropAt[detail.slot])
+                    return (
+                      <>
+                        <ReplicaTags replicas={p.replicas} leader={p.leader}
+                          dropAt={dropAt[detail.slot]} surplus={queued} />
+                        {[...p.replicas, ...queued]
+                          .map((n) => dropHint(n, dropAt[detail.slot]?.[n]))
+                          .filter((h) => h)
+                          .map((h) => (
+                            <div key={h}><Typography.Text type="secondary">{h}</Typography.Text></div>
+                          ))}
+                      </>
+                    )
+                  })()
                 : '-'}
             </Descriptions.Item>
             <Descriptions.Item label="State">

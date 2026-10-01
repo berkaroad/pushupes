@@ -65,6 +65,104 @@ try {
   console.log(`  (live probe skipped: ${e?.message ?? e})`)
 }
 
+// Every command that mutates Raft state (migrate / remove-replica / plan) is
+// controller-only: it must be posted to the Raft leader's admin address, never
+// to a follower (a follower refuses with 429 + err_id 1005 naming the
+// controller; nothing is forwarded). The console resolves that address from
+// the status table it already holds — these offline assertions pin that path,
+// including the real race (the leader moved between the status read and the
+// request): one status re-read, one retry, then a readable error.
+const followerSeen = {
+  raft: { state: 'Follower', leader: 'node-1' },
+  peers: { 'node-1': { id: 'node-1', admin_addr: 'http://follower:8091' } },
+  slots: {},
+}
+const afterMove = {
+  raft: { state: 'Follower', leader: 'node-2' },
+  peers: {
+    'node-1': { id: 'node-1', admin_addr: 'http://follower:8091' },
+    'node-2': { id: 'node-2', admin_addr: 'http://controller:8092' },
+  },
+  slots: {},
+}
+const notController = {
+  response: {
+    status: 429,
+    data: {
+      err_id: 1005,
+      error: 'not the controller (Raft leader): the controller is node-2 at http://controller:8092; '
+        + 'send this command directly to that admin address (this node does not forward it)',
+    },
+  },
+}
+assert('controllerAdminAddr finds the controller admin address',
+  api.controllerAdminAddr(afterMove) === 'http://controller:8092')
+{
+  let msg = ''
+  try { api.controllerAdminAddr({ raft: { leader: '' }, peers: {}, slots: {} }) } catch (e) { msg = e?.message ?? '' }
+  assert('controllerAdminAddr refuses a table without a controller', /没有选出控制器/.test(msg))
+}
+assert('isNotControllerError recognizes the follower refusal',
+  api.isNotControllerError(notController) === true && api.isNotControllerError(new Error('boom')) === false)
+{
+  const tries = []
+  let refreshed = 0
+  const out = await api.withController(
+    async (addr) => { tries.push(addr); if (tries.length === 1) throw notController; return `ok ${addr}` },
+    followerSeen,
+    async () => { refreshed++; return afterMove },
+  )
+  assert('withController retries once against the new controller after a leader change',
+    tries.length === 2 && tries[0] === 'http://follower:8091' && tries[1] === 'http://controller:8092' &&
+    refreshed === 1 && out === 'ok http://controller:8092')
+}
+{
+  let calls = 0
+  let msg = ''
+  try {
+    await api.withController(async () => { calls++; throw notController }, followerSeen, async () => afterMove)
+  } catch (e) { msg = e?.message ?? '' }
+  assert('withController gives a readable error when the retry also refuses',
+    calls === 2 && /控制器已切到 node-2，请重试/.test(msg))
+}
+{
+  let refreshed = 0
+  const out = await api.withController(async (addr) => `ok ${addr}`, afterMove, async () => { refreshed++; return afterMove })
+  assert('withController adds no request while the cached table is current',
+    out === 'ok http://controller:8092' && refreshed === 0)
+}
+{
+  let calls = 0
+  let msg = ''
+  try {
+    await api.withController(async () => { calls++; throw new Error('unknown target node "x"') }, afterMove, async () => afterMove)
+  } catch (e) { msg = e?.message ?? '' }
+  assert('withController passes non-controller errors straight through', calls === 1 && /unknown target node/.test(msg))
+}
+
+// Live probe: hand migrateSlot a deliberately unknown target, which the
+// controller rejects before it touches any state; getting *that* answer proves
+// the call reached the controller (a follower would answer "not the
+// controller" instead), and it exercises the shared addressing helper end to
+// end against a real cluster.
+const probeBase = process.env.PUSHUPES_API_PROBE ?? 'http://127.0.0.1:9591'
+try {
+  const axios = (await import('axios')).default
+  const st = (await axios.get(`${probeBase}/admin/cluster/status`, { timeout: 3000 })).data
+  const ctlAddr = api.controllerAdminAddr(st)
+  const anySlot = Number(Object.keys(st.slots ?? {})[0] ?? 0)
+  try {
+    await api.migrateSlot(anySlot, '__no_such_node__', st)
+    assert('migrate is addressed to the controller', false)
+  } catch (e) {
+    const msg = e?.response?.data?.error ?? e?.message ?? String(e)
+    assert('migrate is addressed to the controller', /unknown target node/.test(msg))
+    console.log(`  (live migrate probe via ${ctlAddr} -> ${msg})`)
+  }
+} catch (e) {
+  console.log(`  (live migrate probe skipped: ${e?.message ?? e})`)
+}
+
 // The drawer's rate chart is a plain SVG: render it with two points and check
 // the polyline is there, then with one point and check the sampling hint.
 const { RateChart } = await vite.ssrLoadModule('/src/RateChart.tsx')
@@ -96,6 +194,46 @@ assert('rate chart caption lines are separate',
 assert('rate chart reports the window average',
   chart.indexOf('峰值 ') < chart.indexOf('平均 ') && chart.indexOf('平均 ') < chart.indexOf('样本 ') &&
   chart.includes('>16<'))
+
+// A replica whose local copy is queued for automatic cleanup after a migration
+// renders WEAKENED (secondary text token + reduced opacity: theme-aware, no
+// hardcoded colour) and says so, with the expected cleanup time; an ordinary
+// replica keeps its normal tag, and nothing is weakened without a queue.
+const { ReplicaTags, dropHint } = await vite.ssrLoadModule('/src/ReplicaTags.tsx')
+const rt = (props) => renderToString(
+  React.createElement(ConfigProvider, { theme: { algorithm: theme.defaultAlgorithm } },
+    React.createElement(ReplicaTags, props)),
+)
+const NOW = 1_900_000_000_000
+// The two migration shapes, pinned to the BACKEND marker (the console never
+// infers "queued" from "was a migration source"):
+//   - an IN-SET hand-over removes nobody, so the backend reports no drop for
+//     the slot (dropping[s] === 0): no node is weakened, the set stands;
+//   - an OUT-OF-SET hand-over takes the former source out of the replica set,
+//     so it reports a deadline for it: that copy is weakened (and, being
+//     surplus, it is rendered next to the set rather than inside it).
+const inSetMoved = rt({ replicas: ['node-1', 'node-2'], leader: 'node-1', dropAt: {}, surplus: [], now: NOW })
+assert('an in-set hand-over (no marker) greys nothing',
+  !/opacity:0\.55/.test(inSetMoved) && /ant-tag-gold[^>]*>node-1</.test(inSetMoved) && /ant-tag[^>]*>node-2</.test(inSetMoved))
+const outOfSetMoved = rt({
+  replicas: ['node-1', 'node-2'], leader: 'node-2',
+  dropAt: { 'node-3': NOW / 1000 + 30 }, surplus: ['node-3'], now: NOW,
+})
+assert('an out-of-set hand-over (marker on the removed copy) greys exactly that copy',
+  /opacity:0\.55/.test(outOfSetMoved) && outOfSetMoved.includes('node-3') && !/opacity:0\.55<\/Tag>[\s\S]*>node-1</.test(outOfSetMoved))
+
+const queued = rt({ replicas: ['node-1', 'node-2'], leader: 'node-1', dropAt: { 'node-2': NOW / 1000 + 600 }, now: NOW })
+const unqueued = rt({ replicas: ['node-1', 'node-2'], leader: 'node-1', dropAt: {}, now: NOW })
+assert('a queued replica renders weakened', /opacity:0\.55/.test(queued) && /ant-typography-secondary/.test(queued))
+assert('the queued replica is the one weakened',
+  queued.indexOf('node-2') > queued.indexOf('ant-typography-secondary') && queued.indexOf('ant-typography-secondary') > -1)
+assert('the leader keeps its normal coloured tag', /ant-tag-gold[^>]*>node-1</.test(queued))
+assert('no weakening without a queue', !/opacity:0\.55/.test(unqueued) && !/ant-typography-secondary/.test(unqueued))
+assert('the unqueued replica keeps the ordinary tag', /ant-tag[^>]*>node-2</.test(unqueued))
+const hint = dropHint('node-2', NOW / 1000 + 600, NOW)
+assert('the cleanup hint names the node and the expected time',
+  /迁移后待自动清理/.test(hint) && hint.includes('node-2') && /\d{2}:\d{2}:\d{2}/.test(hint) && /10 分/.test(hint))
+assert('no hint for a replica that is not queued', dropHint('node-3', 0, NOW) === '')
 
 let failed = 0
 for (const [name, ok] of checks) {

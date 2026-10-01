@@ -49,6 +49,10 @@ export interface SlotDescribe {
   isr: string[] | null
   segments: number
   total_bytes: number
+  // Unix second at which THIS node automatically drops its local copy of the
+  // slot after a migration (0 = nothing queued). The copy is surplus data —
+  // the node is no longer in the slot's replica set.
+  pending_drop_at?: number
 }
 
 export interface SlotStream {
@@ -78,4 +82,8 @@ export interface NodeWrites {
   writes: number[]
   bytes?: number[]
   streams?: number[]
+  // Per-slot post-migration cleanup queue of THAT node: 0, or the unix second
+  // at which that node drops its local copy of the slot. Per-node by nature —
+  // the console marks a replica from the node that reported it.
+  dropping?: number[]
 }
