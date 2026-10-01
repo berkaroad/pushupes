@@ -544,7 +544,20 @@ func (e *Engine) tableReplicasOf(slot int32) []string {
 }
 
 // HW returns the leader-tracked high watermark for a slot.
+//
+// The watermark is leader-side bookkeeping: it is advanced only from the
+// progress reports a slot LEADER receives from its replicas, and nothing
+// clears it when the node stops leading the slot — the value would be left
+// frozen at the step-down point. Reporting that stale leftover would make a
+// former leader's local read silently truncate at it (zero records for
+// aggregates written after the step-down, a few short for aggregates that
+// straddle it, and no error either way), so the watermark is answered only
+// for a slot this node CURRENTLY leads. Everywhere else HW reports 0 — "no
+// live watermark" — and the reader bounds the read by its own durable LEO.
 func (e *Engine) HW(slot int32) uint64 {
+	if !e.Leads(slot) {
+		return 0
+	}
 	e.replMu.Lock()
 	defer e.replMu.Unlock()
 	if sr := e.repl[slot]; sr != nil {
