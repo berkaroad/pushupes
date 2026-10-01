@@ -67,6 +67,16 @@ func (e *Engine) acceptRegistration(reg *Registration) error {
 		return err
 	}
 	if e.node.IsLeader() {
+		// Registrations are retried on a steady heartbeat (registerRetrySteady,
+		// every 10s), so an announcement that matches what the table already
+		// holds is the common case — and committing it would only advance the
+		// Raft commit index, which the console renders as a "commit" number
+		// that creeps up on a completely idle cluster. Skip the no-op commit:
+		// only a real change (a node restarted with different ports) reaches
+		// Raft, while the heartbeat still heals that change within one round.
+		if e.registrationMatches(reg) {
+			return nil
+		}
 		return e.submit(&Command{Op: OpRegister, Peer: &Peer{
 			ID: reg.ID, AdminAddr: reg.AdminAddr, ClientAddr: reg.ClientAddr,
 		}})
@@ -75,6 +85,19 @@ func (e *Engine) acceptRegistration(reg *Registration) error {
 		return e.sendRegistration(context.Background(), addr, reg)
 	}
 	return fmt.Errorf("register: leader unknown yet")
+}
+
+// registrationMatches reports whether the routing table already carries
+// exactly this announcement, i.e. committing it would mutate nothing. A
+// peer that is absent from the table never matches (the first announcement
+// must be committed so the address becomes known).
+func (e *Engine) registrationMatches(reg *Registration) bool {
+	tbl := e.TableSnapshot()
+	if tbl == nil {
+		return false
+	}
+	p, ok := tbl.Peers[reg.ID]
+	return ok && p.AdminAddr == reg.AdminAddr && p.ClientAddr == reg.ClientAddr
 }
 
 // leaderPeerAddr maps the Raft leader id onto its peer address — the one
