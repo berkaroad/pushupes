@@ -265,8 +265,12 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 			// indexes are written; running, the seqs stay in memory instead).
 			if seg.RecordCnt > 0 {
 				need := true
+				var covered map[uint64]bool
 				if ix, err := openSegAggIndex(s.Dir, s.ID, seg.BaseSeq); err == nil && ix != nil {
-					need = !ix.Valid()
+					if ix.Valid() {
+						need = false
+						covered = ix.Covered()
+					}
 					ix.Close()
 				}
 				if need {
@@ -276,9 +280,10 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 						segAggBuilt.Add(1)
 					}
 				} else {
-					// The index is there: the seqs it covers need not stay in
+					// The index is there: the seqs IT covers need not stay in
 					// memory just because loading the segment rebuilt them.
-					s.dropSealedSeqsLocked(seg)
+					// Aggregates the file does not list keep theirs.
+					s.dropSealedSeqsLocked(seg, covered)
 				}
 			}
 		}
@@ -514,23 +519,31 @@ func (s *Slot) appendFrameAtSeq(seq uint64, frame []byte) (bool, error) {
 func aggHash(aggregateID string) uint64 { return data.HashCommandID(aggregateID) }
 
 // sealAggSeqsLocked writes the sealed segment's part of every aggregate's seq
-// list to <baseSeq>.aidx and only then drops those seqs from the arena. An
-// all-or-nothing move: on failure the seqs stay in memory, which costs memory
-// but cannot lose a lookup.
+// list to <baseSeq>.aidx and then drops exactly the seqs that index now covers.
+// An all-or-nothing move per aggregate: an aggregate whose seqs could not be
+// written (or whose earliest live seq lies in an EARLIER segment that has no
+// index) keeps them in memory — it costs memory, but dropping them would make
+// those versions unreadable.
 func (s *Slot) sealAggSeqsLocked(seg *Segment) error {
-	if err := s.writeSegAggSeqsLocked(seg); err != nil {
+	covered, err := s.writeSegAggSeqsLocked(seg)
+	if err != nil {
 		return err
 	}
-	s.dropSealedSeqsLocked(seg)
+	s.dropSealedSeqsLocked(seg, covered)
 	return nil
 }
 
 // writeSegAggSeqsLocked writes the sealed segment's part of every aggregate's
 // seq list to <baseSeq>.aidx, so that nothing is dropped before it is on disk.
-// Caller holds s.mu.
-func (s *Slot) writeSegAggSeqsLocked(seg *Segment) error {
+// It returns the set of aggregate hashes the index now covers: those, and only
+// those, may leave memory. An aggregate whose oldest live seq predates this
+// segment is skipped — the .aidx resolves a version by the aggregate's FIRST
+// version, so a segment can only cover an aggregate whose coverage is already a
+// contiguous prefix; the earlier segment's index has to exist first (a start
+// writes it). Caller holds s.mu.
+func (s *Slot) writeSegAggSeqsLocked(seg *Segment) (map[uint64]bool, error) {
 	if seg.RecordCnt == 0 {
-		return nil
+		return nil, nil
 	}
 	// Each record's byte offset inside the segment, addressed by its ordinal in
 	// it: one frame walk over the sealed segment (the same walk the command index
@@ -539,7 +552,7 @@ func (s *Slot) writeSegAggSeqsLocked(seg *Segment) error {
 	// granularity is about a thousand frames, and cost a millisecond per record.
 	ents, err := collectSegCmdEntries(seg)
 	if err != nil || len(ents) == 0 {
-		return errSegAggNoOffsets // seqs stay in memory; the next start retries
+		return nil, errSegAggNoOffsets // seqs stay in memory; the next start retries
 	}
 	offs := make([]uint32, seg.RecordCnt)
 	for _, e := range ents {
@@ -548,6 +561,7 @@ func (s *Slot) writeSegAggSeqsLocked(seg *Segment) error {
 		}
 	}
 	var lists []segAggList
+	covered := map[uint64]bool{}
 	for id, e := range s.aggs {
 		if e.n == 0 {
 			continue
@@ -581,23 +595,30 @@ func (s *Slot) writeSegAggSeqsLocked(seg *Segment) error {
 			firstOrd: uint32(first - seg.BaseSeq),
 			pairs:    pairs,
 		})
+		covered[aggHash(id)] = true
 	}
 	if len(lists) == 0 {
-		return nil
+		return covered, nil
 	}
 	if seg.aggIx != nil { // the file is about to be rewritten
 		_ = seg.aggIx.Close()
 		seg.aggIx = nil
 	}
-	return writeSegAggIndex(seg, lists)
+	return covered, writeSegAggIndex(seg, lists)
 }
 
-// dropSealedSeqsLocked removes the sealed segment's seqs from the arena, now
-// that they are readable from its aggregate index. It runs at seal and again at
-// every start: a restart must not rebuild in memory what the disk already holds.
-func (s *Slot) dropSealedSeqsLocked(seg *Segment) {
+// dropSealedSeqsLocked removes from the arena exactly the seqs the sealed
+// segment's aggregate index now covers: an aggregate absent from `covered` was
+// not written (its earliest live seq belongs to an earlier segment with no
+// index yet) and must keep its seqs in memory, or those versions would resolve
+// to nothing. It runs at seal and again at every start: a restart must not
+// rebuild in memory what the disk already holds.
+func (s *Slot) dropSealedSeqsLocked(seg *Segment, covered map[uint64]bool) {
+	if len(covered) == 0 {
+		return
+	}
 	for id, e := range s.aggs {
-		if e.n == 0 {
+		if e.n == 0 || !covered[aggHash(id)] {
 			continue
 		}
 		k := sort.Search(e.n, func(i int) bool { return e.seqAt(i) > seg.LastSeq })
@@ -873,6 +894,16 @@ func (s *Slot) AggregateVersion(aggregateID string, fromVersion uint32, limit, u
 		fromVersion = 1
 	}
 	total := uint32(e.sealedN) + uint32(e.n)
+	// The directory's claimed latest version and the number of seqs this slot
+	// can actually resolve must agree. When they do not, returning "as many as
+	// we have" would be a SILENT short read — the caller would see a truncated
+	// stream with no error and believe it complete. Fail loudly instead: the
+	// sealed index and the in-memory seq list disagree, which is a bug, not an
+	// empty range.
+	if e.version != total {
+		return nil, nil, fmt.Errorf("slot %d: aggregate %s desync: latest version %d but only %d versions resolvable",
+			s.ID, aggregateID, e.version, total)
+	}
 	if fromVersion > total {
 		return nil, nil, nil
 	}

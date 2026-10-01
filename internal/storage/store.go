@@ -156,6 +156,22 @@ func (st *Store) DropSlot(slotID int32) error {
 	return os.RemoveAll(st.slotDir(slotID))
 }
 
+// SlotPresent reports whether this node holds a local copy of the slot: the
+// slot is currently open, or its directory still holds files on disk (a slot
+// is opened lazily, so after a restart a copy this node never touched is only
+// visible on disk). It is the "do I actually have something to lose" test the
+// post-migration cleanup uses before scheduling a drop.
+func (st *Store) SlotPresent(slotID int32) bool {
+	if slotID < 0 || slotID >= st.SlotCount {
+		return false
+	}
+	if s := st.slots[slotID].Load(); s != nil {
+		return true
+	}
+	entries, err := os.ReadDir(st.slotDir(slotID))
+	return err == nil && len(entries) > 0
+}
+
 // ReloadSlot reopens a slot from disk (after migration segments were pushed
 // into its directory).
 func (st *Store) ReloadSlot(slotID int32) error {

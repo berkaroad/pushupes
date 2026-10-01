@@ -249,6 +249,21 @@ func (ix *segAggIndex) Lookup(hash uint64, fn func(segAggEntry) bool) bool {
 	return false
 }
 
+// Covered returns the set of aggregate hashes the index holds an entry for.
+// A segment's index is all-or-nothing per aggregate: an aggregate it lists has
+// every one of its seqs in the segment recorded, one it does not list has none.
+// The slot uses this to drop from memory exactly the seqs the file can serve.
+func (ix *segAggIndex) Covered() map[uint64]bool {
+	if ix == nil || ix.aggN == 0 {
+		return nil
+	}
+	m := make(map[uint64]bool, ix.aggN)
+	for i := 0; i < ix.aggN; i++ {
+		m[ix.entryAt(i).hash] = true
+	}
+	return m
+}
+
 // Pair reads the entry's i-th record as (segment ordinal, byte offset). The
 // ordinal is what the index cannot derive: an aggregate's records inside a
 // segment are interleaved with other aggregates', so their ordinals are not
