@@ -321,7 +321,8 @@ leader 才有（它从副本进度上报里维护，`isr` 列的是**在同步�
 
 ```
 slot_count      = 1680         # 固定不可配置（105 的倍数，见 §7.2）
-segment_bytes   = 268435456    # 256MiB 分段
+segment_bytes   = 268435456    # 默认 256MiB；须为 64MiB 的整数倍，最小 64MiB、最大 2GiB
+                              # -segment-bytes 可写字节数或带单位（256MiB / 1GiB / 268435456）
 replica_count   = 2
 election_mode   = leader       # preferred leader 自动回切
 flush.policy    = 每 1000 条或 5s（可关闭为纯页缓存）

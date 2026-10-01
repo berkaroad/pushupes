@@ -44,6 +44,39 @@ const (
 // DefaultSegmentBytes is the 256MiB roll threshold from the design.
 const DefaultSegmentBytes = int64(256 * 1024 * 1024)
 
+// A configured segment size must be a whole number of SegmentBytesMultiple
+// bytes, between MinSegmentBytes and MaxSegmentBytes. The floor exists because
+// a smaller segment buys nothing — per-slot state, index files and file
+// descriptors all scale with the segment count, while the memory a segment
+// holds is bounded by its size either way. The ceiling exists because one
+// segment's index files, its seal-time frame walk and the per-aggregate seq
+// list it keeps in memory are all proportional to it.
+const (
+	SegmentBytesMultiple = int64(64 << 20)
+	MinSegmentBytes      = SegmentBytesMultiple
+	MaxSegmentBytes      = int64(2 << 30)
+)
+
+// ValidateSegmentBytes reports whether n is a usable segment size. The service
+// entry point applies it; the storage layer itself takes whatever it is given,
+// so tests can run on tiny segments.
+func ValidateSegmentBytes(n int64) error {
+	const mib = int64(1 << 20)
+	if n < MinSegmentBytes {
+		return fmt.Errorf("segment-bytes %d (%d MiB) is below the %d MiB minimum", n, n/mib, MinSegmentBytes/mib)
+	}
+	if n > MaxSegmentBytes {
+		return fmt.Errorf("segment-bytes %d (%d MiB) is above the %d MiB maximum", n, n/mib, MaxSegmentBytes/mib)
+	}
+	if n%SegmentBytesMultiple != 0 {
+		lo := n / SegmentBytesMultiple * SegmentBytesMultiple
+		hi := lo + SegmentBytesMultiple
+		return fmt.Errorf("segment-bytes %d (%d MiB) is not a multiple of %d MiB (nearest valid: %d MiB or %d MiB)",
+			n, n/mib, SegmentBytesMultiple/mib, lo/mib, hi/mib)
+	}
+	return nil
+}
+
 // indexEntry maps a seq to its byte position inside one segment.
 type indexEntry struct {
 	seq uint64

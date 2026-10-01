@@ -31,23 +31,25 @@ import (
 
 func main() {
 	var (
-		nodeID     = flag.String("node", envOr("PUSHUPES_NODE", "node-1"), "node id")
-		adminAddr  = flag.String("admin", envOr("PUSHUPES_ADMIN", "http://127.0.0.1:8091"), "HTTP listen address: inter-node replication + admin + pprof")
-		clientAddr = flag.String("client", envOr("PUSHUPES_CLIENT", "http://127.0.0.1:8591"), "gRPC data-plane listen address (event writes + queries)")
-		peerAddr   = flag.String("peer", envOr("PUSHUPES_PEER", "http://127.0.0.1:8391"), "Raft transport listen address (peer-to-peer)")
-		dataDir    = flag.String("data", envOr("PUSHUPES_DATA", "./data"), "data directory")
-		peers      = flag.String("peers", envOr("PUSHUPES_PEERS", ""), "comma list of id=http://host:peerport (admin/client addrs are self-registered; legacy id:peerport:adminport:clientport also accepted)")
+		nodeID     = flag.String("node", envOr("PUSHUPES_NODE", "node-1"), "node id (env PUSHUPES_NODE)")
+		adminAddr  = flag.String("admin", envOr("PUSHUPES_ADMIN", "http://127.0.0.1:8091"), "HTTP admin listen address: admin API + pprof (env PUSHUPES_ADMIN); events and all inter-node traffic use -client and -peer")
+		clientAddr = flag.String("client", envOr("PUSHUPES_CLIENT", "http://127.0.0.1:8591"), "gRPC data-plane listen address: event writes and queries (env PUSHUPES_CLIENT)")
+		peerAddr   = flag.String("peer", envOr("PUSHUPES_PEER", "http://127.0.0.1:8391"), "Raft transport + peer gRPC listen address: all node-to-node traffic (env PUSHUPES_PEER)")
+		dataDir    = flag.String("data", envOr("PUSHUPES_DATA", "./data"), "data directory (env PUSHUPES_DATA)")
+		peers      = flag.String("peers", envOr("PUSHUPES_PEERS", ""), "comma list (env PUSHUPES_PEERS) of id=http://host:peerport (admin/client addrs are self-registered; legacy id:peerport:adminport:clientport also accepted)")
 		// The slot count is a permanent layout decision (routing, placement,
 		// migration granularity), so it is not a runtime knob — it is fixed at
 		// data.DefaultSlotCount. See DESIGN §7.2.
 		slotCount   = data.DefaultSlotCount
 		replication = flag.Int("replication-factor", 2, "replicas per slot")
-		segmentB    = flag.Int64("segment-bytes", storage.DefaultSegmentBytes, "WAL segment roll size in bytes")
-		acksDefault = flag.String("acks", "leader", "default acks for appends: leader|all|none")
+		segmentB    = byteSize(storage.DefaultSegmentBytes)
+		acksDefault = flag.String("acks", "leader", "default acks for appends: leader or all")
 		flushN      = flag.Int64("flush-messages", 1000, "fsync every N records (0 disables)")
 		flushD      = flag.Duration("flush-interval", 5*time.Second, "fsync every interval (0 disables)")
 		bootstrap   = flag.Bool("bootstrap", false, "form a new cluster from -peers when no Raft state exists")
 	)
+	// -segment-bytes takes a size, not just a byte count: 268435456 or 256MiB.
+	flag.Var(&segmentB, "segment-bytes", "WAL segment roll `size` (bytes, or a suffix like 256MiB/1GiB); a multiple of 64MiB, at most 2GiB")
 	flag.Parse()
 
 	// gRPC's stock buffer pool zeroes every buffer it hands out and its size
@@ -62,7 +64,7 @@ func main() {
 	base.SetLevel(logrus.InfoLevel)
 	logger := logrus.NewEntry(base).WithField("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, slotCount, *replication, *segmentB, *acksDefault, *flushN, *flushD, *bootstrap, logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, slotCount, *replication, int64(segmentB), *acksDefault, *flushN, *flushD, *bootstrap, logger); err != nil {
 		logger.WithError(err).Fatal("pushupes exited with error")
 	}
 }
@@ -78,6 +80,9 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slot
 		return err
 	}
 
+	if err := storage.ValidateSegmentBytes(segmentBytes); err != nil {
+		return err
+	}
 	store, err := storage.OpenStore(dataDir, int32(slotCount), segmentBytes, storage.FlushPolicy{
 		IntervalMessages: flushN,
 		Interval:         flushD,
@@ -266,4 +271,60 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// byteSize is a flag.Value for -segment-bytes: it accepts a plain byte count
+// (268435456) or a suffixed size (256MiB, 1GiB), so the flag can be written the
+// way the sizing rule is stated. Ki/Mi/Gi are powers of two, K/M/G are powers
+// of ten.
+type byteSize int64
+
+func (b *byteSize) String() string { return humanBytes(int64(*b)) }
+
+func (b *byteSize) Set(s string) error {
+	n, err := parseByteSize(s)
+	if err != nil {
+		return err
+	}
+	*b = byteSize(n)
+	return nil
+}
+
+func parseByteSize(s string) (int64, error) {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return 0, fmt.Errorf("empty size")
+	}
+	num, mult := t, int64(1)
+	for _, suf := range []struct {
+		name string
+		mult int64
+	}{
+		{"KiB", 1 << 10}, {"MiB", 1 << 20}, {"GiB", 1 << 30}, {"TiB", 1 << 40},
+		{"KB", 1000}, {"MB", 1000 * 1000}, {"GB", 1000 * 1000 * 1000},
+	} {
+		if len(t) > len(suf.name) && strings.EqualFold(t[len(t)-len(suf.name):], suf.name) {
+			num, mult = t[:len(t)-len(suf.name)], suf.mult
+			break
+		}
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(num), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("not a size: %q (use a byte count like 268435456, or a suffix like 256MiB or 1GiB)", s)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("size must not be negative: %q", s)
+	}
+	return v * mult, nil
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30 && n%(1<<30) == 0:
+		return fmt.Sprintf("%dGiB", n>>30)
+	case n >= 1<<20 && n%(1<<20) == 0:
+		return fmt.Sprintf("%dMiB", n>>20)
+	default:
+		return strconv.FormatInt(n, 10)
+	}
 }

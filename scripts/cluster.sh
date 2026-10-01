@@ -15,11 +15,12 @@
 # 脚本可用环境变量覆盖：
 #   REPLICAS=3             节点数
 #   HOST=127.0.0.1         绑定与广播地址
-#   ADMIN_BASE=8091         节点 i 的 admin/复制端口 = ADMIN_BASE + i - 1
-#   PEER_BASE=8391         节点 i 的 Raft(peer)端口 = PEER_BASE + i - 1
+#   ADMIN_BASE=8091         节点 i 的 admin 管理端口（HTTP admin + pprof）= ADMIN_BASE + i - 1
+#   PEER_BASE=8391         节点 i 的 peer 端口（Raft + peer gRPC，全部节点间通讯）= PEER_BASE + i - 1
 #   CLIENT_BASE=8591         节点 i 的客户端(gRPC)端口 = CLIENT_BASE + i - 1
 #   REPLICATION_FACTOR=2   每槽副本数
-#   ACKS=leader            默认 acks（leader|all|none）
+#   ACKS=leader            默认 acks（leader 或 all）
+#   SEGMENT_BYTES=256MiB   段大小（默认 256MiB；须为 64MiB 的整数倍，最大 2GiB）
 #   RUN_DIR=$ROOT/.cluster 运行目录（数据、日志、pid）
 #   READY_TIMEOUT=90       等待就绪秒数
 #   BUILD=1                start 前强制重新编译
@@ -38,6 +39,9 @@ PEER_BASE="${PEER_BASE:-8391}"
 CLIENT_BASE="${CLIENT_BASE:-8591}"
 REPLICATION_FACTOR="${REPLICATION_FACTOR:-2}"
 ACKS="${ACKS:-leader}"
+# 段大小：默认 256MiB（须为 64MiB 的整数倍，最大 2GiB；可写字节数或 256MiB/1GiB 带单位）
+SEGMENT_BYTES="${SEGMENT_BYTES:-256MiB}"
+seg_args=(-segment-bytes "$SEGMENT_BYTES")
 RUN_DIR="${RUN_DIR:-$ROOT/.cluster}"
 READY_TIMEOUT="${READY_TIMEOUT:-90}"
 BIN="$ROOT/bin/pushupes"
@@ -116,13 +120,13 @@ start_node() {
        -admin "$HOST:$(admin_port "$n")" -peer "$HOST:$(peer_port "$n")" \
       -client "$HOST:$(client_port "$n")" \
       -data ./data -peers "$peers" -replication-factor "$REPLICATION_FACTOR" \
-      -acks "$ACKS" "${extra[@]}" >> node.log 2>&1 < /dev/null &
+      -acks "$ACKS" "${seg_args[@]}" "${extra[@]}" >> node.log 2>&1 < /dev/null &
   else
     nohup "$BIN" -node "node-$n" \
        -admin "$HOST:$(admin_port "$n")" -peer "$HOST:$(peer_port "$n")" \
       -client "$HOST:$(client_port "$n")" \
       -data ./data -peers "$peers" -replication-factor "$REPLICATION_FACTOR" \
-      -acks "$ACKS" "${extra[@]}" >> node.log 2>&1 < /dev/null &
+      -acks "$ACKS" "${seg_args[@]}" "${extra[@]}" >> node.log 2>&1 < /dev/null &
   fi
   pid=$!
   echo "$pid" > node.pid
