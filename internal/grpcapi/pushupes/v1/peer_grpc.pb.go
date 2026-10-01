@@ -25,6 +25,8 @@ const (
 	PeerService_ReplicaProgress_FullMethodName = "/pushupes.v1.PeerService/ReplicaProgress"
 	PeerService_Replicate_FullMethodName       = "/pushupes.v1.PeerService/Replicate"
 	PeerService_SlotLeo_FullMethodName         = "/pushupes.v1.PeerService/SlotLeo"
+	PeerService_FenceSlot_FullMethodName       = "/pushupes.v1.PeerService/FenceSlot"
+	PeerService_SlotLeader_FullMethodName      = "/pushupes.v1.PeerService/SlotLeader"
 	PeerService_PushSegments_FullMethodName    = "/pushupes.v1.PeerService/PushSegments"
 	PeerService_TriggerSnapshot_FullMethodName = "/pushupes.v1.PeerService/TriggerSnapshot"
 )
@@ -57,6 +59,22 @@ type PeerServiceClient interface {
 	Replicate(ctx context.Context, in *ReplicateRequest, opts ...grpc.CallOption) (*ReplicateResponse, error)
 	// SlotLeo answers a single slot's log end offset (migration catch-up).
 	SlotLeo(ctx context.Context, in *SlotLeoRequest, opts ...grpc.CallOption) (*SlotLeoResponse, error)
+	// FenceSlot is the migration commit fence: the source stops accepting new
+	// appends for the slot (they block, they are never rejected), drains the
+	// in-flight ones, pushes the frozen tail to the target and answers with the
+	// frozen log end offset only once the target has confirmed it holds that
+	// offset. The fence stays held until the leader move (or an abort) is
+	// applied, and is force-released after a bound so a lost controller cannot
+	// wedge the slot's writes.
+	FenceSlot(ctx context.Context, in *FenceSlotRequest, opts ...grpc.CallOption) (*FenceSlotResponse, error)
+	// SlotLeader answers THIS node's local view of one slot: which node it
+	// believes leads it and at which epoch. The migration source uses it to gate
+	// the commit-fence release on the target having actually applied the leader
+	// move — without it the source starts redirecting the moment IT applies the
+	// move, and a client that then asks the not-yet-updated target is bounced
+	// back to the source: an infinite MOVED/ASK ping-pong for the length of the
+	// follower apply lag (clients with a small redirect budget fail).
+	SlotLeader(ctx context.Context, in *SlotLeaderRequest, opts ...grpc.CallOption) (*SlotLeaderResponse, error)
 	// PushSegments streams sealed WAL segments of a slot into the importing
 	// node (migration snapshot step) in bounded messages — the source never
 	// holds a whole segment in memory.
@@ -134,6 +152,26 @@ func (c *peerServiceClient) SlotLeo(ctx context.Context, in *SlotLeoRequest, opt
 	return out, nil
 }
 
+func (c *peerServiceClient) FenceSlot(ctx context.Context, in *FenceSlotRequest, opts ...grpc.CallOption) (*FenceSlotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FenceSlotResponse)
+	err := c.cc.Invoke(ctx, PeerService_FenceSlot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *peerServiceClient) SlotLeader(ctx context.Context, in *SlotLeaderRequest, opts ...grpc.CallOption) (*SlotLeaderResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SlotLeaderResponse)
+	err := c.cc.Invoke(ctx, PeerService_SlotLeader_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *peerServiceClient) PushSegments(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushSegmentsRequest, PushSegmentsResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &PeerService_ServiceDesc.Streams[0], PeerService_PushSegments_FullMethodName, cOpts...)
@@ -185,6 +223,22 @@ type PeerServiceServer interface {
 	Replicate(context.Context, *ReplicateRequest) (*ReplicateResponse, error)
 	// SlotLeo answers a single slot's log end offset (migration catch-up).
 	SlotLeo(context.Context, *SlotLeoRequest) (*SlotLeoResponse, error)
+	// FenceSlot is the migration commit fence: the source stops accepting new
+	// appends for the slot (they block, they are never rejected), drains the
+	// in-flight ones, pushes the frozen tail to the target and answers with the
+	// frozen log end offset only once the target has confirmed it holds that
+	// offset. The fence stays held until the leader move (or an abort) is
+	// applied, and is force-released after a bound so a lost controller cannot
+	// wedge the slot's writes.
+	FenceSlot(context.Context, *FenceSlotRequest) (*FenceSlotResponse, error)
+	// SlotLeader answers THIS node's local view of one slot: which node it
+	// believes leads it and at which epoch. The migration source uses it to gate
+	// the commit-fence release on the target having actually applied the leader
+	// move — without it the source starts redirecting the moment IT applies the
+	// move, and a client that then asks the not-yet-updated target is bounced
+	// back to the source: an infinite MOVED/ASK ping-pong for the length of the
+	// follower apply lag (clients with a small redirect budget fail).
+	SlotLeader(context.Context, *SlotLeaderRequest) (*SlotLeaderResponse, error)
 	// PushSegments streams sealed WAL segments of a slot into the importing
 	// node (migration snapshot step) in bounded messages — the source never
 	// holds a whole segment in memory.
@@ -219,6 +273,12 @@ func (UnimplementedPeerServiceServer) Replicate(context.Context, *ReplicateReque
 }
 func (UnimplementedPeerServiceServer) SlotLeo(context.Context, *SlotLeoRequest) (*SlotLeoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SlotLeo not implemented")
+}
+func (UnimplementedPeerServiceServer) FenceSlot(context.Context, *FenceSlotRequest) (*FenceSlotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FenceSlot not implemented")
+}
+func (UnimplementedPeerServiceServer) SlotLeader(context.Context, *SlotLeaderRequest) (*SlotLeaderResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SlotLeader not implemented")
 }
 func (UnimplementedPeerServiceServer) PushSegments(grpc.ClientStreamingServer[PushSegmentsRequest, PushSegmentsResponse]) error {
 	return status.Error(codes.Unimplemented, "method PushSegments not implemented")
@@ -355,6 +415,42 @@ func _PeerService_SlotLeo_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PeerService_FenceSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FenceSlotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerServiceServer).FenceSlot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerService_FenceSlot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerServiceServer).FenceSlot(ctx, req.(*FenceSlotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PeerService_SlotLeader_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SlotLeaderRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerServiceServer).SlotLeader(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerService_SlotLeader_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerServiceServer).SlotLeader(ctx, req.(*SlotLeaderRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _PeerService_PushSegments_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(PeerServiceServer).PushSegments(&grpc.GenericServerStream[PushSegmentsRequest, PushSegmentsResponse]{ServerStream: stream})
 }
@@ -410,6 +506,14 @@ var PeerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SlotLeo",
 			Handler:    _PeerService_SlotLeo_Handler,
+		},
+		{
+			MethodName: "FenceSlot",
+			Handler:    _PeerService_FenceSlot_Handler,
+		},
+		{
+			MethodName: "SlotLeader",
+			Handler:    _PeerService_SlotLeader_Handler,
 		},
 		{
 			MethodName: "TriggerSnapshot",

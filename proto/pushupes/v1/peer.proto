@@ -28,6 +28,22 @@ service PeerService {
   rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
   // SlotLeo answers a single slot's log end offset (migration catch-up).
   rpc SlotLeo(SlotLeoRequest) returns (SlotLeoResponse);
+  // FenceSlot is the migration commit fence: the source stops accepting new
+  // appends for the slot (they block, they are never rejected), drains the
+  // in-flight ones, pushes the frozen tail to the target and answers with the
+  // frozen log end offset only once the target has confirmed it holds that
+  // offset. The fence stays held until the leader move (or an abort) is
+  // applied, and is force-released after a bound so a lost controller cannot
+  // wedge the slot's writes.
+  rpc FenceSlot(FenceSlotRequest) returns (FenceSlotResponse);
+  // SlotLeader answers THIS node's local view of one slot: which node it
+  // believes leads it and at which epoch. The migration source uses it to gate
+  // the commit-fence release on the target having actually applied the leader
+  // move — without it the source starts redirecting the moment IT applies the
+  // move, and a client that then asks the not-yet-updated target is bounced
+  // back to the source: an infinite MOVED/ASK ping-pong for the length of the
+  // follower apply lag (clients with a small redirect budget fail).
+  rpc SlotLeader(SlotLeaderRequest) returns (SlotLeaderResponse);
   // PushSegments streams sealed WAL segments of a slot into the importing
   // node (migration snapshot step) in bounded messages — the source never
   // holds a whole segment in memory.
@@ -96,6 +112,21 @@ message ReplicateResponse {}
 
 message SlotLeoRequest { int32 slot = 1; }
 message SlotLeoResponse { uint64 leo = 1; }
+
+// FenceSlotRequest freezes one migrating slot on its source leader. The reply
+// carries the frozen LEO the target has confirmed.
+message FenceSlotRequest { int32 slot = 1; }
+message FenceSlotResponse { uint64 leo = 1; }
+
+// SlotLeaderRequest asks a peer for its local placement view of one slot.
+message SlotLeaderRequest { int32 slot = 1; }
+// SlotLeaderResponse carries the peer's local leader ("" when unassigned) and
+// the placement epoch, so the caller can tell "the target has applied the move"
+// (leader == target, epoch >= the committed one) from a stale view.
+message SlotLeaderResponse {
+  string leader = 1;
+  int64 epoch = 2;
+}
 
 // PushSegmentsRequest is one message of the snapshot stream: the first
 // message of a file carries its name and total size (header bytes included),

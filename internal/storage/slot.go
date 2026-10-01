@@ -14,6 +14,13 @@ import (
 	"pushupes/internal/data"
 )
 
+// ErrSeqDivergence marks a replay of a seq that the local log already holds
+// with DIFFERENT bytes — a real fork of the log, not an idempotent replay.
+// It is a typed sentinel so callers that move replicated data (the replica
+// fetch loop) can classify it: a single slot's fork must not be mistaken for a
+// transport failure and must not fail the whole multiplexed fetch session.
+var ErrSeqDivergence = errors.New("diverged on replay")
+
 // FlushPolicy controls when a slot WAL is fsynced (mirrors the design doc).
 type FlushPolicy struct {
 	IntervalMessages int64         // fsync after N unflushed records (0 = never)
@@ -439,7 +446,7 @@ func (s *Slot) appendAtSeq(seq uint64, rec *data.EventRecord) (bool, error) {
 			if existing.CommandID == rec.CommandID && existing.Version == rec.Version {
 				return false, nil // already replicated
 			}
-			return false, fmt.Errorf("slot %d: seq %d diverged on replay", s.ID, seq)
+			return false, fmt.Errorf("slot %d: seq %d %w", s.ID, seq, ErrSeqDivergence)
 		}
 		return false, fmt.Errorf("slot %d: seq %d below counter %d", s.ID, seq, s.seqCounter.Load())
 	}
@@ -491,7 +498,7 @@ func (s *Slot) appendFrameAtSeq(seq uint64, frame []byte) (bool, error) {
 			if cerr == nil && existing.CommandID == string(cmd) && existing.Version == meta.Version {
 				return false, nil // already replicated
 			}
-			return false, fmt.Errorf("slot %d: seq %d diverged on replay", s.ID, seq)
+			return false, fmt.Errorf("slot %d: seq %d %w", s.ID, seq, ErrSeqDivergence)
 		}
 		return false, fmt.Errorf("slot %d: seq %d below counter %d", s.ID, seq, s.seqCounter.Load())
 	}

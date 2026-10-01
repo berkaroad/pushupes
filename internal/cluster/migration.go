@@ -111,6 +111,22 @@ func (e *Engine) StartMigration(ctx context.Context, slot int32, toNode string) 
 		return fmt.Errorf("catch-up: %w", err)
 	}
 
+	// step 4b: commit fence. awaitCaughtUp samples the target LEO and a
+	// leader move submitted right after that sample can race writes accepted
+	// in between: those records would be absent from the target when it takes
+	// over, and the target would reuse their seqs for different records — a
+	// fork. So freeze the source's log for the commit window: the source blocks
+	// new appends (they never fail; they queue), drains the in-flight ones,
+	// pushes the frozen tail to the target and only answers once the target
+	// confirms it holds the frozen LEO. The fence stays held until the move (or
+	// a rollback) is applied, and self-releases on a bound. A failure here
+	// aborts the migration cleanly: the source stays leader and the slot
+	// returns to stable (rollbackMigration).
+	if _, err := e.fenceSource(ctx, from, slot); err != nil {
+		e.rollbackMigration(slot)
+		return fmt.Errorf("fence: %w", err)
+	}
+
 	// step 5
 	if err := e.submit(&Command{Op: OpLeaderMove, Slots: []int32{slot}, NewLeader: toNode}); err != nil {
 		e.rollbackMigration(slot)

@@ -103,6 +103,21 @@ func (s *peerServer) SlotLeo(_ context.Context, req *pushupesv1.SlotLeoRequest) 
 	return &pushupesv1.SlotLeoResponse{Leo: s.e.HandleLEO(req.Slot)}, nil
 }
 
+func (s *peerServer) FenceSlot(ctx context.Context, req *pushupesv1.FenceSlotRequest) (*pushupesv1.FenceSlotResponse, error) {
+	leo, err := s.e.HandleFenceSlot(ctx, req.Slot)
+	if err != nil {
+		return nil, err
+	}
+	return &pushupesv1.FenceSlotResponse{Leo: leo}, nil
+}
+
+// SlotLeader answers this node's local placement view of a slot (leader +
+// epoch) — the migration source's fence-release gate (see fence.go).
+func (s *peerServer) SlotLeader(_ context.Context, req *pushupesv1.SlotLeaderRequest) (*pushupesv1.SlotLeaderResponse, error) {
+	leader, epoch := s.e.HandleSlotLeader(req.Slot)
+	return &pushupesv1.SlotLeaderResponse{Leader: leader, Epoch: epoch}, nil
+}
+
 func (s *peerServer) PushSegments(stream pushupesv1.PeerService_PushSegmentsServer) error {
 	if err := s.e.writeSegments(stream); err != nil {
 		return err
@@ -249,6 +264,35 @@ func (e *Engine) peerLeo(ctx context.Context, addr string, slot int32) (uint64, 
 		return 0, err
 	}
 	return resp.Leo, nil
+}
+
+// peerFence asks a peer (the migration source) to take the commit fence for a
+// slot and returns the frozen LEO it confirmed the target holds.
+func (e *Engine) peerFence(ctx context.Context, addr string, slot int32) (uint64, error) {
+	c, err := e.peerRPC(addr)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.FenceSlot(ctx, &pushupesv1.FenceSlotRequest{Slot: slot})
+	if err != nil {
+		return 0, err
+	}
+	return resp.Leo, nil
+}
+
+// peerSlotLeader asks a peer for its LOCAL placement view of one slot: the
+// leader it believes in and the epoch. Used by the migration source to gate the
+// fence release on the target having applied the leader move.
+func (e *Engine) peerSlotLeader(ctx context.Context, addr string, slot int32) (string, int64, error) {
+	c, err := e.peerRPC(addr)
+	if err != nil {
+		return "", 0, err
+	}
+	resp, err := c.SlotLeader(ctx, &pushupesv1.SlotLeaderRequest{Slot: slot})
+	if err != nil {
+		return "", 0, err
+	}
+	return resp.Leader, resp.Epoch, nil
 }
 
 // peerOpenPush starts a PushSegments client stream to addr. The caller

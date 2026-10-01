@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -66,6 +67,19 @@ type Engine struct {
 	migFwdMu    sync.Mutex
 	migFwdSince map[int32]time.Time
 
+	// migration commit fence: one preallocated write gate per slot (a writer
+	// must be able to register its in-flight append without racing the fence
+	// object's creation) plus the set of slots currently fenced, so a table
+	// change can release the fence (see fence.go).
+	fences   []slotFence
+	fenceMu  sync.Mutex
+	fenceSet map[int32]bool
+
+	// slots whose local log forked from the leader's at a seq (the fetch loop
+	// quarantines them instead of failing the whole multiplexed session).
+	divMu    sync.Mutex
+	diverged map[int32]string
+
 	// slots this node led as of the previous table walk, so syncMigrationState
 	// can tell a leadership GAIN (drop the previous term's stale follower
 	// positions; see advanceHW) from a steady state.
@@ -75,6 +89,11 @@ type Engine struct {
 	// one replication session per slot leader (multiplexed long-poll fetch)
 	sessMu   sync.Mutex
 	sessions map[string]*fetchSession
+	// sessKick wakes replicaLoop to reconcile sessions at once when the table
+	// changes (a leader move makes a follower follow a new leader; waiting for
+	// the 1s ticker left the new leader's watermark without a report for up to
+	// a second, which stalled every acks=all append to it).
+	sessKick chan struct{}
 
 	// controller liveness: consecutive health-probe failures per peer.
 	// A single failure is not enough — a peer still booting (HTTP not yet
@@ -193,9 +212,12 @@ func NewEngine(node *Node, store *storage.Store, self string, acksDefault string
 		repl:        map[int32]*slotRepl{},
 		fwd:         map[int32]string{},
 		sessions:    map[string]*fetchSession{},
+		sessKick:    make(chan struct{}, 1),
 		failStreak:  map[string]int{},
 		migFwdSince: map[int32]time.Time{},
 		ledPrev:     map[int32]bool{},
+		fenceSet:    map[int32]bool{},
+		diverged:    map[int32]string{},
 		acksDefault: acksDefault,
 		// post-migration cleanup: the former source keeps its copy for this
 		// long once it sees the hand-over committed (-drop-after).
@@ -206,6 +228,7 @@ func NewEngine(node *Node, store *storage.Store, self string, acksDefault string
 	e.progressPool.New = func() any { return &progressBatch{} }
 	e.scanPool.New = func() any { return &fetchScan{} }
 	e.fetchScratchPool.New = func() any { return &fetchScratch{} }
+	e.fences = make([]slotFence, store.SlotCount)
 	if e.logger == nil {
 		l := logrus.New()
 		l.SetLevel(logrus.WarnLevel)
@@ -266,6 +289,22 @@ func (e *Engine) TableSnapshot() *Table {
 	return e.table.Clone()
 }
 
+// HandleSlotLeader answers a peer's query for THIS node's local placement view
+// of a slot: the leader it currently believes in ("" when unassigned) and the
+// placement epoch. It is the migration source's fence-release gate (fence.go):
+// the source only stops blocking (and starts redirecting) once the target
+// reports the slot's leader is the target itself at an epoch not older than the
+// committed one — so a client is never bounced between a source that has
+// applied the move and a target that has not.
+func (e *Engine) HandleSlotLeader(slot int32) (string, int64) {
+	e.tableMu.RLock()
+	defer e.tableMu.RUnlock()
+	if p, ok := e.table.Slots[slot]; ok {
+		return p.Leader, p.Epoch
+	}
+	return "", 0
+}
+
 // ---- Routing ---------------------------------------------------------------
 
 // SlotOf routes an aggregate to its slot.
@@ -295,14 +334,40 @@ func (e *Engine) SlotOf(aggregateID string) int32 { return e.store.SlotOf(aggreg
 // the earlier window expired, i.e. "immediately".
 func (e *Engine) syncMigrationState() {
 	prev := e.replicaSnapshot()
+	fenced := e.fencedSlots()
+	fencedSet := make(map[int32]bool, len(fenced))
+	for _, s := range fenced {
+		fencedSet[s] = true
+	}
+	// placement view of every currently fenced slot: after the scan, a fence is
+	// either kept (still migrating out under this node), released (aborted /
+	// rolled back to stable under this node) or GATED (committed to a new
+	// leader that must apply the move before clients are redirected into it).
+	type leaderEpoch struct {
+		leader string
+		epoch  int64
+	}
+	after := make(map[int32]leaderEpoch, len(fenced))
 
 	e.tableMu.RLock()
 	fwd := make(map[int32]string, 4)
 	member := make(map[int32]bool, len(e.table.Slots))
-	var surplus []int32 // left the replica set while holding a copy: arm a countdown
+	fenceOK := make(map[int32]bool, 4) // slots a held fence is still valid for
+	var surplus []int32                // left the replica set while holding a copy: arm a countdown
 	for s, p := range e.table.Slots {
+		if fencedSet[s] {
+			after[s] = leaderEpoch{p.Leader, p.Epoch}
+		}
 		if p.State == SlotMigratingOut && p.MigratingTo != "" {
 			fwd[s] = p.MigratingTo
+		}
+		// A fence is only meaningful while this node still leads a slot that
+		// is still migrating out. The moment the commit (leader_move) or an
+		// abort (rollback to stable) is applied, the fence must be released so
+		// the blocked writers proceed (and get redirected, or are served by
+		// the still-leading source).
+		if p.State == SlotMigratingOut && p.Leader == e.self {
+			fenceOK[s] = true
 		}
 		inSet := replicaListHas(p.Replicas, e.self)
 		if inSet {
@@ -313,6 +378,25 @@ func (e *Engine) syncMigrationState() {
 		}
 	}
 	e.tableMu.RUnlock()
+
+	// Release any fence whose migration no longer owns this node as leader —
+	// but, for a COMMITTED move (the slot's leader is now a different node),
+	// first gate the release on that target having applied the move itself:
+	// this node applying it says nothing about the target, and until the target
+	// applies it a client asking the target is sent back here while a client
+	// asking here is sent to the target (the MOVED/ASK ping-pong that failed
+	// clients with a small redirect budget). An abort (this node still leads)
+	// or an unassigned slot releases at once, as before.
+	for _, s := range fenced {
+		if fenceOK[s] {
+			continue
+		}
+		if pl, ok := after[s]; ok && pl.leader != "" && pl.leader != e.self {
+			e.holdFenceUntilTargetLeader(s, pl.leader, pl.epoch)
+			continue
+		}
+		e.releaseSlotFence(s)
+	}
 
 	e.setReplicaMembership(member)
 	e.fwdMu.Lock()
@@ -376,15 +460,37 @@ func (e *Engine) syncMigrationState() {
 	for _, s := range surplus {
 		e.startDropCountdown(s)
 	}
+
+	// The table changed: a follower may now follow a different leader. Wake the
+	// session loop so it re-groups immediately instead of on its next 1s tick —
+	// otherwise the new leader's acks=all watermark waits a second for its
+	// first replica report after every leader move.
+	e.kickSessions()
 }
 
 // SubmitAppend routes a client append to the slot leader (executing locally
 // when we are it) and applies acks semantics.
+//
+// The call takes the slot's migration write fence first: while a migration
+// commit fence is held (the source of a live migration, in the window between
+// the frozen LEO and the leader move, see fence.go), the append BLOCKS until
+// the fence is released and is then re-evaluated against the table — it is
+// never failed by the fence, and it is redirected to the new leader once the
+// move is applied.
 func (e *Engine) SubmitAppend(ctx context.Context, rec *data.EventRecord, acks string) (*data.AppendResponse, error) {
 	if acks == "" {
 		acks = e.acksDefault
 	}
 	slot := e.SlotOf(rec.AggregateID)
+	leave := e.enterWriteFence(slot)
+	defer leave()
+	return e.submitAppendLocked(ctx, rec, acks, slot)
+}
+
+// submitAppendLocked is the routing/execution half of SubmitAppend, run while
+// the slot's write-fence registration is held (so the fence drain accounts for
+// this append).
+func (e *Engine) submitAppendLocked(ctx context.Context, rec *data.EventRecord, acks string, slot int32) (*data.AppendResponse, error) {
 
 	// Copy the routing fields under the lock: the placement is mutated in
 	// place by the Raft apply loop (OpSlotState/OpLeaderMove), so holding the
@@ -1296,9 +1402,23 @@ func (e *Engine) replicaLoop(ctx context.Context) {
 			e.sessions = map[string]*fetchSession{}
 			e.sessMu.Unlock()
 			return
+		case <-e.sessKick:
+			e.syncSessions(ctx)
 		case <-ticker.C:
 			e.syncSessions(ctx)
 		}
+	}
+}
+
+// kickSessions asks replicaLoop to reconcile its fetch sessions now instead of
+// on the next tick. Called off the Raft apply path (non-blocking) so a leader
+// move re-establishes the follower sessions immediately: the new leader gets
+// its replicas' progress reports within one RPC round trip instead of up to a
+// second later, so its acks=all watermark does not stall.
+func (e *Engine) kickSessions() {
+	select {
+	case e.sessKick <- struct{}{}:
+	default:
 	}
 }
 
@@ -1421,13 +1541,9 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 	// returns that buffer to the pool, so it must happen after the round has
 	// written everything it took.
 	defer release()
-	productive := false
-	for _, it := range fr.Items {
-		// Sparse response: every entry carries data for its slot.
-		if err := applyFetchPayload(e.store, it.Slot, it.NextSeq, it.Payload); err != nil {
-			return productive, err
-		}
-		productive = true
+	productive, err := e.applyFetchItems(fr.Items)
+	if err != nil {
+		return productive, err
 	}
 	if len(fr.Items) > 0 {
 		// Positions moved: report only the slots that actually advanced
@@ -1437,34 +1553,101 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 		changed := sizedI32(scr.changed, len(fr.Items))[:0]
 		leos := sizedU64(scr.leos, len(fr.Items))[:0]
 		for _, it := range fr.Items {
+			if e.isDiverged(it.Slot) {
+				// A quarantined slot's content is not the leader's: do not
+				// report it, so it cannot stand in for an acks=all replica.
+				continue
+			}
 			changed = append(changed, it.Slot)
 			leos = append(leos, e.store.LastSeqOf(it.Slot)+1)
 		}
 		// The report is a synchronous unary call, so the slices can go back to
 		// the scratch right after it: the message is already on the wire.
-		e.reportProgress(addr, changed, leos, false)
+		if len(changed) > 0 {
+			e.reportProgress(addr, changed, leos, false)
+		}
 		scr.changed, scr.leos = changed[:0], leos[:0]
 	}
 	return productive, nil
 }
 
+// applyFetchItems lands one fetch round's items. Each slot is applied on its
+// own: a slot whose local log forked from the leader's (a seq already held with
+// different bytes) is QUARANTINED — its diverging records are skipped, the rest
+// of that slot's batch still lands, and every other slot of the round is still
+// applied. The fork is never returned as a round error, so one slot cannot fail
+// the whole multiplexed session (which used to back the session off and leave
+// every other slot of that leader without a fetch round — the 10s watermark
+// freeze). A genuine failure (a malformed frame) still aborts the round.
+func (e *Engine) applyFetchItems(items []FetchItem) (bool, error) {
+	productive := false
+	for _, it := range items {
+		dvg, err := applyFetchPayload(e.store, it.Slot, it.NextSeq, it.Payload)
+		if err != nil {
+			return productive, err
+		}
+		if len(dvg) > 0 {
+			e.noteDivergence(it.Slot, dvg)
+		}
+		productive = true
+	}
+	return productive, nil
+}
+
+// noteDivergence latches a slot whose local log forked from its leader's at one
+// or more seqs. The set is the fetch loop's quarantine list: the slot stops
+// being reported as in-sync (so it cannot gate acks=all with the wrong bytes)
+// and every OTHER slot of the same multiplexed session keeps replicating. It is
+// logged once per slot — the fence around the migration commit window is what
+// keeps this from happening at all; reaching here means that invariant broke.
+func (e *Engine) noteDivergence(slot int32, seqs []uint64) {
+	e.divMu.Lock()
+	_, had := e.diverged[slot]
+	e.diverged[slot] = fmt.Sprintf("seqs %v", seqs)
+	e.divMu.Unlock()
+	if !had {
+		e.logger.WithFields(map[string]any{"slot": slot, "seqs": seqs}).Warn(
+			"replica fetch: local log diverged from the leader at a seq; quarantining this slot and keeping the rest of the session (other slots unaffected)")
+	}
+}
+
+// isDiverged reports whether a slot has been quarantined for a fork.
+func (e *Engine) isDiverged(slot int32) bool {
+	e.divMu.Lock()
+	_, ok := e.diverged[slot]
+	e.divMu.Unlock()
+	return ok
+}
+
 // applyFetchPayload replays one slot's concatenated records; the batch ended
 // at nextSeq, so it starts at nextSeq-recordCount(payload).
-func applyFetchPayload(store *storage.Store, slot int32, nextSeq uint64, payload []byte) error {
+//
+// A record whose seq the local log already holds with DIFFERENT bytes is a
+// divergence: it is reported in the returned slice and SKIPPED, so the rest of
+// the batch still lands and the caller can quarantine just this slot. A genuine
+// failure (a malformed frame) is returned as an error. Returns (diverged, err).
+func applyFetchPayload(store *storage.Store, slot int32, nextSeq uint64, payload []byte) ([]uint64, error) {
 	seq := nextSeq - uint64(countRecords(payload))
+	var diverged []uint64
 	rest := payload
 	for len(rest) > 0 {
 		_, consumed, err := data.DecodeRecordMeta(rest)
 		if err != nil {
-			return err
+			return diverged, err
 		}
-		if err := store.AppendFrameAtSeq(slot, seq, rest[:consumed]); err != nil {
-			return err
+		if aerr := store.AppendFrameAtSeq(slot, seq, rest[:consumed]); aerr != nil {
+			if errors.Is(aerr, storage.ErrSeqDivergence) {
+				diverged = append(diverged, seq)
+				rest = rest[consumed:]
+				seq++
+				continue
+			}
+			return diverged, aerr
 		}
 		rest = rest[consumed:]
 		seq++
 	}
-	return nil
+	return diverged, nil
 }
 
 // countRecords walks a concatenated payload counting length prefixes.
