@@ -81,7 +81,7 @@ export default function SlotsPage() {
 
   // Gauge poller: uses the cached table (leaders/peers) and polls each peer's
   // /admin/writes — per-slot counters and gauges only, instead of re-fetching
-  // the full 4096-slot status every 2s. The write rate is no longer a column:
+  // the full slot-table status every 2s. The write rate is no longer a column:
   // the detail drawer samples the opened slot's own counter (see below).
   useEffect(() => {
     let stop = false

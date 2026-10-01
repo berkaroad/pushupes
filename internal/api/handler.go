@@ -61,7 +61,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	// The 4096-slot status is ~350KB of highly repetitive JSON; gzip cuts
+	// The whole slot table is a few hundred KB of highly repetitive JSON at the
+	// default slot count; gzip cuts
 	// it ~20x and browsers fetch transparently advertise the encoding.
 	if strings.HasPrefix(r.URL.Path, "/admin/") && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 		gz := gzip.NewWriter(w)
@@ -193,7 +194,7 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleWrites is the light per-slot poll target, without the 4096-entry slot
+// handleWrites is the light per-slot poll target, without the whole slot
 // table that rides /admin/cluster/status: the durable counters the console
 // diffs every 2s to derive write rates, plus the per-slot gauges it shows as
 // columns (WAL bytes, event stream count). Clients that poll it already hold

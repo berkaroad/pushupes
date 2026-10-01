@@ -11,7 +11,7 @@ export async function getClusterStatus(): Promise<ClusterStatus> {
 }
 
 // fetchNodeWrites pulls one node's per-slot counters AND gauges over CORS —
-// the light endpoint (no 4096-entry slot table) the console polls every 2s:
+// the light endpoint (no full per-slot table) the console polls every 2s:
 // `writes` is diffed into per-slot write rates, `bytes`/`streams` are shown as
 // columns. A node that has not loaded a slot reports 0 for it rather than
 // opening it (opening scans the slot's WAL), so the caller takes the answer

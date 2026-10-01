@@ -2,7 +2,7 @@ package cluster
 
 // Binary slot-table encoding for Raft snapshots.
 //
-// The JSON form of a 4096-slot table costs ~350KB (node ids repeated per
+// The JSON form of the whole slot table costs a few hundred KB (node ids repeated per
 // slot, map keys as strings). Snapshots ride the control plane, so the
 // encoding is a string dictionary plus fixed-layout varint entries:
 //
@@ -13,7 +13,7 @@ package cluster
 //	                 replicaIdx(u8)* migratingToIdx(u8, 255=none) }
 //
 // Repeated leader/replica patterns compress the result to a few KB with
-// gzip; the whole thing is <100KB uncompressed even at 4096 slots.
+// gzip; the whole thing is <100KB uncompressed even at the default slot count.
 
 import (
 	"bytes"

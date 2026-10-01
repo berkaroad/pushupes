@@ -204,7 +204,7 @@ func (e *Engine) ApplyCommand(cmd []byte) ([]byte, error) {
 }
 
 // SnapshotState implements cluster.Applier (binary: ~350KB JSON -> a few KB
-// for 4096 slots; snapshots ride the control plane).
+// for every slot; snapshots ride the control plane).
 func (e *Engine) SnapshotState() ([]byte, error) {
 	e.tableMu.RLock()
 	defer e.tableMu.RUnlock()
@@ -690,7 +690,7 @@ func (e *Engine) HandleMFetch(req MFetchRequest) (*MFetchResponse, error) {
 }
 
 // fetchScratch holds the follower's per-round slices: the reported positions
-// (one per followed slot, ~11KB at 4096 slots) and the progress report of a
+// (one per followed slot, ~11KB at the default slot count) and the progress report of a
 // productive round. Both were allocated fresh every round — hundreds of rounds
 // a second per followed leader — and both are dead as soon as the round's RPC
 // returns, so one goroutine (the session loop) reuses them.
@@ -965,7 +965,7 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 }
 
 // ownershipSnapshot returns the bitmap of slots led by this node, rebuilt
-// only when the Raft table version advances. Rebuilding walks the 4096-
+// only when the Raft table version advances. Rebuilding walks the whole
 // entry map once per table change instead of building a lookup map per
 // fetch round (thousands of rounds per second under load).
 type ownership struct {

@@ -25,8 +25,8 @@ type Store struct {
 	done  chan struct{}
 
 	// dirtyMu guards the set of slots with unflushed records; flushLoop
-	// consults only this set, so an idle 4096-slot node costs O(active)
-	// lock acquisitions per tick instead of O(4096).
+	// consults only this set, so an idle node costs O(active) lock
+	// acquisitions per tick instead of O(slot count).
 	dirtyMu sync.Mutex
 	dirty   map[int32]bool
 
@@ -47,7 +47,7 @@ type Store struct {
 
 // OpenStore loads every existing slot directory under dir and creates the
 // missing ones lazily on first write. Recovery is parallel: each slot's WAL
-// scan is independent, and with 4096 slots a serial scan would dominate
+// scan is independent, and with thousands of slots a serial scan would dominate
 // cold start (one disk walk + index rebuild per slot).
 // OpenStore opens (or creates) the store, repairing each slot's segment
 // indexes on the way: a start is where an index that is missing, stale or
