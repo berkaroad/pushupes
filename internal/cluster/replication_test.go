@@ -221,11 +221,13 @@ func TestSubmitAppendMigratingRedirectsToSource(t *testing.T) {
 	// slot 0: leader=node-1. Mark it migrating to node-2.
 	applyCmd(t, e, &Command{Op: OpSlotState, Slots: []int32{0}, State: SlotMigratingOut, MigratingTo: "node-2"})
 
-	// aggregate in slot 0 (even) — must be redirected to the source leader with ASK/MIGRATING
+	// An aggregate in slot 0 — that is the slot the state above was set on, so
+	// search for one that routes *there*, not for one that merely shares its
+	// parity with it (a coincidence that used to hold and then stopped).
 	agg := ""
-	for i := 0; i < 1000 && agg == ""; i++ {
+	for i := 0; i < 20000 && agg == ""; i++ {
 		cand := fmt.Sprintf("agg-%d", i)
-		if e.SlotOf(cand)%2 == 0 {
+		if e.SlotOf(cand) == 0 {
 			agg = cand
 		}
 	}

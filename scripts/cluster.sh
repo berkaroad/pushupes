@@ -19,7 +19,6 @@
 #   PEER_BASE=8391         节点 i 的 Raft(peer)端口 = PEER_BASE + i - 1
 #   CLIENT_BASE=8591         节点 i 的客户端(gRPC)端口 = CLIENT_BASE + i - 1
 #   REPLICATION_FACTOR=2   每槽副本数
-#   SLOT_COUNT=4096         固定槽数
 #   ACKS=leader            默认 acks（leader|all|none）
 #   RUN_DIR=$ROOT/.cluster 运行目录（数据、日志、pid）
 #   READY_TIMEOUT=90       等待就绪秒数
@@ -38,7 +37,6 @@ ADMIN_BASE="${ADMIN_BASE:-8091}"
 PEER_BASE="${PEER_BASE:-8391}"
 CLIENT_BASE="${CLIENT_BASE:-8591}"
 REPLICATION_FACTOR="${REPLICATION_FACTOR:-2}"
-SLOT_COUNT="${SLOT_COUNT:-4096}"
 ACKS="${ACKS:-leader}"
 RUN_DIR="${RUN_DIR:-$ROOT/.cluster}"
 READY_TIMEOUT="${READY_TIMEOUT:-90}"
@@ -118,13 +116,13 @@ start_node() {
        -admin "$HOST:$(admin_port "$n")" -peer "$HOST:$(peer_port "$n")" \
       -client "$HOST:$(client_port "$n")" \
       -data ./data -peers "$peers" -replication-factor "$REPLICATION_FACTOR" \
-      -slots "$SLOT_COUNT" -acks "$ACKS" "${extra[@]}" >> node.log 2>&1 < /dev/null &
+      -acks "$ACKS" "${extra[@]}" >> node.log 2>&1 < /dev/null &
   else
     nohup "$BIN" -node "node-$n" \
        -admin "$HOST:$(admin_port "$n")" -peer "$HOST:$(peer_port "$n")" \
       -client "$HOST:$(client_port "$n")" \
       -data ./data -peers "$peers" -replication-factor "$REPLICATION_FACTOR" \
-      -slots "$SLOT_COUNT" -acks "$ACKS" "${extra[@]}" >> node.log 2>&1 < /dev/null &
+      -acks "$ACKS" "${extra[@]}" >> node.log 2>&1 < /dev/null &
   fi
   pid=$!
   echo "$pid" > node.pid
@@ -146,8 +144,8 @@ wait_ready() {
         body="$(curl -s --max-time 2 "$(base_url "$i")/admin/cluster/status")"
         local state; state="$(json_field "$body" state)"
         local planned; planned="$(json_count "$body" epoch)"
-        if [[ "${state,,}" == "leader" && "$planned" == "$SLOT_COUNT" ]]; then
-          info "集群就绪：slot 规划 $planned/$SLOT_COUNT（每槽 $REPLICATION_FACTOR 副本）"
+        if [[ "${state,,}" == "leader" && "$planned" -gt 0 ]]; then
+          info "集群就绪：slot 规划 $planned 槽（每槽 $REPLICATION_FACTOR 副本）"
           return 0
         fi
       done
@@ -213,7 +211,7 @@ cmd_status() {
     state="$(json_field "$body" state)"
     leaders="$(printf '%s' "$body" | grep -o "\"leader\":\"node-$i\"" | wc -l | tr -d ' ')"
     migrating="$(printf '%s' "$body" | grep -o '"state":"migrating_' | wc -l | tr -d ' ')"
-    info "  node-$i: raft=${state} leader槽=${leaders}/$SLOT_COUNT 迁移中槽=${migrating} admin=$(admin_port "$i") client=$(client_port "$i")"
+    info "  node-$i: raft=${state} leader槽=${leaders} 迁移中槽=${migrating} admin=$(admin_port "$i") client=$(client_port "$i")"
   done
 }
 

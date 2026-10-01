@@ -31,13 +31,16 @@ import (
 
 func main() {
 	var (
-		nodeID      = flag.String("node", envOr("PUSHUPES_NODE", "node-1"), "node id")
-		adminAddr   = flag.String("admin", envOr("PUSHUPES_ADMIN", "http://127.0.0.1:8091"), "HTTP listen address: inter-node replication + admin + pprof")
-		clientAddr  = flag.String("client", envOr("PUSHUPES_CLIENT", "http://127.0.0.1:8591"), "gRPC data-plane listen address (event writes + queries)")
-		peerAddr    = flag.String("peer", envOr("PUSHUPES_PEER", "http://127.0.0.1:8391"), "Raft transport listen address (peer-to-peer)")
-		dataDir     = flag.String("data", envOr("PUSHUPES_DATA", "./data"), "data directory")
-		peers       = flag.String("peers", envOr("PUSHUPES_PEERS", ""), "comma list of id=http://host:peerport (admin/client addrs are self-registered; legacy id:peerport:adminport:clientport also accepted)")
-		slotCount   = flag.Int("slots", data.DefaultSlotCount, "fixed slot count")
+		nodeID     = flag.String("node", envOr("PUSHUPES_NODE", "node-1"), "node id")
+		adminAddr  = flag.String("admin", envOr("PUSHUPES_ADMIN", "http://127.0.0.1:8091"), "HTTP listen address: inter-node replication + admin + pprof")
+		clientAddr = flag.String("client", envOr("PUSHUPES_CLIENT", "http://127.0.0.1:8591"), "gRPC data-plane listen address (event writes + queries)")
+		peerAddr   = flag.String("peer", envOr("PUSHUPES_PEER", "http://127.0.0.1:8391"), "Raft transport listen address (peer-to-peer)")
+		dataDir    = flag.String("data", envOr("PUSHUPES_DATA", "./data"), "data directory")
+		peers      = flag.String("peers", envOr("PUSHUPES_PEERS", ""), "comma list of id=http://host:peerport (admin/client addrs are self-registered; legacy id:peerport:adminport:clientport also accepted)")
+		// The slot count is a permanent layout decision (routing, placement,
+		// migration granularity), so it is not a runtime knob — it is fixed at
+		// data.DefaultSlotCount. See DESIGN §7.2.
+		slotCount   = data.DefaultSlotCount
 		replication = flag.Int("replication-factor", 2, "replicas per slot")
 		segmentB    = flag.Int64("segment-bytes", storage.DefaultSegmentBytes, "WAL segment roll size in bytes")
 		acksDefault = flag.String("acks", "leader", "default acks for appends: leader|all|none")
@@ -59,7 +62,7 @@ func main() {
 	base.SetLevel(logrus.InfoLevel)
 	logger := logrus.NewEntry(base).WithField("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *slotCount, *replication, *segmentB, *acksDefault, *flushN, *flushD, *bootstrap, logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, slotCount, *replication, *segmentB, *acksDefault, *flushN, *flushD, *bootstrap, logger); err != nil {
 		logger.WithError(err).Fatal("pushupes exited with error")
 	}
 }
