@@ -350,10 +350,14 @@ func TestWriteSegmentsAcceptsGoodStream(t *testing.T) {
 	}
 }
 
-func TestSnapshotFailureRollsBackSlotState(t *testing.T) {
-	// Source (node-1) leads slot 0; migration target node-2 is dead ->
-	// the write forward during migrating_out fails -> the engine must roll
-	// the table back to stable so the source keeps serving untouched.
+// TestMigratingForwardFailureKeepsWriteAndSlot replaces the old
+// "a failed write forward rolls the slot back" expectation. A dead migration
+// target (nothing listening on its peer address) must not fail the client's
+// write — it is already durable in the source WAL — and must not roll the
+// whole migration back either. The source stays leader, keeps serving, and
+// leaves the abort decision to the migration controller's own catch-up
+// timeout (awaitCaughtUp), which is the only place with the whole picture.
+func TestMigratingForwardFailureKeepsWriteAndSlot(t *testing.T) {
 	e, st := newTestEngine(t, "node-1")
 	e.node = newTestRaftNode(t, e)
 
@@ -377,25 +381,199 @@ func TestSnapshotFailureRollsBackSlotState(t *testing.T) {
 		t.Fatal("expected forwarding map populated during migrating_out")
 	}
 
-	// A write during the window is served by the source and forwarded; the
-	// dead target (nothing listening) makes the forward fail fast and the
-	// engine must abort the slot.
-	_, err := e.SubmitAppend(context.Background(), makeRecord(aggAB, 3, "ab-3"), "leader")
-	if err == nil {
-		t.Fatal("expected forward failure")
+	// The write during the window is served by the source and its mirror push
+	// to the dead target fails fast: the write must still be acknowledged.
+	out, err := e.SubmitAppend(context.Background(), makeRecord(aggAB, 3, "ab-3"), "leader")
+	if err != nil {
+		t.Fatalf("a failed migration push must not fail the client write: %v", err)
 	}
-	p, _ := e.TableSnapshot().Slots[0]
-	if p.State != SlotStable || p.MigratingTo != "" {
-		t.Fatalf("slot must be rolled back to stable, got %+v", p)
+	if out == nil || out.Status != data.StatusSuccess || out.Seq != 3 {
+		t.Fatalf("write not acknowledged off the local copy: %+v", out)
 	}
-	// the source WAL still holds all three records — no data was lost
 	if leo := st.LastSeqOf(0); leo != 3 {
 		t.Fatalf("source LEO %d want 3", leo)
 	}
-	// replayed command after abort: exists again via idempotency
-	out, err := e.SubmitAppend(context.Background(), makeRecord(aggAB, 3, "ab-3"), "leader")
+	// the slot keeps migrating: only a per-write push failed, not the migration
+	if p, _ := e.TableSnapshot().Slots[0]; p.State != SlotMigratingOut || p.MigratingTo != "node-2" {
+		t.Fatalf("a failed push rolled the migration back: %+v", p)
+	}
+	// a replayed command after the failed push is still idempotent
+	out, err = e.SubmitAppend(context.Background(), makeRecord(aggAB, 3, "ab-3"), "leader")
 	if err != nil || out.Status != data.StatusExists {
-		t.Fatalf("post-abort replay: %+v %v", out, err)
+		t.Fatalf("post-push replay: %+v %v", out, err)
+	}
+}
+
+// TestMigratingForwardNotContiguousKeepsWriteAndMigration is the regression
+// test for the migration-forward stall. The target is a LIVE peer that does
+// not hold the slot yet (its seq counter is 0 — a snapshot/catch-up still in
+// flight, or a replica the post-migration cleanup recycled), so the push of
+// seq 3 is refused with "seq 3 not contiguous (counter 0)". That refusal is an
+// internal catch-up fact, not a client failure: before the fix the engine
+// returned it to the client AND rolled the migration back, which turned every
+// in-flight append in the migration window into a failure — and the client's
+// retry (which takes the EXISTS path) into another one. Now the write is
+// acknowledged off its durable local copy, the slot keeps migrating, and the
+// target is left to catch up over the ordinary fetch loop.
+func TestMigratingForwardNotContiguousKeepsWriteAndMigration(t *testing.T) {
+	payloadcodec.InstallCodec()
+	leader, st := newTestEngine(t, "node-1")
+	leader.node = newTestRaftNode(t, leader)
+
+	// a live target peer whose local copy of the slot does not exist yet
+	tgt, tgtStore := newTestEngine(t, "node-2")
+	tgtAddr := newPeerHarness(t, tgt)
+
+	join(t, leader, "node-1", "127.0.0.1:1")
+	join(t, leader, "node-2", tgtAddr)
+	applyCmd(t, leader, &Command{Op: OpPlanSlots})
+
+	agg := aggInSlot(t, leader, 0)
+	for v := uint64(1); v <= 2; v++ {
+		if _, err := st.Append(makeRecord(agg, uint32(v), fmt.Sprintf("nc-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	applyCmd(t, leader, &Command{Op: OpSlotState, Slots: []int32{0}, State: SlotMigratingOut, MigratingTo: "node-2"})
+	leader.syncMigrationState()
+
+	resp, err := leader.SubmitAppend(context.Background(), makeRecord(agg, 3, "nc-3"), "leader")
+	if err != nil {
+		t.Fatalf("a forward the target refuses as non-contiguous must not fail the write: %v", err)
+	}
+	if resp == nil || resp.Status != data.StatusSuccess || resp.Seq != 3 {
+		t.Fatalf("write not acknowledged off the local copy: %+v", resp)
+	}
+	if leo := st.LastSeqOf(0); leo != 3 {
+		t.Fatalf("leader LEO %d want 3", leo)
+	}
+	// the migration was NOT rolled back and the slot is still writable here
+	if p, _ := leader.TableSnapshot().Slots[0]; p.State != SlotMigratingOut || p.MigratingTo != "node-2" {
+		t.Fatalf("migration must stay staged, got %+v", p)
+	}
+	// the target genuinely had no prefix: the push really was refused
+	if leo := tgtStore.LastSeqOf(0); leo != 0 {
+		t.Fatalf("target LEO %d want 0 (the push must really have failed)", leo)
+	}
+}
+
+// TestLeaderGainDropsStaleFollowerHW pins the leadership-change reset. A node
+// that starts leading a slot used to keep the previous term's follower
+// positions in its replication bookkeeping; their LEOs are as of the old
+// leader's last sample (often far below this node's own LEO) and stay "fresh"
+// for the staleness window, so the acks=all watermark froze below the leader
+// LEO until each follower happened to report again — the seconds-long pause
+// right after a migration's leader move. Gaining leadership must drop them.
+func TestLeaderGainDropsStaleFollowerHW(t *testing.T) {
+	e, _ := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	// hand slot 0 to node-2, then take it back: the take-back is a leadership
+	// GAIN for node-1.
+	applyCmd(t, e, &Command{Op: OpLeaderMove, Slots: []int32{0}, NewLeader: "node-2"})
+	if p, _ := e.TableSnapshot().Slots[0]; p.Leader != "node-2" {
+		t.Fatalf("setup: slot 0 leader %q", p.Leader)
+	}
+	// the previous term's follower bookkeeping, exactly as advanceHW would
+	// have left it: fresh stamp, far-behind LEO.
+	e.replMu.Lock()
+	e.repl[0] = &slotRepl{node: []string{"node-2"}, leo: []uint64{1}, lastOK: []time.Time{time.Now()}, hw: 1}
+	e.replMu.Unlock()
+
+	applyCmd(t, e, &Command{Op: OpLeaderMove, Slots: []int32{0}, NewLeader: "node-1"})
+	if p, _ := e.TableSnapshot().Slots[0]; p.Leader != "node-1" {
+		t.Fatalf("setup: slot 0 not back on node-1: %q", p.Leader)
+	}
+	e.replMu.Lock()
+	_, kept := e.repl[0]
+	e.replMu.Unlock()
+	if kept {
+		t.Fatal("a newly gained leader must drop the previous term's stale follower positions")
+	}
+}
+
+// TestMigratingForwardExpires pins the migrating_out timeout fallback: a slot
+// that has been migrating_out past migrationForwardTimeout stops mirroring,
+// so a target that never catches up cannot keep every write paying for a
+// doomed push (the persistent-collapse path). Returning to stable clears the
+// deadline so a later migration starts with a fresh window.
+func TestMigrationForwardExpires(t *testing.T) {
+	e, _ := newTestEngine(t, "node-1")
+	e.node = newTestRaftNode(t, e)
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:9")
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	applyCmd(t, e, &Command{Op: OpSlotState, Slots: []int32{0}, State: SlotMigratingOut, MigratingTo: "node-2"})
+	e.syncMigrationState()
+	if e.migrationForwardExpired(0) {
+		t.Fatal("a freshly staged migration must still mirror")
+	}
+	e.migFwdMu.Lock()
+	if _, ok := e.migFwdSince[0]; !ok {
+		e.migFwdMu.Unlock()
+		t.Fatal("staging must record the forward deadline")
+	}
+	e.migFwdSince[0] = time.Now().Add(-migrationForwardTimeout - time.Second)
+	e.migFwdMu.Unlock()
+	if !e.migrationForwardExpired(0) {
+		t.Fatal("a migration older than the timeout must stop mirroring")
+	}
+
+	applyCmd(t, e, &Command{Op: OpSlotState, Slots: []int32{0}, State: SlotStable})
+	e.syncMigrationState()
+	e.migFwdMu.Lock()
+	_, still := e.migFwdSince[0]
+	e.migFwdMu.Unlock()
+	if still {
+		t.Fatal("a slot back to stable must not keep a forward deadline")
+	}
+}
+
+// TestMigrationTargetDoesNotGateHW pins the stall fix. A migration target that
+// is still catching up is an EXTRA copy the migration is building, not one of
+// the replicas the slot's acks=all obligation rests on, so it must not freeze
+// the high watermark at its low LEO. Counting it made the watermark lag the
+// leader's LEO and every acks=all append block to the 10s wait deadline — the
+// seconds-long pause around a migration. An ordinary (non-target) lagging
+// replica still gates, so acks=all is not weakened.
+func TestMigrationTargetDoesNotGateHW(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	join(t, e, "node-3", "127.0.0.1:3")
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	// slot 0 (led by node-1): add node-3 as the migration target.
+	applyCmd(t, e, &Command{Op: OpSlotAddReplica, Slots: []int32{0}, NodeID: "node-3"})
+	agg := aggInSlot(t, e, 0)
+	for v := uint64(1); v <= 5; v++ {
+		if _, err := st.Append(makeRecord(agg, uint32(v), fmt.Sprintf("hw-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	applyCmd(t, e, &Command{Op: OpSlotState, Slots: []int32{0}, State: SlotMigratingOut, MigratingTo: "node-3"})
+
+	// The target reports a far-behind LEO and nothing else has reported: the
+	// watermark must not be pinned at 1 (pre-fix) but follow the leader's LEO.
+	e.NoteReplicaProgress(0, "node-3", 1)
+	if hw := e.HW(0); hw != 5 {
+		t.Fatalf("a catching-up migration target pinned HW at %d, want the leader LEO 5", hw)
+	}
+
+	// counter-case, on a non-migrating slot led by this node (slot 3): an
+	// ordinary lagging replica still holds the watermark back.
+	agg3 := aggInSlot(t, e, 3)
+	for v := uint64(1); v <= 5; v++ {
+		if _, err := st.Append(makeRecord(agg3, uint32(v), fmt.Sprintf("hw3-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.NoteReplicaProgress(3, "node-2", 2)
+	if hw := e.HW(3); hw != 2 {
+		t.Fatalf("an ordinary lagging replica must still gate HW, got %d want 2", hw)
 	}
 }
 

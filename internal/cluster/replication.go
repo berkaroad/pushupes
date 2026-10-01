@@ -59,6 +59,19 @@ type Engine struct {
 	fwdMu sync.RWMutex
 	fwd   map[int32]string
 
+	// when this leader first saw a slot in migrating_out, so a target that
+	// never catches up cannot keep the best-effort mirror alive forever
+	// (see migrationForwardExpired). Cleared as soon as the slot is no
+	// longer migrating_out.
+	migFwdMu    sync.Mutex
+	migFwdSince map[int32]time.Time
+
+	// slots this node led as of the previous table walk, so syncMigrationState
+	// can tell a leadership GAIN (drop the previous term's stale follower
+	// positions; see advanceHW) from a steady state.
+	ledMu   sync.Mutex
+	ledPrev map[int32]bool
+
 	// one replication session per slot leader (multiplexed long-poll fetch)
 	sessMu   sync.Mutex
 	sessions map[string]*fetchSession
@@ -181,6 +194,8 @@ func NewEngine(node *Node, store *storage.Store, self string, acksDefault string
 		fwd:         map[int32]string{},
 		sessions:    map[string]*fetchSession{},
 		failStreak:  map[string]int{},
+		migFwdSince: map[int32]time.Time{},
+		ledPrev:     map[int32]bool{},
 		acksDefault: acksDefault,
 		// post-migration cleanup: the former source keeps its copy for this
 		// long once it sees the hand-over committed (-drop-after).
@@ -304,6 +319,53 @@ func (e *Engine) syncMigrationState() {
 	e.fwd = fwd
 	e.fwdMu.Unlock()
 
+	// Leadership bookkeeping: a slot this node just STARTED leading carries
+	// the previous term's follower positions in e.repl. Their leos are as of
+	// the old leader's last progress sample — often far below this node's own
+	// LEO — and they stay "fresh" for isrStaleAfter, so advanceHW's min would
+	// freeze the watermark below the leader's LEO until each follower happens
+	// to report again. That freeze is what blocked every acks=all append to
+	// the 10s wait deadline around a migration. Dropping the bookkeeping makes
+	// the new leader count only live reports; the followers re-report within
+	// one fetch round and the watermark jumps straight to the true min.
+	e.tableMu.RLock()
+	led := make(map[int32]bool, len(e.table.Slots))
+	for s, p := range e.table.Slots {
+		if p.Leader == e.self {
+			led[s] = true
+		}
+	}
+	e.tableMu.RUnlock()
+	e.ledMu.Lock()
+	prevLed := e.ledPrev
+	e.ledPrev = led
+	e.ledMu.Unlock()
+	e.replMu.Lock()
+	for s := range led {
+		if !prevLed[s] {
+			delete(e.repl, s)
+		}
+	}
+	e.replMu.Unlock()
+
+	// Deadline bookkeeping for the best-effort forward: stamp the moment the
+	// leader first sees a slot in migrating_out, so a target that never
+	// catches up cannot keep the mirror alive forever (see
+	// migrationForwardExpired). Anything no longer migrating is dropped.
+	now := time.Now()
+	e.migFwdMu.Lock()
+	for s := range e.migFwdSince {
+		if _, ok := fwd[s]; !ok {
+			delete(e.migFwdSince, s)
+		}
+	}
+	for s := range fwd {
+		if _, ok := e.migFwdSince[s]; !ok {
+			e.migFwdSince[s] = now
+		}
+	}
+	e.migFwdMu.Unlock()
+
 	// A copy this node is on again is not surplus: cancel whatever was queued
 	// for it (the pending map holds at most a handful of slots).
 	for _, s := range e.pendingSlotIDs() {
@@ -324,8 +386,18 @@ func (e *Engine) SubmitAppend(ctx context.Context, rec *data.EventRecord, acks s
 	}
 	slot := e.SlotOf(rec.AggregateID)
 
+	// Copy the routing fields under the lock: the placement is mutated in
+	// place by the Raft apply loop (OpSlotState/OpLeaderMove), so holding the
+	// *Placement past RUnlock raced a concurrent rollback — it read
+	// MigratingTo as "" mid-write and the forward then dialed an empty peer
+	// address.
 	e.tableMu.RLock()
-	p, ok := e.table.Slots[slot]
+	pp, ok := e.table.Slots[slot]
+	var pState SlotState
+	var pMigratingTo, pLeader string
+	if ok {
+		pState, pMigratingTo, pLeader = pp.State, pp.MigratingTo, pp.Leader
+	}
 	e.tableMu.RUnlock()
 	if !ok {
 		// single-node / unassigned: serve locally
@@ -333,43 +405,45 @@ func (e *Engine) SubmitAppend(ctx context.Context, rec *data.EventRecord, acks s
 	}
 
 	switch {
-	case p.State == SlotMigratingOut && p.MigratingTo != "" && p.Leader == e.self:
+	case pState == SlotMigratingOut && pMigratingTo != "" && pLeader == e.self:
 		// step 4 of migration: source stays leader and keeps serving writes,
-		// but every accepted record is also pushed to the target at the same
+		// and every accepted record is also pushed to the target at the same
 		// seq so the two copies converge before the commit step.
+		//
+		// The push is BEST EFFORT. The target is a replica of this slot, so
+		// the ordinary fetch loop already carries the same records to it and
+		// the migration only commits after the target has caught up
+		// (awaitCaughtUp). A push that fails because the target is not ready
+		// yet — no contiguous prefix locally, a snapshot still importing, no
+		// reachable peer address — therefore must NOT fail the client's
+		// write (it is already durable in the leader's WAL) and must NOT roll
+		// the whole migration back. Failing it did both, and turned every
+		// in-flight append in the migration window into a 10s acks=all
+		// timeout plus a duplicated failure on the client's retry.
 		resp, err := e.localAppend(slot, rec, acks)
 		if err != nil {
 			return nil, err
 		}
-		// fast path: the command already landed during an earlier attempt
 		switch {
 		case resp.Status == data.StatusSuccess && resp.Seq > 0:
-			if ferr := e.forwardTo(ctx, e.peerAddr(p.MigratingTo), slot, resp.Seq, rec); ferr != nil {
-				e.logger.WithError(ferr).WithField("slot", slot).Warn("migration forward failed, rollback slot state")
-				e.rollbackMigration(slot)
-				return nil, ferr
-			}
+			e.forwardBestEffort(ctx, slot, pMigratingTo, resp.Seq, rec)
 		case resp.Status == data.StatusExists && resp.Seq > 0 && resp.Record != nil:
 			// a retried command: make sure the target converged too
-			if ferr := e.forwardTo(ctx, e.peerAddr(p.MigratingTo), slot, resp.Seq, resp.Record); ferr != nil {
-				e.logger.WithError(ferr).WithField("slot", slot).Warn("migration exists-forward failed")
-				e.rollbackMigration(slot)
-				return nil, ferr
-			}
+			e.forwardBestEffort(ctx, slot, pMigratingTo, resp.Seq, resp.Record)
 		}
 		return resp, nil
-	case p.State == SlotMigratingOut:
+	case pState == SlotMigratingOut:
 		// someone else leads a migrating slot: the leader handles forwarding
-		addr := e.clientAddr(p.Leader)
-		return nil, &RedirectError{Kind: data.ErrIDMigrating, Slot: slot, Node: p.Leader, Addr: addr}
-	case p.Leader == e.self:
+		addr := e.clientAddr(pLeader)
+		return nil, &RedirectError{Kind: data.ErrIDMigrating, Slot: slot, Node: pLeader, Addr: addr}
+	case pLeader == e.self:
 		return e.localAppend(slot, rec, acks)
 	default:
-		addr := e.clientAddr(p.Leader)
+		addr := e.clientAddr(pLeader)
 		if addr == "" {
 			return nil, data.ErrSlotNotLocal
 		}
-		return nil, &RedirectError{Kind: data.ErrIDSlotNotLocal, Slot: slot, Node: p.Leader, Addr: addr}
+		return nil, &RedirectError{Kind: data.ErrIDSlotNotLocal, Slot: slot, Node: pLeader, Addr: addr}
 	}
 }
 
@@ -441,6 +515,49 @@ func (e *Engine) forwardTo(ctx context.Context, toAddr string, slot int32, seq u
 	return e.peerReplicate(ctx, toAddr, slot, seq, rec.EncodeBinary(nil))
 }
 
+// migrationForwardTimeout bounds how long a slot leader keeps mirroring writes
+// to a migration target that is not making progress.
+//
+// The mirror in forwardBestEffort is only a convergence accelerator: the
+// target is a replica and the fetch loop carries the same records to it, so
+// stopping the push can never lose data — the migration commit is gated on
+// the target having caught up (awaitCaughtUp), never on this push. Past this
+// bound the leader stops pushing (writes stay plain leader writes, which is
+// what keeps a stuck migration from taxing every append) and the migration
+// controller's own catch-up timeout aborts the migration cleanly. This is the
+// "a slot must not sit in migrating_out forever" fallback.
+const migrationForwardTimeout = 30 * time.Second
+
+// forwardBestEffort mirrors one accepted record to the migration target and
+// swallows every failure. It never fails the caller's write and never rolls
+// the migration back (see SubmitAppend): a failure means "the target is not
+// ready yet", which the replica fetch loop and the migration's own catch-up
+// wait handle.
+func (e *Engine) forwardBestEffort(ctx context.Context, slot int32, toNode string, seq uint64, rec *data.EventRecord) {
+	if toNode == "" || e.migrationForwardExpired(slot) {
+		return
+	}
+	addr := e.peerAddr(toNode)
+	if addr == "" {
+		return // target not registered (yet); fetch catches up when it is
+	}
+	if err := e.forwardTo(ctx, addr, slot, seq, rec); err != nil {
+		e.logger.WithError(err).WithFields(map[string]any{"slot": slot, "target": toNode}).
+			Debug("migration forward skipped; target catches up via fetch")
+	}
+}
+
+// migrationForwardExpired reports whether a slot has been migrating_out longer
+// than migrationForwardTimeout, i.e. its target is not making progress. The
+// exact duration is recorded when the leader first sees the slot migrating
+// (see syncMigrationState).
+func (e *Engine) migrationForwardExpired(slot int32) bool {
+	e.migFwdMu.Lock()
+	since, ok := e.migFwdSince[slot]
+	e.migFwdMu.Unlock()
+	return ok && time.Since(since) > migrationForwardTimeout
+}
+
 // HandleReplicate serves PeerService.Replicate: a migration forwarding push.
 // The payload is a single encoded record to be appended at a fixed seq.
 func (e *Engine) HandleReplicate(slot int32, seq uint64, payload []byte) error {
@@ -474,10 +591,42 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 			return nil
 		}
 		if time.Now().After(deadline) {
+			e.logHWStall(slot, seq, hw)
 			return fmt.Errorf("timeout waiting for high watermark (hw %d < seq %d)", hw, seq)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
+}
+
+// logHWStall reports why an acks=all append ran into the wait deadline: the
+// slot's replica set, each replica's last reported LEO and how stale that
+// report is, and the leader's own LEO. Without this a wedged watermark (the
+// migration stall) only showed up as a client-side timeout.
+func (e *Engine) logHWStall(slot int32, seq, hw uint64) {
+	e.replMu.Lock()
+	sr := e.repl[slot]
+	type rep struct {
+		Node  string `json:"node"`
+		LEO   uint64 `json:"leo"`
+		AgeS  int64  `json:"age_s"`
+		InISR bool   `json:"in_isr"`
+	}
+	var reps []rep
+	if sr != nil {
+		cutoff := time.Now().Add(-isrStaleAfter)
+		now := time.Now()
+		for i, node := range sr.node {
+			reps = append(reps, rep{node, sr.leo[i], int64(now.Sub(sr.lastOK[i]).Seconds()), sr.lastOK[i].After(cutoff)})
+		}
+	}
+	e.replMu.Unlock()
+	e.logger.WithFields(map[string]any{
+		"slot": slot, "seq": seq, "hw": hw,
+		"leader_leo": e.store.LastSeqOf(slot),
+		"replicas":   e.tableReplicasOf(slot),
+		"positions":  reps,
+		"target":     e.migrationTargetOf(slot),
+	}).Warn("acks=all wait deadline hit: high watermark did not cover the append")
 }
 
 func (e *Engine) replicaCount(slot int32) int {
@@ -510,7 +659,18 @@ func (e *Engine) isr(slot int32) []string {
 
 // advanceHW recomputes the slot high watermark as the min LEO across the
 // in-sync set (leader included). Called on every replica progress.
+//
+// A migration TARGET that is still catching up does not gate the watermark.
+// It is an extra copy the migration is building (the admission grew the set to
+// factor+1) and not yet one of the replicas the slot's acks=all obligation
+// rests on — the migration only commits after it caught up (awaitCaughtUp).
+// Counting its low LEO froze the watermark below the leader's LEO and made
+// every acks=all append block to the 10s wait deadline: the seconds-long pause
+// around a migration. The slot's ordinary replicas still gate normally, so
+// acks=all keeps its meaning.
 func (e *Engine) advanceHW(slot int32) {
+	target := e.migrationTargetOf(slot)
+
 	e.replMu.Lock()
 	defer e.replMu.Unlock()
 	sr := e.repl[slot]
@@ -528,6 +688,9 @@ func (e *Engine) advanceHW(slot int32) {
 		if i < 0 || !sr.lastOK[i].After(cutoff) {
 			continue // unknown or out of ISR: excluded from HW computation
 		}
+		if node == target && sr.leo[i] < leaderLEO {
+			continue // still catching up: not an ack holder yet
+		}
 		if l := sr.leo[i]; l < minLEO {
 			minLEO = l
 		}
@@ -535,6 +698,17 @@ func (e *Engine) advanceHW(slot int32) {
 	if minLEO > sr.hw {
 		sr.hw = minLEO
 	}
+}
+
+// migrationTargetOf returns the node a slot is currently migrating to, or ""
+// when it is not migrating_out.
+func (e *Engine) migrationTargetOf(slot int32) string {
+	e.tableMu.RLock()
+	defer e.tableMu.RUnlock()
+	if p, ok := e.table.Slots[slot]; ok && p.State == SlotMigratingOut {
+		return p.MigratingTo
+	}
+	return ""
 }
 
 func (e *Engine) tableReplicasOf(slot int32) []string {
