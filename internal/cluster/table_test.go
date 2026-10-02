@@ -14,7 +14,7 @@ func newTestEngine(t *testing.T, self string) (*Engine, *storage.Store) {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	eng := NewEngine(nil, st, self, "leader", nil)
+	eng := NewEngine(nil, st, self, nil)
 	return eng, st
 }
 

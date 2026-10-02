@@ -39,7 +39,7 @@ message AppendRequest {
   int64 unix_time = 3; // 0 = server clock
   string command_id = 4; // idempotency key
   repeated Event events = 5;
-  string acks = 6; // "leader" | "all" | "none"; empty = node default
+  reserved 6; // append success always means: high watermark covers it
 }
 
 message AppendResponse {

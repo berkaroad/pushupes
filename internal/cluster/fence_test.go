@@ -35,7 +35,7 @@ func TestWriteFenceBlocksAppendsAndDoesNotFailThem(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := e.SubmitAppend(context.Background(), makeRecord(agg, 2, "w-2"), "leader")
+		_, err := e.SubmitAppend(context.Background(), makeRecord(agg, 2, "w-2"))
 		done <- err
 	}()
 
@@ -49,7 +49,7 @@ func TestWriteFenceBlocksAppendsAndDoesNotFailThem(t *testing.T) {
 	}
 
 	// Other slots are not fenced: the fence is per slot.
-	if out, err := e.SubmitAppend(context.Background(), makeRecord(other, 1, "o-1"), "leader"); err != nil || out.Status != data.StatusSuccess {
+	if out, err := e.SubmitAppend(context.Background(), makeRecord(other, 1, "o-1")); err != nil || out.Status != data.StatusSuccess {
 		t.Fatalf("an unrelated slot must stay writable under a fence: %+v %v", out, err)
 	}
 
@@ -169,7 +169,7 @@ func TestHandleFenceSlotPushesFrozenTailAndHoldsFence(t *testing.T) {
 	// The fence stays held after a successful call: the move has not committed.
 	done := make(chan error, 1)
 	go func() {
-		_, err := src.SubmitAppend(context.Background(), makeRecord(agg, 4, "ft-4"), "leader")
+		_, err := src.SubmitAppend(context.Background(), makeRecord(agg, 4, "ft-4"))
 		done <- err
 	}()
 	select {
@@ -213,7 +213,7 @@ func TestHandleFenceSlotAbortsOnUnreachableTarget(t *testing.T) {
 		t.Fatal("an unreachable target must fail the fence, not report success")
 	}
 	// The failed fence must not stay held: writes must keep flowing.
-	if out, err := src.SubmitAppend(context.Background(), makeRecord(agg, 2, "ab-2"), "leader"); err != nil || out.Status != data.StatusSuccess {
+	if out, err := src.SubmitAppend(context.Background(), makeRecord(agg, 2, "ab-2")); err != nil || out.Status != data.StatusSuccess {
 		t.Fatalf("a failed fence must not wedge writes: %+v %v", out, err)
 	}
 }
@@ -325,7 +325,7 @@ func TestApplyFetchItemsQuarantinesOneSlotKeepsSession(t *testing.T) {
 // TestTableChangeKicksReplicaSessions pins the follow-up to the fence: a leader
 // move must make the followers re-group their fetch sessions at once, not on
 // the next 1s tick. Until they do, the new leader has no replica progress report
-// and its acks=all watermark is stuck at 0 — a full-second stall of every append
+// and its watermark is stuck at 0 — a full-second stall of every append
 // right after each migration.
 func TestTableChangeKicksReplicaSessions(t *testing.T) {
 	e, _ := newTestEngine(t, "node-1")
@@ -377,7 +377,7 @@ func TestFenceReleaseWaitsForTargetToApplyMove(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := src.SubmitAppend(context.Background(), makeRecord(agg, 1, "gate-1"), "leader")
+		_, err := src.SubmitAppend(context.Background(), makeRecord(agg, 1, "gate-1"))
 		done <- err
 	}()
 

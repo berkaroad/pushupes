@@ -1,6 +1,6 @@
 // Command seed writes approximately -mib of event records into one slot so
 // migration benchmarks have a realistic sealed-segment layout. It finds an
-// aggregate whose CRC16 hash lands on -slot, then appends with -acks to the
+// aggregate whose hash lands on -slot, then appends to the
 // slot leader (resolved from an admin status snapshot).
 package main
 
@@ -27,7 +27,6 @@ func main() {
 	admin := flag.String("admin", "127.0.0.1:8091", "one admin addr of the cluster")
 	slot := flag.Int("slot", 0, "target slot id")
 	mib := flag.Int("mib", 100, "approx bytes to write, in MiB")
-	acks := flag.String("acks", "leader", "leader or all")
 	conns := flag.Int("conns", 8, "parallel aggregates")
 	flag.Parse()
 
@@ -47,7 +46,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "leader has no client_addr")
 		os.Exit(1)
 	}
-	fmt.Printf("seeding slot %d via leader %s (%s), acks=%s\n", *slot, ldr.Leader, addr, *acks)
+	fmt.Printf("seeding slot %d via leader %s (%s)\n", *slot, ldr.Leader, addr)
 
 	conn, err := grpc.NewClient(hostPort(addr), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -79,7 +78,7 @@ func main() {
 				n := seq.Add(1)
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				_, err := cli.Append(ctx, &pushupesv1.AppendRequest{
-					AggregateId: agg, Version: v, CommandId: fmt.Sprintf("s-%d", n), Acks: *acks,
+					AggregateId: agg, Version: v, CommandId: fmt.Sprintf("s-%d", n),
 					Events: []*pushupesv1.Event{{Type: "Seed", Body: body}},
 				})
 				cancel()

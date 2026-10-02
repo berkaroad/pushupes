@@ -20,8 +20,8 @@ func appendOne(t *testing.T, store *storage.Store, agg, cmd string) {
 // TestMFetchLongPollWakesOnAppend pins the leader-side long-poll contract:
 // a round with WaitMS must return well before the wait deadline once a
 // record is appended to one of the polled slots — the store wake handle,
-// not the deadline, ends the wait. Guards the acks=all latency path
-// (follower learns about new records through this round).
+// not the deadline, ends the wait. Guards the write-acknowledgement
+// latency path (the follower learns about new records through this round).
 func TestMFetchLongPollWakesOnAppend(t *testing.T) {
 	dir := t.TempDir()
 	store, err := storage.OpenStore(dir, 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
@@ -30,7 +30,7 @@ func TestMFetchLongPollWakesOnAppend(t *testing.T) {
 	}
 	defer store.Close()
 
-	e := NewEngine(nil, store, "node-1", "leader", nil)
+	e := NewEngine(nil, store, "node-1", nil)
 	e.tableMu.Lock()
 	e.table.Slots[3] = &Placement{Leader: "node-1", Replicas: []string{"node-1", "node-2"}, Epoch: 1, State: SlotStable}
 	e.tableMu.Unlock()
@@ -78,7 +78,7 @@ func TestMFetchLongPollWakesOnAppend(t *testing.T) {
 // then touches several of them, ONE long-poll response must carry data
 // for every slot the burst advanced — the old behavior answered for the
 // first fired slot only and made the follower pay one round trip per
-// remaining slot (RTT x slots of HW lag under acks=all). Note this is
+// remaining slot (RTT x slots of HW lag per acknowledgement). Note this is
 // the idle→burst path: with data present at request time phase 1 answers
 // immediately (fetch answers with whatever it has), so no waiters park at all.
 // One wake must answer for every slot that has data, not just the slot that
@@ -92,7 +92,7 @@ func TestMFetchBurstDrainAllWaiters(t *testing.T) {
 	}
 	defer store.Close()
 
-	e := NewEngine(nil, store, "node-1", "leader", nil)
+	e := NewEngine(nil, store, "node-1", nil)
 	e.tableMu.Lock()
 	for s := range 8 {
 		e.table.Slots[int32(s)] = &Placement{Leader: "node-1", Replicas: []string{"node-1", "node-2"}, Epoch: 1, State: SlotStable}
@@ -111,7 +111,7 @@ func TestMFetchBurstDrainAllWaiters(t *testing.T) {
 	}
 
 	const wait = 2 * time.Second
-	// The coalescing window is 2ms by design (it delays acks=all, so it cannot be
+	// The coalescing window is 2ms by design (it delays every acknowledgement, so it cannot be
 	// widened), and whether three appends land inside it depends on the machine,
 	// not on the code under test. So burst a few times and require the property
 	// to hold at least once: an implementation that answers one slot per wake

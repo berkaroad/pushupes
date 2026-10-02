@@ -77,11 +77,12 @@ func decodeAppendRequest(b []byte, m *pushupesv1.AppendRequest) error {
 			}
 			m.Events, b = append(m.Events, ev), b[n:]
 		case 6:
-			v, n, err := consumeString(b, typ)
-			if err != nil {
-				return err
+			// reserved field number: skip it like any unknown one
+			n = protowire.ConsumeFieldValue(num, typ, b)
+			if n < 0 {
+				return protowire.ParseError(n)
 			}
-			m.Acks, b = v, b[n:]
+			b = b[n:]
 		default:
 			n = protowire.ConsumeFieldValue(num, typ, b)
 			if n < 0 {

@@ -66,7 +66,6 @@ func main() {
 	dur := flag.Duration("duration", 10*time.Second, "sustained write duration")
 	connsFlag := flag.Int("conns", 16, "workers (aggregates are partitioned across them)")
 	size := flag.Int("size", 1024, "event body bytes (must be <= 1024 * 1024)")
-	acks := flag.String("acks", "leader", "acks: leader|all|none")
 	reportEvery := flag.Duration("report", time.Second, "live report interval")
 	flag.Parse()
 
@@ -92,8 +91,8 @@ func main() {
 		fmt.Printf("FAIL: %d aggregates landed on %d slot(s), need >= 2\n", len(aggIDs), len(slotSeen))
 		os.Exit(1)
 	}
-	fmt.Printf("aggregates=%d across %d slots (body=%dB acks=%s duration=%s)\n",
-		len(aggIDs), len(slotSeen), *size, *acks, *dur)
+	fmt.Printf("aggregates=%d across %d slots (body=%dB duration=%s)\n",
+		len(aggIDs), len(slotSeen), *size, *dur)
 
 	body := makeBody(*size)
 	hc := &http.Client{Timeout: 5 * time.Second}
@@ -217,7 +216,7 @@ func main() {
 					ver[agg]++
 					cmd := fmt.Sprintf("b%d-%d-%d", w, seq, rng.Int63n(1<<40))
 					req := &pushupesv1.AppendRequest{
-						AggregateId: agg, Version: ver[agg], CommandId: cmd, Acks: *acks,
+						AggregateId: agg, Version: ver[agg], CommandId: cmd,
 						Events: []*pushupesv1.Event{{Type: "BenchAppend", Body: body}},
 					}
 					t0 := time.Now()

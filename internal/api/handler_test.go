@@ -78,7 +78,7 @@ func TestAdminWriteHandlersRefuseWithoutController(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	eng := cluster.NewEngine(nil, st, "node-9", "leader", nil)
+	eng := cluster.NewEngine(nil, st, "node-9", nil)
 	srv := New(eng, st)
 
 	cases := []struct {

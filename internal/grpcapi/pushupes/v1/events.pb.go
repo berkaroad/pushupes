@@ -217,7 +217,6 @@ type AppendRequest struct {
 	UnixTime      int64                  `protobuf:"varint,3,opt,name=unix_time,json=unixTime,proto3" json:"unix_time,omitempty"`   // 0 = server clock
 	CommandId     string                 `protobuf:"bytes,4,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"` // idempotency key
 	Events        []*Event               `protobuf:"bytes,5,rep,name=events,proto3" json:"events,omitempty"`
-	Acks          string                 `protobuf:"bytes,6,opt,name=acks,proto3" json:"acks,omitempty"` // "leader" | "all" | "none"; empty = node default
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -285,13 +284,6 @@ func (x *AppendRequest) GetEvents() []*Event {
 		return x.Events
 	}
 	return nil
-}
-
-func (x *AppendRequest) GetAcks() string {
-	if x != nil {
-		return x.Acks
-	}
-	return ""
 }
 
 type AppendResponse struct {
@@ -633,15 +625,14 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\n" +
 	"command_id\x18\x04 \x01(\tR\tcommandId\x12*\n" +
 	"\x06events\x18\x05 \x03(\v2\x12.pushupes.v1.EventR\x06events\x12\x10\n" +
-	"\x03seq\x18\x06 \x01(\x04R\x03seq\"\xc8\x01\n" +
+	"\x03seq\x18\x06 \x01(\x04R\x03seq\"\xba\x01\n" +
 	"\rAppendRequest\x12!\n" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1b\n" +
 	"\tunix_time\x18\x03 \x01(\x03R\bunixTime\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x04 \x01(\tR\tcommandId\x12*\n" +
-	"\x06events\x18\x05 \x03(\v2\x12.pushupes.v1.EventR\x06events\x12\x12\n" +
-	"\x04acks\x18\x06 \x01(\tR\x04acks\"\xe7\x02\n" +
+	"\x06events\x18\x05 \x03(\v2\x12.pushupes.v1.EventR\x06eventsJ\x04\b\x06\x10\a\"\xe7\x02\n" +
 	"\x0eAppendResponse\x12:\n" +
 	"\x06status\x18\x01 \x01(\x0e2\".pushupes.v1.AppendResponse.StatusR\x06status\x12\x15\n" +
 	"\x06err_id\x18\x02 \x01(\rR\x05errId\x12\x18\n" +

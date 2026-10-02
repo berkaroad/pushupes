@@ -82,7 +82,7 @@ func everyType(t *testing.T) map[string]proto.Message {
 	return map[string]proto.Message{
 		"AppendRequest": &pushupesv1.AppendRequest{
 			AggregateId: "agg-1", Version: 7, UnixTime: -2, CommandId: "cmd-1",
-			Events: []*pushupesv1.Event{ev("a", 0), ev("b", 16), ev("c", 100<<10)}, Acks: "all",
+			Events: []*pushupesv1.Event{ev("a", 0), ev("b", 16), ev("c", 100<<10)},
 		},
 		"MFetchResponse": &pushupesv1.MFetchResponse{
 			Follower: "node-2",

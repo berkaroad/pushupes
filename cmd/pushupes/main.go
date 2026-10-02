@@ -43,7 +43,6 @@ func main() {
 		slotCount   = data.DefaultSlotCount
 		replication = flag.Int("replication-factor", 2, "replicas per slot")
 		segmentB    = byteSize(storage.DefaultSegmentBytes)
-		acksDefault = flag.String("acks", "leader", "default acks for appends: leader or all")
 		flushN      = flag.Int64("flush-messages", 1000, "fsync every N records (0 disables)")
 		flushD      = flag.Duration("flush-interval", 5*time.Second, "fsync every interval (0 disables)")
 		dropAfter   = flag.Duration("drop-after", envDurationOr("PUSHUPES_DROP_AFTER", cluster.DefaultDropRetention),
@@ -66,12 +65,12 @@ func main() {
 	base.SetLevel(logrus.InfoLevel)
 	logger := logrus.NewEntry(base).WithField("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, slotCount, *replication, int64(segmentB), *acksDefault, *flushN, *flushD, *dropAfter, *bootstrap, logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, slotCount, *replication, int64(segmentB), *flushN, *flushD, *dropAfter, *bootstrap, logger); err != nil {
 		logger.WithError(err).Fatal("pushupes exited with error")
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slotCount, replicationFactor int, segmentBytes int64, acksDefault string, flushN int64, flushD, dropAfter time.Duration, bootstrap bool, logger *logrus.Entry) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slotCount, replicationFactor int, segmentBytes int64, flushN int64, flushD, dropAfter time.Duration, bootstrap bool, logger *logrus.Entry) error {
 	// Canonical form for every stored address: scheme required. A bare
 	// host:port gets the default "http://" prefix; an explicit protocol
 	// is honoured as passed. TCP-level uses (listen/dial) strip it again.
@@ -114,7 +113,7 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slot
 	// The engine is the Applier the FSM calls into; it also needs the Raft
 	// node to submit commands. Build the engine first with a nil node, then
 	// hand it to NewNode and wire the node back in.
-	eng := cluster.NewEngine(nil, store, nodeID, acksDefault, logger)
+	eng := cluster.NewEngine(nil, store, nodeID, logger)
 	eng.SetDropRetention(dropRetention)
 
 	node, peerGRPC, err := cluster.NewNode(cluster.Config{

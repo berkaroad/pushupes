@@ -26,7 +26,7 @@ func newTestClient(t *testing.T) (pushupesv1.EventServiceClient, *storage.Store)
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	eng := cluster.NewEngine(nil, st, "node-1", "leader", nil)
+	eng := cluster.NewEngine(nil, st, "node-1", nil)
 
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer()

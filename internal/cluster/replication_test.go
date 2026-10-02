@@ -141,7 +141,7 @@ func TestNoteReplicaProgressAdvancesHW(t *testing.T) {
 		t.Fatalf("ISR %v want [node-2]", got)
 	}
 	// stale replica leaves ISR; with ISR={leader} only, the HW follows the
-	// leader's LEO (acks=all degrades to a leader-only
+	// leader's LEO (acknowledgement falls back to a leader-only
 	// guarantee until the replica re-syncs, never a silent stall).
 	e.replMu.Lock()
 	e.repl[0].setLastOK("node-2", time.Now().Add(-time.Minute))
@@ -200,7 +200,7 @@ func TestSubmitAppendRedirects(t *testing.T) {
 	if agg == "" {
 		t.Fatal("no odd-slot aggregate found")
 	}
-	_, err := e.SubmitAppend(context.Background(), makeRecord(agg, 1, "r-1"), "leader")
+	_, err := e.SubmitAppend(context.Background(), makeRecord(agg, 1, "r-1"))
 	rd, ok := err.(*RedirectError)
 	if !ok {
 		t.Fatalf("expected RedirectError, got %v", err)
@@ -231,7 +231,7 @@ func TestSubmitAppendMigratingRedirectsToSource(t *testing.T) {
 			agg = cand
 		}
 	}
-	_, err := e.SubmitAppend(context.Background(), makeRecord(agg, 1, "m-1"), "leader")
+	_, err := e.SubmitAppend(context.Background(), makeRecord(agg, 1, "m-1"))
 	rd, ok := err.(*RedirectError)
 	if !ok {
 		t.Fatalf("expected redirect, got %v", err)
@@ -383,7 +383,7 @@ func TestMigratingForwardFailureKeepsWriteAndSlot(t *testing.T) {
 
 	// The write during the window is served by the source and its mirror push
 	// to the dead target fails fast: the write must still be acknowledged.
-	out, err := e.SubmitAppend(context.Background(), makeRecord(aggAB, 3, "ab-3"), "leader")
+	out, err := e.SubmitAppend(context.Background(), makeRecord(aggAB, 3, "ab-3"))
 	if err != nil {
 		t.Fatalf("a failed migration push must not fail the client write: %v", err)
 	}
@@ -398,7 +398,7 @@ func TestMigratingForwardFailureKeepsWriteAndSlot(t *testing.T) {
 		t.Fatalf("a failed push rolled the migration back: %+v", p)
 	}
 	// a replayed command after the failed push is still idempotent
-	out, err = e.SubmitAppend(context.Background(), makeRecord(aggAB, 3, "ab-3"), "leader")
+	out, err = e.SubmitAppend(context.Background(), makeRecord(aggAB, 3, "ab-3"))
 	if err != nil || out.Status != data.StatusExists {
 		t.Fatalf("post-push replay: %+v %v", out, err)
 	}
@@ -437,7 +437,7 @@ func TestMigratingForwardNotContiguousKeepsWriteAndMigration(t *testing.T) {
 	applyCmd(t, leader, &Command{Op: OpSlotState, Slots: []int32{0}, State: SlotMigratingOut, MigratingTo: "node-2"})
 	leader.syncMigrationState()
 
-	resp, err := leader.SubmitAppend(context.Background(), makeRecord(agg, 3, "nc-3"), "leader")
+	resp, err := leader.SubmitAppend(context.Background(), makeRecord(agg, 3, "nc-3"))
 	if err != nil {
 		t.Fatalf("a forward the target refuses as non-contiguous must not fail the write: %v", err)
 	}
@@ -461,7 +461,7 @@ func TestMigratingForwardNotContiguousKeepsWriteAndMigration(t *testing.T) {
 // that starts leading a slot used to keep the previous term's follower
 // positions in its replication bookkeeping; their LEOs are as of the old
 // leader's last sample (often far below this node's own LEO) and stay "fresh"
-// for the staleness window, so the acks=all watermark froze below the leader
+// for the staleness window, so the watermark froze below the leader
 // LEO until each follower happened to report again — the seconds-long pause
 // right after a migration's leader move. Gaining leadership must drop them.
 func TestLeaderGainDropsStaleFollowerHW(t *testing.T) {
@@ -534,11 +534,11 @@ func TestMigrationForwardExpires(t *testing.T) {
 
 // TestMigrationTargetDoesNotGateHW pins the stall fix. A migration target that
 // is still catching up is an EXTRA copy the migration is building, not one of
-// the replicas the slot's acks=all obligation rests on, so it must not freeze
+// the replicas the slot's durability promise rests on, so it must not freeze
 // the high watermark at its low LEO. Counting it made the watermark lag the
-// leader's LEO and every acks=all append block to the 10s wait deadline — the
+// leader's LEO and every append block to the 10s wait deadline — the
 // seconds-long pause around a migration. An ordinary (non-target) lagging
-// replica still gates, so acks=all is not weakened.
+// replica still gates, so the acknowledged-write promise is not weakened.
 func TestMigrationTargetDoesNotGateHW(t *testing.T) {
 	e, st := newTestEngine(t, "node-1")
 	join(t, e, "node-1", "127.0.0.1:1")

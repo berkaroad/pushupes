@@ -267,7 +267,7 @@ func TestRestartDoesNotDropAnything(t *testing.T) {
 	e1.cancelPendingDrop(0)
 
 	// the restart: a fresh engine over the same data dir and the restored table.
-	e2 := NewEngine(nil, st, "node-2", "leader", nil)
+	e2 := NewEngine(nil, st, "node-2", nil)
 	e2.SetDropRetention(rt)
 	if err := e2.RestoreState(snap); err != nil {
 		t.Fatalf("restore state: %v", err)

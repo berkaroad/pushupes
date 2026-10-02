@@ -40,7 +40,7 @@ func main() {
 	var v2OK bool
 	for pass := 0; pass < 3 && !v2OK; pass++ {
 		r, err := cli(target).Append(ctx, &pushupesv1.AppendRequest{
-			AggregateId: agg, Version: 1, CommandId: "s-1", Acks: "all",
+			AggregateId: agg, Version: 1, CommandId: "s-1",
 			Events: []*pushupesv1.Event{{Type: "Hello", Body: []byte(`{"g":"世界"}`)}},
 		})
 		check(err)
@@ -54,7 +54,7 @@ func main() {
 			fatal("append v1: %v", r)
 		}
 		r2, err := cli(target).Append(ctx, &pushupesv1.AppendRequest{
-			AggregateId: agg, Version: 2, CommandId: "s-2", Acks: "all",
+			AggregateId: agg, Version: 2, CommandId: "s-2",
 			Events: []*pushupesv1.Event{{Type: "Bin", Body: []byte{0, 1, 0xff, 'A'}}},
 		})
 		check(err)
@@ -73,7 +73,7 @@ func main() {
 	if !v2OK {
 		fatal("could not land v2 on leader")
 	}
-	fmt.Printf("wrote v1(seq via leader %s) + v2 acks=all, agg=%s\n", target, agg)
+	fmt.Printf("wrote v1(seq via leader %s) + v2 (ISR-replicated), agg=%s\n", target, agg)
 
 	// 2) 1001 self-heal
 	r3, _ := cli(target).Append(ctx, &pushupesv1.AppendRequest{

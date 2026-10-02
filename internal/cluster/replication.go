@@ -38,8 +38,8 @@ type Engine struct {
 	fetchRot atomic.Uint64
 
 	// fetch round buffers (sync.Pool): a session round allocates its
-	// rotation order and parked set fresh every time; under acks=all the
-	// leader serves thousands of rounds per second and these were the
+	// rotation order and parked set fresh every time; a hot leader
+	// serves thousands of rounds per second and these were the
 	// dominant malloc traffic in the profile.
 	orderPool        sync.Pool // []int, cap >= followed slots
 	parkedPool       sync.Pool // []parkedEntry
@@ -50,7 +50,7 @@ type Engine struct {
 	// ownership bitmap: which slots this node leads, rebuilt only when
 	// the Raft table version advances. Per-item map lookups under the
 	// fetch hot loop (~1.4k followed slots per round) were a top CPU
-	// contributor under acks=all; a word-test per slot is free.
+	// contributor on the write path; a word-test per slot is free.
 	ownMu sync.Mutex
 	own   atomic.Pointer[ownership]
 	// tableGen bumps with every applied table change (holds tableMu).
@@ -92,7 +92,7 @@ type Engine struct {
 	// sessKick wakes replicaLoop to reconcile sessions at once when the table
 	// changes (a leader move makes a follower follow a new leader; waiting for
 	// the 1s ticker left the new leader's watermark without a report for up to
-	// a second, which stalled every acks=all append to it).
+	// a second, which stalled every acknowledged append to it).
 	sessKick chan struct{}
 
 	// controller liveness: consecutive health-probe failures per peer.
@@ -112,8 +112,6 @@ type Engine struct {
 	dropGen      uint64
 	pendingDrops map[int32]pendingDrop
 	replicaOf    map[int32]bool
-
-	acksDefault string
 }
 
 // slotRepl tracks follower LEOs and the high watermark for one slot's
@@ -197,7 +195,7 @@ const (
 
 // NewEngine wires the cluster to the local storage. The Raft node may be
 // attached later with SetNode (they reference each other).
-func NewEngine(node *Node, store *storage.Store, self string, acksDefault string, logger *logrus.Entry) *Engine {
+func NewEngine(node *Node, store *storage.Store, self string, logger *logrus.Entry) *Engine {
 	e := &Engine{
 		node:   node,
 		store:  store,
@@ -218,7 +216,6 @@ func NewEngine(node *Node, store *storage.Store, self string, acksDefault string
 		ledPrev:     map[int32]bool{},
 		fenceSet:    map[int32]bool{},
 		diverged:    map[int32]string{},
-		acksDefault: acksDefault,
 		// post-migration cleanup: the former source keeps its copy for this
 		// long once it sees the hand-over committed (-drop-after).
 		dropAfter: DefaultDropRetention,
@@ -408,8 +405,8 @@ func (e *Engine) syncMigrationState() {
 	// the old leader's last progress sample — often far below this node's own
 	// LEO — and they stay "fresh" for isrStaleAfter, so advanceHW's min would
 	// freeze the watermark below the leader's LEO until each follower happens
-	// to report again. That freeze is what blocked every acks=all append to
-	// the 10s wait deadline around a migration. Dropping the bookkeeping makes
+	// to report again. That freeze is what blocked every append to
+	// the 10s watermark wait deadline around a migration. Dropping the bookkeeping makes
 	// the new leader count only live reports; the followers re-report within
 	// one fetch round and the watermark jumps straight to the true min.
 	e.tableMu.RLock()
@@ -463,13 +460,17 @@ func (e *Engine) syncMigrationState() {
 
 	// The table changed: a follower may now follow a different leader. Wake the
 	// session loop so it re-groups immediately instead of on its next 1s tick —
-	// otherwise the new leader's acks=all watermark waits a second for its
+	// otherwise the new leader's watermark waits a second for its
 	// first replica report after every leader move.
 	e.kickSessions()
 }
 
 // SubmitAppend routes a client append to the slot leader (executing locally
-// when we are it) and applies acks semantics.
+// when we are it) and defines what "write succeeded" means for the whole
+// cluster: an append is acknowledged with success only once the slot's high
+// watermark covers it, i.e. every in-sync replica has the record durable in
+// its own WAL. A node may then die without any acknowledged record being
+// lost (see localAppend / waitForHW).
 //
 // The call takes the slot's migration write fence first: while a migration
 // commit fence is held (the source of a live migration, in the window between
@@ -477,20 +478,17 @@ func (e *Engine) syncMigrationState() {
 // the fence is released and is then re-evaluated against the table — it is
 // never failed by the fence, and it is redirected to the new leader once the
 // move is applied.
-func (e *Engine) SubmitAppend(ctx context.Context, rec *data.EventRecord, acks string) (*data.AppendResponse, error) {
-	if acks == "" {
-		acks = e.acksDefault
-	}
+func (e *Engine) SubmitAppend(ctx context.Context, rec *data.EventRecord) (*data.AppendResponse, error) {
 	slot := e.SlotOf(rec.AggregateID)
 	leave := e.enterWriteFence(slot)
 	defer leave()
-	return e.submitAppendLocked(ctx, rec, acks, slot)
+	return e.submitAppendLocked(ctx, rec, slot)
 }
 
 // submitAppendLocked is the routing/execution half of SubmitAppend, run while
 // the slot's write-fence registration is held (so the fence drain accounts for
 // this append).
-func (e *Engine) submitAppendLocked(ctx context.Context, rec *data.EventRecord, acks string, slot int32) (*data.AppendResponse, error) {
+func (e *Engine) submitAppendLocked(ctx context.Context, rec *data.EventRecord, slot int32) (*data.AppendResponse, error) {
 
 	// Copy the routing fields under the lock: the placement is mutated in
 	// place by the Raft apply loop (OpSlotState/OpLeaderMove), so holding the
@@ -507,7 +505,7 @@ func (e *Engine) submitAppendLocked(ctx context.Context, rec *data.EventRecord, 
 	e.tableMu.RUnlock()
 	if !ok {
 		// single-node / unassigned: serve locally
-		return e.localAppend(slot, rec, acks)
+		return e.localAppend(slot, rec)
 	}
 
 	switch {
@@ -524,9 +522,9 @@ func (e *Engine) submitAppendLocked(ctx context.Context, rec *data.EventRecord, 
 		// reachable peer address — therefore must NOT fail the client's
 		// write (it is already durable in the leader's WAL) and must NOT roll
 		// the whole migration back. Failing it did both, and turned every
-		// in-flight append in the migration window into a 10s acks=all
-		// timeout plus a duplicated failure on the client's retry.
-		resp, err := e.localAppend(slot, rec, acks)
+		// in-flight append in the migration window into a 10s
+		// watermark timeout plus a duplicated failure on the client's retry.
+		resp, err := e.localAppend(slot, rec)
 		if err != nil {
 			return nil, err
 		}
@@ -543,7 +541,7 @@ func (e *Engine) submitAppendLocked(ctx context.Context, rec *data.EventRecord, 
 		addr := e.clientAddr(pLeader)
 		return nil, &RedirectError{Kind: data.ErrIDMigrating, Slot: slot, Node: pLeader, Addr: addr}
 	case pLeader == e.self:
-		return e.localAppend(slot, rec, acks)
+		return e.localAppend(slot, rec)
 	default:
 		addr := e.clientAddr(pLeader)
 		if addr == "" {
@@ -575,9 +573,11 @@ func (e *Engine) clientAddr(nodeID string) string {
 	return e.table.Peers[nodeID].ClientAddr
 }
 
-// localAppend runs the business rules against the local WAL and waits for
-// the high watermark when acks=all.
-func (e *Engine) localAppend(slot int32, rec *data.EventRecord, acks string) (*data.AppendResponse, error) {
+// localAppend runs the business rules against the local WAL, then waits for
+// the slot's high watermark to cover the record before reporting success:
+// an append acknowledged without that wait could vanish if the leader died
+// before its replicas pulled the record.
+func (e *Engine) localAppend(slot int32, rec *data.EventRecord) (*data.AppendResponse, error) {
 	out, err := e.store.Append(rec)
 	if err != nil {
 		return nil, err
@@ -596,14 +596,13 @@ func (e *Engine) localAppend(slot int32, rec *data.EventRecord, acks string) (*d
 		resp.Record = out.Record // stored record, raw bytes end to end
 		return resp, nil
 	}
-	// success: optionally wait for replication
-	if acks == "all" {
-		if err := e.waitForHW(context.Background(), slot, out.Seq, 10*time.Second); err != nil {
-			resp.Status = data.StatusFail
-			resp.ErrID = data.ErrIDNotLeader
-			resp.Err = err.Error()
-			return resp, nil
-		}
+	// success: wait for the watermark so the acknowledged record survives a
+	// leader crash (see the function comment).
+	if err := e.waitForHW(context.Background(), slot, out.Seq, 10*time.Second); err != nil {
+		resp.Status = data.StatusFail
+		resp.ErrID = data.ErrIDNotLeader
+		resp.Err = err.Error()
+		return resp, nil
 	}
 	// Success carries status/seq only: the caller already holds the record it
 	// sent, and echoing a 100KiB body back doubled the bytes on the wire per
@@ -689,10 +688,27 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 		e.replMu.Lock()
 		sr := e.repl[slot]
 		hw := uint64(0)
+		inSync := false
 		if sr != nil {
 			hw = sr.hw
+			cutoff := time.Now().Add(-isrStaleAfter)
+			for i := range sr.lastOK {
+				if sr.lastOK[i].After(cutoff) {
+					inSync = true
+					break
+				}
+			}
 		}
 		e.replMu.Unlock()
+		if !inSync {
+			// No in-sync replica to wait for: the durability promise is to
+			// in-sync replicas only, so the append is acknowledged as durable
+			// as of the leader's own log (same rule advanceHW applies when the
+			// ISR shrinks). Reading the cached sr.hw here could block the full
+			// timeout on a slot whose replicas never reported (or went stale),
+			// which is a stall, not a safety gain.
+			hw = e.store.LastSeqOf(slot)
+		}
 		if hw >= seq {
 			return nil
 		}
@@ -704,7 +720,7 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 	}
 }
 
-// logHWStall reports why an acks=all append ran into the wait deadline: the
+// logHWStall reports why an append ran into the watermark wait deadline: the
 // slot's replica set, each replica's last reported LEO and how stale that
 // report is, and the leader's own LEO. Without this a wedged watermark (the
 // migration stall) only showed up as a client-side timeout.
@@ -732,7 +748,7 @@ func (e *Engine) logHWStall(slot int32, seq, hw uint64) {
 		"replicas":   e.tableReplicasOf(slot),
 		"positions":  reps,
 		"target":     e.migrationTargetOf(slot),
-	}).Warn("acks=all wait deadline hit: high watermark did not cover the append")
+	}).Warn("watermark wait deadline hit: high watermark did not cover the append")
 }
 
 func (e *Engine) replicaCount(slot int32) int {
@@ -768,12 +784,12 @@ func (e *Engine) isr(slot int32) []string {
 //
 // A migration TARGET that is still catching up does not gate the watermark.
 // It is an extra copy the migration is building (the admission grew the set to
-// factor+1) and not yet one of the replicas the slot's acks=all obligation
+// factor+1) and not yet one of the replicas the slot's durability promise
 // rests on — the migration only commits after it caught up (awaitCaughtUp).
 // Counting its low LEO froze the watermark below the leader's LEO and made
-// every acks=all append block to the 10s wait deadline: the seconds-long pause
+// every append block to the 10s wait deadline: the seconds-long pause
 // around a migration. The slot's ordinary replicas still gate normally, so
-// acks=all keeps its meaning.
+// the acknowledged write still rests on in-sync copies.
 func (e *Engine) advanceHW(slot int32) {
 	target := e.migrationTargetOf(slot)
 
@@ -1009,7 +1025,7 @@ type FetchItem struct {
 // slot led by this node, long-polled as a unit. Positions are packed
 // parallel arrays (Slots[i] wanted from FromSeqs[i]): a session carries
 // every followed slot each round and per-entry message objects dominated
-// the wire and CPU cost under acks=all.
+// the wire and CPU cost under sustained writes.
 type MFetchRequest struct {
 	Follower string   `json:"follower"`
 	WaitMS   int64    `json:"wait_ms,omitempty"`
@@ -1220,8 +1236,7 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 			// data, do NOT park a fresh wake handle — the data landed
 			// before this point, so a clean handle would only fire on the
 			// NEXT append and the slot would idle until the wait deadline
-			// (that stall, not the wake path, was the acks=all p99=fetchWait
-			// tail). The rotating cursor serves it next round; marking
+			// (that stall, not the wake path, was the p99=fetchWait tail). The rotating cursor serves it next round; marking
 			// starved makes the response return now instead. If the slot
 			// is truly empty, park so future appends still wake the poll.
 			if waitMS > 0 {
@@ -1276,7 +1291,7 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 			// slot: the store bus aggregates every slot's advance signal,
 			// and a non-blocking scan of the parked handles finds WHICH
 			// slots moved. Rebuilding a 1400-case reflect.Select per round
-			// was a top CPU contributor under acks=all.
+			// was a top CPU contributor on the fetch hot path.
 			select {
 			case <-deadline:
 				break waitLoop // budget spent: answer with whatever we have
@@ -1290,8 +1305,8 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 				// for EVERY slot that has data, not just the one that
 				// fired. A write burst scatters across slots; answering
 				// one slot per round would cost the follower one RTT per
-				// remaining slot before HW can advance (acks=all pays
-				// this on every write). The short settle lets sibling
+				// remaining slot before HW can advance (the write
+				// acknowledgement pays this on every record). The short settle lets sibling
 				// appends of the same burst land before we scan — without
 				// it the scan races the burst and captures only the first
 				// slot. 2ms against a multi-second cadence is negligible.
@@ -1414,7 +1429,7 @@ func (e *Engine) replicaLoop(ctx context.Context) {
 // on the next tick. Called off the Raft apply path (non-blocking) so a leader
 // move re-establishes the follower sessions immediately: the new leader gets
 // its replicas' progress reports within one RPC round trip instead of up to a
-// second later, so its acks=all watermark does not stall.
+// second later, so its watermark does not stall.
 func (e *Engine) kickSessions() {
 	select {
 	case e.sessKick <- struct{}{}:
@@ -1499,7 +1514,7 @@ func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
 			// Transport/leader trouble: back off so a dead leader does not
 			// spin. An *empty* round is NOT backed off — the long-poll made
 			// it zero-CPU, and sleeping between rounds is exactly what
-			// stalled records past the wait deadline (acks=all p90 =
+			// stalled records past the wait deadline (p90 = the
 			// fetchWait tail): a record landing in the backoff window rode
 			// no wake until the next round started.
 			if backoff == 0 {
@@ -1555,7 +1570,7 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 		for _, it := range fr.Items {
 			if e.isDiverged(it.Slot) {
 				// A quarantined slot's content is not the leader's: do not
-				// report it, so it cannot stand in for an acks=all replica.
+				// report it, so it cannot stand in for an in-sync replica.
 				continue
 			}
 			changed = append(changed, it.Slot)
@@ -1596,7 +1611,7 @@ func (e *Engine) applyFetchItems(items []FetchItem) (bool, error) {
 
 // noteDivergence latches a slot whose local log forked from its leader's at one
 // or more seqs. The set is the fetch loop's quarantine list: the slot stops
-// being reported as in-sync (so it cannot gate acks=all with the wrong bytes)
+// being reported as in-sync (so it cannot gate the watermark with wrong bytes)
 // and every OTHER slot of the same multiplexed session keeps replicating. It is
 // logged once per slot — the fence around the migration commit window is what
 // keeps this from happening at all; reaching here means that invariant broke.

@@ -42,7 +42,7 @@ import (
 const (
 	// fenceDrainTimeout bounds waiting for in-flight appends to finish while
 	// the fence is being taken. A write already accepted holds the fence for
-	// its whole local append (including an acks=all watermark wait), so this
+	// its whole local append (including the watermark wait), so this
 	// must exceed a healthy wait and stays far below the 10s client deadline.
 	fenceDrainTimeout = 2 * time.Second
 	// fenceCatchUpTimeout bounds how long the source holds the fence waiting

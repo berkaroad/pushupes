@@ -27,7 +27,7 @@ func TestLeaderReadIsNotCappedByHighWatermark(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	eng := cluster.NewEngine(nil, store, "node-1", "all", nil)
+	eng := cluster.NewEngine(nil, store, "node-1", nil)
 
 	for _, id := range []string{"node-1", "node-2", "node-3"} {
 		c := &cluster.Command{Op: cluster.OpJoinNode, Peer: &cluster.Peer{
@@ -119,7 +119,7 @@ func TestSteppedDownReplicaReadsItsOwnLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	eng := cluster.NewEngine(nil, store, "node-1", "all", nil)
+	eng := cluster.NewEngine(nil, store, "node-1", nil)
 
 	for _, id := range []string{"node-1", "node-2", "node-3"} {
 		c := &cluster.Command{Op: cluster.OpJoinNode, Peer: &cluster.Peer{

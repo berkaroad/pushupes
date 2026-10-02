@@ -89,7 +89,7 @@ func (s *Server) Append(ctx context.Context, req *pushupesv1.AppendRequest) (*pu
 		rec.UnixTime = time.Now().Unix()
 	}
 
-	resp, err := s.engine.SubmitAppend(ctx, rec, req.Acks)
+	resp, err := s.engine.SubmitAppend(ctx, rec)
 	if err != nil {
 		var redir *cluster.RedirectError
 		if errors.As(err, &redir) {
@@ -169,7 +169,7 @@ func (s *Server) ReadStream(ctx context.Context, req *pushupesv1.ReadStreamReque
 
 	// A leader owns its log: it reads up to its own durable LEO. Bounding a
 	// leader read by the replication high watermark would hide records it has
-	// already accepted — and, under acks=all, already acknowledged — because
+	// already accepted — and therefore already acknowledged — because
 	// the HW can lag the LEO whenever a replica falls behind, turning a
 	// complete stream into a SILENT short read.
 	//
