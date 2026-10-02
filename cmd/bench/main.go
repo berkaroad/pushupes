@@ -64,7 +64,7 @@ func main() {
 	nodes := flag.String("nodes", "127.0.0.1:8091", "comma-separated node admin addrs (client-plane addrs resolved from the slot table)")
 	aggs := flag.Int("aggs", 100, "number of aggregate ids")
 	dur := flag.Duration("duration", 10*time.Second, "sustained write duration")
-	connsFlag := flag.Int("conns", 16, "workers (aggregates are partitioned across them)")
+	connsFlag := flag.Int("conns", 16, "workers; each worker owns a partition of the aggregates and appends one at a time (awaits each reply before sending the next), so throughput is bounded by conns / p50 — conns=1 measures a single serialized round trip, not cluster capacity")
 	size := flag.Int("size", 1024, "event body bytes (must be <= 1024 * 1024)")
 	reportEvery := flag.Duration("report", time.Second, "live report interval")
 	flag.Parse()
@@ -91,8 +91,8 @@ func main() {
 		fmt.Printf("FAIL: %d aggregates landed on %d slot(s), need >= 2\n", len(aggIDs), len(slotSeen))
 		os.Exit(1)
 	}
-	fmt.Printf("aggregates=%d across %d slots (body=%dB duration=%s)\n",
-		len(aggIDs), len(slotSeen), *size, *dur)
+	fmt.Printf("aggregates=%d across %d slots (body=%dB conns=%d duration=%s)\n",
+		len(aggIDs), len(slotSeen), *size, *connsFlag, *dur)
 
 	body := makeBody(*size)
 	hc := &http.Client{Timeout: 5 * time.Second}
@@ -127,6 +127,13 @@ func main() {
 
 	// resume per-aggregate versions against the slot LEADER (replicas only
 	// show <=HW data; under-estimating the tail burns retries on 1001).
+	//
+	// This phase is NOT part of the write window: it costs one ReadStream
+	// probe chain per aggregate and grows with the data already on disk
+	// (the tail search is exponential + binary over the existing versions).
+	// Timed separately so the reported throughput stays a write-phase
+	// number instead of being diluted by probing.
+	resumeStart := time.Now()
 	lastVers := make([]uint32, len(aggIDs))
 	{
 		var bm sync.WaitGroup
@@ -151,7 +158,8 @@ func main() {
 	for _, v := range lastVers {
 		resumeSum += uint64(v)
 	}
-	fmt.Printf("resuming: %d existing records across aggregates\n", resumeSum)
+	fmt.Printf("resuming: %d existing records across aggregates (probed in %s)\n",
+		resumeSum, time.Since(resumeStart).Round(time.Millisecond))
 
 	// 2) per-node write counters before the run (admin plane, HTTP)
 	before := map[string][]uint64{}
@@ -185,6 +193,16 @@ func main() {
 	nw := *connsFlag
 	if nw > len(aggIDs) {
 		nw = len(aggIDs)
+	}
+	// Each worker walks its partition strictly in sequence: it sends one
+	// append and awaits the reply before building the next request. With a
+	// single worker there is nothing to overlap, so the run measures one
+	// serialized round trip (throughput ~= 1/p50) rather than cluster
+	// capacity — say so loudly, because that number is easy to misread.
+	if nw == 1 {
+		fmt.Printf("notice: conns=1 -> appends are strictly serialized (one in flight);\n" +
+			"        throughput is a single round-trip measurement (~1/p50), not cluster capacity.\n" +
+			"        Raise -conns to overlap requests (conns partitions -aggs across workers).\n")
 	}
 	var wg sync.WaitGroup
 	// per-run salt: a fixed RNG seed would reproduce last run's command_ids
@@ -287,11 +305,19 @@ func main() {
 		}
 		return fmt.Sprintf("%.2fms", latencies[int(q*float64(len(latencies)-1))])
 	}
+	resumeElapsed := start.Sub(resumeStart)
 	fmt.Printf("\n== bench done in %s ==\n", elapsed.Round(time.Millisecond))
 	fmt.Printf("attempts=%d ok=%d exists=%d fail=%d redirects=%d\n",
 		total.Load(), okCnt.Load(), existsCnt.Load(), failCnt.Load(), redirectCnt.Load())
 	fmt.Printf("throughput=%.0f msg/s  latency p50=%s p90=%s p99=%s\n",
 		float64(total.Load())/elapsed.Seconds(), pct(0.5), pct(0.9), pct(0.99))
+	// Two different denominators are easy to confuse: the line above divides
+	// by the write window only, while the per-slot delta further down divides
+	// by everything the process spent after the chain was ready (resume
+	// probing included). Print both explicitly instead of letting one of them
+	// masquerade as "the" throughput.
+	fmt.Printf("phases: resume=%s (probe only, excluded from throughput=), window=%s (append phase)\n",
+		resumeElapsed.Round(time.Millisecond), elapsed.Round(time.Millisecond))
 
 	// 5) per-slot durable delta per node (admin plane, HTTP)
 	afterMap := map[string][]uint64{}
@@ -336,8 +362,13 @@ func main() {
 	for _, v := range grand {
 		sum += v
 	}
-	fmt.Printf("touched slots=%d total durable=%d (%.0f msg/s)\n",
-		len(grand), sum, float64(sum)/elapsed.Seconds())
+	// The durable counters are sampled before the resume phase, so their
+	// delta covers probing as well as writing. Label the span explicitly and
+	// give the same delta over the write window only — that is the number
+	// comparable with the throughput line above.
+	fmt.Printf("touched slots=%d total durable=%d (%0.f msg/s over window, %.0f msg/s over window+resume)\n",
+		len(grand), sum, float64(sum)/elapsed.Seconds(),
+		float64(sum)/((elapsed + resumeElapsed).Seconds()))
 	if len(grand) < 2 {
 		fmt.Println("FAIL: writes landed on fewer than 2 slots")
 		os.Exit(1)
