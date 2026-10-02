@@ -328,17 +328,48 @@ func (s *Slot) indexRecordLocked(seq uint64, rec *data.EventRecord) {
 
 // indexMetaLocked indexes a record from its header alone — the replicated
 // path never materialises event bodies, so it indexes from RecordMeta.
+//
+// The two numbers in the entry — version (what the aggregate claims its tail
+// is) and sealedN+n (the seqs it can actually resolve) — are the pair every read
+// path requires to be equal: AggregateVersion and TailVersion both refuse to
+// answer when they disagree, so a split makes the aggregate permanently
+// unreadable on this node (see deinv_test.go).
+//
+// They must therefore MOVE TOGETHER, and exactly one condition moves them: the
+// record is the stream's NEXT version. That is the only case in which the
+// directory may both claim a version and count a seq.
+//
+// Every other version leaves the directory untouched, for two different reasons:
+//
+//   - a version BEYOND the next one: the record itself is still written to the
+//     WAL by the caller, but the directory must not claim a version it cannot
+//     resolve. Replicas legitimately receive such a frame — the migration fence
+//     pushes from a target-reported LEO, and the target's view of its own log can
+//     be ahead of the aggregate streams it holds — and a replica knows it is
+//     behind without being able to know what it is missing. Claiming the version
+//     strands every read of that aggregate; withholding it keeps the aggregate
+//     readable at the last version it can actually serve, and the gap closes
+//     when the missing records arrive.
+//
+//   - a version we ALREADY cover: a replay. Its seq is already recorded, so
+//     counting it again would inflate the pair from the other side. No caller
+//     passes an older seq for an aggregate that has a hole — writes append at
+//     the slot's newest seq and recovery walks seqs in ascending order — so
+//     there is nothing to backfill here.
+//
+// An earlier version of this function raised version unconditionally while
+// recording the seq only for contiguous ones, which is exactly how a live
+// cluster ended up with an aggregate at version 104 with 59 resolvable seqs.
+// The asymmetry is what made it possible: version was driven by "any record
+// with a higher number", the seq count by "the contiguous one" — two scales
+// that could only ever disagree by accident of which write path ran.
 func (s *Slot) indexMetaLocked(seq uint64, m data.RecordMeta) {
 	e := s.aggs[m.AggregateID]
-	if m.Version > e.version {
-		e.version = m.Version
-	}
 	if !s.blmsSkipInsert {
 		s.blms.insert(m.CommandHash)
 	}
-	// Only a contiguous append extends the aggregate's seq range; a record
-	// arriving out of order still updates its version, exactly as before.
-	if m.Version == uint32(e.sealedN+e.n+1) {
+	if m.Version == uint32(e.sealedN+e.n)+1 {
+		e.version = m.Version
 		e.appendSeq(seq)
 	}
 	s.aggs[m.AggregateID] = e
