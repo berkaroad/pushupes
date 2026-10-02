@@ -180,39 +180,65 @@ func (e *Engine) StartMigration(ctx context.Context, slot int32, toNode string) 
 // reclaim must NOT fail it. It logs and leaves the extra replica in place; a
 // later migration or the manual remove-replica endpoint can still reclaim it.
 // Nothing here deletes the removed node's on-disk copy.
+//
+// The decision itself lives in surplusForReclaim, so the part that a test can
+// actually observe — whether to reclaim and whom — is a pure function.
 func (e *Engine) reclaimSurplusReplica(slot int32, from, toNode string) {
-	for {
-		tbl := e.TableSnapshot()
-		p, ok := tbl.Slots[slot]
-		if !ok {
-			return // unknown slot: nothing to reclaim
-		}
-		if p.State != SlotStable {
-			return // a migration still owns this placement; it reclaims on commit
-		}
-		if len(p.Replicas) <= tbl.Replicas {
+	// One snapshot, no loop. The only path that used to iterate was a
+	// successful RemoveReplica: the next pass then re-snapshotted the whole
+	// table just to find the set already back at the factor. Reading the
+	// placement once is enough — RemoveReplica commits through Raft and this
+	// is best effort, so re-checking afterwards would only re-read a value the
+	// caller has no decision left to make about.
+	tbl := e.TableSnapshot()
+	p, ok := tbl.Slots[slot]
+	if !ok {
+		return // unknown slot: nothing to reclaim
+	}
+	node, over := surplusForReclaim(p, tbl.Replicas, from, toNode)
+	if !over {
+		if p.State == SlotStable {
 			e.logger.WithFields(map[string]any{"slot": slot, "factor": tbl.Replicas}).
 				Info("migration step 3/3: no surplus replica (set already at the factor)")
-			return
 		}
-		node := surplusReplica(p, from, toNode)
-		if node == "" {
-			// Over the factor, yet no member is eligible (every one is the
-			// leader or the target): leave it to the operator rather than guess.
-			e.logger.WithFields(map[string]any{"slot": slot, "from": from, "to": toNode}).
-				Warn("migration step 3/3: set is over the factor but no replica is eligible for reclaim")
-			return
-		}
-		if err := e.RemoveReplica(context.Background(), slot, node); err != nil {
-			e.logger.WithError(err).WithFields(map[string]any{
-				"slot": slot, "node": node, "from": from, "to": toNode, "op": OpSlotRemoveReplica,
-			}).Warn("migration step 3/3: surplus replica reclaim failed; leaving it in the set (migration stays committed)")
-			return
-		}
-		e.logger.WithFields(map[string]any{
-			"slot": slot, "node": node, "from": from, "factor": tbl.Replicas, "op": OpSlotRemoveReplica,
-		}).Info("migration step 3/3: source replica reclaimed (set back at the factor)")
+		return // not stable (a migration owns it), or already at the factor
 	}
+	if node == "" {
+		// Over the factor, yet no member is eligible (every one is the
+		// leader or the target): leave it to the operator rather than guess.
+		e.logger.WithFields(map[string]any{"slot": slot, "from": from, "to": toNode}).
+			Warn("migration step 3/3: set is over the factor but no replica is eligible for reclaim")
+		return
+	}
+	if err := e.RemoveReplica(context.Background(), slot, node); err != nil {
+		e.logger.WithError(err).WithFields(map[string]any{
+			"slot": slot, "node": node, "from": from, "to": toNode, "op": OpSlotRemoveReplica,
+		}).Warn("migration step 3/3: surplus replica reclaim failed; leaving it in the set (migration stays committed)")
+		return
+	}
+	e.logger.WithFields(map[string]any{
+		"slot": slot, "node": node, "from": from, "factor": tbl.Replicas, "op": OpSlotRemoveReplica,
+	}).Info("migration step 3/3: source replica reclaimed (set back at the factor)")
+}
+
+// surplusForReclaim decides whether a slot's replica set has a member to drop
+// and, if so, which one. Pure and side-effect free, so the decision can be
+// asserted directly: the reclaim path commits through Raft, which a test engine
+// has no node for, so "did it try, and whom did it pick" is the observable that
+// a pure function makes checkable.
+//
+// Returns ("", false) when the set is already at the factor (or under it), and
+// ("", true) when the set is over the factor but no member is eligible — every
+// remaining member is the leader or the migration target, which the caller
+// reports to the operator rather than guessing.
+func surplusForReclaim(p *Placement, factor int, from, toNode string) (node string, over bool) {
+	if p == nil || p.State != SlotStable {
+		return "", false
+	}
+	if len(p.Replicas) <= factor {
+		return "", false
+	}
+	return surplusReplica(p, from, toNode), true
 }
 
 // surplusReplica picks the member to drop from an oversized replica set: the
