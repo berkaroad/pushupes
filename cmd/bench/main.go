@@ -128,31 +128,65 @@ func main() {
 	// resume per-aggregate versions against the slot LEADER (replicas only
 	// show <=HW data; under-estimating the tail burns retries on 1001).
 	//
-	// This phase is NOT part of the write window: it costs one ReadStream
-	// probe chain per aggregate and grows with the data already on disk
-	// (the tail search is exponential + binary over the existing versions).
-	// Timed separately so the reported throughput stays a write-phase
-	// number instead of being diluted by probing.
+	// Done as one ReadTails call per node instead of one ReadStream probe
+	// chain per aggregate: the per-aggregate form cost O(aggregates x
+	// log(tail)) RPCs and grew with the data already on disk (measured
+	// 5.5s at 58k existing records across 1000 aggregates).
+	//
+	// This phase is NOT part of the write window, and it is timed separately
+	// so the reported throughput stays a write-phase number.
 	resumeStart := time.Now()
 	lastVers := make([]uint32, len(aggIDs))
 	{
-		var bm sync.WaitGroup
-		sem := make(chan struct{}, 16)
-		for i := range aggIDs {
-			bm.Add(1)
-			go func(i int) {
-				defer bm.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-				slot := data.SlotOf(aggIDs[i], data.DefaultSlotCount)
-				addr, ok := leaderOf[slot]
-				if !ok {
-					addr = anyGrpc[0] // single-node bootstrap etc.
-				}
-				lastVers[i] = tailVersion(addr, aggIDs[i])
-			}(i)
+		// Group aggregates by the node we will ask: ReadTails groups by slot
+		// internally, so asking the slot leader directly keeps it to one RPC
+		// per node with no cross-node forwarding.
+		byAddr := map[string][]int{}
+		var order []string
+		for i, id := range aggIDs {
+			addr := leaderOf[data.SlotOf(id, data.DefaultSlotCount)]
+			if addr == "" {
+				addr = anyGrpc[0] // single-node bootstrap etc.
+			}
+			if _, ok := byAddr[addr]; !ok {
+				order = append(order, addr)
+			}
+			byAddr[addr] = append(byAddr[addr], i)
 		}
-		bm.Wait()
+		type tailsReq struct {
+			idx []int
+			ids []string
+		}
+		reqs := make([]tailsReq, len(order))
+		var wg sync.WaitGroup
+		for n, addr := range order {
+			idx := byAddr[addr]
+			ids := make([]string, len(idx))
+			for k, i := range idx {
+				ids[k] = aggIDs[i]
+			}
+			reqs[n] = tailsReq{idx: idx, ids: ids}
+			wg.Add(1)
+			go func(addr string, r tailsReq) {
+				defer wg.Done()
+				cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				resp, err := eventClient(addr).ReadTails(cctx, &pushupesv1.ReadTailsRequest{AggregateIds: r.ids})
+				if err != nil {
+					fmt.Printf("warn: read tails %s: %v (tails left at 0)\n", addr, err)
+					return
+				}
+				if len(resp.Versions) != len(r.ids) {
+					fmt.Printf("warn: read tails %s: got %d versions for %d aggregates\n",
+						addr, len(resp.Versions), len(r.ids))
+					return
+				}
+				for k, i := range r.idx {
+					lastVers[i] = resp.Versions[k]
+				}
+			}(addr, reqs[n])
+		}
+		wg.Wait()
 	}
 	var resumeSum uint64
 	for _, v := range lastVers {
@@ -414,43 +448,6 @@ func appendWithRetry(w int, agg string, req *pushupesv1.AppendRequest,
 		return resp, nil
 	}
 	return nil, fmt.Errorf("append unreachable")
-}
-
-// probeVersion reports whether version k exists for one aggregate (versions
-// are contiguous from 1, so existence of k means tail >= k).
-func probeVersion(addr, agg string, k uint32) bool {
-	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	out, err := eventClient(addr).ReadStream(cctx, &pushupesv1.ReadStreamRequest{
-		AggregateId: agg, FromVersion: k, Limit: 1,
-	})
-	if err != nil {
-		return false
-	}
-	return len(out.Records) > 0
-}
-
-// tailVersion finds the highest existing version of one aggregate from the
-// slot leader with exponential probe + binary search — O(log tail) one-row
-// reads, no full-stream fetch.
-func tailVersion(addr, agg string) uint32 {
-	if !probeVersion(addr, agg, 1) {
-		return 0
-	}
-	hi := uint32(1)
-	for probeVersion(addr, agg, hi) {
-		hi *= 2
-	}
-	lo := hi / 2
-	for lo+1 < hi {
-		mid := (lo + hi) / 2
-		if probeVersion(addr, agg, mid) {
-			lo = mid
-		} else {
-			hi = mid
-		}
-	}
-	return lo
 }
 
 // aggIndex finds an aggregate id's position; -1 when absent.

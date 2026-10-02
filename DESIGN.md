@@ -215,7 +215,7 @@ Body: Record*，每条记录：
 - **client 面（gRPC，客户端事件写入/查询唯一入口，默认 `-client
   http://127.0.0.1:8591`，`PUSHUPES_CLIENT`）**：proto3 契约
   `proto/pushupes/v1/events.proto`（`pushupes.v1.EventService`：`Append` +
-  `ReadStream` + `ReadByCommand`）。body 为原始 bytes，无 JSON/base64 层。
+  `ReadStream` + `ReadTails` + `ReadByCommand`）。body 为原始 bytes，无 JSON/base64 层。
   MOVED/ASK 重定向的 `node` 字段携带槽 leader 的 **client 地址**（路由表
   Peer 同时记 PeerAddr/AdminAddr/ClientAddr），客户端据此重连。本节点既无槽又无副本
   时，服务端向 leader 的 client 面代理转发（`ReadProxyAddr` 返回 leader
@@ -243,6 +243,7 @@ Body: Record*，每条记录：
 gRPC  EventService/Append         写入：幂等(command_id)/版本(+1)/等 ISR 高水位确认，MOVED/ASK
 gRPC  EventService/ReadStream     范围查询（≤HW 语义）
 gRPC  EventService/ReadByCommand  command_id 幂等探针
+gRPC  EventService/ReadTails      批量取多个聚合的最新版本（resume 扫描用；按槽分组一次 RPC，非持有者按目标节点成组转发）
 
 # ---- peer 面（PeerService gRPC，与 Raft 同端口，proto/pushupes/v1/peer.proto）----
 gRPC  PeerService/MFetch          副本拉取（长轮询，多槽复用，payload=裸 WAL 字节）
@@ -410,7 +411,7 @@ pushupes/
 │   │                          #   peer_mux.go（peer 端口首字节分流 Raft/gRPC），
 │   │                          #   migration.go（六步热迁移），register.go（地址自报 announcer+RPC）
 ├── internal/api/              # handler.go（仅管理：status/writes/plan/migrate/describe/pprof），server.go
-├── internal/grpcapi/          # gRPC 客户端数据面：server.go（Append/ReadStream/ReadByCommand）
+├── internal/grpcapi/          # gRPC 客户端数据面：server.go（Append/ReadStream/ReadTails/ReadByCommand）
 └── proto/pushupes/v1/         # events.proto 客户端契约 + peer.proto 节点间契约（buf 生成至 internal/grpcapi）
 ```
 

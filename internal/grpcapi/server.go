@@ -206,6 +206,116 @@ func (s *Server) ReadStream(ctx context.Context, req *pushupesv1.ReadStreamReque
 	return out, nil
 }
 
+// ---- ReadTails -----------------------------------------------------------------
+
+// ReadTails answers the latest version of many aggregates in one call: the bulk
+// form of "what is this stream's tail", which a resume scan needs per stream.
+//
+// Two things keep it from being N single probes wearing a trench coat:
+//
+//  1. The ownership decision is made ONCE PER SLOT, not once per aggregate.
+//     ReadProxyAddr clones the whole slot table, so calling it per aggregate
+//     would repeat the expensive part of an already expensive scan.
+//  2. Aggregates this node can serve locally are answered in one storage pass;
+//     only the ones it holds neither slot nor replica for are forwarded, and
+//     those are grouped by destination so each peer gets ONE RPC carrying all
+//     of its aggregates.
+//
+// The visibility bound is ReadStream's: a node answering locally reports what
+// its own durable LEO covers. Server-side we never bound by the replication
+// watermark, because this node is a replica for every slot it can answer from
+// and a stale watermark would silently under-report.
+func (s *Server) ReadTails(ctx context.Context, req *pushupesv1.ReadTailsRequest) (*pushupesv1.ReadTailsResponse, error) {
+	out := &pushupesv1.ReadTailsResponse{Versions: make([]uint32, len(req.AggregateIds))}
+	if len(req.AggregateIds) == 0 {
+		return out, nil
+	}
+
+	// Group by slot first: the slot decides routing, so every aggregate that
+	// shares a slot shares a destination.
+	bySlot := map[int32][]int{}
+	slots := make([]int32, 0, len(req.AggregateIds))
+	for i, id := range req.AggregateIds {
+		if id == "" {
+			continue // answered with 0
+		}
+		slot := s.store.SlotOf(id)
+		if _, ok := bySlot[slot]; !ok {
+			slots = append(slots, slot)
+		}
+		bySlot[slot] = append(bySlot[slot], i)
+	}
+
+	// One ownership lookup per slot, and a peer grouping so each destination
+	// gets a single forwarded RPC.
+	type fwdBatch struct {
+		idx  []int // positions in req.AggregateIds
+		ids  []string
+		addr string
+	}
+	fwd := map[string]*fwdBatch{}
+	var fwdOrder []string
+	var localIdx []int
+
+	for _, slot := range slots {
+		idx := bySlot[slot]
+		if addr := s.engine.ReadProxyAddr(slot); addr == "" {
+			localIdx = append(localIdx, idx...)
+			continue
+		} else {
+			b := fwd[addr]
+			if b == nil {
+				b = &fwdBatch{addr: addr}
+				fwd[addr] = b
+				fwdOrder = append(fwdOrder, addr)
+			}
+			for _, i := range idx {
+				b.idx = append(b.idx, i)
+				b.ids = append(b.ids, req.AggregateIds[i])
+			}
+		}
+	}
+
+	// Local answers: one slot lookup per aggregate inside the store, but no
+	// routing clone and no extra RPC.
+	for _, i := range localIdx {
+		v, err := s.store.TailVersionOf(req.AggregateIds[i], 0)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "read tails: %v", err)
+		}
+		out.Versions[i] = v
+	}
+
+	// Forwarded answers: one RPC per destination, carrying all of its
+	// aggregates. A failed destination leaves its slots at 0 (the caller's
+	// contract: 0 means "nothing visible here"), matching the per-aggregate
+	// probe which also answered 0 on a transport error.
+	for _, addr := range fwdOrder {
+		b := fwd[addr]
+		client, err := s.leaderClient(addr)
+		if err != nil {
+			s.logger.WithError(err).WithField("addr", addr).
+				Warn("read tails: proxy dial failed; reporting 0 for its aggregates")
+			continue
+		}
+		sub, err := client.ReadTails(ctx, &pushupesv1.ReadTailsRequest{AggregateIds: b.ids})
+		if err != nil {
+			s.logger.WithError(err).WithField("addr", addr).
+				Warn("read tails: proxy call failed; reporting 0 for its aggregates")
+			continue
+		}
+		if len(sub.Versions) != len(b.ids) {
+			s.logger.WithFields(map[string]any{"addr": addr, "want": len(b.ids), "got": len(sub.Versions)}).
+				Warn("read tails: proxy returned a mismatched length; reporting 0 for its aggregates")
+			continue
+		}
+		for n, i := range b.idx {
+			out.Versions[i] = sub.Versions[n]
+		}
+	}
+	return out, nil
+}
+
 // ---- ReadByCommand --------------------------------------------------------------
 
 func (s *Server) ReadByCommand(ctx context.Context, req *pushupesv1.ReadByCommandRequest) (*pushupesv1.ReadByCommandResponse, error) {

@@ -14,6 +14,8 @@ service EventService {
   rpc Append(AppendRequest) returns (AppendResponse);
   // ReadStream reads a version range of one aggregate stream.
   rpc ReadStream(ReadStreamRequest) returns (ReadStreamResponse);
+  // ReadTails reports the latest version of many aggregates in one call.
+  rpc ReadTails(ReadTailsRequest) returns (ReadTailsResponse);
   // ReadByCommand looks one record up by command_id (idempotency probe).
   rpc ReadByCommand(ReadByCommandRequest) returns (ReadByCommandResponse);
 }
@@ -69,6 +71,24 @@ message ReadStreamResponse {
   repeated Record records = 1;
   uint32 next_version = 2;
   uint32 last_version = 3;
+}
+
+// ReadTailsRequest asks for the latest version of each listed aggregate.
+message ReadTailsRequest {
+  repeated string aggregate_ids = 1;
+}
+
+// ReadTailsResponse answers with one version per requested aggregate, in the
+// SAME ORDER as the request: versions[i] is the tail of aggregate_ids[i], and
+// 0 means that aggregate has no records in the slot the answering node holds.
+//
+// This is the bulk form of "does version k exist" probing: a resume scan needs
+// one number per aggregate, and one RPC per aggregate made the scan cost grow
+// with the number of streams. The bound is the same one ReadStream applies —
+// the answering node's own durable LEO (never a stale former-leader
+// watermark), same as ReadStream.
+message ReadTailsResponse {
+  repeated uint32 versions = 1;
 }
 
 message ReadByCommandRequest {

@@ -506,6 +506,104 @@ func (x *ReadStreamResponse) GetLastVersion() uint32 {
 	return 0
 }
 
+// ReadTailsRequest asks for the latest version of each listed aggregate.
+type ReadTailsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	AggregateIds  []string               `protobuf:"bytes,1,rep,name=aggregate_ids,json=aggregateIds,proto3" json:"aggregate_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReadTailsRequest) Reset() {
+	*x = ReadTailsRequest{}
+	mi := &file_pushupes_v1_events_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReadTailsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReadTailsRequest) ProtoMessage() {}
+
+func (x *ReadTailsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_events_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReadTailsRequest.ProtoReflect.Descriptor instead.
+func (*ReadTailsRequest) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *ReadTailsRequest) GetAggregateIds() []string {
+	if x != nil {
+		return x.AggregateIds
+	}
+	return nil
+}
+
+// ReadTailsResponse answers with one version per requested aggregate, in the
+// SAME ORDER as the request: versions[i] is the tail of aggregate_ids[i], and
+// 0 means that aggregate has no records in the slot the answering node holds.
+//
+// This is the bulk form of "does version k exist" probing: a resume scan needs
+// one number per aggregate, and one RPC per aggregate made the scan cost grow
+// with the number of streams. The bound is the same one ReadStream applies —
+// the answering node's own durable LEO (never a stale former-leader
+// watermark), same as ReadStream.
+type ReadTailsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Versions      []uint32               `protobuf:"varint,1,rep,packed,name=versions,proto3" json:"versions,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReadTailsResponse) Reset() {
+	*x = ReadTailsResponse{}
+	mi := &file_pushupes_v1_events_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReadTailsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReadTailsResponse) ProtoMessage() {}
+
+func (x *ReadTailsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_events_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReadTailsResponse.ProtoReflect.Descriptor instead.
+func (*ReadTailsResponse) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *ReadTailsResponse) GetVersions() []uint32 {
+	if x != nil {
+		return x.Versions
+	}
+	return nil
+}
+
 type ReadByCommandRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	AggregateId   string                 `protobuf:"bytes,1,opt,name=aggregate_id,json=aggregateId,proto3" json:"aggregate_id,omitempty"`
@@ -516,7 +614,7 @@ type ReadByCommandRequest struct {
 
 func (x *ReadByCommandRequest) Reset() {
 	*x = ReadByCommandRequest{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[6]
+	mi := &file_pushupes_v1_events_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -528,7 +626,7 @@ func (x *ReadByCommandRequest) String() string {
 func (*ReadByCommandRequest) ProtoMessage() {}
 
 func (x *ReadByCommandRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[6]
+	mi := &file_pushupes_v1_events_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -541,7 +639,7 @@ func (x *ReadByCommandRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadByCommandRequest.ProtoReflect.Descriptor instead.
 func (*ReadByCommandRequest) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{6}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ReadByCommandRequest) GetAggregateId() string {
@@ -568,7 +666,7 @@ type ReadByCommandResponse struct {
 
 func (x *ReadByCommandResponse) Reset() {
 	*x = ReadByCommandResponse{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[7]
+	mi := &file_pushupes_v1_events_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -580,7 +678,7 @@ func (x *ReadByCommandResponse) String() string {
 func (*ReadByCommandResponse) ProtoMessage() {}
 
 func (x *ReadByCommandResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[7]
+	mi := &file_pushupes_v1_events_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -593,7 +691,7 @@ func (x *ReadByCommandResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadByCommandResponse.ProtoReflect.Descriptor instead.
 func (*ReadByCommandResponse) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{7}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ReadByCommandResponse) GetFound() bool {
@@ -654,18 +752,23 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\x12ReadStreamResponse\x12-\n" +
 	"\arecords\x18\x01 \x03(\v2\x13.pushupes.v1.RecordR\arecords\x12!\n" +
 	"\fnext_version\x18\x02 \x01(\rR\vnextVersion\x12!\n" +
-	"\flast_version\x18\x03 \x01(\rR\vlastVersion\"X\n" +
+	"\flast_version\x18\x03 \x01(\rR\vlastVersion\"7\n" +
+	"\x10ReadTailsRequest\x12#\n" +
+	"\raggregate_ids\x18\x01 \x03(\tR\faggregateIds\"/\n" +
+	"\x11ReadTailsResponse\x12\x1a\n" +
+	"\bversions\x18\x01 \x03(\rR\bversions\"X\n" +
 	"\x14ReadByCommandRequest\x12!\n" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x02 \x01(\tR\tcommandId\"Z\n" +
 	"\x15ReadByCommandResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12+\n" +
-	"\x06record\x18\x02 \x01(\v2\x13.pushupes.v1.RecordR\x06record2\xf8\x01\n" +
+	"\x06record\x18\x02 \x01(\v2\x13.pushupes.v1.RecordR\x06record2\xc4\x02\n" +
 	"\fEventService\x12A\n" +
 	"\x06Append\x12\x1a.pushupes.v1.AppendRequest\x1a\x1b.pushupes.v1.AppendResponse\x12M\n" +
 	"\n" +
-	"ReadStream\x12\x1e.pushupes.v1.ReadStreamRequest\x1a\x1f.pushupes.v1.ReadStreamResponse\x12V\n" +
+	"ReadStream\x12\x1e.pushupes.v1.ReadStreamRequest\x1a\x1f.pushupes.v1.ReadStreamResponse\x12J\n" +
+	"\tReadTails\x12\x1d.pushupes.v1.ReadTailsRequest\x1a\x1e.pushupes.v1.ReadTailsResponse\x12V\n" +
 	"\rReadByCommand\x12!.pushupes.v1.ReadByCommandRequest\x1a\".pushupes.v1.ReadByCommandResponseB2Z0pushupes/internal/grpcapi/pushupes/v1;pushupesv1b\x06proto3"
 
 var (
@@ -681,7 +784,7 @@ func file_pushupes_v1_events_proto_rawDescGZIP() []byte {
 }
 
 var file_pushupes_v1_events_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_pushupes_v1_events_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_pushupes_v1_events_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_pushupes_v1_events_proto_goTypes = []any{
 	(AppendResponse_Status)(0),    // 0: pushupes.v1.AppendResponse.Status
 	(*Event)(nil),                 // 1: pushupes.v1.Event
@@ -690,27 +793,31 @@ var file_pushupes_v1_events_proto_goTypes = []any{
 	(*AppendResponse)(nil),        // 4: pushupes.v1.AppendResponse
 	(*ReadStreamRequest)(nil),     // 5: pushupes.v1.ReadStreamRequest
 	(*ReadStreamResponse)(nil),    // 6: pushupes.v1.ReadStreamResponse
-	(*ReadByCommandRequest)(nil),  // 7: pushupes.v1.ReadByCommandRequest
-	(*ReadByCommandResponse)(nil), // 8: pushupes.v1.ReadByCommandResponse
+	(*ReadTailsRequest)(nil),      // 7: pushupes.v1.ReadTailsRequest
+	(*ReadTailsResponse)(nil),     // 8: pushupes.v1.ReadTailsResponse
+	(*ReadByCommandRequest)(nil),  // 9: pushupes.v1.ReadByCommandRequest
+	(*ReadByCommandResponse)(nil), // 10: pushupes.v1.ReadByCommandResponse
 }
 var file_pushupes_v1_events_proto_depIdxs = []int32{
-	1, // 0: pushupes.v1.Record.events:type_name -> pushupes.v1.Event
-	1, // 1: pushupes.v1.AppendRequest.events:type_name -> pushupes.v1.Event
-	0, // 2: pushupes.v1.AppendResponse.status:type_name -> pushupes.v1.AppendResponse.Status
-	2, // 3: pushupes.v1.AppendResponse.record:type_name -> pushupes.v1.Record
-	2, // 4: pushupes.v1.ReadStreamResponse.records:type_name -> pushupes.v1.Record
-	2, // 5: pushupes.v1.ReadByCommandResponse.record:type_name -> pushupes.v1.Record
-	3, // 6: pushupes.v1.EventService.Append:input_type -> pushupes.v1.AppendRequest
-	5, // 7: pushupes.v1.EventService.ReadStream:input_type -> pushupes.v1.ReadStreamRequest
-	7, // 8: pushupes.v1.EventService.ReadByCommand:input_type -> pushupes.v1.ReadByCommandRequest
-	4, // 9: pushupes.v1.EventService.Append:output_type -> pushupes.v1.AppendResponse
-	6, // 10: pushupes.v1.EventService.ReadStream:output_type -> pushupes.v1.ReadStreamResponse
-	8, // 11: pushupes.v1.EventService.ReadByCommand:output_type -> pushupes.v1.ReadByCommandResponse
-	9, // [9:12] is the sub-list for method output_type
-	6, // [6:9] is the sub-list for method input_type
-	6, // [6:6] is the sub-list for extension type_name
-	6, // [6:6] is the sub-list for extension extendee
-	0, // [0:6] is the sub-list for field type_name
+	1,  // 0: pushupes.v1.Record.events:type_name -> pushupes.v1.Event
+	1,  // 1: pushupes.v1.AppendRequest.events:type_name -> pushupes.v1.Event
+	0,  // 2: pushupes.v1.AppendResponse.status:type_name -> pushupes.v1.AppendResponse.Status
+	2,  // 3: pushupes.v1.AppendResponse.record:type_name -> pushupes.v1.Record
+	2,  // 4: pushupes.v1.ReadStreamResponse.records:type_name -> pushupes.v1.Record
+	2,  // 5: pushupes.v1.ReadByCommandResponse.record:type_name -> pushupes.v1.Record
+	3,  // 6: pushupes.v1.EventService.Append:input_type -> pushupes.v1.AppendRequest
+	5,  // 7: pushupes.v1.EventService.ReadStream:input_type -> pushupes.v1.ReadStreamRequest
+	7,  // 8: pushupes.v1.EventService.ReadTails:input_type -> pushupes.v1.ReadTailsRequest
+	9,  // 9: pushupes.v1.EventService.ReadByCommand:input_type -> pushupes.v1.ReadByCommandRequest
+	4,  // 10: pushupes.v1.EventService.Append:output_type -> pushupes.v1.AppendResponse
+	6,  // 11: pushupes.v1.EventService.ReadStream:output_type -> pushupes.v1.ReadStreamResponse
+	8,  // 12: pushupes.v1.EventService.ReadTails:output_type -> pushupes.v1.ReadTailsResponse
+	10, // 13: pushupes.v1.EventService.ReadByCommand:output_type -> pushupes.v1.ReadByCommandResponse
+	10, // [10:14] is the sub-list for method output_type
+	6,  // [6:10] is the sub-list for method input_type
+	6,  // [6:6] is the sub-list for extension type_name
+	6,  // [6:6] is the sub-list for extension extendee
+	0,  // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_pushupes_v1_events_proto_init() }
@@ -724,7 +831,7 @@ func file_pushupes_v1_events_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pushupes_v1_events_proto_rawDesc), len(file_pushupes_v1_events_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   8,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

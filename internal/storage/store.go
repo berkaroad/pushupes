@@ -337,6 +337,24 @@ func (st *Store) RecordByCommand(aggregateID, commandID string) (*data.EventReco
 	return slot.RecordByCommand(commandID)
 }
 
+// TailVersionOf returns the latest version of one aggregate that is visible
+// at uptoSeq (0 = the slot's durable LEO), i.e. the version a ReadStream
+// bounded by the same seq would report as its last record. It is the bulk
+// probe behind ReadTails: a resume scan wants one number per stream instead
+// of a whole record range.
+//
+// The bound is applied version by version, stopping at the first version whose
+// seq exceeds uptoSeq, so a partially visible tail reports exactly the same
+// value a bounded ReadStream would return rather than an unclipped directory
+// count. 0 means "no records visible".
+func (st *Store) TailVersionOf(aggregateID string, uptoSeq uint64) (uint32, error) {
+	slot, err := st.Slot(st.SlotOf(aggregateID))
+	if err != nil {
+		return 0, err
+	}
+	return slot.TailVersion(aggregateID, uptoSeq)
+}
+
 // LastSeq returns the durable LEO for one slot (0 when the slot is unknown).
 func (st *Store) LastSeqOf(slotID int32) uint64 {
 	s, err := st.Slot(slotID)

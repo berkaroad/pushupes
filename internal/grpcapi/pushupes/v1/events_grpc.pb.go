@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	EventService_Append_FullMethodName        = "/pushupes.v1.EventService/Append"
 	EventService_ReadStream_FullMethodName    = "/pushupes.v1.EventService/ReadStream"
+	EventService_ReadTails_FullMethodName     = "/pushupes.v1.EventService/ReadTails"
 	EventService_ReadByCommand_FullMethodName = "/pushupes.v1.EventService/ReadByCommand"
 )
 
@@ -38,6 +39,8 @@ type EventServiceClient interface {
 	Append(ctx context.Context, in *AppendRequest, opts ...grpc.CallOption) (*AppendResponse, error)
 	// ReadStream reads a version range of one aggregate stream.
 	ReadStream(ctx context.Context, in *ReadStreamRequest, opts ...grpc.CallOption) (*ReadStreamResponse, error)
+	// ReadTails reports the latest version of many aggregates in one call.
+	ReadTails(ctx context.Context, in *ReadTailsRequest, opts ...grpc.CallOption) (*ReadTailsResponse, error)
 	// ReadByCommand looks one record up by command_id (idempotency probe).
 	ReadByCommand(ctx context.Context, in *ReadByCommandRequest, opts ...grpc.CallOption) (*ReadByCommandResponse, error)
 }
@@ -70,6 +73,16 @@ func (c *eventServiceClient) ReadStream(ctx context.Context, in *ReadStreamReque
 	return out, nil
 }
 
+func (c *eventServiceClient) ReadTails(ctx context.Context, in *ReadTailsRequest, opts ...grpc.CallOption) (*ReadTailsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReadTailsResponse)
+	err := c.cc.Invoke(ctx, EventService_ReadTails_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *eventServiceClient) ReadByCommand(ctx context.Context, in *ReadByCommandRequest, opts ...grpc.CallOption) (*ReadByCommandResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReadByCommandResponse)
@@ -94,6 +107,8 @@ type EventServiceServer interface {
 	Append(context.Context, *AppendRequest) (*AppendResponse, error)
 	// ReadStream reads a version range of one aggregate stream.
 	ReadStream(context.Context, *ReadStreamRequest) (*ReadStreamResponse, error)
+	// ReadTails reports the latest version of many aggregates in one call.
+	ReadTails(context.Context, *ReadTailsRequest) (*ReadTailsResponse, error)
 	// ReadByCommand looks one record up by command_id (idempotency probe).
 	ReadByCommand(context.Context, *ReadByCommandRequest) (*ReadByCommandResponse, error)
 	mustEmbedUnimplementedEventServiceServer()
@@ -111,6 +126,9 @@ func (UnimplementedEventServiceServer) Append(context.Context, *AppendRequest) (
 }
 func (UnimplementedEventServiceServer) ReadStream(context.Context, *ReadStreamRequest) (*ReadStreamResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReadStream not implemented")
+}
+func (UnimplementedEventServiceServer) ReadTails(context.Context, *ReadTailsRequest) (*ReadTailsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReadTails not implemented")
 }
 func (UnimplementedEventServiceServer) ReadByCommand(context.Context, *ReadByCommandRequest) (*ReadByCommandResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReadByCommand not implemented")
@@ -172,6 +190,24 @@ func _EventService_ReadStream_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _EventService_ReadTails_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReadTailsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EventServiceServer).ReadTails(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EventService_ReadTails_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EventServiceServer).ReadTails(ctx, req.(*ReadTailsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _EventService_ReadByCommand_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReadByCommandRequest)
 	if err := dec(in); err != nil {
@@ -204,6 +240,10 @@ var EventService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReadStream",
 			Handler:    _EventService_ReadStream_Handler,
+		},
+		{
+			MethodName: "ReadTails",
+			Handler:    _EventService_ReadTails_Handler,
 		},
 		{
 			MethodName: "ReadByCommand",

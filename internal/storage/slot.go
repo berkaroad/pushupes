@@ -964,6 +964,58 @@ func (s *Slot) LastVersionOf(aggregateID string) uint32 {
 	return uint32(e.sealedN + e.n)
 }
 
+// TailVersion returns the highest version of an aggregate that is visible at
+// uptoSeq (0 = the slot's durable LEO) — the last_version a ReadStream bounded
+// by the same seq would report for that stream, and 0 when nothing is visible.
+//
+// It walks versions upward exactly like AggregateVersion and stops at the first
+// version whose seq exceeds the bound, so a partially visible tail reports the
+// version a bounded read would actually return instead of the directory's
+// unclipped count. The desync check matches AggregateVersion: a directory whose
+// claimed latest version disagrees with the number of resolvable seqs is a bug,
+// and answering a tail from it would be a silent mis-report.
+func (s *Slot) TailVersion(aggregateID string, uptoSeq uint64) (uint32, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e := s.aggs[aggregateID]
+	total := uint32(e.sealedN) + uint32(e.n)
+	// Same desync gate as AggregateVersion: a directory whose claimed latest
+	// version disagrees with the number of resolvable seqs is a bug, and
+	// answering a tail from it would be a silent mis-report.
+	if e.version != total {
+		return 0, fmt.Errorf("slot %d: aggregate %s desync: latest version %d but only %d versions resolvable",
+			s.ID, aggregateID, e.version, total)
+	}
+	if total == 0 {
+		return 0, nil
+	}
+	if uptoSeq == 0 {
+		// 0 means "no bound": the caller wants the durable LEO, which the
+		// slot tracks itself. The seqs below are all <= LEO by construction.
+		return total, nil
+	}
+	// Walk down from the tail rather than up from 1: a resume probe asks
+	// about streams with long histories, and the answer is almost always
+	// "the whole thing is visible".
+	liveFirst := uint32(e.sealedN) + 1
+	for v := total; v >= 1; v-- {
+		var seq uint64
+		if v >= liveFirst {
+			seq = e.seqAt(int(v - liveFirst))
+		} else {
+			got, _, err := s.sealedVersionSeqLocked(aggregateID, v)
+			if err != nil {
+				return 0, err
+			}
+			seq = got
+		}
+		if seq <= uptoSeq {
+			return v, nil
+		}
+	}
+	return 0, nil
+}
+
 // ReadRange returns byte ranges covering records fromSeq <= seq < untilSeq
 // across segments (untilSeq 0 = to LEO). Used by replica fetch and migration.
 func (s *Slot) ReadRange(fromSeq, untilSeq uint64, maxBytes int64) ([]data.ByteRange, uint64, error) {
