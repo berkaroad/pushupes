@@ -565,3 +565,13 @@ func (st *Store) Close() error {
 	<-st.done
 	return st.Flush()
 }
+
+// SlotDigest answers the same summary for a slot id, opening nothing: an
+// unloaded slot is reported as empty rather than being brought into memory.
+func (st *Store) SlotDigest(slotID int32) (aggregates, versions, resolvable uint64) {
+	sl, err := st.SlotIfLoaded(slotID)
+	if err != nil || sl == nil {
+		return 0, 0, 0
+	}
+	return sl.SlotDigest()
+}

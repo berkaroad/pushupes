@@ -1245,3 +1245,25 @@ func (s *Slot) Drop() error {
 	s.segments = nil
 	return os.RemoveAll(s.Dir)
 }
+
+// SlotDigest summarizes a slot's aggregate directory for a consistency check:
+// how many aggregates it holds, the sum of their claimed latest versions, and
+// the sum of the seqs the directory can actually resolve (DESIGN.md §1.1 rule 3).
+//
+// The two sums are the point. A node can sit at a high LEO while one aggregate's
+// stream is short — records appended above it never entered the directory — so
+// comparing LEOs alone says "in sync" about a node that cannot serve everything
+// it claims. When versions != resolvable, some claimed version has no seq behind
+// it and the slot is structurally inconsistent.
+//
+// An unloaded slot reports zeroes: it holds nothing to be inconsistent about.
+func (s *Slot) SlotDigest() (aggregates, versions, resolvable uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, e := range s.aggs {
+		aggregates++
+		versions += uint64(e.version)
+		resolvable += uint64(e.sealedN) + uint64(e.n)
+	}
+	return aggregates, versions, resolvable
+}

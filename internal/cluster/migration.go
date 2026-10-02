@@ -603,7 +603,101 @@ func (e *Engine) HandleSnapshotCommand(ctx context.Context, slot int32, toNode s
 	return e.pushSealedSegments(ctx, slot, toNode)
 }
 
+// HandleDropSlot discards this node's local copy of a slot and reopens it empty,
+// so the migration source can rebuild it from scratch. The caller is the fence on
+// the migration source: the slot is migrating_out (still advertised to this node
+// only because it is the target), so no reader depends on the local copy.
+//
+// Refusing to drop a slot this node LEADS is the safety line: dropping the copy a
+// live slot writes to would destroy acknowledged records. A target never leads the
+// slot it is receiving.
+func (e *Engine) HandleDropSlot(slot int32, from string) error {
+	if e.Leads(slot) {
+		return fmt.Errorf("drop slot %d: this node leads it (refusing to discard a live writer's log)", slot)
+	}
+	if err := e.store.DropSlot(slot); err != nil {
+		return err
+	}
+	e.logger.WithFields(map[string]any{"slot": slot, "from": from}).
+		Warn("migration target copy discarded: its streams were inconsistent with its LEO; rebuilding from the source")
+	return nil
+}
+
+// ensureTargetConsistent makes sure the migration target's local streams agree
+// with the source's before any increment is shipped to it.
+//
+// A target can be at a high LEO while one of its aggregates is short or absent:
+// records appended above that stream never entered its directory, so they sit in
+// its WAL unreadable. An increment cannot repair that (the seqs the missing
+// versions need are already spent on other aggregates, and only counter+1 may be
+// written), and the LEO comparison the caller relies on cannot detect it either.
+// So the copy is dropped and re-pulled from scratch.
+//
+// The comparison must be against the SOURCE, not the target against itself. A
+// target whose aggregate is missing entirely reports versions == resolvable (both
+// sides just omit it), so an internal-consistency check calls it healthy — the
+// sums hide the omission. Comparing the two digests catches a target that is
+// missing an aggregate or has a shorter stream for one.
+func (e *Engine) ensureTargetConsistent(ctx context.Context, slot int32, targetAddr, toNode string) error {
+	st, err := e.remoteSlotState(ctx, targetAddr, slot)
+	if err != nil {
+		return err
+	}
+	srcAgg, srcVer, srcRes := e.store.SlotDigest(slot)
+	if st.Aggregates == srcAgg && st.Versions == srcVer && st.Resolvable == srcRes {
+		return nil
+	}
+	e.logger.WithFields(map[string]any{
+		"slot": slot, "target": toNode, "target_leo": st.LEO,
+		"target_digest": fmt.Sprintf("agg=%d versions=%d resolvable=%d", st.Aggregates, st.Versions, st.Resolvable),
+		"source_digest": fmt.Sprintf("agg=%d versions=%d resolvable=%d", srcAgg, srcVer, srcRes),
+	}).Warn("migration target's streams do not match this source; discarding its copy and rebuilding")
+
+	if err := e.peerDropSlot(ctx, targetAddr, slot, toNode); err != nil {
+		return fmt.Errorf("fence: drop inconsistent target copy: %w", err)
+	}
+	// Rebuild: sealed segments first (the bulk), then the live tail from seq 1 so
+	// every record arrives in seq order and the directory adopts each version.
+	// The source's log is frozen by the caller's fence, so this is a bounded job.
+	if err := e.pushSealedSegments(ctx, slot, toNode); err != nil {
+		return fmt.Errorf("fence: rebuild target segments: %w", err)
+	}
+	if err := e.pushFrames(ctx, targetAddr, slot, 1, e.store.LastSeqOf(slot)); err != nil {
+		return fmt.Errorf("fence: rebuild target tail: %w", err)
+	}
+	after, err := e.remoteSlotState(ctx, targetAddr, slot)
+	if err != nil {
+		return err
+	}
+	if after.Aggregates != srcAgg || after.Versions != srcVer || after.Resolvable != srcRes {
+		return fmt.Errorf("fence: rebuilt target %s still differs from source (target agg=%d versions=%d resolvable=%d, source agg=%d versions=%d resolvable=%d)",
+			toNode, after.Aggregates, after.Versions, after.Resolvable, srcAgg, srcVer, srcRes)
+	}
+	return nil
+}
+
+// peerDropSlot asks a target to discard its local copy of a slot.
+func (e *Engine) peerDropSlot(ctx context.Context, addr string, slot int32, self string) error {
+	c, err := e.peerRPC(addr)
+	if err != nil {
+		return err
+	}
+	cctx, cancel := context.WithTimeout(ctx, peerRPCTimeout)
+	defer cancel()
+	_, err = c.DropSlot(cctx, &pushupesv1.DropSlotRequest{Slot: slot, Node: self})
+	return err
+}
+
 // HandleLEO answers a slot-LEO probe.
 func (e *Engine) HandleLEO(slot int32) uint64 {
 	return e.store.LastSeqOf(slot)
+}
+
+// HandleSlotLeo answers the migration catch-up probe: the slot's LEO plus the
+// directory summary that tells the caller whether this node's streams are
+// consistent with that offset (see SlotDigest).
+func (e *Engine) HandleSlotLeo(slot int32) (leo, aggregates, versions, resolvable uint64) {
+	leo = e.store.LastSeqOf(slot)
+	aggregates, versions, resolvable = e.store.SlotDigest(slot)
+	return leo, aggregates, versions, resolvable
 }

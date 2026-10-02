@@ -29,6 +29,7 @@ const (
 	PeerService_SlotLeader_FullMethodName      = "/pushupes.v1.PeerService/SlotLeader"
 	PeerService_PushSegments_FullMethodName    = "/pushupes.v1.PeerService/PushSegments"
 	PeerService_TriggerSnapshot_FullMethodName = "/pushupes.v1.PeerService/TriggerSnapshot"
+	PeerService_DropSlot_FullMethodName        = "/pushupes.v1.PeerService/DropSlot"
 )
 
 // PeerServiceClient is the client API for PeerService service.
@@ -82,6 +83,13 @@ type PeerServiceClient interface {
 	// TriggerSnapshot asks this node, as migration source, to push its
 	// sealed segments of a slot to the target.
 	TriggerSnapshot(ctx context.Context, in *TriggerSnapshotRequest, opts ...grpc.CallOption) (*TriggerSnapshotResponse, error)
+	// DropSlot discards this node's local copy of one slot and reopens it empty.
+	// Used by the migration fence when a target's streams are inconsistent with
+	// its LEO (DESIGN.md §1.1 rule 3): the increment that would repair it cannot
+	// be shipped, because the seqs the missing versions need are already spent, so
+	// the copy is rebuilt from the source instead. The caller owns the slot's
+	// placement and must not be asking a node that serves it.
+	DropSlot(ctx context.Context, in *DropSlotRequest, opts ...grpc.CallOption) (*DropSlotResponse, error)
 }
 
 type peerServiceClient struct {
@@ -195,6 +203,16 @@ func (c *peerServiceClient) TriggerSnapshot(ctx context.Context, in *TriggerSnap
 	return out, nil
 }
 
+func (c *peerServiceClient) DropSlot(ctx context.Context, in *DropSlotRequest, opts ...grpc.CallOption) (*DropSlotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DropSlotResponse)
+	err := c.cc.Invoke(ctx, PeerService_DropSlot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PeerServiceServer is the server API for PeerService service.
 // All implementations must embed UnimplementedPeerServiceServer
 // for forward compatibility.
@@ -246,6 +264,13 @@ type PeerServiceServer interface {
 	// TriggerSnapshot asks this node, as migration source, to push its
 	// sealed segments of a slot to the target.
 	TriggerSnapshot(context.Context, *TriggerSnapshotRequest) (*TriggerSnapshotResponse, error)
+	// DropSlot discards this node's local copy of one slot and reopens it empty.
+	// Used by the migration fence when a target's streams are inconsistent with
+	// its LEO (DESIGN.md §1.1 rule 3): the increment that would repair it cannot
+	// be shipped, because the seqs the missing versions need are already spent, so
+	// the copy is rebuilt from the source instead. The caller owns the slot's
+	// placement and must not be asking a node that serves it.
+	DropSlot(context.Context, *DropSlotRequest) (*DropSlotResponse, error)
 	mustEmbedUnimplementedPeerServiceServer()
 }
 
@@ -285,6 +310,9 @@ func (UnimplementedPeerServiceServer) PushSegments(grpc.ClientStreamingServer[Pu
 }
 func (UnimplementedPeerServiceServer) TriggerSnapshot(context.Context, *TriggerSnapshotRequest) (*TriggerSnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method TriggerSnapshot not implemented")
+}
+func (UnimplementedPeerServiceServer) DropSlot(context.Context, *DropSlotRequest) (*DropSlotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DropSlot not implemented")
 }
 func (UnimplementedPeerServiceServer) mustEmbedUnimplementedPeerServiceServer() {}
 func (UnimplementedPeerServiceServer) testEmbeddedByValue()                     {}
@@ -476,6 +504,24 @@ func _PeerService_TriggerSnapshot_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PeerService_DropSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DropSlotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerServiceServer).DropSlot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerService_DropSlot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerServiceServer).DropSlot(ctx, req.(*DropSlotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // PeerService_ServiceDesc is the grpc.ServiceDesc for PeerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -518,6 +564,10 @@ var PeerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "TriggerSnapshot",
 			Handler:    _PeerService_TriggerSnapshot_Handler,
+		},
+		{
+			MethodName: "DropSlot",
+			Handler:    _PeerService_DropSlot_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

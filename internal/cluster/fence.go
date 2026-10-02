@@ -362,6 +362,19 @@ func (e *Engine) HandleFenceSlot(ctx context.Context, slot int32) (uint64, error
 // pushFencedTail ships the records the target is missing (up to the frozen
 // LEO) and waits until the target reports it holds them. It reuses the existing
 // replication/forward path and the existing LEO probe — no new data channel.
+//
+// The target's streams must first be CONSISTENT with its own LEO (DESIGN.md
+// §1.1 rule 3). A target can sit at a high LEO while one aggregate's stream is
+// short: records appended above it never entered the target's directory, so they
+// are in its WAL but no reader can serve them. Shipping an increment cannot
+// repair that — the seqs those missing versions would need are already spent on
+// other aggregates (rule 1) and only counter+1 may be written (rule 2) — and the
+// catch-up gate compares LEOs, so it would report "caught up" about a target
+// that cannot serve everything the new leader will be asked for.
+//
+// So an inconsistent target is REBUILT: its local copy is dropped and re-pulled
+// from scratch, while the source still holds the full slot and the fence keeps
+// this slot frozen. A consistent target takes the ordinary incremental path.
 func (e *Engine) pushFencedTail(ctx context.Context, slot int32, leo uint64) error {
 	to := e.migrationTargetOf(slot)
 	if to == "" {
@@ -370,6 +383,9 @@ func (e *Engine) pushFencedTail(ctx context.Context, slot int32, leo uint64) err
 	addr := e.peerAddr(to)
 	if addr == "" {
 		return fmt.Errorf("fence: no address for migration target %s", to)
+	}
+	if err := e.ensureTargetConsistent(ctx, slot, addr, to); err != nil {
+		return err
 	}
 	deadline := time.Now().Add(fenceCatchUpTimeout)
 	for {

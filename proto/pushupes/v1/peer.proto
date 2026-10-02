@@ -51,6 +51,13 @@ service PeerService {
   // TriggerSnapshot asks this node, as migration source, to push its
   // sealed segments of a slot to the target.
   rpc TriggerSnapshot(TriggerSnapshotRequest) returns (TriggerSnapshotResponse);
+  // DropSlot discards this node's local copy of one slot and reopens it empty.
+  // Used by the migration fence when a target's streams are inconsistent with
+  // its LEO (DESIGN.md §1.1 rule 3): the increment that would repair it cannot
+  // be shipped, because the seqs the missing versions need are already spent, so
+  // the copy is rebuilt from the source instead. The caller owns the slot's
+  // placement and must not be asking a node that serves it.
+  rpc DropSlot(DropSlotRequest) returns (DropSlotResponse);
 }
 
 message PingRequest {}
@@ -111,7 +118,30 @@ message ReplicateRequest {
 message ReplicateResponse {}
 
 message SlotLeoRequest { int32 slot = 1; }
-message SlotLeoResponse { uint64 leo = 1; }
+
+// SlotLeoResponse answers a slot's log end offset plus a summary of its
+// aggregate directory, so a caller can tell whether this node holds a slot
+// whose stream state is CONSISTENT with what its LEO claims.
+//
+// leo alone is not enough: a node can sit at a high LEO while some aggregate's
+// stream is shorter, because the records above it were appended without the
+// directory adopting their versions (DESIGN.md §1.1 rule 3). Comparing LEOs is
+// then satisfied while records exist that no reader can serve. The three
+// counters below make that state detectable in the same round trip:
+//
+//   - aggregates: directory entries (one per aggregate the slot holds)
+//   - versions:   sum of the claimed latest version over those entries
+//   - resolvable: sum of the seqs the directory can actually resolve
+//
+// versions == resolvable means every claimed version has a resolvable seq, so
+// nothing is stranded in the WAL. A caller that needs "this node really holds
+// everything up to leo" must check that equality, not just the offset.
+message SlotLeoResponse {
+  uint64 leo = 1;
+  uint64 aggregates = 2;
+  uint64 versions = 3;
+  uint64 resolvable = 4;
+}
 
 // FenceSlotRequest freezes one migrating slot on its source leader. The reply
 // carries the frozen LEO the target has confirmed.
@@ -144,3 +174,11 @@ message TriggerSnapshotRequest {
   string to_node = 2;
 }
 message TriggerSnapshotResponse {}
+
+// DropSlotRequest asks a peer to discard its local copy of one slot (see the
+// DropSlot RPC). node names the caller, for the target's log.
+message DropSlotRequest {
+  int32 slot = 1;
+  string node = 2;
+}
+message DropSlotResponse {}

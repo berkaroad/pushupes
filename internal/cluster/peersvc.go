@@ -100,7 +100,10 @@ func (s *peerServer) Replicate(_ context.Context, req *pushupesv1.ReplicateReque
 }
 
 func (s *peerServer) SlotLeo(_ context.Context, req *pushupesv1.SlotLeoRequest) (*pushupesv1.SlotLeoResponse, error) {
-	return &pushupesv1.SlotLeoResponse{Leo: s.e.HandleLEO(req.Slot)}, nil
+	leo, aggregates, versions, resolvable := s.e.HandleSlotLeo(req.Slot)
+	return &pushupesv1.SlotLeoResponse{
+		Leo: leo, Aggregates: aggregates, Versions: versions, Resolvable: resolvable,
+	}, nil
 }
 
 func (s *peerServer) FenceSlot(ctx context.Context, req *pushupesv1.FenceSlotRequest) (*pushupesv1.FenceSlotResponse, error) {
@@ -130,6 +133,17 @@ func (s *peerServer) TriggerSnapshot(ctx context.Context, req *pushupesv1.Trigge
 		return nil, err
 	}
 	return &pushupesv1.TriggerSnapshotResponse{}, nil
+}
+
+// DropSlot discards this node's local copy of a slot. The migration fence calls
+// it on a target whose streams are inconsistent with its LEO, because the
+// increment that would repair it cannot be shipped (the seqs are spent) — the
+// copy is rebuilt from the source instead.
+func (s *peerServer) DropSlot(_ context.Context, req *pushupesv1.DropSlotRequest) (*pushupesv1.DropSlotResponse, error) {
+	if err := s.e.HandleDropSlot(req.Slot, req.Node); err != nil {
+		return nil, err
+	}
+	return &pushupesv1.DropSlotResponse{}, nil
 }
 
 // ---- message conversion ------------------------------------------------------
@@ -255,15 +269,43 @@ func (e *Engine) peerProgress(ctx context.Context, addr, follower string, slots 
 }
 
 func (e *Engine) peerLeo(ctx context.Context, addr string, slot int32) (uint64, error) {
+	leo, _, _, _, err := e.peerSlotState(ctx, addr, slot)
+	return leo, err
+}
+
+// slotState is a peer's answer to the catch-up probe: the slot LEO plus the
+// directory summary (see storage.SlotDigest) that lets the caller compare the
+// peer's streams against its own.
+type slotState struct {
+	LEO        uint64
+	Aggregates uint64
+	Versions   uint64
+	Resolvable uint64
+}
+
+// peerSlotState asks a peer for one slot's LEO and directory summary in a single
+// round trip.
+func (e *Engine) peerSlotState(ctx context.Context, addr string, slot int32) (uint64, uint64, uint64, uint64, error) {
 	c, err := e.peerRPC(addr)
 	if err != nil {
-		return 0, err
+		return 0, 0, 0, 0, err
 	}
 	resp, err := c.SlotLeo(ctx, &pushupesv1.SlotLeoRequest{Slot: slot})
 	if err != nil {
-		return 0, err
+		return 0, 0, 0, 0, err
 	}
-	return resp.Leo, nil
+	return resp.Leo, resp.Aggregates, resp.Versions, resp.Resolvable, nil
+}
+
+// remoteSlotState is peerSlotState with the standard probe timeout.
+func (e *Engine) remoteSlotState(ctx context.Context, addr string, slot int32) (slotState, error) {
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	leo, agg, ver, res, err := e.peerSlotState(cctx, addr, slot)
+	if err != nil {
+		return slotState{}, err
+	}
+	return slotState{LEO: leo, Aggregates: agg, Versions: ver, Resolvable: res}, nil
 }
 
 // peerFence asks a peer (the migration source) to take the commit fence for a
