@@ -213,9 +213,9 @@ func (s *Server) ReadStream(ctx context.Context, req *pushupesv1.ReadStreamReque
 //
 // Two things keep it from being N single probes wearing a trench coat:
 //
-//  1. The ownership decision is made ONCE PER SLOT, not once per aggregate.
-//     ReadProxyAddr clones the whole slot table, so calling it per aggregate
-//     would repeat the expensive part of an already expensive scan.
+//  1. The ownership decision is made ONCE PER SLOT, not once per aggregate:
+//     routing is per slot, so one lookup per slot covers every aggregate that
+//     shares it (LeaderReplica, a single table-lock read).
 //  2. Aggregates this node can serve locally are answered in one storage pass;
 //     only the ones it holds neither slot nor replica for are forwarded, and
 //     those are grouped by destination so each peer gets ONE RPC carrying all
