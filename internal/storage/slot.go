@@ -68,6 +68,12 @@ type Slot struct {
 	// disk has its metadata applied.
 	blmsMark       int
 	blmsSkipInsert bool
+	// blmsWatermark is the highest seq already placed into blms. Indexing runs
+	// in ascending seq order (writes append at the newest seq, recovery walks
+	// segments and their frames in order), so anything at or below it is
+	// already in the filter and must not be placed again — recovery replays a
+	// whole WAL on every start, and re-placing costs real bytes-per-entry.
+	blmsWatermark uint64
 
 	segmentBytes int64
 	flush        FlushPolicy
@@ -236,6 +242,12 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 			s.blms.filters = append(s.blms.filters, segIdx.Bloom().filters...)
 			segIdx.Close()
 			s.blmsSkipInsert = false
+			// The segment's whole bloom just came off disk, so every seq it
+			// covers is already placed. Advance the watermark past them or the
+			// index replay below would place each hash a second time.
+			if seg.RecordCnt > 0 && seg.LastSeq > s.blmsWatermark {
+				s.blmsWatermark = seg.LastSeq
+			}
 		case !isTail && seg.RecordCnt > 0:
 			// No usable bloom for a sealed segment. Rebuilding it needs the
 			// records just indexed, which is startup work; running, the set is
@@ -366,7 +378,16 @@ func (s *Slot) indexRecordLocked(seq uint64, rec *data.EventRecord) {
 func (s *Slot) indexMetaLocked(seq uint64, m data.RecordMeta) {
 	e := s.aggs[m.AggregateID]
 	if !s.blmsSkipInsert {
-		s.blms.insert(m.CommandHash)
+		// A seq at or below the watermark was already indexed (the recovery
+		// paths replay a whole WAL through here, and every caller walks seqs
+		// in ascending order), so its hash is already in the filter. Asking
+		// the filter itself cannot answer this: a bloom "maybe" is also true
+		// for colliding hashes, and skipping on it would drop a stored command
+		// from the filter for good. The watermark is exact.
+		s.blms.insertPlaced(m.CommandHash, seq <= s.blmsWatermark)
+		if seq > s.blmsWatermark {
+			s.blmsWatermark = seq
+		}
 	}
 	if m.Version == uint32(e.sealedN+e.n)+1 {
 		e.version = m.Version

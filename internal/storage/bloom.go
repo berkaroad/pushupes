@@ -26,6 +26,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"math"
 )
 
 const (
@@ -107,9 +108,32 @@ func (s *bloomSet) maybe(hash uint64) bool {
 }
 
 // insert adds a hash, growing the set when the newest filter filled up.
+//
+// Repeated inserts of the SAME command must not consume capacity: the recovery
+// paths replay every record of every segment on each start, and bloomBits grows
+// by doubling with b.entries driving full(), so a hash placed twice costs a slot
+// twice — measured as bytes-per-entry climbing above the 1.25 B/entry that one
+// placement per command gives, with the false-positive rate rising alongside it.
+//
+// Dedup cannot be inferred from maybe(): a bloom "maybe" is also true for the
+// ~0.8% of hashes that collide with unrelated entries, so skipping on it drops
+// those hashes from the filter entirely — and "absent" must never be reported
+// for a stored command. Exact dedup needs to know which records have already
+// been placed, which the caller does: insertPlaced takes that answer.
 func (s *bloomSet) insert(hash uint64) {
+	s.insertPlaced(hash, false)
+}
+
+// insertPlaced places a hash unless placed reports it is already in the set.
+// placed must be the exact answer for this record (see Slot.indexMetaLocked);
+// callers that cannot know it pass false, which places the hash. Over-placing
+// costs bytes; under-placing would make a stored command read as absent.
+func (s *bloomSet) insertPlaced(hash uint64, placed bool) {
 	if len(s.filters) == 0 {
 		s.filters = append(s.filters, newBloomBits(bloomFirstCapacity))
+	}
+	if placed {
+		return
 	}
 	last := s.filters[len(s.filters)-1]
 	if last.full() {
@@ -190,9 +214,74 @@ func decodeBloomSet(buf []byte) *bloomSet {
 			f.bits[j] = binary.BigEndian.Uint64(buf[off : off+8])
 			off += 8
 		}
+		// The file does not store the insertion count, but full() gates the
+		// growth of the set and a filter reading 0 is "empty" forever: it would
+		// keep absorbing hashes the chain meant to hand to a fresh filter, and
+		// the count would understate the real load forever. The bit density is
+		// the load — estimate it from the set bits, which is what full()
+		// compares against capacity anyway.
+		f.entries = estimateEntries(f.bits)
 		set.filters = append(set.filters, f)
 	}
 	return set
+}
+
+// estimateEntries infers how many entries a filter holds from how many of its
+// bits are set. With k probes per entry and m bits, the expected fraction of
+// unset bits is (1-1/m)^(k*n), so:
+//
+//	n = log(unset/m) / (k * log(1-1/m))
+//
+// It is an estimate, not a count: full() only needs to know whether the filter
+// reached capacity, and the error is small next to the doubling step that
+// follows. One correction matters in practice — as the filter fills, the unset
+// fraction stops following the ideal (1-1/m)^(k*n) because bits collide, so the
+// raw inversion under-predicts occupancy exactly where accuracy matters. Lifting
+// it by the first-order collision term keeps a full filter looking full; the
+// result is clamped to capacity because full() compares against capacity and an
+// over-estimate there only opens the next filter a few entries early.
+func estimateEntries(bits []uint64) int {
+	m := float64(len(bits) * 64)
+	if m == 0 {
+		return 0
+	}
+	capacity := int(m) * 64 / (64 * bloomBitsPerEntry)
+	if capacity < 1 {
+		capacity = 1
+	}
+	unset := 0
+	for _, w := range bits {
+		unset += 64 - popcount(w)
+	}
+	if unset == 0 {
+		return capacity // saturated
+	}
+	if unset == int(m) {
+		return 0 // untouched
+	}
+	n := math.Log(float64(unset)/m) / (float64(bloomK) * math.Log(1-1/m))
+	if n <= 0 {
+		return 0
+	}
+	// Scale for the saturation bias: as the unset fraction drops the linear
+	// inversion undercounts the real occupancy, so n is lifted before clamping.
+	// 1/(1-x) with x = set fraction tracks the first-order collision term.
+	set := 1 - float64(unset)/m
+	n *= 1 / (1 - set*0.5)
+	if n > float64(capacity) {
+		return capacity
+	}
+	return int(n)
+}
+
+// popcount counts the set bits of a word.
+func popcount(w uint64) int {
+	n := 0
+	for w != 0 {
+		w &= w - 1
+		n++
+	}
+	return n
 }
 
 // bloomStats is a diagnostic string (tests and counters).
