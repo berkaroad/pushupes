@@ -47,6 +47,10 @@ func main() {
 		flushD      = flag.Duration("flush-interval", 5*time.Second, "fsync every interval (0 disables)")
 		dropAfter   = flag.Duration("drop-after", envDurationOr("PUSHUPES_DROP_AFTER", cluster.DefaultDropRetention),
 			"post-migration retention: how long the FORMER SOURCE keeps its local copy of a migrated slot before dropping it (positive = that window, 0 = the default 30s; negative is rejected; the cleanup cannot be disabled — env PUSHUPES_DROP_AFTER)")
+		rebalanceInterval = flag.Duration("rebalance-interval", envDurationOr("PUSHUPES_REBALANCE_INTERVAL", cluster.DefaultRebalanceInterval),
+			"how often the controller checks the leader layout against the slot ring and hands deviated slots back (a node that died returns to its own slots after failover; 0 disables the rebalancer; negative is rejected — env PUSHUPES_REBALANCE_INTERVAL)")
+		rebalanceBatch = flag.Int("rebalance-batch", envIntOr("PUSHUPES_REBALANCE_BATCH", cluster.DefaultRebalanceBatch),
+			"max leader hand-overs one rebalance round executes, run serially (smaller = gentler write-latency noise, larger = faster convergence; 0 disables the rebalancer; negative is rejected — env PUSHUPES_REBALANCE_BATCH)")
 		bootstrap = flag.Bool("bootstrap", false, "form a new cluster from -peers when no Raft state exists")
 	)
 	// -segment-bytes takes a size, not just a byte count: 268435456 or 256MiB.
@@ -65,12 +69,12 @@ func main() {
 	base.SetLevel(logrus.InfoLevel)
 	logger := logrus.NewEntry(base).WithField("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, slotCount, *replication, int64(segmentB), *flushN, *flushD, *dropAfter, *bootstrap, logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, slotCount, *replication, int64(segmentB), *flushN, *flushD, *dropAfter, *rebalanceInterval, *rebalanceBatch, *bootstrap, logger); err != nil {
 		logger.WithError(err).Fatal("pushupes exited with error")
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slotCount, replicationFactor int, segmentBytes int64, flushN int64, flushD, dropAfter time.Duration, bootstrap bool, logger *logrus.Entry) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slotCount, replicationFactor int, segmentBytes int64, flushN int64, flushD, dropAfter time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, logger *logrus.Entry) error {
 	// Canonical form for every stored address: scheme required. A bare
 	// host:port gets the default "http://" prefix; an explicit protocol
 	// is honoured as passed. TCP-level uses (listen/dial) strip it again.
@@ -115,6 +119,22 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slot
 	// hand it to NewNode and wire the node back in.
 	eng := cluster.NewEngine(nil, store, nodeID, logger)
 	eng.SetDropRetention(dropRetention)
+	// Leader rebalance: 0 on either knob is the operator's off switch; a
+	// negative value is a startup error (same fail-fast rule as -drop-after).
+	if rebalanceInterval < 0 {
+		return fmt.Errorf("-rebalance-interval %s must not be negative (positive = the check cadence, 0 = the rebalancer is off)", rebalanceInterval)
+	}
+	if rebalanceBatch < 0 {
+		return fmt.Errorf("-rebalance-batch %d must not be negative (positive = hand-overs per round, 0 = the rebalancer is off)", rebalanceBatch)
+	}
+	eng.SetRebalanceConfig(rebalanceInterval, rebalanceBatch)
+	if rebalanceInterval > 0 && rebalanceBatch > 0 {
+		logger.WithFields(map[string]any{
+			"interval": rebalanceInterval.String(), "batch": rebalanceBatch,
+		}).Info("leader rebalance: the controller hands deviated slots back to the ring layout")
+	} else {
+		logger.Info("leader rebalance disabled (-rebalance-interval or -rebalance-batch is 0)")
+	}
 
 	node, peerGRPC, err := cluster.NewNode(cluster.Config{
 		NodeID:     nodeID,
@@ -281,6 +301,22 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// envIntOr reads an integer from the environment, falling back to def. A
+// malformed or non-integer value is fatal rather than silently defaulting:
+// a typo in a tuning knob should be loud.
+func envIntOr(k string, def int) int {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid %s=%q: %v (want an integer like 8, or 0 to disable)\n", k, v, err)
+		os.Exit(2)
+	}
+	return n
 }
 
 // envDurationOr reads a Go duration (30s, 2m, 1h) from the environment,

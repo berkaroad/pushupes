@@ -195,8 +195,18 @@ Body: Record*，每条记录：
 - **故障切换**：controller（Raft leader）每 1s 经 peer 面 `PeerService.Ping` 探活，
   连续 3 次失败判定失联 → 从剩余 ISR 副本为该节点名下所有槽重选 leader
   （epoch+1，经 Raft 提交）→ 客户端收到 MOVED 重定向。无 peer 地址
-  （PeerAddr 为空）的 peer 不参与探活，避免启动竞态误杀。`election_mode=leader`
-  （默认）：原 preferred leader 恢复后自动回切，减少抖动。
+  （PeerAddr 为空）的 peer 不参与探活，避免启动竞态误杀。
+- **leader 回切（再平衡）**：失联节点恢复并重新加入后，`replan_slots` 只把它
+  补回副本集（follower，经 fetch 追数据），**不动 leader**——故障切换留下的
+  失衡由 controller 的再平衡循环收敛：每 `-rebalance-interval`（默认 15s）一
+  轮，把偏离环布局（leader ≠ `node[slot % N]`，环按当前成员目录计算，因此宕
+  机期间剩余节点之间也会互相平衡）的 stable 槽，按每轮至多 `-rebalance-batch`
+  个（默认 8，串行）经**既有六步热迁移**的 leader_move 通道迁回环上的预期
+  leader。安全门禁：任一秒位在迁移中（如人工 migrate 在飞）整轮让路；回切目标
+  必须已完成注册且 Ping 存活；目标副本必须与源端**摘要等价**（LEO 不低于源且
+  aggregates/versions/resolvable 三元组相等）才动手——因此回切全程走迁移的快
+  路径（摘要等价即跳过快照，不重传封段；副本追平 leader 走的是普通 fetch，
+  与再平衡无关）。0=关闭再平衡；负数启动即报错。
 - **默认拓扑**：`replica_count=2`（每槽 1 leader + 1 follower，散布不同
   节点），`slot_count=1680`（固定）。3 节点以上时副本环按
   `slot % N` 起、向前取 `replica_count` 个节点。
@@ -474,7 +484,7 @@ pushupes/
 | 客户端协议 | gRPC EventService（事件读写唯一入口） |
 | 数据复制 | PeerService.MFetch 会话（gRPC/HTTP2 与 Raft 同端口，seq 坐标，多槽复用长轮询，有数据即答） |
 | 可靠性语义 | ISR + HW（success 的条件是高水位覆盖该 seq，单点故障不丢已确认写入） |
-| 再平衡 | 槽位热迁移（快照+增量+转发窗口，六步不停写） |
+| 再平衡 | 槽位热迁移（快照+增量+转发窗口，六步不停写）；leader 回切：controller 定期把偏离环布局的槽经热迁移迁回预期 leader（摘要等价即跳过快照） |
 | 幂等 | command_id 槽内索引 |
 
 ## 7.1 内存索引：记录条数驱动的三档收敛（Phase 3）
