@@ -1,0 +1,352 @@
+package cluster
+
+import (
+	"context"
+	"strconv"
+	"testing"
+	"time"
+
+	"pushupes/internal/data"
+	"pushupes/internal/storage"
+)
+
+// ---- PlanLeaderRebalance: the ring anchor, as a pure function --------------
+
+func rebalanceTable(nodes ...string) *Table {
+	tbl := NewTable(8, 2)
+	for _, id := range nodes {
+		tbl.Peers[id] = Peer{ID: id}
+	}
+	tbl.Slots = PlanSlots(nodes, tbl.SlotCount, 2)
+	return tbl
+}
+
+func slotSet(t *testing.T, moves []LeaderMove) map[int32]LeaderMove {
+	t.Helper()
+	out := map[int32]LeaderMove{}
+	for _, m := range moves {
+		if _, dup := out[m.Slot]; dup {
+			t.Fatalf("duplicate slot %d in plan", m.Slot)
+		}
+		out[m.Slot] = m
+	}
+	return out
+}
+
+func TestPlanLeaderRebalanceRingAnchored(t *testing.T) {
+	// Ring layout: nothing to move — the plan is empty on a fresh table.
+	tbl := rebalanceTable("node-1", "node-2", "node-3")
+	if moves := PlanLeaderRebalance(tbl); len(moves) != 0 {
+		t.Fatalf("a ring-exact table must plan no moves, got %v", moves)
+	}
+
+	// node-1 dies: the failover command (OpLeaveNode) drops it from the
+	// directory and hands its slots to the surviving replicas. With node-1
+	// gone the ring is the SURVIVORS' ring: slots 1 and 7 (node-2's under
+	// the old ring) now expect node-3 — the plan balances leadership across
+	// the nodes that are actually up, not "give node-1's slots back" (it is
+	// not a member to give anything to).
+	apply := func(c *Command) {
+		if err := tbl.Apply(c); err != nil {
+			t.Fatalf("apply %s: %v", c.Op, err)
+		}
+	}
+	apply(&Command{Op: OpLeaveNode, NodeID: "node-1"})
+	moves := PlanLeaderRebalance(tbl)
+	if len(moves) != 2 {
+		t.Fatalf("the survivors' ring must plan exactly the slots 1 and 7 (to node-3), got %v", moves)
+	}
+	for _, m := range moves {
+		if m.To != "node-3" || m.Slot != 1 && m.Slot != 7 {
+			t.Fatalf("unexpected survivor-ring move %+v", m)
+		}
+	}
+
+	// node-1 returns and replan re-admits it: the ring is its own again and
+	// its slots, still led by the failover nodes, must be handed back. This
+	// is the case the rebalancer exists for.
+	apply(&Command{Op: OpJoinNode, Peer: &Peer{ID: "node-1"}})
+	apply(&Command{Op: OpReplanSlots})
+	moves = PlanLeaderRebalance(tbl)
+	if len(moves) != 3 {
+		t.Fatalf("expected one move per ring slot of node-1 (0,3,6), got %v", moves)
+	}
+	bySlot := slotSet(t, moves)
+	for s, m := range bySlot {
+		if m.To != "node-1" {
+			t.Errorf("slot %d: rebalance must hand leadership BACK to the ring leader node-1, got %+v", s, m)
+		}
+		if m.From == "" || m.From == "node-1" {
+			t.Errorf("slot %d: bogus source %q", s, m.From)
+		}
+	}
+	// Every move is an in-set hand-over: the target already holds a copy.
+	for _, m := range moves {
+		p := tbl.Slots[m.Slot]
+		if !replicaListHas(p.Replicas, m.To) {
+			t.Fatalf("slot %d: rebalance targets %s which is NOT a replica — that would be a full data migration", m.Slot, m.To)
+		}
+	}
+
+	// Executing the plan (leader moves onto replica-set members) must drain
+	// it: the table converges to the ring in one round.
+	var slots []int32
+	for _, m := range moves {
+		slots = append(slots, m.Slot)
+	}
+	apply(&Command{Op: OpLeaderMove, Slots: slots, NewLeader: "node-1"})
+	if left := PlanLeaderRebalance(tbl); len(left) != 0 {
+		t.Fatalf("applying the plan must reach the ring layout, leftovers: %v", left)
+	}
+}
+
+func TestPlanLeaderRebalanceIgnoresWhatItMustNotTouch(t *testing.T) {
+	tbl := rebalanceTable("node-1", "node-2", "node-3")
+
+	// Slot 0: mid-migration (a human started it) — even though its leader
+	// then deviates from the ring, a non-stable slot is never a plan entry.
+	// (Set the placement by hand: Apply(OpLeaderMove) commits a migration
+	// and returns the slot to stable, which is its own behaviour to keep.)
+	if err := tbl.Apply(&Command{Op: OpSlotState, Slots: []int32{0}, State: SlotMigratingOut, MigratingTo: "node-2"}); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Slots[0].Leader = "node-2"
+
+	// Slot 2: leader unassigned (everything else is down) is not a
+	// deviation this function fixes — the operator (or the full plan) owns it.
+	tbl.Slots[2].Leader = ""
+
+	for _, m := range PlanLeaderRebalance(tbl) {
+		if m.Slot == 0 || m.Slot == 2 {
+			t.Fatalf("plan touches a slot it must not: %+v", m)
+		}
+	}
+
+	// Single node: nothing to rebalance between.
+	single := NewTable(4, 1)
+	single.Peers["node-1"] = Peer{ID: "node-1"}
+	single.Slots = PlanSlots([]string{"node-1"}, 4, 1)
+	if moves := PlanLeaderRebalance(single); moves != nil {
+		t.Fatalf("single-node plan: %v", moves)
+	}
+}
+
+func TestPlanLeaderRebalanceSkipsNodeWithoutTheData(t *testing.T) {
+	tbl := rebalanceTable("node-1", "node-2", "node-3")
+	// node-1 left and has NOT been re-admitted: every ring slot of node-1
+	// is led elsewhere but node-1 holds no copy. A leader hand-back would
+	// have to move the data — that is a migration decision, not a
+	// rebalance one, so the plan must be empty until replan tops the sets.
+	if err := tbl.Apply(&Command{Op: OpLeaveNode, NodeID: "node-1"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range tbl.Slots {
+		p.Replicas = []string{} // failover removed node-1; keep the sets honest
+	}
+	if moves := PlanLeaderRebalance(tbl); len(moves) != 0 {
+		t.Fatalf("no node without a replica copy may be a rebalance target: %v", moves)
+	}
+}
+
+// ---- rebalanceRound: the controller-loop gates ------------------------------
+
+// tableWithLeaders plans the ring over the joined peers and moves the given
+// slots onto leaderOf.
+func tableWithLeaders(t *testing.T, e *Engine, leaderOf map[int32]string) {
+	t.Helper()
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+	for s, who := range leaderOf {
+		applyCmd(t, e, &Command{Op: OpSlotAddReplica, Slots: []int32{s}, NodeID: who})
+		applyCmd(t, e, &Command{Op: OpLeaderMove, Slots: []int32{s}, NewLeader: who})
+	}
+}
+
+// layoutSettled is production code (table.go); these tests drive the
+// rebalancer gates that consume it.
+
+func TestLayoutSettled(t *testing.T) {
+	tbl := rebalanceTable("node-1", "node-2", "node-3")
+	if !layoutSettled(tbl) {
+		t.Fatal("a fresh ring is settled")
+	}
+	if err := tbl.Apply(&Command{Op: OpSlotState, Slots: []int32{4}, State: SlotMigratingOut, MigratingTo: "node-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if layoutSettled(tbl) {
+		t.Fatal("one migrating slot unsettles the whole round")
+	}
+}
+
+func TestRebalanceRoundSkipsUnregisteredTarget(t *testing.T) {
+	e, _ := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	join(t, e, "node-3", "127.0.0.1:3")
+	// The post-failover survivors' ring: slot 1 would move from node-2 to
+	// node-3, but nothing listens on node-3's address (the test's fake
+	// addresses): the gate must skip it without churning the placement.
+	tableWithLeaders(t, e, map[int32]string{0: "node-2"})
+	before := e.TableSnapshot()
+	if len(PlanLeaderRebalance(before)) == 0 {
+		t.Fatal("setup: the table must deviate from its ring or this proves nothing")
+	}
+	if done := e.rebalanceRound(context.Background(), 8); done != 0 {
+		t.Fatalf("no move may execute against an unreachable target")
+	}
+	after := e.TableSnapshot()
+	for s, p := range after.Slots {
+		if beforeLeader := before.Slots[s].Leader; p.Leader != beforeLeader || p.State != before.Slots[s].State {
+			t.Fatalf("gated round disturbed slot %d: %+v", s, p)
+		}
+	}
+}
+
+// ---- End-to-end: failover → rejoin → rebalance hands the ring leader back --
+
+// TestRebalanceHandBackEndToEnd drives the real production shape on loopback
+// with two engines and real stores: node-1 dies (OpLeaveNode: node-2 takes
+// its ring slots), comes back (join + register + replan re-admits it as a
+// FOLLOWER), and the rebalancer hands node-1 its ring leadership back — only
+// once node-1's replica copy is equivalent, with the per-round batch limit
+// respected, the segment snapshot skipped for the equivalent copies, and the
+// acknowledged data intact on both sides afterwards.
+func TestRebalanceHandBackEndToEnd(t *testing.T) {
+	oldStore, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oldStore.Close()
+	old := NewEngine(nil, oldStore, "node-1", nil) // node-1: the ring leader, died, came back
+
+	newStore, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newStore.Close()
+	neu := NewEngine(nil, newStore, "node-2", nil) // node-2: leads node-1's slots now
+	neu.node = newTestRaftNode(t, neu)
+
+	oldAddr := newPeerHarness(t, old)
+	newAddr := newPeerHarness(t, neu)
+
+	// Healthy ring on both tables (3 nodes / 8 slots: node-1 leads 0,3,6),
+	// with the real addresses registered so every peer-plane probe answers.
+	for _, e := range []*Engine{old, neu} {
+		// The production join shape: the controller's directory sync carries
+		// the PeerAddr from the raft config; registration patches the
+		// self-announced admin/client addrs in place. node-3 gets an address
+		// nobody listens on, so its liveness gate genuinely fires.
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-1", PeerAddr: oldAddr}})
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-2", PeerAddr: newAddr}})
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-3", PeerAddr: "127.0.0.1:9"}})
+		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-1", AdminAddr: oldAddr, ClientAddr: oldAddr}})
+		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-2", AdminAddr: newAddr, ClientAddr: newAddr}})
+		applyCmd(t, e, &Command{Op: OpPlanSlots})
+	}
+
+	// node-1 dies: the failover sweep's exact damage (OpLeaveNode drops it
+	// from the directory and from every replica set, moving leadership to
+	// replicas[0]) — node-2 now leads slots 0, 3, 6 as well as its own.
+	// While node-1 is out of the directory the ring is the SURVIVORS' ring
+	// (N=2): the plan wants node-2 to shed slots 1 and 7 to node-3 — a
+	// balanced layout during the outage, which must wait for node-3's
+	// registration (it has no address yet here, so the round must not act).
+	for _, e := range []*Engine{old, neu} {
+		applyCmd(t, e, &Command{Op: OpLeaveNode, NodeID: "node-1"})
+	}
+	midFail := PlanLeaderRebalance(neu.TableSnapshot())
+	if len(midFail) != 2 {
+		t.Fatalf("with node-1 gone the ring rebalances over the survivors (want slots 1,7 to node-3), plan: %v", midFail)
+	}
+	for _, m := range midFail {
+		if m.To != "node-3" || m.From != "node-2" {
+			t.Fatalf("unexpected survivor-ring move %+v", m)
+		}
+	}
+	if done := neu.rebalanceRound(context.Background(), 8); done != 0 {
+		t.Fatalf("node-3 has no registered address: the round must not move leadership to it")
+	}
+
+	// Acknowledged writes for slot 0 land on the current leader node-2.
+	slot0 := int32(0)
+	agg := ""
+	for i := 0; i < 4096 && agg == ""; i++ {
+		id := "hand-back-" + strconv.Itoa(i)
+		if newStore.SlotOf(id) == slot0 {
+			agg = id
+		}
+	}
+	if agg == "" {
+		t.Fatal("test setup: no aggregate routes to slot 0")
+	}
+	for v := uint32(1); v <= 5; v++ {
+		rec := &data.EventRecord{
+			AggregateID: agg, Version: v,
+			CommandID: "hb-" + strconv.FormatUint(uint64(v), 10),
+			Events:    []data.Event{{Type: "T", Body: []byte("payload")}},
+		}
+		if _, err := newStore.Append(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// node-1 rejoins: join + register + replan. Replan tops slot 0's set
+	// (short: [node-2]) back to the ring pair, making node-1 a FOLLOWER —
+	// leadership is not moved. The rebalancer now has candidates {0,3,6},
+	// but node-1's copy of slot 0 is five records behind: the equivalence
+	// gate must hold that slot back. Slots 3 and 6 are EMPTY everywhere, so
+	// they are equivalent already — and the batch limit (1) must stop the
+	// round after the first one of them.
+	for _, e := range []*Engine{old, neu} {
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-1", PeerAddr: oldAddr}})
+		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-1", AdminAddr: oldAddr, ClientAddr: oldAddr}})
+		applyCmd(t, e, &Command{Op: OpReplanSlots})
+	}
+	if p, _ := neu.TableSnapshot().Slots[slot0]; p.Leader != "node-2" || !replicaListHas(p.Replicas, "node-1") {
+		t.Fatalf("test setup: slot 0 after rejoin %+v", p)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if done := neu.rebalanceRound(ctx, 1); done != 1 {
+		t.Fatalf("batch limit: one empty-equivalent move, then the round stops, got %d", done)
+	}
+	if p, _ := neu.TableSnapshot().Slots[slot0]; p.Leader != "node-2" {
+		t.Fatalf("slot 0 moved before its replica caught up: %+v", p)
+	}
+	if p, _ := neu.TableSnapshot().Slots[6]; p.Leader != "node-2" {
+		t.Fatalf("slot 6 moved past the batch limit: %+v", p)
+	}
+
+	// node-1's fetch loop catches the replica copy up: same records, same
+	// seqs, via the ordinary replication landing path.
+	for seq := uint64(1); seq <= 5; seq++ {
+		_, next, payload, err := newStore.ReadSlotBytes(slot0, seq, seq+1, 1<<20)
+		if err != nil || next != seq+1 || len(payload) == 0 {
+			t.Fatalf("read slot 0 seq %d: next=%d len=%d err=%v", seq, next, len(payload), err)
+		}
+		if err := old.HandleReplicate(slot0, seq, payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The final round: slot 0 is equivalent now, slot 6 still waits — both
+	// hand back, and slot 0's migration must take the fast path (the
+	// equivalence skip, the fence's ensureTargetConsistent seeing matching
+	// digests: no segment is re-shipped for a copy that is already there).
+	if done := neu.rebalanceRound(ctx, 8); done != 2 {
+		t.Fatalf("want slot 0 back (caught up) + slot 6 (queued last round), got %d moves", done)
+	}
+	for _, s := range []int32{0, 3, 6} {
+		p, _ := neu.TableSnapshot().Slots[s]
+		if p.Leader != "node-1" || p.State != SlotStable || p.Epoch < 2 {
+			t.Fatalf("slot %d not handed back to the ring leader: %+v", s, p)
+		}
+	}
+	if oldStore.LastSeqOf(slot0) != 5 || newStore.LastSeqOf(slot0) != 5 {
+		t.Fatalf("data must survive the hand-back on both sides: old=%d new=%d",
+			oldStore.LastSeqOf(slot0), newStore.LastSeqOf(slot0))
+	}
+	if left := PlanLeaderRebalance(neu.TableSnapshot()); len(left) != 0 {
+		t.Fatalf("after the hand-backs the ring is reached; leftovers: %v", left)
+	}
+}

@@ -100,7 +100,27 @@ func (e *Engine) StartMigration(ctx context.Context, slot int32, toNode string) 
 		e.rollbackMigration(slot)
 		return fmt.Errorf("no address for source %s", from)
 	}
-	if err := e.snapshotTo(ctx, srcAddr, slot, toNode); err != nil {
+	// Fast path — a target that already holds an EQUIVALENT copy (same
+	// directory digest, not behind the source's LEO) needs no segment
+	// transfer at all. The ordinary reason such a target exists is the
+	// leader rebalance (balance.go): the target is the slot's in-set
+	// replica catching up over the fetch protocol, and handing leadership
+	// back must not re-ship the source's whole WAL (a slot is up to 256MiB
+	// of sealed segments, and a restarted node's share of the ring is
+	// slotCount/N slots). When the source IS this node its copy is read
+	// locally; any probe error falls through to the full snapshot path
+	// (conservative: a wrong skip would be data loss, a wrong snapshot is
+	// only slow). awaitCaughtUp and the commit fence's
+	// ensureTargetConsistent re-verify after the skip — the safety net is
+	// the fence, not this check.
+	srcProbe := srcAddr
+	if from == e.self {
+		srcProbe = "" // read our own copy locally (the source IS us)
+	}
+	if equivalent, err := e.slotCopyEquivalent(ctx, slot, srcProbe, e.peerAddr(toNode)); err == nil && equivalent {
+		e.logger.WithFields(map[string]any{"slot": slot, "target": toNode, "op": "skip_snapshot"}).
+			Info("migration step 2/3: target already holds an equivalent copy; skipping the segment snapshot")
+	} else if err := e.snapshotTo(ctx, srcAddr, slot, toNode); err != nil {
 		e.rollbackMigration(slot)
 		return fmt.Errorf("snapshot: %w", err)
 	}

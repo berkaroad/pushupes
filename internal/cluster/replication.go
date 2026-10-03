@@ -101,6 +101,12 @@ type Engine struct {
 	failMu     sync.Mutex
 	failStreak map[string]int
 
+	// leader rebalance (balance.go): how often the controller re-checks the
+	// ring layout and how many leader hand-overs one round may execute.
+	// Set from the -rebalance-interval / -rebalance-batch flags.
+	rebalanceInterval time.Duration
+	rebalanceBatch    int
+
 	// post-migration local cleanup: slots whose local copy this node is
 	// scheduled to drop after the retention window (slot -> schedule), plus
 	// this node's replica-set membership as of the previous table walk (the
@@ -219,6 +225,10 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *logrus.Ent
 		// post-migration cleanup: the former source keeps its copy for this
 		// long once it sees the hand-over committed (-drop-after).
 		dropAfter: DefaultDropRetention,
+		// leader rebalance: enabled by default, tuned with -rebalance-interval
+		// and -rebalance-batch (an interval or batch of 0 turns it off).
+		rebalanceInterval: DefaultRebalanceInterval,
+		rebalanceBatch:    DefaultRebalanceBatch,
 	}
 	e.orderPool.New = func() any { return make([]int, 0, 64) }
 	e.parkedPool.New = func() any { return make([]parkedEntry, 0, 64) }
@@ -1849,8 +1859,10 @@ func (e *Engine) loggerf(format string, args ...any) {
 
 // ---- Start / Stop -------------------------------------------------------------
 
-// Start launches background loops (replica fetch + controller).
+// Start launches background loops (replica fetch + controller + leader
+// rebalance; the rebalancer exits at once when the knob is turned off).
 func (e *Engine) Start(ctx context.Context) {
 	go e.replicaLoop(ctx)
 	go e.RunController(ctx)
+	go e.RunRebalancer(ctx)
 }

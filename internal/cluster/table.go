@@ -126,6 +126,69 @@ func PlanSlots(nodes []string, slotCount int32, replicaFactor int) map[int32]*Pl
 	return out
 }
 
+// LeaderMove is one rebalance step: hand slot s from its current leader to
+// To. Pure metadata (a controller-side plan entry, never replicated itself).
+type LeaderMove struct {
+	Slot int32
+	From string
+	To   string
+}
+
+// PlanLeaderRebalance computes the leader layout the ring policy prescribes
+// and lists the stable slots that currently deviate from it. The ring is the
+// exact output of PlanSlots over the sorted member ids (DESIGN §默认拓扑:
+// leader(s) = nodes[s % N]), so a table this function returns no moves for is
+// byte-identical in its leader assignment to a freshly planned one.
+//
+// The anchor is the RING, not a free "balance the counts" search: after a
+// failover the expected leader is back on the layout it had before the node
+// died — the behaviour is deterministic and explainable (and survives
+// controller restarts: the plan is a pure function of the table). The cost of
+// anchoring is that a hand-picked placement a rebalance can express as a move
+// will be moved back; that is the accepted trade-off for a converging layout.
+//
+// The expected leader is the ring over the CURRENT member directory — the
+// same input a fresh PlanSlots would use — so during a failure the plan
+// balances leadership across the surviving nodes, and once the failed node
+// re-joins (and replan_slots has re-admitted it to the replica sets) the
+// same function hands its slots back to it. A deviating slot is only a
+// candidate when its expected leader is a replica of the slot: moving a
+// leader onto a node without the data is a full migration, not a rebalance,
+// and belongs to the operator. Replica sets still short of the factor are
+// left to replan_slots' top-up; the rebalancer never adds members.
+// Non-stable slots are owned by a live migration — never touched.
+func PlanLeaderRebalance(t *Table) []LeaderMove {
+	nodes := t.PeerIDs()
+	if len(nodes) < 2 {
+		return nil
+	}
+	var out []LeaderMove
+	for s, p := range t.Slots {
+		if p.State != SlotStable || p.Leader == "" {
+			continue
+		}
+		want := nodes[int(s)%len(nodes)]
+		if p.Leader == want || !replicaListHas(p.Replicas, want) {
+			continue
+		}
+		out = append(out, LeaderMove{Slot: s, From: p.Leader, To: want})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Slot < out[j].Slot })
+	return out
+}
+
+// layoutSettled reports whether every placement is stable: a slot in any
+// migration state means a live hand-over owns the layout, and the leader
+// rebalancer yields to it rather than starting a competing move mid-flight.
+func layoutSettled(t *Table) bool {
+	for _, p := range t.Slots {
+		if p.State != SlotStable {
+			return false
+		}
+	}
+	return true
+}
+
 // ---- Replicated commands ---------------------------------------------------
 
 // Command ops. Commands are JSON-encoded and applied identically on every
