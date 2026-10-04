@@ -122,20 +122,39 @@ export async function getClusterStatus(): Promise<ClusterStatus> {
   }
 }
 
-// ensureLeader runs the startup probe once when several admins are configured:
-// it pins the client to the leader BEFORE the first page render, so pages
-// never paint against a follower. Single-entry configs skip the extra request.
-// Returns the status it resolved with; concurrent callers share one probe.
+// ensureLeader pins the client to the Raft leader BEFORE the first page render,
+// so pages never paint against a follower. It is a ONE-SHOT: the first call
+// runs the pool probe, every later call is an ordinary status poll (which is
+// also what keeps the pin current). Single-entry configs skip the probe.
+//
+// Getting this wrong is silent, and was: the probe promise was cached forever,
+// so every caller after the first got the SAME ClusterStatus object back. A
+// page that stores it with setStatus() then sees a reference-equal value on
+// every timer tick — React bails out of the update and the view freezes at the
+// boot-time snapshot. No request, no error, just a dead auto-refresh.
 let bootProbe: Promise<ClusterStatus> | null = null
+let booted = false
+
 export function ensureLeader(): Promise<ClusterStatus> {
-  if (adminPool().length <= 1) {
+  if (booted || adminPool().length <= 1) {
     return getClusterStatus()
   }
-  if (!bootProbe) {
-    bootProbe = probePool().then((r) => r.st)
-    bootProbe.catch(() => { bootProbe = null }) // allow a retry after a failed boot
+  if (bootProbe) {
+    return bootProbe // a probe is already in flight: share it, don't stack one
   }
-  return bootProbe
+  const p = probePool().then((r) => {
+    booted = true
+    return r.st
+  })
+  // Give up the in-flight slot either way: on success later calls poll, and on
+  // failure the next call retries the probe instead of latching a rejection.
+  // (The rejection is handled here, so the caller still sees its own.)
+  p.then(
+    () => { bootProbe = null },
+    () => { bootProbe = null },
+  )
+  bootProbe = p
+  return p
 }
 
 // fetchNodeWrites pulls one node's per-slot counters AND gauges over CORS —

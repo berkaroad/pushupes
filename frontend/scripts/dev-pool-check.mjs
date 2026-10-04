@@ -30,13 +30,23 @@ assert('env var produces the 3-endpoint pool (not /api)', pool.length === 3, JSO
 assert('pool entries are the configured admins', pool.join(',') === POOL, JSON.stringify(pool))
 
 // ---- B) boot pins to the current leader ------------------------------------
-const st1 = await api.ensureLeader()
-assert('boot resolved a leader', !!st1.raft.leader, st1.raft.leader)
-// The redirect is usable if EITHER source is present: the controller_* fields
-// (new server) or the peers[leader].admin_addr fallback (older server). The
-// console must work against both, so accept either.
-const leaderAdmin = st1.controller_admin_addr || st1.peers?.[st1.raft.leader]?.admin_addr
-assert('leader admin address is resolvable (controller field or peers fallback)', !!leaderAdmin, String(leaderAdmin))
+// The cluster has to be up for this to mean anything: report that as a failed
+// check rather than dying on an unhandled rejection, which would skip section E
+// and leave node-1 killed.
+let st1
+try {
+  st1 = await api.ensureLeader()
+} catch (e) {
+  assert('boot reached the cluster (.cluster running?)', false, String(e?.message ?? e))
+}
+if (st1) {
+  assert('boot resolved a leader', !!st1.raft.leader, st1.raft.leader)
+  // The redirect is usable if EITHER source is present: the controller_* fields
+  // (new server) or the peers[leader].admin_addr fallback (older server). The
+  // console must work against both, so accept either.
+  const leaderAdmin = st1.controller_admin_addr || st1.peers?.[st1.raft.leader]?.admin_addr
+  assert('leader admin address is resolvable (controller field or peers fallback)', !!leaderAdmin, String(leaderAdmin))
+}
 
 // ---- helper: kill / restart one node by its admin port ---------------------
 const port = (i) => 8090 + i
@@ -99,8 +109,16 @@ assert('polls keep working after the first pool entry dies', recovered, lastErr)
 // in place, a status is still obtained above, so this is the same assertion.
 
 // ---- E) restore node-1 -----------------------------------------------------
-startNode(1)
-assert('node-1 came back', await waitAlive(1), `port ${port(1)}`)
+// Always, and even if an assertion above threw: this script kills a real node
+// of the .cluster, so a failure that skipped the restart would leave the
+// cluster short a node (and the next run would then fail on ECONNREFUSED with
+// no hint of why).
+try {
+	startNode(1)
+	assert('node-1 came back', await waitAlive(1), `port ${port(1)}`)
+} catch (e) {
+	assert('node-1 came back', false, String(e?.message ?? e))
+}
 
 let failed = 0
 for (const [n, ok, x] of checks) { console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${!ok && x ? '  [' + x + ']' : ''}`); if (!ok) failed++ }
