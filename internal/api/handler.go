@@ -192,14 +192,21 @@ func (s *Server) handleSlotStreams(w http.ResponseWriter, r *http.Request) {
 
 // ---- admin ---------------------------------------------------------------------
 
+// handleClusterStatus answers from THIS node's view. controller_* is the
+// machine-readable redirect the console follows to pin its traffic to the
+// Raft leader: id + admin address resolved from the replicated peer directory
+// (empty while no leader is elected or the leader has not registered yet).
 func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	tbl := s.Engine.TableSnapshot()
+	leaderID, leaderAdmin := s.Engine.Controller()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"node":       s.Engine.Self(),
-		"raft":       s.Engine.RaftStats(),
-		"peers":      tbl.Peers,
-		"slots":      tbl.Slots,
-		"slot_count": tbl.SlotCount,
+		"node":                  s.Engine.Self(),
+		"raft":                  s.Engine.RaftStats(),
+		"peers":                 tbl.Peers,
+		"slots":                 tbl.Slots,
+		"slot_count":            tbl.SlotCount,
+		"controller":            leaderID,
+		"controller_admin_addr": leaderAdmin,
 		// durable writes per slot since this process started; clients diff
 		// successive snapshots to derive write rates (msg/sec).
 		"writes": s.Engine.WriteCounts(),
