@@ -34,7 +34,12 @@ import (
 //     is both the gate and what makes the move cheap: StartMigration's fast
 //     path skips the segment snapshot for such a target, so a hand-back is
 //     pure metadata plus a millisecond fence — a restart of one node never
-//     moves slot data around;
+//     moves slot data around. The gate distinguishes "still catching up"
+//     (wait) from "diverged" (same LEO, different directory — a copy whose
+//     aggregate directory stopped adopting versions, which fetching can
+//     never repair): a diverged target is handed to the ordinary migration
+//     path, whose ensureTargetConsistent drops and rebuilds it. Refusing
+//     both would strand such a slot off the ring forever;
 //   - moves run strictly serially, at most `batch` per round: each one's
 //     commit fence freezes exactly one slot, and serial rounds keep the
 //     frozen-slot count at one, so rebalance latency noise is bounded to a
@@ -131,13 +136,41 @@ func (e *Engine) rebalanceRound(ctx context.Context, limit int) int {
 			continue // the move-back target must be reachable (its liveness
 			// is also what failover is about to re-shape: do not race it)
 		}
-		// Gate the move on the target already holding an equivalent copy.
-		// Until the replica's fetch catches up, a hand-back would be a full
-		// snapshot migration — and the point of the ring layout is that the
-		// data does NOT have to move twice.
-		equivalent, err := e.slotCopyEquivalent(ctx, m.Slot, srcAddr, dstAddr)
-		if err != nil || !equivalent {
-			continue
+		// Gate the move on the target's copy. Two different refusals live
+		// here, and they must not be conflated:
+		//
+		//   - the target is BEHIND (its fetch is still catching up): wait.
+		//     Handing leadership over now would make the hand-back a full
+		//     snapshot migration, and the point of the ring layout is that
+		//     the data does NOT have to move twice;
+		//
+		//   - the target is DIVERGED (same or higher LEO, different
+		//     directory): wait forever, which is what this used to do. Its
+		//     aggregate directory stopped adopting versions at a gap, so the
+		//     records above that point sit in its WAL unreadable and no
+		//     amount of fetching repairs them — the copy is structurally
+		//     short while its LEO says "in sync". Skipping it leaves the ring
+		//     permanently unbalanced for that slot (observed: 5 slots stuck
+		//     at a settled 559/563/558, rebalance round after round, with no
+		//     log line saying why).
+		//
+		// So a diverged target is handed to the ordinary migration path
+		// instead: StartMigration's ensureTargetConsistent drops such a copy
+		// and rebuilds it from this source before moving leadership, which is
+		// the only thing that repairs it. The move is expensive — a real
+		// rebuild under the fence — and that is the honest price of healing a
+		// replica the leader is still counting as in-sync.
+		equivalent, behind, err := e.slotCopyStatus(ctx, m.Slot, srcAddr, dstAddr)
+		if err != nil {
+			continue // peer-plane error: it will either heal or be caught next round
+		}
+		if behind {
+			continue // still catching up: the cheap hand-back waits for it
+		}
+		if !equivalent {
+			e.logger.WithFields(map[string]any{
+				"slot": m.Slot, "from": m.From, "to": m.To, "op": "rebalance_repair",
+			}).Warn("rebalance: target copy has the source's LEO but a different directory; rebuilding it before handing leadership back")
 		}
 		if err := e.StartMigration(ctx, m.Slot, m.To); err != nil {
 			e.loggerf("rebalance: moving slot %d back to %s failed: %v (retried next round)", m.Slot, m.To, err)
@@ -151,11 +184,11 @@ func (e *Engine) rebalanceRound(ctx context.Context, limit int) int {
 	return done
 }
 
-// slotCopyEquivalent reports whether the target's copy of a slot is
-// equivalent to the source's copy: the same directory digest (aggregate
-// count, total versions, resolvable versions) and not behind the source's
-// LEO. Both nodes are reached over the peer plane; an empty srcAddr means
-// THIS node is the source and reads its own store.
+// slotCopyEquivalent reports whether the target's copy of a slot is equivalent
+// to the source's: the same directory digest (aggregate count, total versions,
+// resolvable versions) and not behind the source's LEO. Both nodes are reached
+// over the peer plane; an empty srcAddr means THIS node is the source and reads
+// its own store.
 //
 // The digest — not just the LEO — is what makes the comparison safe to skip
 // a snapshot with. A caught-up in-set replica pulls every record from the
@@ -165,19 +198,47 @@ func (e *Engine) rebalanceRound(ctx context.Context, limit int) int {
 // above a stream's tail) fails the digest and takes the ordinary
 // snapshot/rebuild path. This is ensureTargetConsistent's comparison, used
 // before the fence instead of under it: the fence window must stay O(tail).
+//
+// Callers that must tell "not caught up yet" from "never will be" want
+// slotCopyStatus instead — this wrapper is for the migration fast path, which
+// only asks whether the snapshot can be skipped.
 func (e *Engine) slotCopyEquivalent(ctx context.Context, slot int32, srcAddr, dstAddr string) (bool, error) {
+	equivalent, _, err := e.slotCopyStatus(ctx, slot, srcAddr, dstAddr)
+	return equivalent, err
+}
+
+// slotCopyStatus compares the two copies and separates the two ways they can
+// fail to agree:
+//
+//   - equivalent: identical digest and the target is not behind;
+//   - behind: the target's LEO is below the source's — its fetch is still
+//     catching up, and waiting is the right answer;
+//   - neither: the target reports the source's LEO (or more) but a different
+//     directory. That is a copy whose aggregate directory stopped adopting
+//     versions, so the records above the gap sit in its WAL unreadable: the
+//     fetch loop cannot repair it (the seqs the missing versions need are
+//     already spent elsewhere and only counter+1 may be appended), and
+//     waiting leaves it wrong forever. Callers must rebuild it instead —
+//     see rebalanceRound, and ensureTargetConsistent, which does the drop
+//     and re-pull.
+//
+// An error is a peer-plane failure and says nothing about the copies.
+func (e *Engine) slotCopyStatus(ctx context.Context, slot int32, srcAddr, dstAddr string) (equivalent, behind bool, err error) {
 	src, err := e.slotStateAt(ctx, slot, srcAddr)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	dst, err := e.remoteSlotState(ctx, dstAddr, slot)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	if dst.LEO < src.LEO {
-		return false, nil
+		return false, true, nil
 	}
-	return dst.Aggregates == src.Aggregates && dst.Versions == src.Versions && dst.Resolvable == src.Resolvable, nil
+	if dst.Aggregates == src.Aggregates && dst.Versions == src.Versions && dst.Resolvable == src.Resolvable {
+		return true, false, nil
+	}
+	return false, false, nil // diverged: same LEO (or more), different directory
 }
 
 // slotStateAt reads one node's copy of a slot over the peer plane; an empty

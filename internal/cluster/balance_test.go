@@ -406,3 +406,98 @@ func TestRebalanceHandBackEndToEnd(t *testing.T) {
 		t.Fatalf("after the hand-backs the ring is reached; leftovers: %v", left)
 	}
 }
+
+// TestSlotCopyStatusSeparatesBehindFromDiverged pins the distinction the
+// rebalance gate rests on — and getting it wrong is what stranded slots off
+// the ring for good.
+//
+// A target whose LEO is below the source's is merely BEHIND: its fetch is
+// still catching up, and the round must wait for it (that is the cheap
+// hand-back the ring layout is built on). A target that reports the source's
+// LEO with a DIFFERENT directory is DIVERGED: its aggregate directory stopped
+// adopting versions at a gap, so the records above the gap sit in its WAL
+// unreadable and no amount of fetching repairs them. Skipping that one every
+// round is a permanent, silent refusal to rebalance the slot — the round has
+// to hand it to the migration path so the copy gets rebuilt instead.
+func TestSlotCopyStatusSeparatesBehindFromDiverged(t *testing.T) {
+	src, srcStore := newTestEngine(t, "node-1")
+	dst, dstStore := newTestEngine(t, "node-2")
+	srcAddr := newPeerHarness(t, src)
+	dstAddr := newPeerHarness(t, dst)
+	ctx := context.Background()
+
+	aggFor := func(st *storage.Store, slot int32, prefix string) string {
+		for i := 0; i < 1_000_000; i++ {
+			id := prefix + strconv.Itoa(i)
+			if st.SlotOf(id) == slot {
+				return id
+			}
+		}
+		t.Fatalf("no aggregate routes to slot %d", slot)
+		return ""
+	}
+	appendRange := func(st *storage.Store, agg string, from, to int) {
+		for v := from; v <= to; v++ {
+			rec := &data.EventRecord{
+				AggregateID: agg, Version: uint32(v),
+				CommandID: agg + "-" + strconv.Itoa(v),
+				Events:    []data.Event{{Type: "T", Body: []byte("p")}},
+			}
+			if _, err := st.Append(rec); err != nil {
+				t.Fatalf("append %s v%d: %v", agg, v, err)
+			}
+		}
+	}
+
+	// --- slot 0: behind, then equivalent ------------------------------------
+	slot0 := int32(0)
+	agg0 := aggFor(srcStore, slot0, "behind-")
+	appendRange(srcStore, agg0, 1, 5)
+	appendRange(dstStore, agg0, 1, 2)
+
+	eq, behind, err := src.slotCopyStatus(ctx, slot0, srcAddr, dstAddr)
+	if err != nil {
+		t.Fatalf("slot 0 behind: %v", err)
+	}
+	if eq || !behind {
+		t.Fatalf("a target 3 records behind must read as (equivalent=false, behind=true), got (%v,%v)", eq, behind)
+	}
+
+	appendRange(dstStore, agg0, 3, 5) // caught up: same records, same directory
+	eq, behind, err = src.slotCopyStatus(ctx, slot0, srcAddr, dstAddr)
+	if err != nil {
+		t.Fatalf("slot 0 equivalent: %v", err)
+	}
+	if !eq || behind {
+		t.Fatalf("a caught-up copy must read as (equivalent=true, behind=false), got (%v,%v)", eq, behind)
+	}
+
+	// --- slot 1: same LEO, different directory ------------------------------
+	slot1 := int32(1)
+	agg1 := aggFor(srcStore, slot1, "div-")
+	appendRange(srcStore, agg1, 1, 5)
+
+	// The target reaches the SAME LEO (5) through two aggregates instead of
+	// one: the sums differ only in the aggregate count, which is exactly the
+	// "high LEO, short stream" shape the digest exists to catch.
+	aggA := aggFor(dstStore, slot1, "divA-")
+	aggB := aggFor(dstStore, slot1, "divB-")
+	if aggA == aggB {
+		t.Fatal("test setup: need two distinct aggregates routing to slot 1")
+	}
+	appendRange(dstStore, aggA, 1, 3)
+	appendRange(dstStore, aggB, 1, 2)
+
+	if got := dstStore.LastSeqOf(slot1); got != srcStore.LastSeqOf(slot1) {
+		t.Fatalf("test setup: LEOs must match to model divergence (target %d, source %d)",
+			got, srcStore.LastSeqOf(slot1))
+	}
+	eq, behind, err = src.slotCopyStatus(ctx, slot1, srcAddr, dstAddr)
+	if err != nil {
+		t.Fatalf("slot 1 diverged: %v", err)
+	}
+	if eq || behind {
+		t.Fatalf("same LEO with a different directory must read as (equivalent=false, behind=false) "+
+			"so the caller rebuilds it, got (%v,%v)", eq, behind)
+	}
+}
