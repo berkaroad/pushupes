@@ -135,6 +135,15 @@ func (s *Server) handleSlotDescribe(w http.ResponseWriter, r *http.Request) {
 	if t, ok := s.Engine.PendingDrop(int32(slot)); ok {
 		pendingDropAt = t.Unix()
 	}
+	// The copy's digest — the same sums the leader rebalancer and the
+	// migration fence compare: how many aggregates the slot holds, the sum of
+	// their claimed versions, and the sum of the seqs the directory can
+	// actually resolve. A copy whose last_seq sits at the leader's while
+	// versions/resolvable are lower is structurally short: its WAL holds
+	// records its aggregate directory never adopted, so those records cannot
+	// be read on this node. Surfacing it here is what makes that visible
+	// without a leader round to notice it (see storage.Slot.SlotDigest).
+	digestAgg, digestVers, digestResolvable := s.Store.SlotDigest(int32(slot))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"slot":        slot,
 		"node":        self,
@@ -147,6 +156,9 @@ func (s *Server) handleSlotDescribe(w http.ResponseWriter, r *http.Request) {
 		"placement":   p,
 		"isr":         s.Engine.ISR(int32(slot)),
 		"writes":      s.Store.WriteCount(int32(slot)),
+		"aggregates":  digestAgg,
+		"versions":    digestVers,
+		"resolvable":  digestResolvable,
 		// A non-zero value means this node has queued the automatic
 		// post-migration cleanup of its local copy of the slot.
 		"pending_drop_at": pendingDropAt,
