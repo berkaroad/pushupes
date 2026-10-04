@@ -119,6 +119,9 @@ scripts/cluster.sh start     # 编译 + 拉起 3 节点，等待选主与槽规�
 scripts/cluster.sh status    # 各节点 Raft 角色、leader 槽数、迁移中槽数
 scripts/cluster.sh smoke     # 端到端冒烟：MOVED → v1/v2 写入 → 幂等 exists
                              #           → 版本冲突 fail/1001 → 回读
+scripts/cluster.sh slotcheck # 副本一致性体检：逐槽比较 leader 与各副本的聚合摘要，
+                             #   报出「LEO 相同但目录偏短」的发散副本（有则退出码 1）
+                             #   可加 -quiet / -json / -list=N 透传给 bin/slotcheck
 scripts/cluster.sh logs 1    # 跟踪 node-1 日志
 scripts/cluster.sh restart   # 重启（保留数据，验证 WAL/Raft 崩溃恢复）
 scripts/cluster.sh stop      # 停止（只杀 pid 文件记录的进程）
@@ -211,6 +214,11 @@ go run ./cmd/batchsmoke
 
 # 单槽灌数据（容量/恢复调试）
 go run ./cmd/seed -slot 7 -mib 512
+
+# 副本一致性体检：逐槽比较 leader 与各副本的聚合摘要（读 /admin/slots/N/describe）。
+# 报出「LEO 相同但目录偏短」的发散副本 —— 这类副本在环上不可见（leader 回切器只看
+# 偏离环的槽），但读不到自己尾部，且会让该槽永远回切不回去。有发散时退出码 1。
+go run ./cmd/slotcheck -admins http://127.0.0.1:8091,http://127.0.0.1:8092,http://127.0.0.1:8093
 ```
 
 修改 proto 后重新生成：`buf generate --template buf.gen.yaml proto`。

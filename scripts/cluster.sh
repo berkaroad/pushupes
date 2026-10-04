@@ -7,6 +7,7 @@
 #   scripts/cluster.sh start     启动集群（编译、逐个拉起、等待选主与槽规划，并打印管理台多地址启动命令）
 #   scripts/cluster.sh status    查看各节点 Raft 角色、Leader 槽数、迁移中槽数
 #   scripts/cluster.sh smoke     端到端冒烟：MOVED 重定向 → v1/v2 写入 → 幂等 exists → 版本冲突 fail/1001 → 回读
+#   scripts/cluster.sh slotcheck 副本一致性体检：逐槽比较 leader 与各副本摘要（有发散副本时退出码 1）
 #   scripts/cluster.sh logs [N]  跟踪某个节点日志（默认 node-1）
 #   scripts/cluster.sh restart   重启（保留数据，验证 WAL/Raft 崩溃恢复）
 #   scripts/cluster.sh stop      停止集群
@@ -78,7 +79,7 @@ json_count() {
 }
 
 build_binary() {
-  if [[ ! -x "$BIN" || "${BUILD:-0}" == "1" ]]; then
+  if [[ ! -x "$BIN" || ! -x "$ROOT/bin/slotcheck" || "${BUILD:-0}" == "1" ]]; then
     info "编译 pushupes..."
     if ! command -v go >/dev/null 2>&1; then
       [[ -x /root/.local/go/bin/go ]] && export PATH=/root/.local/go/bin:$PATH || die "找不到 go，请安装或加入 PATH"
@@ -88,7 +89,7 @@ build_binary() {
     [[ -w "${GOCACHE:-/nonexistent}" ]] || export GOCACHE=/root/.cache/go-build
     mkdir -p "$GOTMPDIR" "$GOPATH" "$GOCACHE" 2>/dev/null || true
     export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
-    (cd "$ROOT" && go build -o bin/pushupes ./cmd/pushupes && go build -o bin/grpccheck ./cmd/grpccheck) || die "编译失败"
+    (cd "$ROOT" && go build -o bin/pushupes ./cmd/pushupes && go build -o bin/grpccheck ./cmd/grpccheck && go build -o bin/slotcheck ./cmd/slotcheck) || die "编译失败"
   fi
 }
 
@@ -203,6 +204,16 @@ cmd_start() {
   cmd_status
 }
 
+# 副本一致性体检：逐槽比较 leader 与各副本的聚合摘要（aggregates/versions/
+# resolvable），报出「LEO 相同但目录偏短」的发散副本。这类副本在环上不可见
+# （回切器只看偏离环的槽），所以例行跑一次才知道有没有。
+cmd_slotcheck() {
+  build_binary
+  local list="" i
+  for i in $(seq 1 "$REPLICAS"); do list+="${list:+,}$HOST:$(admin_port "$i")"; done
+  "$ROOT/bin/slotcheck" -admins "$list" "$@"
+}
+
 cmd_status() {
   local i body state leader leaders migrating
   info "=== PushupES 集群（REPLICAS=$REPLICAS）==="
@@ -291,9 +302,10 @@ case "${1:-}" in
   stop)    cmd_stop ;;
   status)  cmd_status ;;
   smoke)   cmd_smoke ;;
+  slotcheck) shift; cmd_slotcheck "$@" ;;
   logs)    cmd_logs "${2:-1}" ;;
   restart) cmd_stop; sleep 1; cmd_start ;;
   clean)   cmd_clean ;;
   ""|-h|--help|help) usage ;;
-  *)       die "未知命令 '$1'（可用: start stop status smoke logs restart clean）" ;;
+  *)       die "未知命令 '$1'（可用: start stop status smoke slotcheck logs restart clean）" ;;
 esac
