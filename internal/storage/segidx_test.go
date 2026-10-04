@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"testing"
 )
@@ -97,8 +99,8 @@ func TestSegIndexRoundTripAndDamage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if w2.idxOff != int64(blockBytes(256)) {
-		t.Fatalf("reopen offset %d, want the validated prefix %d", w2.idxOff, blockBytes(256))
+	if want := int64(segIdxBlockHead + 256*segIdxEntryBytes); w2.idxOff != want {
+		t.Fatalf("reopen offset %d, want the validated prefix's extent %d", w2.idxOff, want)
 	}
 	for i := 256; i < 300; i++ {
 		w2.add(0xAAAA0000_0000_0000+uint64(i), base+uint64(i), fmt.Sprintf("agg-%d", i%2), uint32(i%3+1))
@@ -115,5 +117,130 @@ func TestSegIndexRoundTripAndDamage(t *testing.T) {
 		if e.seq != base+uint64(i) {
 			t.Fatalf("repaired entry %d: seq %d", i, e.seq)
 		}
+	}
+}
+
+// TestSegIndexResumeAfterPartialBlocks pins the resume offset when the file is
+// NOT densely packed — the shape every real index has.
+//
+// flush() writes whatever partial block is buffered (that is what makes the
+// index durable), so a reopened writer starts a fresh block right after a
+// short one and the file accumulates mid-stream partial blocks. Deriving the
+// resume offset from the ENTRY COUNT (blockBytes, which computes a densely
+// packed layout) then lands short of the true end: the truncate cuts into the
+// last block and the next append overwrites the entries that were there,
+// leaving a run of seqs missing from the middle of the file.
+//
+// That gap is not cosmetic. The loader feeds the index into a slot's aggregate
+// directory, which adopts a version only when it follows the previous one, so
+// one missing entry freezes the directory for every record above it: the copy
+// then reports the leader's LEO with a short directory, reads past the gap fail
+// on that node, and the rebalancer's equivalence gate refuses the slot forever.
+func TestSegIndexResumeAfterPartialBlocks(t *testing.T) {
+	dir := t.TempDir()
+	const slotID, base = int32(9), uint64(1)
+	add := func(w *segIndexWriter, from, to int) {
+		for i := from; i < to; i++ {
+			w.add(0xBBBB0000_0000_0000+uint64(i), base+uint64(i), "agg", uint32(i+1))
+		}
+	}
+
+	w, err := openSegIndexWriter(dir, slotID, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	add(w, 0, 100)
+	if err := w.flush(); err != nil { // partial block of 100 on disk
+		t.Fatal(err)
+	}
+	add(w, 100, 200)
+	if err := w.flush(); err != nil { // a second partial block
+		t.Fatal(err)
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen and continue. The offset must be the real end of the second
+	// partial block, not a packed-layout guess.
+	w2, err := openSegIndexWriter(dir, slotID, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(2 * (segIdxBlockHead + 100*segIdxEntryBytes)); w2.idxOff != want {
+		t.Fatalf("resume offset %d, want the end of the two partial blocks %d", w2.idxOff, want)
+	}
+	add(w2, 200, 300)
+	if err := w2.close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every entry must have survived, in seq order. A wrong resume offset shows
+	// up here as missing seqs — the same shape that freezes a slot directory.
+	load, err := openSegIndex(dir, slotID, base, -1, -1)
+	if err != nil || load == nil {
+		t.Fatalf("load: %v load=%v", err, load)
+	}
+	if load.Count() != 300 {
+		t.Fatalf("loaded %d entries, want 300", load.Count())
+	}
+	for i := 0; i < load.Count(); i++ {
+		e, ok := load.Entry(i)
+		if !ok || e.seq != base+uint64(i) {
+			t.Fatalf("entry %d reads back as seq %v, want %d — the resume offset dropped entries",
+				i, e.seq, base+uint64(i))
+		}
+	}
+}
+
+// TestSegIndexRefusesASeqGap pins the detector for the one corruption the block
+// checksums cannot see: a block whose entries skip ahead. A block CRC covers the
+// bytes the block holds, not the seqs its entries name, so a file whose seqs
+// jump passes every checksum — and then freezes the aggregate directory at the
+// gap, because the directory adopts a version only when it follows the previous
+// one. The loader must refuse the whole prefix instead: the WAL walk rebuilds
+// the index, which costs startup time and never correctness.
+func TestSegIndexRefusesASeqGap(t *testing.T) {
+	dir := t.TempDir()
+	const slotID, base = int32(11), uint64(1)
+	w, err := openSegIndexWriter(dir, slotID, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 300; i++ {
+		w.add(0xCCCC0000_0000_0000+uint64(i), base+uint64(i), "agg", uint32(i+1))
+	}
+	if err := w.close(); err != nil { // block 0 full (256), block 1 partial (44)
+		t.Fatal(err)
+	}
+
+	// Shift every entry of the SECOND block 51 seqs ahead and keep that block's
+	// CRC valid: exactly the shape a wrong resume offset leaves behind.
+	p := segIdxPath(dir, base)
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	off := segIdxHeaderBytes
+	off += segIdxBlockHead + int(binary.BigEndian.Uint16(raw[off+4:off+6]))*segIdxEntryBytes
+	count := int(binary.BigEndian.Uint16(raw[off+4 : off+6]))
+	if count == 0 {
+		t.Fatal("test setup: expected a second block")
+	}
+	for i := 0; i < count; i++ {
+		at := off + segIdxBlockHead + i*segIdxEntryBytes + 8
+		binary.BigEndian.PutUint32(raw[at:at+4], binary.BigEndian.Uint32(raw[at:at+4])+51)
+	}
+	body := raw[off+4 : off+segIdxBlockHead+count*segIdxEntryBytes]
+	binary.BigEndian.PutUint32(raw[off:off+4], crc32.Checksum(body, segIdxCRC))
+	if err := os.WriteFile(p, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if load, err := openSegIndex(dir, slotID, base, -1, -1); err != nil || load != nil {
+		t.Fatalf("an index whose seqs skip ahead must be refused, got load=%v err=%v", load, err)
+	}
+	if segIndexDamaged.Load() == 0 {
+		t.Fatal("refusing the gapped index was not counted as damage")
 	}
 }

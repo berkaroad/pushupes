@@ -79,6 +79,9 @@ type segIndexLoad struct {
 	base    uint64            // the segment's base seq
 	sparse  []indexEntry      // seq -> file offset, ascending
 	release func()
+	// sparseBody is the sparse file's extent for the loaded blocks — the
+	// offset a resuming writer must continue from (see idxFlat.bodyBytes).
+	sparseBody int64
 }
 
 // Count is the number of records the index covers.
@@ -185,11 +188,19 @@ func openSegIndexWriter(dir string, slotID int32, baseSeq uint64) (*segIndexWrit
 		return nil, err
 	}
 	if load != nil {
-		// Resuming only needs where the existing blocks end, so the entries are
-		// never walked: reopening the index of every loaded segment used to
-		// materialize them just to take their length.
-		w.idxOff = int64(blockBytes(load.Count()))
-		w.spxOff = int64(blockBytes16(len(load.sparse)))
+		// Continue exactly where the validated prefix's BLOCKS end. This offset
+		// is not derivable from the entry count: block sizes follow the flush
+		// cadence (a flush writes whatever partial block is buffered, and a
+		// reopened writer starts a fresh block right after one), so a real file
+		// is full of mid-stream partial blocks and blockBytes(count) — which
+		// computes a densely packed layout — lands short of the true end.
+		// Truncating and appending there descends into the middle of the file
+		// and silently drops a run of entries, leaving a seq gap that freezes
+		// the aggregate directory at it (a replica that reports the leader's
+		// LEO with a short directory). The loader reports the extent it actually
+		// read, so use that.
+		w.idxOff = load.flat.bodyBytes
+		w.spxOff = load.sparseBody
 		load.Release()
 	}
 	if w.agx, err = openAppendFile(segAgxPath(dir, baseSeq), segAgxMagic, slotID, baseSeq); err != nil {
@@ -270,25 +281,47 @@ func openAppendFile(path, magic string, slotID int32, baseSeq uint64) (*os.File,
 // (blocks can be any size, and several small ones may sit side by side).
 const segIdxBlockHead = 6
 
-// blockBytes is the on-disk size of the first n record entries.
-func blockBytes(n int) int {
-	full := n / segIdxBlockMax
-	rem := n % segIdxBlockMax
-	total := full * (segIdxBlockHead + segIdxBlockMax*segIdxEntryBytes)
-	if rem > 0 {
-		total += segIdxBlockHead + rem*segIdxEntryBytes
+// idxOffsetOfEntry returns the file offset (header included) at which entry n
+// of an index file begins — where a file truncated to n entries must end.
+//
+// It walks the block headers rather than computing from n. Block sizes follow
+// the flush cadence: flush() writes whatever partial block is buffered, and a
+// writer reopened after one starts a fresh block right after it, so a real
+// index is full of mid-stream partial blocks and the offset of entry n is not
+// a function of n. blockBytes() computes the densely packed layout a file
+// never has, and truncating to it cuts inside the wrong block — silently
+// dropping a run of entries and leaving the seq gap that freezes an aggregate
+// directory.
+//
+// A torn block ends the walk: the caller's file stops there, which is what the
+// loader expects (it drops the torn tail and the WAL replay rewrites it).
+func idxOffsetOfEntry(f *os.File, n int, entryBytes int) (int64, error) {
+	off := int64(segIdxHeaderBytes)
+	if n <= 0 {
+		return off, nil
 	}
-	return total
-}
-
-func blockBytes16(n int) int {
-	full := n / segIdxBlockMax
-	rem := n % segIdxBlockMax
-	total := full * (segIdxBlockHead + segIdxBlockMax*segSpxEntryBytes)
-	if rem > 0 {
-		total += segIdxBlockHead + rem*segSpxEntryBytes
+	st, err := f.Stat()
+	if err != nil {
+		return 0, err
 	}
-	return total
+	size := st.Size()
+	var head [segIdxBlockHead]byte
+	for left := n; off+int64(segIdxBlockHead) <= size && left > 0; {
+		if err := readAtFull(f, head[:], off); err != nil {
+			return 0, err
+		}
+		count := int(binary.BigEndian.Uint16(head[4:6]))
+		payload := int64(count) * int64(entryBytes)
+		if count <= 0 || off+int64(segIdxBlockHead)+payload > size {
+			break // torn block: stop before it
+		}
+		if left <= count {
+			return off + int64(segIdxBlockHead) + int64(left)*int64(entryBytes), nil
+		}
+		left -= count
+		off += int64(segIdxBlockHead) + payload
+	}
+	return off, nil
 }
 
 func boolInt(b bool) int {
@@ -442,10 +475,17 @@ func (w *segIndexWriter) truncateToSeq(lastSeq uint64, sparse []indexEntry) erro
 	if lastSeq >= w.baseSeq {
 		keep = int(lastSeq-w.baseSeq) + 1
 	}
-	if err := w.idx.Truncate(int64(segIdxHeaderBytes + blockBytes(keep))); err != nil {
+	// Cut at the byte offset of entry `keep`, walking the block headers: block
+	// sizes follow the flush cadence, so a packed-layout guess (blockBytes)
+	// would cut inside the wrong block and leave a seq gap behind.
+	idxEnd, err := idxOffsetOfEntry(w.idx, keep, segIdxEntryBytes)
+	if err != nil {
 		return err
 	}
-	w.idxOff = int64(blockBytes(keep))
+	if err := w.idx.Truncate(idxEnd); err != nil {
+		return err
+	}
+	w.idxOff = idxEnd - segIdxHeaderBytes
 	w.block = w.block[:0]
 
 	var kept []byte
@@ -507,8 +547,24 @@ func openSegIndex(dir string, slotID int32, baseSeq uint64, maxEntries int, maxP
 	// Sweep the dictionary references over the whole buffer before any of it is
 	// applied: an entry naming an id the segment does not have voids the index,
 	// and half an index applied is worse than none. The sweep allocates nothing.
+	//
+	// The same pass checks the other invariant every consumer rests on: entry i
+	// describes the record at seq base+i. The loader replays the WAL "from
+	// base+Count" and the aggregate directory adopts a version only when it
+	// follows the previous one, so an index holding a run of entries that skip
+	// ahead does not merely look wrong — it silently freezes the directory for
+	// every record above the gap on a node that then reports the leader's LEO
+	// with a short directory. A file like that is damaged, whatever its CRCs
+	// say (they cover the block bytes, not the seqs they describe), and the walk
+	// that rebuilds it costs startup time, never correctness.
 	for i := 0; i < entries.count; i++ {
-		if _, ok := byID[binary.BigEndian.Uint32(entries.at(i)[12:16])]; !ok {
+		raw := entries.at(i)
+		if _, ok := byID[binary.BigEndian.Uint32(raw[12:16])]; !ok {
+			release()
+			segIndexDamaged.Add(1)
+			return nil, nil
+		}
+		if binary.BigEndian.Uint32(raw[8:12]) != uint32(i) {
 			release()
 			segIndexDamaged.Add(1)
 			return nil, nil
@@ -517,6 +573,21 @@ func openSegIndex(dir string, slotID int32, baseSeq uint64, maxEntries int, maxP
 	if entries.count == 0 && maxEntries > 0 {
 		release()
 		return nil, nil // an empty index for a non-empty segment is no index
+	}
+	// A resume-shaped caller (maxEntries < 0: the segment loader and the index
+	// writer that continues it) needs the exact byte extent of the prefix it
+	// accepts, because it truncates the file there and appends from it. If the
+	// loader could not report that extent, the index is not resumable: resuming
+	// from a guessed offset overwrites entries in the middle of the file, which
+	// is how a seq gap — and the frozen aggregate directory behind it — is born.
+	// Refusing the whole prefix is safe by construction: the caller walks the
+	// WAL and re-indexes the segment, which costs startup work, never
+	// correctness. Bounded readers (maxEntries >= 0) never resume and are
+	// unaffected.
+	if maxEntries < 0 && entries.count > 0 && entries.bodyBytes <= 0 {
+		release()
+		segIndexDamaged.Add(1)
+		return nil, nil
 	}
 	sparse, spxDamaged, spxRelease, err := loadIdxEntries(segSpxPath(dir, baseSeq), segSpxMagic, slotID, baseSeq, segSpxEntryBytes, -1)
 	if err != nil {
@@ -533,11 +604,20 @@ func openSegIndex(dir string, slotID int32, baseSeq uint64, maxEntries int, maxP
 		seq := binary.BigEndian.Uint64(raw[0:8])
 		pos := int64(binary.BigEndian.Uint64(raw[8:16]))
 		if maxPos >= 0 && pos >= maxPos {
-			break
+			break // beyond what the WAL holds: a torn/truncated tail, not damage
+		}
+		// The hints must ascend, for the same reason the record entries must: a
+		// block CRC covers the bytes, so a sparse file whose offsets were
+		// overwritten by a bad resume offset still validates — and a seek that
+		// starts from a hint pointing past the record it wants never finds it.
+		if i > 0 && seq <= out[len(out)-1].seq {
+			release() // the sparse buffer is released by the deferred spxRelease
+			segIndexDamaged.Add(1)
+			return nil, nil
 		}
 		out = append(out, indexEntry{seq: seq, pos: pos})
 	}
-	return &segIndexLoad{flat: entries, ids: byID, base: baseSeq, sparse: out, release: release}, nil
+	return &segIndexLoad{flat: entries, ids: byID, base: baseSeq, sparse: out, release: release, sparseBody: sparse.bodyBytes}, nil
 }
 
 // idxFlat is a whole index file's validated prefix in one buffer, entries dense
@@ -548,6 +628,16 @@ type idxFlat struct {
 	buf    []byte
 	stride int
 	count  int
+	// bodyBytes is the extent in the FILE (segIdxHeaderBytes excluded) of the
+	// blocks that produced buf — i.e. exactly where the next block must be
+	// written. It is NOT derivable from count: block sizes vary with the flush
+	// cadence (flush() writes whatever partial block is buffered, and a writer
+	// reopened after one starts a fresh block right after it), so a file is
+	// full of mid-stream partial blocks and the byte extent for n entries is
+	// not a function of n. Zero means "unknown" (a bounded read that stopped
+	// inside a block); callers that must resume at this point treat zero as
+	// "no resumable index" rather than guessing.
+	bodyBytes int64
 }
 
 func (f idxFlat) at(i int) []byte { return f.buf[i*f.stride : (i+1)*f.stride] }
@@ -606,8 +696,9 @@ func loadIdxEntries(path, magic string, slotID int32, baseSeq uint64, entryBytes
 		*bufp = buf[:0]
 		flatBufPool.Put(bufp)
 	}
+	var bodyBytes int64 // file extent of the blocks accepted into buf
 	damaged := func() (idxFlat, bool, func(), error) {
-		return idxFlat{buf: buf, stride: entryBytes, count: len(buf) / entryBytes}, true, release, nil
+		return idxFlat{buf: buf, stride: entryBytes, count: len(buf) / entryBytes, bodyBytes: bodyBytes}, true, release, nil
 	}
 	var head [segIdxBlockHead]byte
 	for off := int64(segIdxHeaderBytes); off < size; {
@@ -644,13 +735,18 @@ func loadIdxEntries(path, magic string, slotID int32, baseSeq uint64, entryBytes
 		copy(buf[start:], buf[start+segIdxBlockHead:end])
 		buf = buf[:start+n*entryBytes]
 		off += int64(segIdxBlockHead) + payload
+		bodyBytes = off - segIdxHeaderBytes // this block is fully accepted
 	}
-	if maxEntries > 0 {
-		if n := len(buf) / entryBytes; n > maxEntries {
-			buf = buf[:maxEntries*entryBytes]
-		}
+	covered := len(buf) / entryBytes
+	if maxEntries > 0 && covered > maxEntries {
+		// The loop above stopped as soon as maxEntries entries were in: this
+		// cut always lands inside the last block accepted, so bodyBytes spans
+		// more than what buf now holds. Say "unknown" rather than handing a
+		// resumer an offset that would skip the rest of that block.
+		buf = buf[:maxEntries*entryBytes]
+		bodyBytes = 0
 	}
-	return idxFlat{buf: buf, stride: entryBytes, count: len(buf) / entryBytes}, false, release, nil
+	return idxFlat{buf: buf, stride: entryBytes, count: len(buf) / entryBytes, bodyBytes: bodyBytes}, false, release, nil
 }
 
 // readAtFull reads exactly len(buf) bytes at off (a short read is an error).
