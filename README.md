@@ -175,6 +175,11 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 - `EventService/Append`：事件写入。服务端校验幂等与版本（见「数据模型与
   写入协议」），槽不在本节点时以响应字段返回重定向：`err_id=1003/1004`
   （MOVED/ASK）+ `node`（槽 leader 的 client 地址），客户端据此重连。
+- `EventService/BatchAppend`：批量写入。一批携带多条 `AppendRequest`（批内
+  `aggregate_id` 必须各不相同，重复的那组整组 `fail/1002` 且不执行），逐条
+  独立走同一套写入规则，按请求同序返回逐条结果（回显 `aggregate_id`）。
+  服务端同槽串行、异槽并行（并发上限 8×CPU 核数）。单批必须装进 client 面
+  gRPC 消息上限（`-grpc-max-msg-size`，默认 4MiB）。
 - `EventService/ReadStream`：按聚合读取事件流（≤HW 语义）。
 - `EventService/ReadByCommand`：按 `command_id` 查询已写入的记录。
 
@@ -195,8 +200,13 @@ admin 地址**，follower 一律拒绝（425 + 1005），不做转发。
 # 冒烟探针（MOVED 跟随 + 幂等 + 版本冲突 + 回读断言）
 go run ./cmd/grpccheck -addrs http://127.0.0.1:8591,http://127.0.0.1:8592,http://127.0.0.1:8593
 
-# 写压测（-nodes 传 admin 地址，自动从 status 解析 client 地址）
+# 写压测（-nodes 传 admin 地址，自动从 status 解析 client 地址；
+# -batch N>0 切换为 BatchAppend 批量写，N=每批条数）
 go run ./cmd/bench -nodes http://127.0.0.1:8091 -conns 8 -size 1024 -duration 30s
+go run ./cmd/bench -nodes http://127.0.0.1:8091 -conns 8 -size 1024 -batch 64 -duration 30s
+
+# BatchAppend 冒烟（success/exists/1001/批内重复拒绝/重定向跟随/空批，直打 8591）
+go run ./cmd/batchsmoke
 
 # 单槽灌数据（容量/恢复调试）
 go run ./cmd/seed -slot 7 -mib 512
@@ -221,6 +231,7 @@ go run ./cmd/seed -slot 7 -mib 512
 | 1 KiB 记录，conns=8 | ~1700–1870 msg/s（3 节点合计，服务端约 0.55 核 / 1000 msg/s） |
 | 100 KiB 大事件体，conns=8 | ~1050 msg/s，每条消息 CPU 成本约 2.14 ms |
 | 写入尾延迟，conns=16 | p99 约 62 ms、吞吐约 1092 msg/s（1 核容器） |
+| BatchAppend A/B（同轮同集群、1 KiB、aggs=200、conns=4、2 核容器、含每槽合并 HW 等待） | 单条 `Append`：909 msg/s（p50 4.76ms）；`-batch 64`：**5633 msg/s**（≈6.2×，时延按批往返计 p50 34.1ms ≈ 0.53ms/条），fail=0、落盘计数一致 |
 
 #### 启动与内存使用
 

@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 
 	"pushupes/internal/cluster"
+	"pushupes/internal/data"
 	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
 	"pushupes/internal/lease"
 	"pushupes/internal/payloadcodec"
@@ -166,5 +168,185 @@ func TestGRPCValidation(t *testing.T) {
 	}
 	if _, err := cli.ReadStream(ctx, &pushupesv1.ReadStreamRequest{}); err == nil {
 		t.Fatal("missing aggregate_id must be InvalidArgument")
+	}
+}
+
+// ---- BatchAppend -------------------------------------------------------------
+
+// batchPair returns two aggregate ids that route to the SAME slot, plus one
+// id that routes to a DIFFERENT slot, probed against the store's own routing.
+func batchPair(t *testing.T, st *storage.Store) (sameA, sameB, otherA string) {
+	t.Helper()
+	seen := map[int32]string{}
+	for i := 0; i < 1000; i++ {
+		id := fmt.Sprintf("bagg-%d", i)
+		slot := st.SlotOf(id)
+		if prev, ok := seen[slot]; ok {
+			return prev, id, "bagg-other"
+		}
+		seen[slot] = id
+	}
+	t.Fatal("no two ids share a slot in 1000 probes (routing broken?)")
+	return
+}
+
+func TestBatchAppendResults(t *testing.T) {
+	cli, st := newTestClient(t)
+	ctx := context.Background()
+	sameA, sameB, otherA := batchPair(t, st)
+
+	// Seed one record so the batch can produce an EXISTS against real state.
+	if r, err := cli.Append(ctx, appendReq(sameA, 1, "seed-1", "s")); err != nil ||
+		r.Status != pushupesv1.AppendResponse_STATUS_SUCCESS {
+		t.Fatalf("seed: %+v %v", r, err)
+	}
+
+	// (a) A batch with a DUPLICATED aggregate_id: exactly the duplicate
+	// records fail 1002 and neither executes; the distinct aggregates land.
+	resp, err := cli.BatchAppend(ctx, &pushupesv1.BatchAppendRequest{Records: []*pushupesv1.AppendRequest{
+		appendReq(otherA, 1, "b-1", "o"), // success
+		appendReq(sameB, 1, "b-2", "x"),  // success (same slot as sameA)
+		appendReq(sameA, 2, "b-3", "y"),  // FAIL 1002: sameA duplicated in batch
+		appendReq(sameA, 3, "b-4", "z"),  // FAIL 1002: sameA duplicated in batch
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Results) != 4 {
+		t.Fatalf("results len: %d", len(resp.Results))
+	}
+	want := []struct {
+		agg    string
+		status pushupesv1.AppendResponse_Status
+		errID  uint32
+	}{
+		{otherA, pushupesv1.AppendResponse_STATUS_SUCCESS, 0},
+		{sameB, pushupesv1.AppendResponse_STATUS_SUCCESS, 0},
+		{sameA, pushupesv1.AppendResponse_STATUS_FAIL, data.ErrIDBadRequest},
+		{sameA, pushupesv1.AppendResponse_STATUS_FAIL, data.ErrIDBadRequest},
+	}
+	for i, w := range want {
+		g := resp.Results[i]
+		if g.AggregateId != w.agg || g.Response.Status != w.status || g.Response.ErrId != w.errID {
+			t.Fatalf("result %d: want %+v got agg=%q resp=%+v", i, w, g.AggregateId, g.Response)
+		}
+	}
+	// The rejected sameA v2 must NOT have been written: its tail is still 1.
+	if tv, _ := st.TailVersionOf(sameA, 0); tv != 1 {
+		t.Fatalf("duplicate-agg record must not execute: tail %d want 1", tv)
+	}
+
+	// (b) EXISTS echo + version-conflict self-heal fields, distinct aggregates.
+	resp2, err := cli.BatchAppend(ctx, &pushupesv1.BatchAppendRequest{Records: []*pushupesv1.AppendRequest{
+		appendReq(sameA, 1, "seed-1", "s"), // EXISTS: idempotent replay, echoes record
+		appendReq(otherA, 9, "b-5", "y"),   // 1001 conflict, current_version=1
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := resp2.Results[0]
+	if e.AggregateId != sameA || e.Response.Status != pushupesv1.AppendResponse_STATUS_EXISTS ||
+		e.Response.Record == nil || e.Response.Record.CommandId != "seed-1" {
+		t.Fatalf("exists result: %+v", e)
+	}
+	c := resp2.Results[1]
+	if c.AggregateId != otherA || c.Response.Status != pushupesv1.AppendResponse_STATUS_FAIL ||
+		c.Response.ErrId != data.ErrIDVersionConflict || c.Response.CurrentVersion != 1 {
+		t.Fatalf("conflict result: %+v", c)
+	}
+}
+
+// batchSameSlot returns n distinct aggregate ids that all route to the SAME
+// slot of st (probed, not guessed), to exercise the serial path inside one
+// slot's worker.
+func batchSameSlot(t *testing.T, st *storage.Store, n int) []string {
+	t.Helper()
+	bySlot := map[int32][]string{}
+	for i := 0; len(bySlot[int32(i%8)]) < n; i++ {
+		id := fmt.Sprintf("ss-agg-%d", i)
+		slot := st.SlotOf(id)
+		bySlot[slot] = append(bySlot[slot], id)
+		if len(bySlot[slot]) >= n {
+			return bySlot[slot]
+		}
+	}
+	t.Fatal("unreachable")
+	return nil
+}
+
+func TestBatchAppendEmptyAndSerial(t *testing.T) {
+	cli, st := newTestClient(t)
+	ctx := context.Background()
+
+	// Empty batch: empty results, no error.
+	resp, err := cli.BatchAppend(ctx, &pushupesv1.BatchAppendRequest{})
+	if err != nil || len(resp.Results) != 0 {
+		t.Fatalf("empty batch: %+v %v", resp, err)
+	}
+
+	// Serial execution INSIDE one slot: n distinct aggregates that all hash
+	// to the same slot, written in request order. Every result succeeds and
+	// seqs strictly increase in request order — the per-slot worker keeps
+	// WAL append order = request order even across aggregates.
+	aggs := batchSameSlot(t, st, 20)
+	recs := make([]*pushupesv1.AppendRequest, 0, len(aggs))
+	for i, agg := range aggs {
+		recs = append(recs, appendReq(agg, 1, fmt.Sprintf("ser-%d", i), "b"))
+	}
+	resp, err = cli.BatchAppend(ctx, &pushupesv1.BatchAppendRequest{Records: recs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lastSeq uint64
+	for i, r := range resp.Results {
+		if r.AggregateId != aggs[i] {
+			t.Fatalf("result %d misaligned: agg %q want %q", i, r.AggregateId, aggs[i])
+		}
+		if r.Response.Status != pushupesv1.AppendResponse_STATUS_SUCCESS {
+			t.Fatalf("serial result %d: %+v", i, r.Response)
+		}
+		if r.Response.Seq <= lastSeq {
+			t.Fatalf("seq not increasing at %d: %d after %d", i, r.Response.Seq, lastSeq)
+		}
+		lastSeq = r.Response.Seq
+	}
+	// Spot-check one stream landed exactly as sent.
+	rr, err := cli.ReadStream(ctx, &pushupesv1.ReadStreamRequest{AggregateId: aggs[0], FromVersion: 1})
+	if err != nil || len(rr.Records) != 1 || rr.Records[0].CommandId != "ser-0" {
+		t.Fatalf("stream after serial batch: %+v %v", rr, err)
+	}
+}
+
+func TestBatchAppendLeaseRelease(t *testing.T) {
+	// Through the production codec: the batch's inner event bodies alias the
+	// receive buffer; the handler releases the whole-request lease once.
+	payloadcodec.InstallCodec()
+	leasesBefore := lease.Outstanding()
+	cli, _ := newTestClient(t)
+	ctx := context.Background()
+
+	big := make([]byte, 64<<10) // past the alias threshold: bodies alias the buffer
+	for i := range big {
+		big[i] = byte(i)
+	}
+	recs := make([]*pushupesv1.AppendRequest, 0, 8)
+	for i := 0; i < 8; i++ {
+		recs = append(recs, &pushupesv1.AppendRequest{
+			AggregateId: fmt.Sprintf("lease-agg-%d", i), Version: 1,
+			CommandId: fmt.Sprintf("lease-cmd-%d", i),
+			Events:    []*pushupesv1.Event{{Type: "T", Body: big}},
+		})
+	}
+	resp, err := cli.BatchAppend(ctx, &pushupesv1.BatchAppendRequest{Records: recs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, r := range resp.Results {
+		if r.Response.Status != pushupesv1.AppendResponse_STATUS_SUCCESS {
+			t.Fatalf("result %d: %+v", i, r.Response)
+		}
+	}
+	if got := lease.Outstanding(); got != leasesBefore {
+		t.Fatalf("%d leases left outstanding after batch append", got-leasesBefore)
 	}
 }

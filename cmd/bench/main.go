@@ -60,12 +60,20 @@ func eventClient(addr string) pushupesv1.EventServiceClient {
 // anyGrpc is the round-robin entry-point list (all peer gRPC addrs).
 var anyGrpc []string
 
+// first batch transport errors, verbatim (capped): a no-response record needs
+// its cause on the report, not just a count.
+var (
+	errSampleMu sync.Mutex
+	errSamples  []string
+)
+
 func main() {
 	nodes := flag.String("nodes", "127.0.0.1:8091", "comma-separated node admin addrs (client-plane addrs resolved from the slot table)")
 	aggs := flag.Int("aggs", 100, "number of aggregate ids")
 	dur := flag.Duration("duration", 10*time.Second, "sustained write duration")
 	connsFlag := flag.Int("conns", 16, "workers; each worker owns a partition of the aggregates and appends one at a time (awaits each reply before sending the next), so throughput is bounded by conns / p50 — conns=1 measures a single serialized round trip, not cluster capacity")
 	size := flag.Int("size", 1024, "event body bytes (must be <= 1024 * 1024)")
+	batch := flag.Int("batch", 0, "records per BatchAppend call (>0 switches the write phase to batched appends: one record per aggregate in the chunk, grouped per slot leader; 0 = one Append RPC per record). Latency lines then report per-batch round trips")
 	reportEvery := flag.Duration("report", time.Second, "live report interval")
 	flag.Parse()
 
@@ -212,7 +220,9 @@ func main() {
 		cancel()
 	}()
 
-	var total, okCnt, existsCnt, failCnt, redirectCnt atomic.Int64
+	var total, okCnt, existsCnt, failCnt, redirectCnt, noRespCnt atomic.Int64
+	var errIDMu sync.Mutex
+	errIDCnt := map[uint32]*atomic.Int64{} // per wire error id of batch failures
 	var latMu sync.Mutex
 	var latencies []float64 // ms
 
@@ -259,6 +269,81 @@ func main() {
 				}
 			}
 			seq := 0
+			// bump builds one fresh append request for agg (next version,
+			// fresh command id).
+			bump := func(agg string) *pushupesv1.AppendRequest {
+				seq++
+				ver[agg]++
+				return &pushupesv1.AppendRequest{
+					AggregateId: agg, Version: ver[agg],
+					CommandId: fmt.Sprintf("b%d-%d-%d", w, seq, rng.Int63n(1<<40)),
+					Events:    []*pushupesv1.Event{{Type: "BenchAppend", Body: body}},
+				}
+			}
+			if *batch > 0 {
+				// Batched mode: one BatchAppend per chunk of DISTINCT
+				// aggregates (the batch rule rejects repeats). The chunk is
+				// sent to the leader of the first aggregate's slot;
+				// redirected records are resent (as one batch) to their own
+				// leader by batchWithRetry. Throughput counts records,
+				// latency counts batch round trips (retries included).
+				for ctx.Err() == nil {
+					for c := 0; c < len(targets); c += *batch {
+						if ctx.Err() != nil {
+							return
+						}
+						end := c + *batch
+						if end > len(targets) {
+							end = len(targets)
+						}
+						chunk := targets[c:end]
+						recs := make([]*pushupesv1.AppendRequest, len(chunk))
+						for k, agg := range chunk {
+							recs[k] = bump(agg)
+						}
+						t0 := time.Now()
+						resps := batchWithRetry(w, recs, routes, &routeMu)
+						lat := float64(time.Since(t0).Microseconds()) / 1000.0
+						total.Add(int64(len(recs)))
+						latMu.Lock()
+						latencies = append(latencies, lat)
+						latMu.Unlock()
+						for k, resp := range resps {
+							if resp == nil {
+								failCnt.Add(1)
+								noRespCnt.Add(1)
+								continue
+							}
+							switch resp.Status {
+							case pushupesv1.AppendResponse_STATUS_SUCCESS:
+								okCnt.Add(1)
+							case pushupesv1.AppendResponse_STATUS_EXISTS:
+								existsCnt.Add(1)
+							default:
+								failCnt.Add(1)
+								errIDMu.Lock()
+								c := errIDCnt[resp.ErrId]
+								if c == nil {
+									c = &atomic.Int64{}
+									errIDCnt[resp.ErrId] = c
+								}
+								errIDMu.Unlock()
+								c.Add(1)
+								// self-heal the local version map on 1001 so
+								// the next round sends tail+1 (same rule as
+								// the single-append path)
+								if resp.ErrId == data.ErrIDVersionConflict {
+									ver[chunk[k]] = resp.CurrentVersion
+								}
+							}
+							if resp.ErrId == data.ErrIDSlotNotLocal || resp.ErrId == data.ErrIDMigrating {
+								redirectCnt.Add(1)
+							}
+						}
+					}
+				}
+				return
+			}
 			for ctx.Err() == nil {
 				for _, agg := range targets {
 					if ctx.Err() != nil {
@@ -343,6 +428,22 @@ func main() {
 	fmt.Printf("\n== bench done in %s ==\n", elapsed.Round(time.Millisecond))
 	fmt.Printf("attempts=%d ok=%d exists=%d fail=%d redirects=%d\n",
 		total.Load(), okCnt.Load(), existsCnt.Load(), failCnt.Load(), redirectCnt.Load())
+	if *batch > 0 {
+		// batch failures need their cause spelled out: unreachable-vs-answer
+		// and which wire error dominated (1001 self-heal races vs 1005 HW)
+		errIDMu.Lock()
+		fmt.Printf("batch fail detail: no-response=%d", noRespCnt.Load())
+		for id, c := range errIDCnt {
+			fmt.Printf(" err_%d=%d", id, c.Load())
+		}
+		errIDMu.Unlock()
+		fmt.Println()
+		errSampleMu.Lock()
+		for _, es := range errSamples {
+			fmt.Printf("  batch transport error: %s\n", es)
+		}
+		errSampleMu.Unlock()
+	}
 	fmt.Printf("throughput=%.0f msg/s  latency p50=%s p90=%s p99=%s\n",
 		float64(total.Load())/elapsed.Seconds(), pct(0.5), pct(0.9), pct(0.99))
 	// Two different denominators are easy to confuse: the line above divides
@@ -448,6 +549,91 @@ func appendWithRetry(w int, agg string, req *pushupesv1.AppendRequest,
 		return resp, nil
 	}
 	return nil, fmt.Errorf("append unreachable")
+}
+
+// batchWithRetry posts one batch over gRPC, following MOVED/ASK at most
+// twice per record: a redirected record is resent to its redirect target on
+// the next attempt (grouped by destination, so each node still gets one RPC
+// per attempt). Returns the final response per record position (nil =
+// unreachable or still redirected).
+func batchWithRetry(w int, recs []*pushupesv1.AppendRequest,
+	routes map[int32]string, routeMu *sync.RWMutex) []*pushupesv1.AppendResponse {
+
+	slotOf := func(agg string) int32 { return data.SlotOf(agg, data.DefaultSlotCount) }
+	routeFor := func(slot int32) string {
+		routeMu.RLock()
+		addr, ok := routes[slot]
+		routeMu.RUnlock()
+		if !ok {
+			addr = anyGrpc[w%len(anyGrpc)]
+		}
+		return addr
+	}
+
+	out := make([]*pushupesv1.AppendResponse, len(recs))
+	// pending pairs original positions with their records; it shrinks to the
+	// redirected/unanswered subset after each attempt.
+	pending := make([]int, len(recs))
+	for i := range pending {
+		pending[i] = i
+	}
+	for attempt := 0; attempt < 3 && len(pending) > 0; attempt++ {
+		// One BatchAppend per destination node: group by the cached route.
+		byAddr := map[string][]int{}
+		var order []string
+		for _, i := range pending {
+			addr := routeFor(slotOf(recs[i].AggregateId))
+			if _, ok := byAddr[addr]; !ok {
+				order = append(order, addr)
+			}
+			byAddr[addr] = append(byAddr[addr], i)
+		}
+		var next []int
+		for _, addr := range order {
+			idx := byAddr[addr]
+			batch := make([]*pushupesv1.AppendRequest, len(idx))
+			for k, i := range idx {
+				batch[k] = recs[i]
+			}
+			cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			resp, err := eventClient(addr).BatchAppend(cctx, &pushupesv1.BatchAppendRequest{Records: batch})
+			cancel()
+			if err != nil {
+				errSampleMu.Lock()
+				if len(errSamples) < 8 {
+					errSamples = append(errSamples, err.Error())
+				}
+				errSampleMu.Unlock()
+			}
+			if err != nil || len(resp.Results) != len(batch) {
+				// transport failure or misaligned answer: rotate the route
+				// and requeue these records for the next attempt
+				routeMu.Lock()
+				for _, i := range idx {
+					routes[slotOf(recs[i].AggregateId)] = anyGrpc[(w+attempt+1)%len(anyGrpc)]
+				}
+				routeMu.Unlock()
+				next = append(next, idx...)
+				continue
+			}
+			for k, r := range resp.Results {
+				i := idx[k]
+				switch r.Response.ErrId {
+				case data.ErrIDSlotNotLocal, data.ErrIDMigrating:
+					if r.Response.Node != "" {
+						routeMu.Lock()
+						routes[slotOf(recs[i].AggregateId)] = r.Response.Node
+						routeMu.Unlock()
+					}
+					next = append(next, i)
+				default:
+					out[i] = r.Response
+				}
+			}
+		}
+		pending = next
+	}
+	return out
 }
 
 // aggIndex finds an aggregate id's position; -1 when absent.

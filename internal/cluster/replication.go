@@ -113,8 +113,12 @@ type Engine struct {
 	// transition member -> not-a-member is what arms a countdown). Exposed to
 	// the admin plane so the console can show which copy of a slot is on its
 	// way out. See localdrop.go.
-	dropMu       sync.Mutex
-	dropAfter    time.Duration
+	dropMu    sync.Mutex
+	dropAfter time.Duration
+	// hwWait is the watermark deadline an acknowledged append waits on
+	// before fail/1005 (default defaultHWWaitTimeout; a batch group pays it
+	// ONCE — see SubmitBatch). Tests shorten it.
+	hwWait       time.Duration
 	dropGen      uint64
 	pendingDrops map[int32]pendingDrop
 	replicaOf    map[int32]bool
@@ -184,14 +188,15 @@ type fetchSession struct {
 // whole idle cycle (wait+maxBackoff) must stay inside the ISR staleness
 // window for replicas to remain in-sync.
 const (
-	fetchBaseInterval  = 100 * time.Millisecond
-	fetchMaxBackoff    = 2 * time.Second
-	fetchWait          = 2 * time.Second      // follower-requested long-poll budget
-	fetchSlack         = 1 * time.Second      // client-side timeout margin
-	fetchMaxWait       = 5 * time.Second      // leader-side cap on a requested wait
-	fetchBurstSettle   = 2 * time.Millisecond // coalescing window after one waiter wakes
-	fetchSweepInterval = 2 * time.Second      // stamp all positions at least this often
-	isrStaleAfter      = 10 * time.Second     // must exceed fetchWait+fetchMaxBackoff
+	fetchBaseInterval    = 100 * time.Millisecond
+	fetchMaxBackoff      = 2 * time.Second
+	fetchWait            = 2 * time.Second      // follower-requested long-poll budget
+	fetchSlack           = 1 * time.Second      // client-side timeout margin
+	fetchMaxWait         = 5 * time.Second      // leader-side cap on a requested wait
+	fetchBurstSettle     = 2 * time.Millisecond // coalescing window after one waiter wakes
+	fetchSweepInterval   = 2 * time.Second      // stamp all positions at least this often
+	isrStaleAfter        = 10 * time.Second     // must exceed fetchWait+fetchMaxBackoff
+	defaultHWWaitTimeout = 10 * time.Second     // the write-ack watermark deadline
 
 	// maxPayloadBytes caps one long-poll response: during a backlog the
 	// session streams item by item across rounds instead of building a
@@ -225,6 +230,12 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *logrus.Ent
 		// post-migration cleanup: the former source keeps its copy for this
 		// long once it sees the hand-over committed (-drop-after).
 		dropAfter: DefaultDropRetention,
+		// how long an acknowledged append waits for the slot's high
+		// watermark before fail/1005 (the record stays in the leader's WAL;
+		// a client retry converges on exists). A batch pays this deadline
+		// once per slot group, not once per record (SubmitBatch's merged
+		// wait). Tests shorten it.
+		hwWait: defaultHWWaitTimeout,
 		// leader rebalance: enabled by default, tuned with -rebalance-interval
 		// and -rebalance-batch (an interval or batch of 0 turns it off).
 		rebalanceInterval: DefaultRebalanceInterval,
@@ -588,6 +599,27 @@ func (e *Engine) clientAddr(nodeID string) string {
 // an append acknowledged without that wait could vanish if the leader died
 // before its replicas pulled the record.
 func (e *Engine) localAppend(slot int32, rec *data.EventRecord) (*data.AppendResponse, error) {
+	resp, err := e.landLocalAppend(slot, rec)
+	if err != nil || resp.Status != data.StatusSuccess {
+		return resp, err
+	}
+	// success: wait for the watermark so the acknowledged record survives a
+	// leader crash (see the function comment).
+	if _, err := e.waitForHW(context.Background(), slot, resp.Seq, e.hwWait); err != nil {
+		resp.Status = data.StatusFail
+		resp.ErrID = data.ErrIDNotLeader
+		resp.Err = err.Error()
+		return resp, nil
+	}
+	return resp, nil
+}
+
+// landLocalAppend applies the business rules to the local WAL WITHOUT the
+// watermark wait; the caller decides when and how long to wait (a single
+// append waits for its own seq, a batch waits once for the group's max —
+// see SubmitBatch). The returned response for a success carries the assigned
+// seq; exists carries the stored record; fail carries the wire error.
+func (e *Engine) landLocalAppend(slot int32, rec *data.EventRecord) (*data.AppendResponse, error) {
 	out, err := e.store.Append(rec)
 	if err != nil {
 		return nil, err
@@ -606,19 +638,116 @@ func (e *Engine) localAppend(slot int32, rec *data.EventRecord) (*data.AppendRes
 		resp.Record = out.Record // stored record, raw bytes end to end
 		return resp, nil
 	}
-	// success: wait for the watermark so the acknowledged record survives a
-	// leader crash (see the function comment).
-	if err := e.waitForHW(context.Background(), slot, out.Seq, 10*time.Second); err != nil {
-		resp.Status = data.StatusFail
-		resp.ErrID = data.ErrIDNotLeader
-		resp.Err = err.Error()
-		return resp, nil
-	}
 	// Success carries status/seq only: the caller already holds the record it
 	// sent, and echoing a 100KiB body back doubled the bytes on the wire per
 	// append (see DESIGN.md §6). EXISTS still returns the stored record, which
 	// is the one case where the caller cannot know it.
 	return resp, nil
+}
+
+// SubmitBatch appends a group of records that ALL route to the given slot, in
+// request order, answering each record individually. The group enters the
+// slot's write fence ONCE and reads the routing table once — both are
+// slot-level state, so per-record lookups in the single path were a batch tax,
+// not a requirement.
+//
+// The headline difference from N single appends is the MERGED watermark wait:
+// every record lands (serially, under the slot's WAL lock, preserving WAL
+// order = request order), then the group waits for the slot's high watermark
+// ONCE, against the largest seq the group wrote. Records are judged against
+// the watermark observed when the wait ends: on timeout, the prefix the
+// watermark does cover is still acknowledged success (its durability promise is
+// met), only the records above it fail/1005 — durable in the leader's WAL,
+// retried by the client under the same command_id, converging on exists. A
+// stalled replica set therefore costs the group ONE timeout, not one per
+// record, and never re-fails records the watermark already covers.
+//
+// A routing outcome that is not local (MOVED/ASK/NOT_LEADER for the slot)
+// fails the WHOLE group the same way: it is slot-level state, every record
+// shares the answer. Migration forwarding stays per record (best effort).
+func (e *Engine) SubmitBatch(ctx context.Context, slot int32, recs []*data.EventRecord) ([]*data.AppendResponse, error) {
+	if len(recs) == 0 {
+		return nil, nil
+	}
+	leave := e.enterWriteFence(slot)
+	defer leave()
+
+	// One routing snapshot for the group (same copy-under-lock rule as
+	// submitAppendLocked: the placement is mutated in place by the apply loop).
+	e.tableMu.RLock()
+	pp, ok := e.table.Slots[slot]
+	var pState SlotState
+	var pMigratingTo, pLeader string
+	if ok {
+		pState, pMigratingTo, pLeader = pp.State, pp.MigratingTo, pp.Leader
+	}
+	e.tableMu.RUnlock()
+
+	switch {
+	case !ok:
+		// single-node / unassigned: serve locally
+		return e.batchLocal(ctx, slot, recs, "")
+	case pState == SlotMigratingOut && pMigratingTo != "" && pLeader == e.self:
+		// step 4 of migration: source keeps serving and mirrors accepted
+		// records to the target (see submitAppendLocked for why the push is
+		// best effort)
+		return e.batchLocal(ctx, slot, recs, pMigratingTo)
+	case pState == SlotMigratingOut:
+		return nil, &RedirectError{Kind: data.ErrIDMigrating, Slot: slot, Node: pLeader, Addr: e.clientAddr(pLeader)}
+	case pLeader == e.self:
+		return e.batchLocal(ctx, slot, recs, "")
+	default:
+		addr := e.clientAddr(pLeader)
+		if addr == "" {
+			return nil, data.ErrSlotNotLocal
+		}
+		return nil, &RedirectError{Kind: data.ErrIDSlotNotLocal, Slot: slot, Node: pLeader, Addr: addr}
+	}
+}
+
+// batchLocal is the local-execution half of SubmitBatch: land every record in
+// request order, mirror accepted ones to a migration target when set, then
+// wait for the watermark once against the group's max seq.
+func (e *Engine) batchLocal(ctx context.Context, slot int32, recs []*data.EventRecord, fwdTarget string) ([]*data.AppendResponse, error) {
+	out := make([]*data.AppendResponse, len(recs))
+	var maxSeq uint64
+	for i, rec := range recs {
+		resp, err := e.landLocalAppend(slot, rec)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = resp
+		if resp.Status == data.StatusSuccess && resp.Seq > maxSeq {
+			maxSeq = resp.Seq
+		}
+		if fwdTarget != "" && resp.Seq > 0 {
+			switch resp.Status {
+			case data.StatusSuccess:
+				e.forwardBestEffort(ctx, slot, fwdTarget, resp.Seq, rec)
+			case data.StatusExists:
+				e.forwardBestEffort(ctx, slot, fwdTarget, resp.Seq, resp.Record)
+			}
+		}
+	}
+	if maxSeq == 0 {
+		return out, nil // nothing new landed: fail/exists only, no wait
+	}
+	if hw, err := e.waitForHW(context.Background(), slot, maxSeq, e.hwWait); err != nil {
+		// The group's wait ran out. Judge every record against the watermark
+		// waitForHW observed at the deadline: the prefix it covers keeps its
+		// success (its durability promise IS met), only the records above it
+		// fail/1005 — durable in the leader's WAL, retried by the client
+		// under the same command_id, converging on exists. The timeout thus
+		// costs the group ONE deadline, not one per record.
+		for _, resp := range out {
+			if resp.Status == data.StatusSuccess && resp.Seq > hw {
+				resp.Status = data.StatusFail
+				resp.ErrID = data.ErrIDNotLeader
+				resp.Err = err.Error()
+			}
+		}
+	}
+	return out, nil
 }
 
 // forwardTo pushes a just-appended record (with its leader-assigned seq) to
@@ -689,9 +818,12 @@ func (e *Engine) HandleReplicate(slot int32, seq uint64, payload []byte) error {
 // ---- High watermark / ISR ----------------------------------------------------
 
 // waitForHW blocks until the slot's high watermark covers seq, or timeout.
-func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout time.Duration) error {
+// It reports the watermark observed when it returns: on a timeout the caller
+// can judge a GROUP of seqs against it (see SubmitBatchLocal's merged wait)
+// instead of guessing.
+func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout time.Duration) (uint64, error) {
 	if e.replicaCount(slot) <= 1 {
-		return nil // nothing to wait for
+		return 0, nil // nothing to wait for
 	}
 	deadline := time.Now().Add(timeout)
 	for {
@@ -720,11 +852,11 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 			hw = e.store.LastSeqOf(slot)
 		}
 		if hw >= seq {
-			return nil
+			return hw, nil
 		}
 		if time.Now().After(deadline) {
 			e.logHWStall(slot, seq, hw)
-			return fmt.Errorf("timeout waiting for high watermark (hw %d < seq %d)", hw, seq)
+			return hw, fmt.Errorf("timeout waiting for high watermark (hw %d < seq %d)", hw, seq)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}

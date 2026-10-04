@@ -99,6 +99,28 @@ seq 升序重放同一批记录，把计数器重建到 LEO。
 并发控制：锁粒度 = slot。同一槽串行写（保证 seq/version 原子推进），
 不同槽并行。1680 槽 = 最多 1680 条并行写路径。
 
+**批量写入 `BatchAppend`（gRPC client 面）**：一次 RPC 携带多条
+`AppendRequest`，逐条独立走上面同一套业务规则（幂等/版本/HW 确认），按请求
+**同序**逐条返回 `success / exists / fail`（响应里回显 `aggregate_id`，结果与
+请求一一对应，客户端不依赖位置也能对号）。批内约束与执行模型：
+
+- **批内 aggregate_id 必须各不相同**：任一聚合出现多次，该聚合的所有条目一起
+  返回 `fail/1002` 且**一条都不执行**，其余聚合照常执行。同批两次写同一聚合
+  没有确定的先后顺序，部分执行还会让重试语义变浑，所以整组拒绝而不是先到先得。
+- **空批次返回空 results**，不算错误。
+- **不设条数上限**：唯一的界是 gRPC 消息上限（`-grpc-max-msg-size`，默认 4MiB，
+  recv/send 同值），批次大小随该配置一起调。
+- **执行模型 = 同槽串行、异槽并行**：服务端按路由槽分组，每槽一个 worker 串行走
+  `Engine.SubmitBatch`——整组一次写栅栏、一次路由表读取、按请求顺序逐条落盘
+  （WAL 顺序 = 请求顺序），然后**整组只等一次槽高水位**（合并等待：对组内最大
+  seq 等一次；超时水位覆盖到的前缀仍 success——其持久化承诺已兑现——水位之上
+  的条目才 fail/1005，记录仍在 leader WAL，按同 command_id 重试命中 exists。
+  副本停滞时整组只付一个截止周期，不是每条一个）。不同槽并发执行，并发上限
+  8×CPU 核数（一批铺满 1680 槽时不至于瞬间压上等量并发 WAL 写者）。
+- 重定向（MOVED/ASK/NOT_LEADER）也是**逐条结果**：该条 fail + 权威
+  `slot`/`node`，服务端不代理转发写；客户端刷新路由后只重发受影响的那几条。
+  幂等规则保证"部分成功 + 按 command_id 重试"安全收敛。
+
 ## 3. 存储设计（slot WAL）
 
 目录布局：
@@ -193,15 +215,30 @@ Body: Record*，每条记录：
   - ISR 维护：follower 在 `replica.lag.time.max` 内跟上进 ISR；
     掉出后按自己 LEO 重新追。
 - **故障切换**：controller（Raft leader）每 1s 经 peer 面 `PeerService.Ping` 探活，
-  连续 3 次失败判定失联 → 从剩余 ISR 副本为该节点名下所有槽重选 leader
-  （epoch+1，经 Raft 提交）→ 客户端收到 MOVED 重定向。无 peer 地址
+  连续 3 次失败判定失联 → 经 Raft 提交 `mark_down`：为该节点名下所有槽从存活
+  副本重选 leader（优先选「在线」的副本；epoch+1）→ 客户端收到 MOVED 重定向。
+  **目录条目不删除**（`mark_down` 只打 down 标记：admin/client 地址、副本集成员
+  身份全部保留）——失联节点在路由表里始终以「离线」形态可见，恢复后 `mark_up`
+  清标记、fetch 追平、回切拿回环上槽位。（旧实现用 `leave_node` 删除条目，与
+  「按 Raft 配置同步目录」的 join 步骤互相抵消：删掉→重新塞回空壳（无地址）→
+  再删……节点在控制台忽隐忽现，且宕机期间每几秒重写整表。`leave_node` 现在只在
+  对账「目录条目 ∉ Raft 投票者」时提交——即运维真正移除成员。）无 peer 地址
   （PeerAddr 为空）的 peer 不参与探活，避免启动竞态误杀。
+- **在线集合**：`Table.OnlinePeerIDs()` = 已自报 client 地址 **且** 未被
+  `mark_down` 的成员（`Peer.Offline()` 取反）。回切环布局（PlanLeaderRebalance）
+  与故障切换择主（backupLeaderFor）只锚定这个集合——控制台「离线」与集群放置
+  决策同源不漂移。plan_slots/replan_slots 则铺满**全目录**：bootstrap 期只有
+  自己注册完成，按在线集规划会把所有槽堆到单个节点上；而真宕机的成员反正已被
+  `mark_down` 移走 leadership，回切环也禁止把它放回去。
 - **leader 回切（再平衡）**：失联节点恢复并重新加入后，`replan_slots` 只把它
   补回副本集（follower，经 fetch 追数据），**不动 leader**——故障切换留下的
-  失衡由 controller 的再平衡循环收敛：每 `-rebalance-interval`（默认 15s）一
-  轮，把偏离环布局（leader ≠ `node[slot % N]`，环按当前成员目录计算，因此宕
-  机期间剩余节点之间也会互相平衡）的 stable 槽，按每轮至多 `-rebalance-batch`
-  个（默认 8，串行）经**既有六步热迁移**的 leader_move 通道迁回环上的预期
+  失衡由 controller 的再平衡循环收敛：每 `-rebalance-interval`（默认 2s）一
+  轮，把偏离环布局（leader ≠ `node[slot % N]`，环按**在线成员**目录计算——已
+  自报 client 地址（clientAddr）的节点才算在线，只 join 未注册的节点既不在环
+  上、也绝不会成为回切目标，因此宕机期间剩余在线节点之间也会互相平衡，节点
+  重新注册后自动回到环上）的 stable 槽，按每轮至多 `-rebalance-batch`
+  个（默认 28，串行；回切目标与源端摘要等价，单个交接=元数据+毫秒级栅栏，
+  560 槽最坏情况 20 轮收敛）经**既有六步热迁移**的 leader_move 通道迁回环上的预期
   leader。安全门禁：任一秒位在迁移中（如人工 migrate 在飞）整轮让路；回切目标
   必须已完成注册且 Ping 存活；目标副本必须与源端**摘要等价**（LEO 不低于源且
   aggregates/versions/resolvable 三元组相等）才动手——因此回切全程走迁移的快

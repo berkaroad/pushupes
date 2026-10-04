@@ -8,6 +8,8 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
@@ -72,8 +74,30 @@ func (s *Server) Append(ctx context.Context, req *pushupesv1.AppendRequest) (*pu
 	// The codec aliases the event bodies into the receive buffer: the lease
 	// covers this handler, which is where the bytes reach the WAL.
 	defer lease.Release(req)
+	rec, failResp := toRecord(req)
+	if failResp != nil {
+		return failResp, nil
+	}
+	resp, err := s.engine.SubmitAppend(ctx, rec)
+	if err != nil {
+		var redir *cluster.RedirectError
+		if errors.As(err, &redir) {
+			return s.fail(redir.Kind, "redirect", 0, redir.Slot, cluster.HostPort(redir.Addr)), nil
+		}
+		if errors.Is(err, data.ErrSlotNotLocal) {
+			return s.fail(data.ErrIDSlotNotLocal, "slot not local", 0, 0, ""), nil
+		}
+		return nil, status.Errorf(codes.Internal, "append: %v", err)
+	}
+	return convertAppend(resp), nil
+}
+
+// toRecord converts one request into the domain record, answering nil plus a
+// fail response when the request itself is invalid (the same 1002 rule the
+// single Append applies before touching the engine).
+func toRecord(req *pushupesv1.AppendRequest) (*data.EventRecord, *pushupesv1.AppendResponse) {
 	if req.AggregateId == "" || req.CommandId == "" || len(req.Events) == 0 {
-		return s.fail(data.ErrIDBadRequest, "aggregate_id, command_id and at least one event are required", 0, 0, ""), nil
+		return nil, s0fail("aggregate_id, command_id and at least one event are required")
 	}
 	rec := &data.EventRecord{
 		AggregateID: req.AggregateId,
@@ -88,19 +112,175 @@ func (s *Server) Append(ctx context.Context, req *pushupesv1.AppendRequest) (*pu
 	if rec.UnixTime == 0 {
 		rec.UnixTime = time.Now().Unix()
 	}
+	return rec, nil
+}
 
-	resp, err := s.engine.SubmitAppend(ctx, rec)
-	if err != nil {
-		var redir *cluster.RedirectError
-		if errors.As(err, &redir) {
-			return s.fail(redir.Kind, "redirect", 0, redir.Slot, cluster.HostPort(redir.Addr)), nil
-		}
-		if errors.Is(err, data.ErrSlotNotLocal) {
-			return s.fail(data.ErrIDSlotNotLocal, "slot not local", 0, 0, ""), nil
-		}
-		return nil, status.Errorf(codes.Internal, "append: %v", err)
+// s0fail builds the pre-engine 1002 fail (slot 0, no node): the shape the
+// Append handler used for its own argument validation.
+func s0fail(msg string) *pushupesv1.AppendResponse {
+	return &pushupesv1.AppendResponse{
+		Status:  pushupesv1.AppendResponse_STATUS_FAIL,
+		ErrId:   data.ErrIDBadRequest,
+		Message: msg,
 	}
-	return convertAppend(resp), nil
+}
+
+// batchSlot executes one slot group of a BatchAppend: convert + validate the
+// requests (bad ones answer 1002 and never enter the engine — the batch rule
+// that a rejected record does not execute extends to invalid input), then run
+// the rest through Engine.SubmitBatch, which lands them in request order and
+// waits for the slot's watermark ONCE for the whole group. A slot-level
+// redirect answers every record of the group (routing is per slot).
+func (s *Server) batchSlot(ctx context.Context, slot int32, reqs []*pushupesv1.AppendRequest) []*pushupesv1.AppendResponse {
+	out := make([]*pushupesv1.AppendResponse, len(reqs))
+	recs := make([]*data.EventRecord, len(reqs))
+	var live []int
+	for i, q := range reqs {
+		rec, failResp := toRecord(q)
+		if failResp != nil {
+			out[i] = failResp
+			continue
+		}
+		recs[i] = rec
+		live = append(live, i)
+	}
+	if len(live) == 0 {
+		return out
+	}
+	group := make([]*data.EventRecord, len(live))
+	for k, i := range live {
+		group[k] = recs[i]
+	}
+	resps, err := s.engine.SubmitBatch(ctx, slot, group)
+	if err != nil {
+		// routing/internal outcome for the SLOT: every live record shares it
+		var failResp *pushupesv1.AppendResponse
+		var redir *cluster.RedirectError
+		switch {
+		case errors.As(err, &redir):
+			failResp = s.fail(redir.Kind, "redirect", 0, redir.Slot, cluster.HostPort(redir.Addr))
+		case errors.Is(err, data.ErrSlotNotLocal):
+			failResp = s.fail(data.ErrIDSlotNotLocal, "slot not local", 0, 0, "")
+		default:
+			failResp = s.fail(0, fmt.Sprintf("append: %v", err), 0, 0, "")
+		}
+		for _, i := range live {
+			out[i] = failResp
+		}
+		return out
+	}
+	for k, i := range live {
+		out[i] = convertAppend(resps[k])
+	}
+	return out
+}
+
+// ---- BatchAppend -------------------------------------------------------------
+
+// batchSlotParallelism caps how many slots one batch executes concurrently:
+// 8x CPU cores. Different slots take independent write fences and hit
+// independent WALs; within one slot records execute serially in request
+// order. The cap is about a batch spanning MANY slots (1680 of them) not
+// swamping the node with concurrent WAL writers while a normal batch keeps
+// full slot-level parallelism.
+func batchSlotParallelism() int {
+	n := 8 * runtime.GOMAXPROCS(0)
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// BatchAppend appends many records in one call. Each record gets its own
+// result (success/exists/fail) in the SAME ORDER as the request. The batch
+// must carry distinct aggregate_ids: every record sharing an aggregate_id
+// with another record in the same batch fails (1002) and none of them is
+// executed — a stream that would be written twice in one batch has no
+// well-defined order, and partial execution could land one of the two and
+// fail the other, leaving the retry semantics murky. Every other aggregate
+// executes normally. An empty batch returns empty results.
+//
+// Execution is slot-parallel and slot-serial: records are grouped by their
+// routing slot, one worker per slot runs them in request order through the
+// ordinary SubmitAppend path (write fence, routing, idempotency, version
+// check, HW wait — the same rules a single Append applies), and distinct
+// slots run concurrently under a shared cap. The slot WAL lock already
+// serialises appends to one slot; keeping the HW waits serial per slot as
+// well is what stops two batch records from racing to observe a watermark
+// for the other's seq.
+func (s *Server) BatchAppend(ctx context.Context, req *pushupesv1.BatchAppendRequest) (*pushupesv1.BatchAppendResponse, error) {
+	// One lease for the whole request: its inner AppendRequest event bodies
+	// alias the same receive buffer, and this handler is where they reach
+	// the WAL.
+	defer lease.Release(req)
+
+	n := len(req.Records)
+	out := &pushupesv1.BatchAppendResponse{Results: make([]*pushupesv1.BatchAppendResult, n)}
+	if n == 0 {
+		return out, nil
+	}
+
+	// Duplicate-aggregate detection first (map iteration order is random,
+	// so detection must not depend on execution order): every record whose
+	// aggregate_id appears more than once in the batch fails without
+	// executing.
+	counts := make(map[string]int, n)
+	for _, r := range req.Records {
+		counts[r.AggregateId]++
+	}
+
+	// Group the executable records by slot; positions index the response.
+	type slotGroup struct {
+		slot int32
+		idx  []int
+	}
+	var groups []*slotGroup
+	bySlot := make(map[int32]*slotGroup, 16)
+	for i, r := range req.Records {
+		if counts[r.AggregateId] > 1 {
+			out.Results[i] = &pushupesv1.BatchAppendResult{
+				AggregateId: r.AggregateId,
+				Response: s.fail(data.ErrIDBadRequest,
+					fmt.Sprintf("duplicate aggregate_id in batch: %s", r.AggregateId), 0, 0, ""),
+			}
+			continue
+		}
+		slot := s.store.SlotOf(r.AggregateId)
+		g := bySlot[slot]
+		if g == nil {
+			g = &slotGroup{slot: slot}
+			bySlot[slot] = g
+			groups = append(groups, g)
+		}
+		g.idx = append(g.idx, i)
+	}
+
+	// Fan out per slot; the semaphore caps concurrent slots across the
+	// batch. Each slot group executes as ONE SubmitBatch: serial land in
+	// request order + one merged watermark wait for the group.
+	sem := make(chan struct{}, batchSlotParallelism())
+	var wg sync.WaitGroup
+	for _, g := range groups {
+		wg.Add(1)
+		go func(g *slotGroup) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			sub := make([]*pushupesv1.AppendRequest, len(g.idx))
+			for k, i := range g.idx {
+				sub[k] = req.Records[i]
+			}
+			resps := s.batchSlot(ctx, g.slot, sub)
+			for k, i := range g.idx {
+				out.Results[i] = &pushupesv1.BatchAppendResult{
+					AggregateId: req.Records[i].AggregateId,
+					Response:    resps[k],
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	return out, nil
 }
 
 func convertAppend(r *data.AppendResponse) *pushupesv1.AppendResponse {

@@ -12,6 +12,12 @@ option go_package = "pushupes/internal/grpcapi/pushupes/v1;pushupesv1";
 service EventService {
   // Append appends one record to one aggregate stream.
   rpc Append(AppendRequest) returns (AppendResponse);
+  // BatchAppend appends many records in one call. Every record carries its
+  // own result (success/exists/fail) in request order; records sharing an
+  // aggregate_id within one batch are all failed (the batch must hold
+  // distinct aggregate ids), other streams are unaffected. The server
+  // executes one slot at a time serially and different slots concurrently.
+  rpc BatchAppend(BatchAppendRequest) returns (BatchAppendResponse);
   // ReadStream reads a version range of one aggregate stream.
   rpc ReadStream(ReadStreamRequest) returns (ReadStreamResponse);
   // ReadTails reports the latest version of many aggregates in one call.
@@ -59,6 +65,28 @@ message AppendResponse {
   int32 slot = 6; // routing slot (authoritative even on redirects)
   string node = 7; // redirect target "host:port" for MOVED/ASK/NOT_LEADER
   Record record = 8; // set on STATUS_EXISTS only (the stored duplicate)
+}
+
+// BatchAppendRequest carries a batch of appends. No size cap: the only bound
+// is the gRPC message limit, which the operator configures
+// (-grpc-max-msg-size, default 4MiB). An empty batch returns empty results.
+message BatchAppendRequest {
+  repeated AppendRequest records = 1;
+}
+
+// BatchAppendResult pairs one aggregate with its append outcome.
+// aggregate_id echoes the request field so a result can be identified without
+// positional assumptions; response mirrors single Append exactly
+// (status/err_id/current_version/seq/slot/node/record).
+message BatchAppendResult {
+  string aggregate_id = 1;
+  AppendResponse response = 2;
+}
+
+// BatchAppendResponse answers one result per request record, in the SAME
+// ORDER as BatchAppendRequest.records.
+message BatchAppendResponse {
+  repeated BatchAppendResult results = 1;
 }
 
 message ReadStreamRequest {

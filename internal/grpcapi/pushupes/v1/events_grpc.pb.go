@@ -20,6 +20,7 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	EventService_Append_FullMethodName        = "/pushupes.v1.EventService/Append"
+	EventService_BatchAppend_FullMethodName   = "/pushupes.v1.EventService/BatchAppend"
 	EventService_ReadStream_FullMethodName    = "/pushupes.v1.EventService/ReadStream"
 	EventService_ReadTails_FullMethodName     = "/pushupes.v1.EventService/ReadTails"
 	EventService_ReadByCommand_FullMethodName = "/pushupes.v1.EventService/ReadByCommand"
@@ -37,6 +38,12 @@ const (
 type EventServiceClient interface {
 	// Append appends one record to one aggregate stream.
 	Append(ctx context.Context, in *AppendRequest, opts ...grpc.CallOption) (*AppendResponse, error)
+	// BatchAppend appends many records in one call. Every record carries its
+	// own result (success/exists/fail) in request order; records sharing an
+	// aggregate_id within one batch are all failed (the batch must hold
+	// distinct aggregate ids), other streams are unaffected. The server
+	// executes one slot at a time serially and different slots concurrently.
+	BatchAppend(ctx context.Context, in *BatchAppendRequest, opts ...grpc.CallOption) (*BatchAppendResponse, error)
 	// ReadStream reads a version range of one aggregate stream.
 	ReadStream(ctx context.Context, in *ReadStreamRequest, opts ...grpc.CallOption) (*ReadStreamResponse, error)
 	// ReadTails reports the latest version of many aggregates in one call.
@@ -57,6 +64,16 @@ func (c *eventServiceClient) Append(ctx context.Context, in *AppendRequest, opts
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(AppendResponse)
 	err := c.cc.Invoke(ctx, EventService_Append_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *eventServiceClient) BatchAppend(ctx context.Context, in *BatchAppendRequest, opts ...grpc.CallOption) (*BatchAppendResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchAppendResponse)
+	err := c.cc.Invoke(ctx, EventService_BatchAppend_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -105,6 +122,12 @@ func (c *eventServiceClient) ReadByCommand(ctx context.Context, in *ReadByComman
 type EventServiceServer interface {
 	// Append appends one record to one aggregate stream.
 	Append(context.Context, *AppendRequest) (*AppendResponse, error)
+	// BatchAppend appends many records in one call. Every record carries its
+	// own result (success/exists/fail) in request order; records sharing an
+	// aggregate_id within one batch are all failed (the batch must hold
+	// distinct aggregate ids), other streams are unaffected. The server
+	// executes one slot at a time serially and different slots concurrently.
+	BatchAppend(context.Context, *BatchAppendRequest) (*BatchAppendResponse, error)
 	// ReadStream reads a version range of one aggregate stream.
 	ReadStream(context.Context, *ReadStreamRequest) (*ReadStreamResponse, error)
 	// ReadTails reports the latest version of many aggregates in one call.
@@ -123,6 +146,9 @@ type UnimplementedEventServiceServer struct{}
 
 func (UnimplementedEventServiceServer) Append(context.Context, *AppendRequest) (*AppendResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Append not implemented")
+}
+func (UnimplementedEventServiceServer) BatchAppend(context.Context, *BatchAppendRequest) (*BatchAppendResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BatchAppend not implemented")
 }
 func (UnimplementedEventServiceServer) ReadStream(context.Context, *ReadStreamRequest) (*ReadStreamResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReadStream not implemented")
@@ -168,6 +194,24 @@ func _EventService_Append_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(EventServiceServer).Append(ctx, req.(*AppendRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _EventService_BatchAppend_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchAppendRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EventServiceServer).BatchAppend(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EventService_BatchAppend_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EventServiceServer).BatchAppend(ctx, req.(*BatchAppendRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -236,6 +280,10 @@ var EventService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Append",
 			Handler:    _EventService_Append_Handler,
+		},
+		{
+			MethodName: "BatchAppend",
+			Handler:    _EventService_BatchAppend_Handler,
 		},
 		{
 			MethodName: "ReadStream",

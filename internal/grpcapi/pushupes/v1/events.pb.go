@@ -386,6 +386,155 @@ func (x *AppendResponse) GetRecord() *Record {
 	return nil
 }
 
+// BatchAppendRequest carries a batch of appends. No size cap: the only bound
+// is the gRPC message limit, which the operator configures
+// (-grpc-max-msg-size, default 4MiB). An empty batch returns empty results.
+type BatchAppendRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Records       []*AppendRequest       `protobuf:"bytes,1,rep,name=records,proto3" json:"records,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchAppendRequest) Reset() {
+	*x = BatchAppendRequest{}
+	mi := &file_pushupes_v1_events_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchAppendRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchAppendRequest) ProtoMessage() {}
+
+func (x *BatchAppendRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_events_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchAppendRequest.ProtoReflect.Descriptor instead.
+func (*BatchAppendRequest) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *BatchAppendRequest) GetRecords() []*AppendRequest {
+	if x != nil {
+		return x.Records
+	}
+	return nil
+}
+
+// BatchAppendResult pairs one aggregate with its append outcome.
+// aggregate_id echoes the request field so a result can be identified without
+// positional assumptions; response mirrors single Append exactly
+// (status/err_id/current_version/seq/slot/node/record).
+type BatchAppendResult struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	AggregateId   string                 `protobuf:"bytes,1,opt,name=aggregate_id,json=aggregateId,proto3" json:"aggregate_id,omitempty"`
+	Response      *AppendResponse        `protobuf:"bytes,2,opt,name=response,proto3" json:"response,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchAppendResult) Reset() {
+	*x = BatchAppendResult{}
+	mi := &file_pushupes_v1_events_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchAppendResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchAppendResult) ProtoMessage() {}
+
+func (x *BatchAppendResult) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_events_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchAppendResult.ProtoReflect.Descriptor instead.
+func (*BatchAppendResult) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *BatchAppendResult) GetAggregateId() string {
+	if x != nil {
+		return x.AggregateId
+	}
+	return ""
+}
+
+func (x *BatchAppendResult) GetResponse() *AppendResponse {
+	if x != nil {
+		return x.Response
+	}
+	return nil
+}
+
+// BatchAppendResponse answers one result per request record, in the SAME
+// ORDER as BatchAppendRequest.records.
+type BatchAppendResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Results       []*BatchAppendResult   `protobuf:"bytes,1,rep,name=results,proto3" json:"results,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchAppendResponse) Reset() {
+	*x = BatchAppendResponse{}
+	mi := &file_pushupes_v1_events_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchAppendResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchAppendResponse) ProtoMessage() {}
+
+func (x *BatchAppendResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_events_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchAppendResponse.ProtoReflect.Descriptor instead.
+func (*BatchAppendResponse) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *BatchAppendResponse) GetResults() []*BatchAppendResult {
+	if x != nil {
+		return x.Results
+	}
+	return nil
+}
+
 type ReadStreamRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	AggregateId   string                 `protobuf:"bytes,1,opt,name=aggregate_id,json=aggregateId,proto3" json:"aggregate_id,omitempty"`
@@ -397,7 +546,7 @@ type ReadStreamRequest struct {
 
 func (x *ReadStreamRequest) Reset() {
 	*x = ReadStreamRequest{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[4]
+	mi := &file_pushupes_v1_events_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -409,7 +558,7 @@ func (x *ReadStreamRequest) String() string {
 func (*ReadStreamRequest) ProtoMessage() {}
 
 func (x *ReadStreamRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[4]
+	mi := &file_pushupes_v1_events_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -422,7 +571,7 @@ func (x *ReadStreamRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadStreamRequest.ProtoReflect.Descriptor instead.
 func (*ReadStreamRequest) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{4}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ReadStreamRequest) GetAggregateId() string {
@@ -457,7 +606,7 @@ type ReadStreamResponse struct {
 
 func (x *ReadStreamResponse) Reset() {
 	*x = ReadStreamResponse{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[5]
+	mi := &file_pushupes_v1_events_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -469,7 +618,7 @@ func (x *ReadStreamResponse) String() string {
 func (*ReadStreamResponse) ProtoMessage() {}
 
 func (x *ReadStreamResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[5]
+	mi := &file_pushupes_v1_events_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -482,7 +631,7 @@ func (x *ReadStreamResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadStreamResponse.ProtoReflect.Descriptor instead.
 func (*ReadStreamResponse) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{5}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ReadStreamResponse) GetRecords() []*Record {
@@ -516,7 +665,7 @@ type ReadTailsRequest struct {
 
 func (x *ReadTailsRequest) Reset() {
 	*x = ReadTailsRequest{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[6]
+	mi := &file_pushupes_v1_events_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -528,7 +677,7 @@ func (x *ReadTailsRequest) String() string {
 func (*ReadTailsRequest) ProtoMessage() {}
 
 func (x *ReadTailsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[6]
+	mi := &file_pushupes_v1_events_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -541,7 +690,7 @@ func (x *ReadTailsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadTailsRequest.ProtoReflect.Descriptor instead.
 func (*ReadTailsRequest) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{6}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ReadTailsRequest) GetAggregateIds() []string {
@@ -569,7 +718,7 @@ type ReadTailsResponse struct {
 
 func (x *ReadTailsResponse) Reset() {
 	*x = ReadTailsResponse{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[7]
+	mi := &file_pushupes_v1_events_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -581,7 +730,7 @@ func (x *ReadTailsResponse) String() string {
 func (*ReadTailsResponse) ProtoMessage() {}
 
 func (x *ReadTailsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[7]
+	mi := &file_pushupes_v1_events_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -594,7 +743,7 @@ func (x *ReadTailsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadTailsResponse.ProtoReflect.Descriptor instead.
 func (*ReadTailsResponse) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{7}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ReadTailsResponse) GetVersions() []uint32 {
@@ -614,7 +763,7 @@ type ReadByCommandRequest struct {
 
 func (x *ReadByCommandRequest) Reset() {
 	*x = ReadByCommandRequest{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[8]
+	mi := &file_pushupes_v1_events_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -626,7 +775,7 @@ func (x *ReadByCommandRequest) String() string {
 func (*ReadByCommandRequest) ProtoMessage() {}
 
 func (x *ReadByCommandRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[8]
+	mi := &file_pushupes_v1_events_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -639,7 +788,7 @@ func (x *ReadByCommandRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadByCommandRequest.ProtoReflect.Descriptor instead.
 func (*ReadByCommandRequest) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{8}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ReadByCommandRequest) GetAggregateId() string {
@@ -666,7 +815,7 @@ type ReadByCommandResponse struct {
 
 func (x *ReadByCommandResponse) Reset() {
 	*x = ReadByCommandResponse{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[9]
+	mi := &file_pushupes_v1_events_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -678,7 +827,7 @@ func (x *ReadByCommandResponse) String() string {
 func (*ReadByCommandResponse) ProtoMessage() {}
 
 func (x *ReadByCommandResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[9]
+	mi := &file_pushupes_v1_events_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -691,7 +840,7 @@ func (x *ReadByCommandResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadByCommandResponse.ProtoReflect.Descriptor instead.
 func (*ReadByCommandResponse) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{9}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ReadByCommandResponse) GetFound() bool {
@@ -744,7 +893,14 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\x12STATUS_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eSTATUS_SUCCESS\x10\x01\x12\x11\n" +
 	"\rSTATUS_EXISTS\x10\x02\x12\x0f\n" +
-	"\vSTATUS_FAIL\x10\x03\"o\n" +
+	"\vSTATUS_FAIL\x10\x03\"J\n" +
+	"\x12BatchAppendRequest\x124\n" +
+	"\arecords\x18\x01 \x03(\v2\x1a.pushupes.v1.AppendRequestR\arecords\"o\n" +
+	"\x11BatchAppendResult\x12!\n" +
+	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x127\n" +
+	"\bresponse\x18\x02 \x01(\v2\x1b.pushupes.v1.AppendResponseR\bresponse\"O\n" +
+	"\x13BatchAppendResponse\x128\n" +
+	"\aresults\x18\x01 \x03(\v2\x1e.pushupes.v1.BatchAppendResultR\aresults\"o\n" +
 	"\x11ReadStreamRequest\x12!\n" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x12!\n" +
 	"\ffrom_version\x18\x02 \x01(\rR\vfromVersion\x12\x14\n" +
@@ -763,9 +919,10 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"command_id\x18\x02 \x01(\tR\tcommandId\"Z\n" +
 	"\x15ReadByCommandResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12+\n" +
-	"\x06record\x18\x02 \x01(\v2\x13.pushupes.v1.RecordR\x06record2\xc4\x02\n" +
+	"\x06record\x18\x02 \x01(\v2\x13.pushupes.v1.RecordR\x06record2\x96\x03\n" +
 	"\fEventService\x12A\n" +
-	"\x06Append\x12\x1a.pushupes.v1.AppendRequest\x1a\x1b.pushupes.v1.AppendResponse\x12M\n" +
+	"\x06Append\x12\x1a.pushupes.v1.AppendRequest\x1a\x1b.pushupes.v1.AppendResponse\x12P\n" +
+	"\vBatchAppend\x12\x1f.pushupes.v1.BatchAppendRequest\x1a .pushupes.v1.BatchAppendResponse\x12M\n" +
 	"\n" +
 	"ReadStream\x12\x1e.pushupes.v1.ReadStreamRequest\x1a\x1f.pushupes.v1.ReadStreamResponse\x12J\n" +
 	"\tReadTails\x12\x1d.pushupes.v1.ReadTailsRequest\x1a\x1e.pushupes.v1.ReadTailsResponse\x12V\n" +
@@ -784,40 +941,48 @@ func file_pushupes_v1_events_proto_rawDescGZIP() []byte {
 }
 
 var file_pushupes_v1_events_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_pushupes_v1_events_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_pushupes_v1_events_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_pushupes_v1_events_proto_goTypes = []any{
 	(AppendResponse_Status)(0),    // 0: pushupes.v1.AppendResponse.Status
 	(*Event)(nil),                 // 1: pushupes.v1.Event
 	(*Record)(nil),                // 2: pushupes.v1.Record
 	(*AppendRequest)(nil),         // 3: pushupes.v1.AppendRequest
 	(*AppendResponse)(nil),        // 4: pushupes.v1.AppendResponse
-	(*ReadStreamRequest)(nil),     // 5: pushupes.v1.ReadStreamRequest
-	(*ReadStreamResponse)(nil),    // 6: pushupes.v1.ReadStreamResponse
-	(*ReadTailsRequest)(nil),      // 7: pushupes.v1.ReadTailsRequest
-	(*ReadTailsResponse)(nil),     // 8: pushupes.v1.ReadTailsResponse
-	(*ReadByCommandRequest)(nil),  // 9: pushupes.v1.ReadByCommandRequest
-	(*ReadByCommandResponse)(nil), // 10: pushupes.v1.ReadByCommandResponse
+	(*BatchAppendRequest)(nil),    // 5: pushupes.v1.BatchAppendRequest
+	(*BatchAppendResult)(nil),     // 6: pushupes.v1.BatchAppendResult
+	(*BatchAppendResponse)(nil),   // 7: pushupes.v1.BatchAppendResponse
+	(*ReadStreamRequest)(nil),     // 8: pushupes.v1.ReadStreamRequest
+	(*ReadStreamResponse)(nil),    // 9: pushupes.v1.ReadStreamResponse
+	(*ReadTailsRequest)(nil),      // 10: pushupes.v1.ReadTailsRequest
+	(*ReadTailsResponse)(nil),     // 11: pushupes.v1.ReadTailsResponse
+	(*ReadByCommandRequest)(nil),  // 12: pushupes.v1.ReadByCommandRequest
+	(*ReadByCommandResponse)(nil), // 13: pushupes.v1.ReadByCommandResponse
 }
 var file_pushupes_v1_events_proto_depIdxs = []int32{
 	1,  // 0: pushupes.v1.Record.events:type_name -> pushupes.v1.Event
 	1,  // 1: pushupes.v1.AppendRequest.events:type_name -> pushupes.v1.Event
 	0,  // 2: pushupes.v1.AppendResponse.status:type_name -> pushupes.v1.AppendResponse.Status
 	2,  // 3: pushupes.v1.AppendResponse.record:type_name -> pushupes.v1.Record
-	2,  // 4: pushupes.v1.ReadStreamResponse.records:type_name -> pushupes.v1.Record
-	2,  // 5: pushupes.v1.ReadByCommandResponse.record:type_name -> pushupes.v1.Record
-	3,  // 6: pushupes.v1.EventService.Append:input_type -> pushupes.v1.AppendRequest
-	5,  // 7: pushupes.v1.EventService.ReadStream:input_type -> pushupes.v1.ReadStreamRequest
-	7,  // 8: pushupes.v1.EventService.ReadTails:input_type -> pushupes.v1.ReadTailsRequest
-	9,  // 9: pushupes.v1.EventService.ReadByCommand:input_type -> pushupes.v1.ReadByCommandRequest
-	4,  // 10: pushupes.v1.EventService.Append:output_type -> pushupes.v1.AppendResponse
-	6,  // 11: pushupes.v1.EventService.ReadStream:output_type -> pushupes.v1.ReadStreamResponse
-	8,  // 12: pushupes.v1.EventService.ReadTails:output_type -> pushupes.v1.ReadTailsResponse
-	10, // 13: pushupes.v1.EventService.ReadByCommand:output_type -> pushupes.v1.ReadByCommandResponse
-	10, // [10:14] is the sub-list for method output_type
-	6,  // [6:10] is the sub-list for method input_type
-	6,  // [6:6] is the sub-list for extension type_name
-	6,  // [6:6] is the sub-list for extension extendee
-	0,  // [0:6] is the sub-list for field type_name
+	3,  // 4: pushupes.v1.BatchAppendRequest.records:type_name -> pushupes.v1.AppendRequest
+	4,  // 5: pushupes.v1.BatchAppendResult.response:type_name -> pushupes.v1.AppendResponse
+	6,  // 6: pushupes.v1.BatchAppendResponse.results:type_name -> pushupes.v1.BatchAppendResult
+	2,  // 7: pushupes.v1.ReadStreamResponse.records:type_name -> pushupes.v1.Record
+	2,  // 8: pushupes.v1.ReadByCommandResponse.record:type_name -> pushupes.v1.Record
+	3,  // 9: pushupes.v1.EventService.Append:input_type -> pushupes.v1.AppendRequest
+	5,  // 10: pushupes.v1.EventService.BatchAppend:input_type -> pushupes.v1.BatchAppendRequest
+	8,  // 11: pushupes.v1.EventService.ReadStream:input_type -> pushupes.v1.ReadStreamRequest
+	10, // 12: pushupes.v1.EventService.ReadTails:input_type -> pushupes.v1.ReadTailsRequest
+	12, // 13: pushupes.v1.EventService.ReadByCommand:input_type -> pushupes.v1.ReadByCommandRequest
+	4,  // 14: pushupes.v1.EventService.Append:output_type -> pushupes.v1.AppendResponse
+	7,  // 15: pushupes.v1.EventService.BatchAppend:output_type -> pushupes.v1.BatchAppendResponse
+	9,  // 16: pushupes.v1.EventService.ReadStream:output_type -> pushupes.v1.ReadStreamResponse
+	11, // 17: pushupes.v1.EventService.ReadTails:output_type -> pushupes.v1.ReadTailsResponse
+	13, // 18: pushupes.v1.EventService.ReadByCommand:output_type -> pushupes.v1.ReadByCommandResponse
+	14, // [14:19] is the sub-list for method output_type
+	9,  // [9:14] is the sub-list for method input_type
+	9,  // [9:9] is the sub-list for extension type_name
+	9,  // [9:9] is the sub-list for extension extendee
+	0,  // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_pushupes_v1_events_proto_init() }
@@ -831,7 +996,7 @@ func file_pushupes_v1_events_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pushupes_v1_events_proto_rawDesc), len(file_pushupes_v1_events_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   10,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
