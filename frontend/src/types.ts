@@ -34,6 +34,13 @@ export interface ClusterStatus {
   slot_count: number
   replicas?: number
   writes?: number[]
+  // Machine-readable leader redirect (every node answers it): the Raft
+  // controller's node id and its admin address from the replicated peer
+  // directory. Empty while no leader is elected / registered yet. The console
+  // pins all traffic here; older nodes without these fields fall back to
+  // raft.leader + peers[leader].admin_addr.
+  controller?: string
+  controller_admin_addr?: string
 }
 
 

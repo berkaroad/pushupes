@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Alert, Card, Col, Row, Space, Statistic, Switch, Typography } from 'antd'
 import type { ClusterStatus } from '../types'
-import { getClusterStatus } from '../api'
+import { ensureLeader } from '../api'
 import { PeerCard, isOnlinePeer } from '../PeerCard'
 
 export default function ClusterPage() {
@@ -11,7 +11,10 @@ export default function ClusterPage() {
 
   const refresh = useCallback(async () => {
     try {
-      const d = await getClusterStatus()
+      // ensureLeader: with several configured admins the FIRST call probes the
+      // pool and pins all traffic to the Raft leader; later calls are plain
+      // status polls against that pin (and re-pin when leadership moves).
+      const d = await ensureLeader()
       setStatus(d)
       setErr(null)
     } catch (e: any) {

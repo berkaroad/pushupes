@@ -4,6 +4,11 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PushupES Console</title>
+    <!-- Admin endpoints: comma-separated list of node admin addresses. The
+         console probes them at startup and follows the Raft leader from then
+         on; leave empty to use the dev-server /api proxy. Edit this file (or
+         dist/index.html after `npm run build`) — no rebuild needed. -->
+    <script>window.__PUSHUPES_ADMIN__ = ''</script>
   </head>
   <body>
     <div id="root"></div>

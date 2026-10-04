@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Button, Descriptions, Drawer, Form, Input, Modal, Select, Space, Table, Tag, Typography } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import type { ClusterStatus, NodeWrites, Placement, SlotDescribe, SlotStream, SlotStreams } from '../types'
-import { fetchNodeWrites, fetchSlotDescribe, fetchSlotStreams, getClusterStatus, migrateSlot } from '../api'
+import { ensureLeader, fetchNodeWrites, fetchSlotDescribe, fetchSlotStreams, migrateSlot } from '../api'
 import { RATE_POINTS, RateChart, type RatePoint } from '../RateChart'
 import { ReplicaTags, dropHint } from '../ReplicaTags'
 
@@ -83,7 +83,9 @@ export default function SlotsPage() {
 
   const refresh = useCallback(async () => {
     try {
-      const st = await getClusterStatus()
+      // first call runs the startup pool probe (pins to the leader); later
+      // calls are plain status polls against that pin.
+      const st = await ensureLeader()
       statusRef.current = st
       setStatus(st)
       setErr(null)
