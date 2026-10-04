@@ -4,7 +4,7 @@
 # 默认拉起 3 节点（node-1 为 bootstrap，其余自动 join），每个节点独立的
 # admin / peer(Raft) / client(gRPC) 端口与数据目录，槽位自动均衡。
 #
-#   scripts/cluster.sh start     启动集群（编译、逐个拉起、等待选主与槽规划）
+#   scripts/cluster.sh start     启动集群（编译、逐个拉起、等待选主与槽规划，并打印管理台多地址启动命令）
 #   scripts/cluster.sh status    查看各节点 Raft 角色、Leader 槽数、迁移中槽数
 #   scripts/cluster.sh smoke     端到端冒烟：MOVED 重定向 → v1/v2 写入 → 幂等 exists → 版本冲突 fail/1001 → 回读
 #   scripts/cluster.sh logs [N]  跟踪某个节点日志（默认 node-1）
@@ -195,9 +195,11 @@ cmd_start() {
   for i in "${to_start[@]}"; do start_node "$i"; done
   wait_ready || exit 1
   info ""
+  local admin_list="" i
+  for i in $(seq 1 "$REPLICAS"); do admin_list+="${admin_list:+,}$(base_url "$i")"; done
   info "客户端入口（任意节点均可，写自动重定向到 leader）："
   for i in $(seq 1 "$REPLICAS"); do info "  $(base_url "$i")"; done
-  info "管理台：cd frontend && PUSHUPES_API=$(base_url 1) npm run dev"
+  info "管理台（自动跟随 leader）: cd frontend && PUSHUPES_ADMIN_ENDPOINTS=\"$admin_list\" npm run dev"
   cmd_status
 }
 
