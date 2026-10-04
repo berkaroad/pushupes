@@ -26,7 +26,7 @@ import (
 
 const (
 	tableMagic = "PTAB"
-	tableVer   = byte(2)
+	tableVer   = byte(3)
 	noNode     = byte(255)
 )
 
@@ -94,6 +94,14 @@ func (t *Table) EncodeTableBinary() []byte {
 		putStr(&body, p.PeerAddr)
 		putStr(&body, p.AdminAddr)
 		putStr(&body, p.ClientAddr)
+		// Down flag (v3): the controller's liveness verdict must survive a
+		// snapshot, or a bootstrapped follower would consider a dead peer
+		// active until the controller's next sweep re-marked it.
+		if p.Down {
+			body.WriteByte(1)
+		} else {
+			body.WriteByte(0)
+		}
 	}
 	// pre-register peer ids so common case entries hit the dictionary
 	for _, id := range peerIDs {
@@ -198,7 +206,12 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 		if err != nil {
 			return nil, err
 		}
-		t.Peers[id] = Peer{ID: id, PeerAddr: peerAddr, AdminAddr: adminAddr, ClientAddr: clientAddr}
+		// Down flag (v3): one byte, matches the encode side.
+		var db [1]byte
+		if _, err := io.ReadFull(r, db[:]); err != nil {
+			return nil, err
+		}
+		t.Peers[id] = Peer{ID: id, PeerAddr: peerAddr, AdminAddr: adminAddr, ClientAddr: clientAddr, Down: db[0] == 1}
 	}
 	nameN, err := binary.ReadUvarint(r)
 	if err != nil {

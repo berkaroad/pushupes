@@ -45,13 +45,17 @@ import (
 const (
 	// DefaultRebalanceInterval is how often the controller re-checks the
 	// ring layout. The layout only ever needs healing after a failover or a
-	// late-joined replica catches up, so a slow tick is cheap and quiet.
-	DefaultRebalanceInterval = 15 * time.Second
+	// late-joined replica catches up; a fast tick matters because the batch
+	// (not the tick) is the throughput knob the operator thinks about.
+	DefaultRebalanceInterval = 2 * time.Second
 	// DefaultRebalanceBatch caps the hand-overs one round may execute. With
 	// 1680 slots the worst case (a node that led 560 slots died) converges
-	// in ~70 rounds ≈ 17 minutes at the default interval; a smaller batch
-	// trades convergence time for a longer tail of the failover layout.
-	DefaultRebalanceBatch = 8
+	// in 20 rounds at the default batch; moves stay strictly serial within
+	// a round, so one commit fence freezes exactly one slot at a time and a
+	// round may run longer than the tick (the ticker simply skips ahead).
+	// A smaller batch trades convergence time for a longer tail of the
+	// failover layout.
+	DefaultRebalanceBatch = 28
 )
 
 // SetRebalanceConfig wires the -rebalance-interval / -rebalance-batch knobs.

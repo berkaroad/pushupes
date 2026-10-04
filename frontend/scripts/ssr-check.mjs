@@ -235,6 +235,29 @@ assert('the cleanup hint names the node and the expected time',
   /迁移后待自动清理/.test(hint) && hint.includes('node-2') && /\d{2}:\d{2}:\d{2}/.test(hint) && /10 分/.test(hint))
 assert('no hint for a replica that is not queued', dropHint('node-3', 0, NOW) === '')
 
+// The node list marks a peer OFFLINE (中文「离线」+ weakened dashed card) when
+// it has not announced a client address — the same online rule the rebalancer
+// uses (OnlinePeerIDs). An online peer renders no 离线 tag.
+const { PeerCard, isOnlinePeer } = await vite.ssrLoadModule('/src/PeerCard.tsx')
+assert('isOnlinePeer: announced client addr is online', isOnlinePeer({ client_addr: 'http://h:8591' }) === true)
+assert('isOnlinePeer: empty / missing client addr is offline',
+  isOnlinePeer({ client_addr: '' }) === false && isOnlinePeer({ client_addr: undefined }) === false)
+assert('isOnlinePeer: a marked-down peer is offline even with an announced addr',
+  isOnlinePeer({ client_addr: 'http://h:8591', down: true }) === false)
+const pc = (props) => renderToString(
+  React.createElement(ConfigProvider, { theme: { algorithm: theme.defaultAlgorithm } },
+    React.createElement(PeerCard, props)),
+)
+const offlineCard = pc({ peer: { id: 'node-2', peer_addr: 'http://h:8392', admin_addr: '', client_addr: '' }, current: false, slots: 5 })
+assert('an offline peer is tagged 离线', offlineCard.includes('离线'))
+assert('an offline card is weakened (dashed border)', /border-style:dashed/.test(offlineCard))
+assert('an offline peer shows - for the missing admin addr', offlineCard.includes('>-<'))
+const downCard = pc({ peer: { id: 'node-3', peer_addr: 'http://h:8393', admin_addr: 'http://h:8093', client_addr: 'http://h:8593', down: true }, current: false, slots: 0 })
+assert('a marked-down peer with announced addresses is still tagged 离线',
+  downCard.includes('离线') && downCard.includes('http://h:8593') && /border-style:dashed/.test(downCard))
+const onlineCard = pc({ peer: { id: 'node-1', peer_addr: 'http://h:8391', admin_addr: 'http://h:8091', client_addr: 'http://h:8591' }, current: true, slots: 561 })
+assert('an online peer renders no 离线 tag', !onlineCard.includes('离线') && onlineCard.includes('当前') && !/border-style:dashed/.test(onlineCard))
+
 let failed = 0
 for (const [name, ok] of checks) {
   if (!ok) failed++

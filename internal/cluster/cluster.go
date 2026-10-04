@@ -44,7 +44,19 @@ type Peer struct {
 	PeerAddr   string `json:"peer_addr"`
 	AdminAddr  string `json:"admin_addr"`
 	ClientAddr string `json:"client_addr"`
+	// Down is the controller's liveness verdict, replicated through Raft:
+	// the peer failed its consecutive peer-plane probes. The directory entry
+	// KEEPS its announced addresses (unlike leave_node, which deletes it),
+	// so a failed node stays visible — flagged 离线 in the console — instead
+	// of flickering between "removed" and "re-seeded without addresses".
+	Down bool `json:"down,omitempty"`
 }
+
+// Offline is the cluster-wide "clients cannot reach this node" rule: no
+// announced client address (not registered yet) or a live-marked-down peer.
+// The ring layout, the rebalancer's targets and the console's 离线 tag all
+// read this predicate — one definition, no drift.
+func (p Peer) Offline() bool { return p.Down || p.ClientAddr == "" }
 
 // Config configures one Raft node.
 type Config struct {

@@ -85,6 +85,26 @@ func (t *Table) PeerIDs() []string {
 	return ids
 }
 
+// OnlinePeerIDs lists the peers the cluster may put leadership ON: members
+// that are not Offline (self-announced a client address AND not marked down
+// by the controller's liveness sweep). This is the single authoritative
+// "which nodes can serve clients right now" set: the rebalancer ring and the
+// failover leader pick anchor on it, so they can never hand a slot to a node
+// clients cannot reach. (plan_slots/replan_slots spread over the FULL
+// directory — at bootstrap only one member is registered, and a down member
+// loses leadership anyway via mark_down/ring.) Sorted like PeerIDs so the
+// layout is a stable function of the table.
+func (t *Table) OnlinePeerIDs() []string {
+	ids := make([]string, 0, len(t.Peers))
+	for id, p := range t.Peers {
+		if !p.Offline() {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 // LeaderOf returns the leader node and epoch for a slot.
 func (t *Table) LeaderOf(slot int32) (string, int64, bool) {
 	p, ok := t.Slots[slot]
@@ -147,18 +167,20 @@ type LeaderMove struct {
 // anchoring is that a hand-picked placement a rebalance can express as a move
 // will be moved back; that is the accepted trade-off for a converging layout.
 //
-// The expected leader is the ring over the CURRENT member directory — the
-// same input a fresh PlanSlots would use — so during a failure the plan
-// balances leadership across the surviving nodes, and once the failed node
-// re-joins (and replan_slots has re-admitted it to the replica sets) the
-// same function hands its slots back to it. A deviating slot is only a
+// The expected leader is the ring over the ONLINE member directory (members
+// only — Table.OnlinePeerIDs: a peer with no announced client addr, or
+// one the controller has marked down, is not a node clients can reach, and
+// leadership must not land on it). During a failure the plan balances
+// leadership across the surviving online nodes, and once the failed node
+// answers probes again and re-announces (and replan_slots has re-admitted it
+// to the replica sets) the same function hands its slots back. A deviating slot is only a
 // candidate when its expected leader is a replica of the slot: moving a
 // leader onto a node without the data is a full migration, not a rebalance,
 // and belongs to the operator. Replica sets still short of the factor are
 // left to replan_slots' top-up; the rebalancer never adds members.
 // Non-stable slots are owned by a live migration — never touched.
 func PlanLeaderRebalance(t *Table) []LeaderMove {
-	nodes := t.PeerIDs()
+	nodes := t.OnlinePeerIDs()
 	if len(nodes) < 2 {
 		return nil
 	}
@@ -194,8 +216,18 @@ func layoutSettled(t *Table) bool {
 // Command ops. Commands are JSON-encoded and applied identically on every
 // node, so all tables converge. Data never appears here — only metadata.
 const (
-	OpJoinNode       = "join_node"        // add a peer to the directory
-	OpLeaveNode      = "leave_node"       // remove a peer (also drops it from replicas)
+	OpJoinNode  = "join_node"  // add a peer to the directory
+	OpLeaveNode = "leave_node" // remove a peer (also drops it from replicas)
+	// OpMarkDown / OpMarkUp carry the controller's liveness verdict into the
+	// replicated directory. Down marks a peer offline WITHOUT deleting its
+	// entry (leave_node deletes it, and the raft-config directory sync then
+	// re-seeds it address-less — the pair of them made a failed node flicker
+	// in the console) and moves the leadership of its slots to live
+	// replicas. The replica set is left intact: when the node answers probes
+	// again MarkUp clears the flag, its fetch loop catches the copy up, and
+	// the rebalancer hands its ring slots back.
+	OpMarkDown       = "mark_down"
+	OpMarkUp         = "mark_up"
 	OpPlanSlots      = "plan_slots"       // (re)spread all slots over current members
 	OpLeaderMove     = "leader_move"      // explicit leader change for some slots (migration commit)
 	OpSlotState      = "slot_state"       // migration state transition for one slot
@@ -282,7 +314,49 @@ func (t *Table) Apply(c *Command) error {
 				p.Epoch++
 			}
 		}
+	case OpMarkDown:
+		// The liveness verdict of the controller, replicated. The directory
+		// entry STAYS (addresses and replica-set membership included): the
+		// console keeps showing the node — flagged offline — instead of it
+		// flickering between deleted and re-seeded-address-less, and the
+		// returning node's copy is still a replica the fetch loop can catch
+		// up. Only leadership moves: every slot this node led gets a live
+		// replica as leader (preferring one that is itself active).
+		p, ok := t.Peers[c.NodeID]
+		if !ok {
+			return fmt.Errorf("mark_down: unknown peer %s", c.NodeID)
+		}
+		if !p.Down {
+			p.Down = true
+			t.Peers[c.NodeID] = p
+		}
+		for _, pl := range t.Slots {
+			if pl.Leader != c.NodeID {
+				continue
+			}
+			if next := t.backupLeaderFor(pl, c.NodeID); next != "" {
+				pl.Leader = next
+				pl.Epoch++
+			}
+		}
+	case OpMarkUp:
+		p, ok := t.Peers[c.NodeID]
+		if !ok {
+			return fmt.Errorf("mark_up: unknown peer %s", c.NodeID)
+		}
+		if p.Down {
+			p.Down = false
+			t.Peers[c.NodeID] = p
+		}
 	case OpPlanSlots:
+		// Placement spreads over the FULL member directory: at bootstrap no
+		// peer but oneself has announced addresses yet, and a plan that
+		// "respected the online set" here would put every slot on the first
+		// voter and converge only through the slow rebalancer. Registration
+		// lands within seconds; a member that is genuinely down at plan
+		// time loses leadership anyway (mark_down moved it, the ring gate
+		// keeps it off the leaders until it returns). The ACTIVE set is the
+		// rebalancer's and the failover pick's domain, not the layout's.
 		nodes := t.PeerIDs()
 		if len(nodes) == 0 {
 			return fmt.Errorf("plan_slots: no members")
@@ -292,7 +366,10 @@ func (t *Table) Apply(c *Command) error {
 		// Fill in any slot that is still unassigned, and top up replica
 		// sets that are below the configured factor (late-joining members).
 		// Leaders of assigned, stable slots are never moved — adding a
-		// replica is safe because the new replica pulls via fetch.
+		// replica is safe because the new replica pulls via fetch. A
+		// marked-down member KEEPS its replica seats (that is how its copy
+		// is still home when it returns); the sets are topped from the full
+		// directory for the same reason the plan uses it above.
 		nodes := t.PeerIDs()
 		if len(nodes) == 0 {
 			return fmt.Errorf("replan_slots: no members")
@@ -417,6 +494,29 @@ func removeString(list []string, s string) []string {
 		}
 	}
 	return out
+}
+
+// backupLeaderFor picks the new leader of a slot whose leader just went down:
+// the first replica that is not itself offline (a live node clients can
+// reach); if every other replica is offline too, fall back to the first other
+// replica so leadership at least leaves the failed node. Deterministic: the
+// replica list order is the same on every node (the table is replicated), so
+// Apply converges. "" when the set holds nobody else.
+func (t *Table) backupLeaderFor(p *Placement, down string) string {
+	for _, r := range p.Replicas {
+		if r == down {
+			continue
+		}
+		if peer, ok := t.Peers[r]; ok && !peer.Offline() {
+			return r
+		}
+	}
+	for _, r := range p.Replicas {
+		if r != down {
+			return r
+		}
+	}
+	return ""
 }
 
 // EncodeTable serialises the whole table for snapshots.

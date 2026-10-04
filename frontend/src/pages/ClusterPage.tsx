@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Alert, Card, Col, Descriptions, Row, Space, Statistic, Switch, Tag, Typography } from 'antd'
+import { Alert, Card, Col, Row, Space, Statistic, Switch, Typography } from 'antd'
 import type { ClusterStatus } from '../types'
 import { getClusterStatus } from '../api'
+import { PeerCard, isOnlinePeer } from '../PeerCard'
 
 export default function ClusterPage() {
   const [status, setStatus] = useState<ClusterStatus | null>(null)
@@ -37,6 +38,8 @@ export default function ClusterPage() {
 
   const slots = Object.values(status.slots)
   const migrating = slots.filter((s) => s.state !== 'stable').length
+  const peers = Object.values(status.peers)
+  const online = peers.filter(isOnlinePeer).length
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -45,24 +48,17 @@ export default function ClusterPage() {
         <Switch checked={auto} onChange={setAuto} size="small" />
       </Space>
       <Row gutter={16}>
-        <Col span={6}><Card><Statistic title="节点" value={Object.keys(status.peers).length} /></Card></Col>
+        <Col span={6}><Card><Statistic title="节点（在线 / 总数）" value={`${online} / ${peers.length}`}
+          valueStyle={online < peers.length ? { color: '#cf1322' } : undefined} /></Card></Col>
         <Col span={6}><Card><Statistic title="槽位总数" value={status.slot_count} /></Card></Col>
         <Col span={6}><Card><Statistic title="迁移中槽位" value={migrating} valueStyle={{ color: migrating ? '#faad14' : undefined }} /></Card></Col>
         <Col span={6}><Card><Statistic title="Raft 状态" value={status.raft.state} valueStyle={{ color: String(status.raft.state).toLowerCase() === 'leader' ? '#3f8600' : undefined }} /></Card></Col>
       </Row>
       <Card title="节点">
         <Row gutter={16}>
-          {Object.values(status.peers).map((p) => (
+          {peers.map((p) => (
             <Col span={8} key={p.id}>
-              <Card size="small" type="inner"
-                title={<Space>{p.id}{p.id === status.node ? <Tag color="blue">当前</Tag> : null}</Space>}
-                extra={<Tag>{leaderCount[p.id] ?? 0} slots</Tag>}>
-                <Descriptions column={1} size="small">
-                  <Descriptions.Item label="Admin">{p.admin_addr}</Descriptions.Item>
-                  <Descriptions.Item label="Client">{p.client_addr}</Descriptions.Item>
-                  <Descriptions.Item label="Peer">{p.peer_addr}</Descriptions.Item>
-                </Descriptions>
-              </Card>
+              <PeerCard peer={p} current={p.id === status.node} slots={leaderCount[p.id] ?? 0} />
             </Col>
           ))}
         </Row>

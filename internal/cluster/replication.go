@@ -1910,6 +1910,12 @@ func (e *Engine) RunController(ctx context.Context) {
 		// command. PeerAddr is authoritative from the raft configuration;
 		// admin/client addresses come from the peer's registration
 		// announcement (OpRegister patches them in whenever they land).
+		// The inverse direction is reconciled too: a directory entry whose
+		// id is no longer a raft voter is a member an operator removed —
+		// leave_node deletes it. Liveness NEVER deletes (see the sweep):
+		// delete-then-rejoin dropped the announced addresses and re-seeded
+		// an empty shell every cycle, which made a failed node flicker in
+		// the console and re-planned the whole table every few seconds.
 		tbl := e.TableSnapshot()
 		raftAddrs := e.node.PeerAddrs()
 		for id, peerAddr := range raftAddrs {
@@ -1928,6 +1934,12 @@ func (e *Engine) RunController(ctx context.Context) {
 			}
 			e.submit(&Command{Op: OpJoinNode, Peer: &p})
 		}
+		for id := range tbl.Peers {
+			if _, ok := raftAddrs[id]; !ok {
+				e.loggerf("peer %s is no longer a raft voter; removing it from the directory", id)
+				e.submit(&Command{Op: OpLeaveNode, NodeID: id})
+			}
+		}
 		// 2) plan: full replan only when nothing is assigned; otherwise fill
 		// gaps left by member joins without disturbing placed slots.
 		tbl = e.TableSnapshot()
@@ -1939,9 +1951,16 @@ func (e *Engine) RunController(ctx context.Context) {
 		} else if len(tbl.Slots) < int(tbl.SlotCount) || tableReplicaShortfall(tbl) {
 			e.submit(&Command{Op: OpReplanSlots})
 		}
-		// 3) liveness sweep: probe peers over the peer plane; fail a peer
-		// over only after several consecutive misses so a booting node is
-		// not evicted.
+		// 3) liveness sweep: probe peers over the peer plane; a peer that
+		// misses several consecutive probes is MARKED DOWN (leadership
+		// moves to live replicas; the directory entry, its addresses and
+		// its replica-set membership survive). A booting node is never
+		// evicted (threshold), and a node that answers probes again is
+		// marked back up — its copy is still a replica, so the ordinary
+		// fetch loop catches it up and the rebalancer hands its ring slots
+		// back. Commands are submitted only on a REAL state change: the
+		// steady-state table of a dead node is one mark_down, not a Raft
+		// entry per round.
 		for id, p := range tbl.Peers {
 			if id == e.self || p.PeerAddr == "" {
 				// peers without a peer address are not probed: membership
@@ -1951,13 +1970,16 @@ func (e *Engine) RunController(ctx context.Context) {
 			e.failMu.Lock()
 			if !e.alive(p.PeerAddr) {
 				e.failStreak[id]++
-				if e.failStreak[id] >= livenessFailThreshold {
-					e.loggerf("peer %s unreachable (%d consecutive probes), failing slots over", id, e.failStreak[id])
-					e.submit(&Command{Op: OpLeaveNode, NodeID: id})
-					delete(e.failStreak, id)
+				if e.failStreak[id] >= livenessFailThreshold && !p.Down {
+					e.loggerf("peer %s unreachable (%d consecutive probes), marking it down", id, e.failStreak[id])
+					e.submit(&Command{Op: OpMarkDown, NodeID: id})
 				}
 			} else {
 				e.failStreak[id] = 0
+				if p.Down {
+					e.loggerf("peer %s answers probes again, marking it up", id)
+					e.submit(&Command{Op: OpMarkUp, NodeID: id})
+				}
 			}
 			e.failMu.Unlock()
 		}

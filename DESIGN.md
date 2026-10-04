@@ -309,7 +309,10 @@ Body: Record*，每条记录：
 - **client 面（gRPC，客户端事件写入/查询唯一入口，默认 `-client
   http://127.0.0.1:8591`，`PUSHUPES_CLIENT`）**：proto3 契约
   `proto/pushupes/v1/events.proto`（`pushupes.v1.EventService`：`Append` +
-  `ReadStream` + `ReadTails` + `ReadByCommand`）。body 为原始 bytes，无 JSON/base64 层。
+  `BatchAppend` + `ReadStream` + `ReadTails` + `ReadByCommand`）。body 为原始
+  bytes，无 JSON/base64 层。client 面 gRPC 消息上限由 `-grpc-max-msg-size`
+  配置（默认 4MiB，recv/send 同值）：`BatchAppend` 一整批要装进这个上限，
+  批次大小随它一起调。
   MOVED/ASK 重定向的 `node` 字段携带槽 leader 的 **client 地址**（路由表
   Peer 同时记 PeerAddr/AdminAddr/ClientAddr），客户端据此重连。本节点既无槽又无副本
   时，服务端向 leader 的 client 面代理转发（`ReadProxyAddr` 返回 leader

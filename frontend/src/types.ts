@@ -3,6 +3,11 @@ export interface Peer {
   peer_addr: string
   admin_addr: string
   client_addr: string
+  // The controller's replicated liveness verdict: consecutive peer-plane
+  // probes failed. The directory entry (addresses included) survives a
+  // down-mark — only leadership moves off it — so the console can show the
+  // node as 离线 instead of watching it flicker in and out of the list.
+  down?: boolean
 }
 
 export interface Placement {

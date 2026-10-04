@@ -165,8 +165,9 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 | `-flush-interval` | — | 5s | 每周期 fsync（0 关闭） |
 | `-segment-bytes` | — | 256MiB | WAL 段滚动大小：64MiB 整数倍，≤2GiB；可写字节数或带单位（`256MiB`/`1GiB`） |
 | `-drop-after` | `PUSHUPES_DROP_AFTER` | 30s | 迁移后前源副本保留期；0=默认，负数启动即报错，不可关闭 |
-| `-rebalance-interval` | `PUSHUPES_REBALANCE_INTERVAL` | 15s | controller 每隔多久检查一次 leader 布局并执行回切（节点宕机恢复后把槽 leader 迁回环上预期节点）；0=关闭，负数启动即报错 |
-| `-rebalance-batch` | `PUSHUPES_REBALANCE_BATCH` | 8 | 每轮回切最多串行执行几个 leader 交接；0=关闭，负数启动即报错 |
+| `-rebalance-interval` | `PUSHUPES_REBALANCE_INTERVAL` | 2s | controller 每隔多久检查一次 leader 布局并执行回切（节点宕机恢复后把槽 leader 迁回环上预期节点）；0=关闭，负数启动即报错 |
+| `-rebalance-batch` | `PUSHUPES_REBALANCE_BATCH` | 28 | 每轮回切最多串行执行几个 leader 交接；轮内串行保证任一时刻只有一个槽在交接栅栏上，一轮跑不完下个间隔自动顺延；0=关闭，负数启动即报错 |
+| `-grpc-max-msg-size` | `PUSHUPES_GRPC_MAX_MSG_SIZE` | 4MiB | client 面 gRPC 消息上限（recv/send 同值）；`BatchAppend` 单批要装进它，可写 `16MiB` 等带单位形式；≤0 启动即报错 |
 
 ### 客户端接入
 

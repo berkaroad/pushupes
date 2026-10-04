@@ -15,7 +15,9 @@ import (
 func rebalanceTable(nodes ...string) *Table {
 	tbl := NewTable(8, 2)
 	for _, id := range nodes {
-		tbl.Peers[id] = Peer{ID: id}
+		// tests model ONLINE members by default: the ring anchors on the
+		// self-announced client addr (see OnlinePeerIDs).
+		tbl.Peers[id] = Peer{ID: id, ClientAddr: "http://" + id + ":8591"}
 	}
 	tbl.Slots = PlanSlots(nodes, tbl.SlotCount, 2)
 	return tbl
@@ -64,8 +66,11 @@ func TestPlanLeaderRebalanceRingAnchored(t *testing.T) {
 
 	// node-1 returns and replan re-admits it: the ring is its own again and
 	// its slots, still led by the failover nodes, must be handed back. This
-	// is the case the rebalancer exists for.
+	// is the case the rebalancer exists for. The join seed carries no
+	// client addr (the -peers shape); re-entering the ring requires the
+	// re-registration first.
 	apply(&Command{Op: OpJoinNode, Peer: &Peer{ID: "node-1"}})
+	apply(&Command{Op: OpRegister, Peer: &Peer{ID: "node-1", AdminAddr: "http://127.0.0.1:8091", ClientAddr: "http://127.0.0.1:8591"}})
 	apply(&Command{Op: OpReplanSlots})
 	moves = PlanLeaderRebalance(tbl)
 	if len(moves) != 3 {
@@ -128,6 +133,50 @@ func TestPlanLeaderRebalanceIgnoresWhatItMustNotTouch(t *testing.T) {
 	single.Slots = PlanSlots([]string{"node-1"}, 4, 1)
 	if moves := PlanLeaderRebalance(single); moves != nil {
 		t.Fatalf("single-node plan: %v", moves)
+	}
+}
+
+func TestPlanLeaderRebalanceSkipsOfflinePeers(t *testing.T) {
+	// The ring anchors on ONLINE members only: a peer in the directory that
+	// has not self-announced its client-plane address (ClientAddr empty —
+	// the -peers seed carries just the peer port) is not a node clients can
+	// reach, so it neither takes part in the ring nor may leadership move
+	// onto it. Here node-3 is offline in that sense: the plan treats the
+	// cluster as a 2-node ring.
+	tbl := rebalanceTable("node-1", "node-2", "node-3")
+	tbl.Peers["node-3"] = Peer{ID: "node-3"} // no ClientAddr: offline
+	// Everything piled on node-1 (an outage's worst shape): with node-3
+	// offline the online ring is node-1/node-2, so the plan must shed the
+	// ODD slots to node-2 and never touch node-3 — neither as a target nor
+	// through a 3-node ring that would give slots 2,5 to node-3.
+	for _, p := range tbl.Slots {
+		p.Leader = "node-1"
+	}
+	moves := PlanLeaderRebalance(tbl)
+	for _, m := range moves {
+		if m.To == "node-3" {
+			t.Fatalf("leadership must not move onto an offline peer: %+v", m)
+		}
+		want := []string{"node-1", "node-2"}[int(m.Slot)%2]
+		if m.To != want {
+			t.Fatalf("slot %d: online-ring leader should be %q, got %+v", m.Slot, want, m)
+		}
+	}
+	// odd slots whose replica set genuinely holds node-2 must be planned
+	if len(moves) == 0 {
+		t.Fatal("an unbalanced layout over the ONLINE ring must plan moves")
+	}
+	// once node-3 re-registers, the 3-node ring is authoritative again and
+	// the plan hands node-3's own slots back to it
+	tbl.Peers["node-3"] = Peer{ID: "node-3", ClientAddr: "http://node-3:8591"}
+	var back int
+	for _, m := range PlanLeaderRebalance(tbl) {
+		if m.To == "node-3" {
+			back++
+		}
+	}
+	if back == 0 {
+		t.Fatal("a re-registered node must re-enter the ring")
 	}
 }
 
@@ -241,6 +290,12 @@ func TestRebalanceHandBackEndToEnd(t *testing.T) {
 		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-3", PeerAddr: "127.0.0.1:9"}})
 		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-1", AdminAddr: oldAddr, ClientAddr: oldAddr}})
 		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-2", AdminAddr: newAddr, ClientAddr: newAddr}})
+		// node-3 announces a client addr NOBODY listens on: it counts as
+		// online (so it enters the ring), and the liveness gate fires for
+		// real when a round tries to move leadership onto it. An
+		// UNregistered peer would not even be planned — see
+		// TestPlanLeaderRebalanceSkipsOfflinePeers.
+		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-3", AdminAddr: "127.0.0.1:9", ClientAddr: "127.0.0.1:9"}})
 		applyCmd(t, e, &Command{Op: OpPlanSlots})
 	}
 
@@ -249,8 +304,9 @@ func TestRebalanceHandBackEndToEnd(t *testing.T) {
 	// replicas[0]) — node-2 now leads slots 0, 3, 6 as well as its own.
 	// While node-1 is out of the directory the ring is the SURVIVORS' ring
 	// (N=2): the plan wants node-2 to shed slots 1 and 7 to node-3 — a
-	// balanced layout during the outage, which must wait for node-3's
-	// registration (it has no address yet here, so the round must not act).
+	// balanced layout during the outage, which must wait for node-3 to be
+	// reachable (its announced address goes nowhere here, so the liveness
+	// gate must keep the round from acting).
 	for _, e := range []*Engine{old, neu} {
 		applyCmd(t, e, &Command{Op: OpLeaveNode, NodeID: "node-1"})
 	}
@@ -264,7 +320,7 @@ func TestRebalanceHandBackEndToEnd(t *testing.T) {
 		}
 	}
 	if done := neu.rebalanceRound(context.Background(), 8); done != 0 {
-		t.Fatalf("node-3 has no registered address: the round must not move leadership to it")
+		t.Fatalf("node-3 answers no ping: the round must not move leadership to it")
 	}
 
 	// Acknowledged writes for slot 0 land on the current leader node-2.
