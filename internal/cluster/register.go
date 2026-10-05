@@ -103,15 +103,15 @@ func (e *Engine) registrationMatches(reg *Registration) bool {
 // leaderPeerAddr maps the Raft leader id onto its peer address — the one
 // address every node knows statically for every configured peer.
 func (e *Engine) leaderPeerAddr() string {
-	id, _ := e.node.raft.LeaderWithID()
+	id := e.node.raft.LeaderID()
 	if id == "" {
 		return ""
 	}
-	if string(id) == e.self {
+	if id == e.self {
 		return e.node.cfg.PeerAddr
 	}
 	for _, p := range e.node.cfg.Peers {
-		if p.ID == string(id) {
+		if p.ID == id {
 			return p.PeerAddr
 		}
 	}

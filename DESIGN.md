@@ -163,12 +163,22 @@ Body: Record*，每条记录：
 
 分层结构：
 
-- **控制面（Raft）**：hashicorp/raft 集群只复制元数据——
+- **控制面（自研 Raft）**：集群共识层是**仓库内自研的简化 Raft**
+  （`internal/raft`：选主/日志复制/提交推进/快照），日志与 term/vote 存于
+  **自研分段 WAL**（`internal/raft/wal.go`，组提交 + CRC + 崩溃截断恢复），
+  不再依赖 `hashicorp/raft` 与 BoltDB。成员集合**静态**（启动时由 `-peers`
+  写入 WAL 首条，增减节点=全集群重启），不支持运行时 AddVoter/PreVote/ReadIndex。
+  它只复制元数据——
   slot 分配表（`slot → {leader, replicas[], epoch, state}`）、集群成员、
   节点数据面地址（`OpRegister`，见 §6 peer 面）。FSM 模型：
   `Applier` 接口 + 快照/恢复（快照为二进制表编码 `table_bin.go`，1680 槽
-  ~350KB JSON → 几 KB）。成员集合由 Raft 配置唯一决定；路由表里每个成员
+  ~350KB JSON → 几 KB）。成员集合由静态 voter 集唯一决定；路由表里每个成员
   同时记 `PeerAddr/AdminAddr/ClientAddr` 三个地址。
+  设计稿与实测见 `docs/raft-自研设计.md`。与替换前的 A/B 实测（256B 命令、
+  真实 TCP、3s×3 取中位）：单节点顺序 Apply 2.10ms→1.46ms（+43%，p99 2.87ms→1.94ms）、
+  单节点并发 2.08ms→1.45ms、3 节点顺序 5.01ms→5.52ms（−9%，p99 7.64ms→6.68ms
+  仍优于旧实现），每 op 分配 108→17 allocs；依赖树去掉 hashicorp/raft、
+  raft-boltdb、go-hclog 及其带进的 bbolt/msgpack/metrics 等。
 - **数据面（专用拉取）**：
   - 客户端把 `Append` 发给槽 leader 的 gRPC client 面；leader 追加本地
     WAL 得到 seq。
@@ -331,7 +341,7 @@ Body: Record*，每条记录：
   解码往返的 CPU（实测 100KiB body 下占 leader CPU 一半），已随 HTTP 事件面退役
   一并删除。
 - **peer 面（Raft + PeerService gRPC，默认 `-peer http://127.0.0.1:8391`，`PUSHUPES_PEER`）**：复制槽位分配表等元数据（Raft），并承载**全部节点间数据面**——副本拉取、LEO 上报/探活、迁移快照/段拷贝/写转发/LEO 追平、地址注册协议（proto3 契约 `proto/pushupes/v1/peer.proto`，`pushupes.v1.PeerService`，服务端 `peersvc.go`）。**运维只配这一个端口**：`-peers` 主格式 `node-id=http://ip:peerport`（或裸 `ip:peerport`，地址兼作节点 id）。**地址统一规范：存储/路由表/status JSON 中所有 admin/client/peer 地址都带 scheme——未写协议默认补 `http://`，显式协议以传入为准；TCP 拨号（listen/dial/gRPC/Raft transport）前再剥掉 scheme**（`cluster.NormalizeAddr`/`HostPort`）。admin/client 地址不配置，由各节点自报进路由表：
-  - peer 端口上是复用监听器（`peerMux`/`peer_mux.go`，实现 raft.StreamLayer）：按连接**首字节 `P`**（HTTP/2 client preface `"PRI ..."` 以 `P` 开头）把 PeerService gRPC 流量与 Raft 流量分流（Raft 线上协议首字节是版本号 0，永不冲突；两路都经 `replayConn` 回填被 peek 消费的字节）。gRPC 服务端由 `Engine.ServePeer` 挂在该分流 listener 上，peer 面与 Raft 从此共用一个端口、一套 gRPC 语义（HTTP/2 多路复用，每对节点一条缓存连接 `peerClient`，keepalive 10s，服务端放宽 enforcement）。
+  - peer 端口上是复用监听器（`peerMux`/`peer_mux.go`，实现共识层的 `raft.Transport`）：按连接**首字节 `P`**（HTTP/2 client preface `"PRI ..."` 以 `P` 开头）把 PeerService gRPC 流量与共识流量分流（自研 Raft 的握手首字节是 magic `0x9E`，**断言 ≠ 'P'**，永不冲突；两路都经 `replayConn` 回填被 peek 消费的字节）。gRPC 服务端由 `Engine.ServePeer` 挂在该分流 listener 上，peer 面与共识层从此共用一个端口、一套 gRPC 语义（HTTP/2 多路复用，每对节点一条缓存连接 `peerClient`，keepalive 10s，服务端放宽 enforcement）。
   - leader 收到注册 RPC 后提交 `OpRegister`（就地修补路由表中该成员的 `AdminAddr/ClientAddr`，不新增成员——成员集合仍由 Raft 配置决定）；follower 收到则转发给 leader 的 peer 地址。
   - announcer 幂等周期重试（启动期 1s，收敛后转 10s 心跳），任意启动顺序都能收敛；节点换端口重启也会被自报值修补。
   - 旧多端口格式 `id:peerport:adminport:clientport` / `id:host:peerport:adminport:clientport` 仍兼容（作为静态种子，注册落地后以自报值为准）。

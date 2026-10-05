@@ -11,7 +11,7 @@ leader→follower 专用拉取协议**（ISR + 高水位语义），两条链路
                                   │
                      follower 长轮询拉取（PeerService.MFetch，与 Raft 同端口）
                                   │
-Raft（hashicorp/raft，仅元数据）──▶ 槽位分配表 / epoch / 集群成员
+Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分配表 / epoch / 集群成员
 ```
 
 ## 功能特性
@@ -46,8 +46,10 @@ Raft（hashicorp/raft，仅元数据）──▶ 槽位分配表 / epoch / 集�
 
 ### 高可用与复制
 
-- 控制面：hashicorp/raft 集群复制槽位分配表（`slot → {leader, replicas[],
-  epoch, state}`）与成员；路由表快照为二进制编码（几 KB 级）。
+- 控制面：**自研简化 Raft**（`internal/raft`，日志与 term/vote 存于自研分段
+  WAL `internal/raft/wal.go`；不依赖 hashicorp/raft 与 BoltDB）复制槽位分配表
+  （`slot → {leader, replicas[], epoch, state}`）与成员；成员集合静态（由
+  `-peers` 启动时写入）；路由表快照为二进制编码（几 KB 级）。
 - 数据面：follower 把要跟随的槽按 leader 分组，**每个 leader 维持一条常驻的
   MFetch 长轮询会话**（gRPC/HTTP2 多路复用，一次请求合并多个槽，payload 是
   裸 WAL 字节；有数据立即应答，唤醒后合并窗口内的全部增量一次带走）。
@@ -162,7 +164,7 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 | `-client` | `PUSHUPES_CLIENT` | `http://127.0.0.1:8591` | client 面：gRPC 事件读写唯一入口 |
 | `-data` | `PUSHUPES_DATA` | `./data` | 数据目录 |
 | `-peers` | `PUSHUPES_PEERS` | 空 | 集群种子 `id=host:peerport,...` |
-| `-bootstrap` | — | false | 从 `-peers` 组建新集群（仅首个节点加） |
+| `-bootstrap` | — | false | 兼容保留：成员集合静态，启动时由 `-peers` 写入，此开关已无作用 |
 | `-replication-factor` | — | 2 | 每槽副本数 |
 | `-flush-messages` | — | 1000 | 每 N 条 fsync（0 关闭） |
 | `-flush-interval` | — | 5s | 每周期 fsync（0 关闭） |

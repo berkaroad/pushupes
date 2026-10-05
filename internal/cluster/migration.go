@@ -462,9 +462,17 @@ func (e *Engine) awaitCaughtUp(ctx context.Context, from, toNode string, slot in
 // awaitApplied waits until the local FSM applied everything committed.
 func (e *Engine) awaitApplied(ctx context.Context, timeout time.Duration) error {
 	num := func(key string) uint64 {
-		st := e.node.raft.Stats()
-		v, _ := strconv.ParseUint(st[key], 10, 64)
-		return v
+		st := e.node.Stats()
+		switch v := st[key].(type) {
+		case uint64:
+			return v
+		case int:
+			return uint64(v)
+		case string:
+			n, _ := strconv.ParseUint(v, 10, 64)
+			return n
+		}
+		return 0
 	}
 	target := num("commit-index")
 	deadline := time.Now().Add(timeout)

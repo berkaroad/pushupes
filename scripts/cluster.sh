@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # PushupES 集群启停脚本
 #
-# 默认拉起 3 节点（node-1 为 bootstrap，其余自动 join），每个节点独立的
+# 默认拉起 3 节点（成员集合静态：各节点启动时按 -peers 写入同一 voter 集，
+# 无 bootstrap/join 差异），每个节点独立的
 # admin / peer(Raft) / client(gRPC) 端口与数据目录，槽位自动均衡。
 #
 #   scripts/cluster.sh start     启动集群（编译、逐个拉起、等待选主与槽规划，并打印管理台多地址启动命令）
@@ -110,7 +111,8 @@ start_node() {
   peers="$(peers_csv)"
   : > "$dir/node.log"
   local extra=()
-  [[ "$n" == "1" ]] && extra=(-bootstrap)
+  # -bootstrap 已废弃：成员集合静态，每个节点启动时按 -peers 写入同一 voter 集，
+  # 不再有「先 bootstrap 再 join」的差异。
 
   cd "$dir" || die "无法进入 $dir"
   # setsid 让节点脱离本脚本会话；fd 全部重定向，否则管道调用永不返回

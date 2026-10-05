@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/raft"
+	"pushupes/internal/raft"
 )
 
 const (
@@ -33,9 +33,10 @@ type acceptResult struct {
 	err  error
 }
 
-// peerMux implements raft.StreamLayer over a plain TCP listener, diverting
-// gRPC (HTTP/2 preface) connections to GRPCListener() and handing
-// everything else — including indeterminate connections — to Raft.
+// peerMux implements the consensus Transport over a plain TCP listener,
+// diverting gRPC (HTTP/2 preface) connections to GRPCListener() and handing
+// everything else — including indeterminate connections — to the consensus
+// layer.
 type peerMux struct {
 	listener  *net.TCPListener
 	advertise *net.TCPAddr
@@ -62,6 +63,11 @@ func newPeerMux(bindAddr string, advertise *net.TCPAddr) (*peerMux, error) {
 		raftCh:    make(chan acceptResult, peerAcceptQueue),
 		grpcCh:    make(chan acceptResult, peerAcceptQueue),
 		closed:    make(chan struct{}),
+	}
+	if m.advertise == nil || m.advertise.Port == 0 {
+		if a, ok := tcpLn.Addr().(*net.TCPAddr); ok {
+			m.advertise = a
+		}
 	}
 	go m.demux()
 	return m, nil
@@ -165,7 +171,9 @@ func (m *peerMux) shutdown(res acceptResult) {
 	}
 }
 
-// ---- raft.StreamLayer (what the transport consumes) ----
+// ---- raft.Transport (what the consensus layer consumes) ----
+
+var _ raft.Transport = (*peerMux)(nil)
 
 func (m *peerMux) Accept() (net.Conn, error) {
 	select {
@@ -176,10 +184,10 @@ func (m *peerMux) Accept() (net.Conn, error) {
 	}
 }
 
-func (m *peerMux) Addr() net.Addr { return m.advertise }
+func (m *peerMux) Addr() string { return m.advertise.String() }
 
-func (m *peerMux) Dial(address raft.ServerAddress, timeout time.Duration) (net.Conn, error) {
-	return net.DialTimeout("tcp", HostPort(string(address)), timeout)
+func (m *peerMux) Dial(address string, timeout time.Duration) (net.Conn, error) {
+	return net.DialTimeout("tcp", HostPort(address), timeout)
 }
 
 func (m *peerMux) Close() error {

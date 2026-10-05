@@ -61,11 +61,15 @@ func main() {
 		// operator raises it together with typical batch size (a 4MiB cap
 		// carries roughly 4000 records of 1KiB bodies).
 		grpcMaxMsg = byteSize(envIntOr("PUSHUPES_GRPC_MAX_MSG_SIZE", defaultGrpcMaxMsgBytes))
-		bootstrap  = flag.Bool("bootstrap", false, "form a new cluster from -peers when no Raft state exists")
+		bootstrap  = flag.Bool("bootstrap", false, "accepted for compatibility: membership is static and written on first start, so this is a no-op")
+		raftFlush  = flag.Duration("raft-flush-interval", envDurationOr("PUSHUPES_RAFT_FLUSH_INTERVAL", cluster.DefaultRaftFlushInterval),
+			"consensus WAL group-commit window: appends arriving within it share a single fsync (env PUSHUPES_RAFT_FLUSH_INTERVAL)")
+		raftSegB = byteSize(envIntOr("PUSHUPES_RAFT_SEGMENT_BYTES", cluster.DefaultRaftSegmentBytes))
 	)
 	// -segment-bytes takes a size, not just a byte count: 268435456 or 256MiB.
 	flag.Var(&segmentB, "segment-bytes", "WAL segment roll `size` (bytes, or a suffix like 256MiB/1GiB); a multiple of 64MiB, at most 2GiB")
 	flag.Var(&grpcMaxMsg, "grpc-max-msg-size", "client-plane gRPC max message `size` in bytes (suffixes like 16MiB accepted; the gRPC default 4MiB applies when unset)")
+	flag.Var(&raftSegB, "raft-segment-bytes", "consensus WAL segment roll `size` (bytes, or a suffix like 64MiB)")
 	flag.Parse()
 
 	// gRPC's stock buffer pool zeroes every buffer it hands out and its size
@@ -80,12 +84,12 @@ func main() {
 	base.SetLevel(logrus.InfoLevel)
 	logger := logrus.NewEntry(base).WithField("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, slotCount, *replication, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *dropAfter, *rebalanceInterval, *rebalanceBatch, *bootstrap, logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, slotCount, *replication, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *dropAfter, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, int64(raftSegB), logger); err != nil {
 		logger.WithError(err).Fatal("pushupes exited with error")
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slotCount, replicationFactor int, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD, dropAfter time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, logger *logrus.Entry) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slotCount, replicationFactor int, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD, dropAfter time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush time.Duration, raftSegBytes int64, logger *logrus.Entry) error {
 	// Canonical form for every stored address: scheme required. A bare
 	// host:port gets the default "http://" prefix; an explicit protocol
 	// is honoured as passed. TCP-level uses (listen/dial) strip it again.
@@ -153,13 +157,15 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slot
 	}
 
 	node, peerGRPC, err := cluster.NewNode(cluster.Config{
-		NodeID:     nodeID,
-		PeerAddr:   peerAddr,
-		AdminAddr:  adminAddr,
-		ClientAddr: clientAddr,
-		DataDir:    filepath.Join(dataDir, "cluster"),
-		Bootstrap:  bootstrap,
-		Peers:      peers,
+		NodeID:        nodeID,
+		PeerAddr:      peerAddr,
+		AdminAddr:     adminAddr,
+		ClientAddr:    clientAddr,
+		DataDir:       filepath.Join(dataDir, "cluster"),
+		Bootstrap:     bootstrap,
+		Peers:         peers,
+		FlushInterval: raftFlush,
+		SegmentBytes:  raftSegBytes,
 	}, eng, logger)
 	if err != nil {
 		return fmt.Errorf("raft node: %w", err)
