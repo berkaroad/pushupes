@@ -165,7 +165,7 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 | `-data` | `PUSHUPES_DATA` | `./data` | 数据目录 |
 | `-peers` | `PUSHUPES_PEERS` | 空 | 集群种子 `id=host:peerport,...` |
 | `-bootstrap` | — | false | 兼容保留：成员集合静态，启动时由 `-peers` 写入，此开关已无作用 |
-| `-replication-factor` | — | 2 | 每槽副本数 |
+| `-replication-factor` | — | 2 | 每槽副本数（含 leader）：控制器自动把槽表因子对齐到该值并补齐副本；超过成员数时按成员数截断；改小不裁剪多余副本 |
 | `-flush-messages` | — | 1000 | 每 N 条 fsync（0 关闭） |
 | `-flush-interval` | — | 5s | 每周期 fsync（0 关闭） |
 | `-segment-bytes` | — | 256MiB | WAL 段滚动大小：64MiB 整数倍，≤2GiB；可写字节数或带单位（`256MiB`/`1GiB`） |

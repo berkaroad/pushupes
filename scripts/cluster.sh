@@ -20,7 +20,7 @@
 #   ADMIN_BASE=8091         节点 i 的 admin 管理端口（HTTP admin + pprof）= ADMIN_BASE + i - 1
 #   PEER_BASE=8391         节点 i 的 peer 端口（Raft + peer gRPC，全部节点间通讯）= PEER_BASE + i - 1
 #   CLIENT_BASE=8591         节点 i 的客户端(gRPC)端口 = CLIENT_BASE + i - 1
-#   REPLICATION_FACTOR=2   每槽副本数
+#   REPLICATION_FACTOR=2   每槽副本数（含 leader；改大后重启集群会自动补齐副本）
 #   SEGMENT_BYTES=256MiB   段大小（默认 256MiB；须为 64MiB 的整数倍，最大 2GiB）
 #   RUN_DIR=$ROOT/.cluster 运行目录（数据、日志、pid）
 #   READY_TIMEOUT=90       等待就绪秒数

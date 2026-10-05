@@ -71,6 +71,34 @@ func (e *Engine) SetRebalanceConfig(interval time.Duration, batch int) {
 	e.rebalanceBatch = batch
 }
 
+// SetReplicationFactor wires the -replication-factor knob: the replica count
+// every slot is planned and topped up to. Values below 1 are clamped to 1.
+//
+// Without this the table keeps the factor it was constructed with, so the flag
+// silently had no effect (a 5-node cluster still held 2 replicas per slot).
+func (e *Engine) SetReplicationFactor(n int) {
+	if n < 1 {
+		n = 1
+	}
+	e.replicationFactor = n
+}
+
+// effectiveReplicationFactor is the factor actually written into the table:
+// the configured one, clamped to the member count. PlanSlots clamps the same
+// way, so a factor larger than the cluster must not leave the shortfall check
+// permanently true (that would submit a replan command on every controller
+// tick forever).
+func (e *Engine) effectiveReplicationFactor(members int) int {
+	n := e.replicationFactor
+	if n < 1 {
+		n = 1
+	}
+	if members > 0 && n > members {
+		n = members
+	}
+	return n
+}
+
 func (e *Engine) rebalanceEnabled() bool {
 	return e.rebalanceInterval > 0 && e.rebalanceBatch > 0
 }

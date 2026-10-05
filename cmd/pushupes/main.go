@@ -46,7 +46,7 @@ func main() {
 		// migration granularity), so it is not a runtime knob — it is fixed at
 		// data.DefaultSlotCount. See DESIGN §7.2.
 		slotCount   = data.DefaultSlotCount
-		replication = flag.Int("replication-factor", 2, "replicas per slot")
+		replication = flag.Int("replication-factor", cluster.DefaultReplicationFactor, "replicas per slot: every slot is planned and topped up to this many (clamped to the member count)")
 		segmentB    = byteSize(storage.DefaultSegmentBytes)
 		flushN      = flag.Int64("flush-messages", 1000, "fsync every N records (0 disables)")
 		flushD      = flag.Duration("flush-interval", 5*time.Second, "fsync every interval (0 disables)")
@@ -139,6 +139,13 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slot
 	// hand it to NewNode and wire the node back in.
 	eng := cluster.NewEngine(nil, store, nodeID, logger)
 	eng.SetDropRetention(dropRetention)
+	// -replication-factor: the controller reconciles the slot table's replica
+	// factor to this value and tops up short replica sets, so a cluster
+	// restarted with a higher factor converges without a manual replan.
+	if replicationFactor < 1 {
+		return fmt.Errorf("-replication-factor %d must be at least 1", replicationFactor)
+	}
+	eng.SetReplicationFactor(replicationFactor)
 	// Leader rebalance: 0 on either knob is the operator's off switch; a
 	// negative value is a startup error (same fail-fast rule as -drop-after).
 	if rebalanceInterval < 0 {

@@ -259,6 +259,11 @@ Body: Record*，每条记录：
   `slot % N` 起、向前取 `replica_count` 个节点。
   新成员加入只做增量补位（`replan_slots` 填未分配槽/补足副本），不扰动
   有数据的槽。
+- **副本数由 `-replication-factor` 决定并自动收敛**：控制器每轮先把
+  `-replication-factor` 与槽表里的因子对齐（超过成员数时按成员数截断，
+  `OpConfig`），再对「副本集小于该因子」的 stable 槽发 `replan_slots` 补齐。
+  因此**改大 `-replication-factor` 后重启集群即自动追加副本**，不需要手工重规划；
+  新增副本按普通 fetch 追平，不触发热迁移。改小不会主动裁掉多余副本。
 
 ## 5. 槽位热迁移（文件级搬运）
 

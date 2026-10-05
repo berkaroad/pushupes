@@ -33,6 +33,11 @@ const (
 	DefaultRaftSegmentBytes  = 64 << 20
 )
 
+// DefaultReplicationFactor is the replica count per slot when the operator
+// does not pass -replication-factor. The controller reconciles the slot
+// table's factor to the configured value and tops up short replica sets.
+const DefaultReplicationFactor = 2
+
 // Applier is implemented by the engine: it applies replicated slot-table
 // commands and can snapshot/restore that state.
 type Applier interface {
