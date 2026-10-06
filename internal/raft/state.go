@@ -185,6 +185,31 @@ func (n *Node) onElectionTimeout() {
 		resetTimer(n.electionTimer, n.randomElectionTimeout())
 		return
 	}
+	// A node that knows no configuration must not stand for election. Its
+	// voter set is empty because it has not learned the cluster's
+	// configuration yet — a runtime-joined seed before the leader's first
+	// entries/snapshot reach it, or a node whose data directory was rebuilt
+	// while its id is still a member. quorum(0) is 1, so such a node would
+	// elect itself on the spot: it bumps the term (forcing the real leader to
+	// step down) and, having no voters to replicate to, writes a no-op at
+	// index 1 of its own log. A lower-term entry never overwrites an existing
+	// one, so the cluster's real index-1 configuration entry can then never
+	// reach it: it applies everything above that point with no configuration
+	// as the base and ends up with a partial voter set (observed:
+	// [node-4..node-7] on a node whose own id was node-3) — and on the next
+	// restart the binary refuses to start it, because it is not in the
+	// membership it recorded.
+	//
+	// The configuration arrives through AppendEntries / InstallSnapshot, so
+	// waiting is all this node has to do.
+	if len(n.voters) == 0 {
+		if !n.noConfWarned {
+			n.noConfWarned = true
+			n.logger.Warnf("raft: %s knows no configuration yet; waiting for the leader instead of standing for election", n.cfg.NodeID)
+		}
+		resetTimer(n.electionTimer, n.randomElectionTimeout())
+		return
+	}
 	n.becomeCandidate()
 }
 

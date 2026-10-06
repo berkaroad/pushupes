@@ -64,15 +64,19 @@ type Node struct {
 	leaderID    string
 	commitIndex uint64
 	applied     uint64
-	nextIndex   map[string]uint64
-	matchIndex  map[string]uint64
-	votes       map[string]bool
-	replicators map[string]*replicator
-	waiters     []applyWaiter
-	barriers    []barrierWait
-	pendingAcks []pendingAck
-	durableLSN  uint64
-	snapRunning bool
+	// noConfWarned records that the "no configuration learned yet, waiting"
+	// warning has been printed, so a node waiting for the leader does not log
+	// it once per election timeout.
+	noConfWarned bool
+	nextIndex    map[string]uint64
+	matchIndex   map[string]uint64
+	votes        map[string]bool
+	replicators  map[string]*replicator
+	waiters      []applyWaiter
+	barriers     []barrierWait
+	pendingAcks  []pendingAck
+	durableLSN   uint64
+	snapRunning  bool
 	// snapWG tracks the goroutine writing a snapshot file into the data
 	// directory, so Close does not return while one is still being placed.
 	snapWG sync.WaitGroup
