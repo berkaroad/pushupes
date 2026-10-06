@@ -95,12 +95,13 @@ type Config struct {
 	AdminAddr  string
 	ClientAddr string
 	DataDir    string
-	Bootstrap  bool
 	Peers      []Peer
 	// Seed marks Peers as a bootstrap seed rather than an authoritative
-	// membership: a node started with -join is not in the cluster it is
-	// joining, and this tells the consensus layer to start with the seed
-	// instead of refusing.
+	// membership: a node that does not author the cluster's configuration
+	// (a runtime joiner, or any configured node other than the one leading
+	// -peers) is not a member of the cluster it is joining yet, and this tells
+	// the consensus layer to start with the seed instead of refusing — and,
+	// crucially, instead of writing a competing configuration of its own.
 	Seed              bool
 	ApplyTimeout      time.Duration
 	SnapshotThreshold uint64
@@ -185,9 +186,6 @@ func NewNode(cfg Config, applier Applier, logger *logrus.Entry) (*Node, net.List
 		return nil, nil, err
 	}
 
-	if cfg.Bootstrap {
-		logger.Info("cluster: -bootstrap is obsolete with static membership; the voter set is written on first start")
-	}
 	return &Node{cfg: cfg, raft: rn, fsm: fsm, mux: mux, logger: logger}, mux.GRPCListener(), nil
 }
 

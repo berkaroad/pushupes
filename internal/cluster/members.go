@@ -146,39 +146,62 @@ func (e *Engine) sendAdoption(ctx context.Context, id, offerAddr, targetAddr str
 	return err
 }
 
-// Joiner is the joining node's loop: offer yourself through the member named by
-// -join until the leader has put you into the configuration.
+// Joiner is the joining node's loop: offer yourself through one of the cluster
+// members until the leader has put you into the configuration.
 type Joiner struct {
 	e        *Engine
-	target   string // the existing member to offer through (-join)
-	selfAddr string // this node's own peer address (what it announces)
+	targets  []string // members to offer through, tried in rotation
+	selfAddr string   // this node's own peer address (what it announces)
 	interval time.Duration
 }
 
-// NewJoiner builds the joining node's offer loop. addr is the peer address of a
-// running cluster member (the -join flag); the node announces its OWN peer
-// address, never that target.
-func (e *Engine) NewJoiner(addr string, interval time.Duration) *Joiner {
+// NewJoiner builds the joining node's offer loop. targets are the peer
+// addresses of running members: an explicit -join address, or — for a node
+// that is simply not the author of the cluster's configuration — the -peers
+// list it was configured with. None of them is announced as this node's
+// address; the node announces its own peer address.
+//
+// Several targets are the norm now: a joiner comes up while the cluster it is
+// joining may still be starting, so one unreachable seed must not stop the
+// offer.
+func (e *Engine) NewJoiner(targets []string, interval time.Duration) *Joiner {
 	if interval <= 0 {
 		interval = DefaultAdoptInterval
 	}
+	cleaned := make([]string, 0, len(targets))
+	seen := map[string]bool{}
+	for _, t := range targets {
+		a := HostPort(NormalizeAddr(t))
+		if a == "" || seen[a] {
+			continue
+		}
+		seen[a] = true
+		cleaned = append(cleaned, a)
+	}
 	return &Joiner{
 		e:        e,
-		target:   HostPort(NormalizeAddr(addr)),
+		targets:  cleaned,
 		selfAddr: HostPort(NormalizeAddr(e.node.cfg.PeerAddr)),
 		interval: interval,
 	}
 }
 
-// Run offers this node to the cluster until it is a member, or ctx closes.
+// Run offers this node to the cluster until it is a member, or ctx closes. The
+// targets are tried in rotation: a member that is mid-restart costs one round,
+// not the join.
 func (j *Joiner) Run(ctx context.Context) {
-	for {
+	if len(j.targets) == 0 {
+		j.e.loggerf("join: no member address to offer through (empty -peers and no -join); this node stays out of the cluster")
+		return
+	}
+	for i := 0; ; i++ {
 		if j.e.node != nil && j.e.node.IsMember(j.e.self) {
 			j.e.loggerf("joined the cluster: %s is now a raft voter", j.e.self)
 			return
 		}
-		if err := j.e.sendAdoption(ctx, j.e.self, j.selfAddr, j.target); err != nil {
-			j.e.loggerf("join offer to %s failed: %v", j.target, err)
+		target := j.targets[i%len(j.targets)]
+		if err := j.e.sendAdoption(ctx, j.e.self, j.selfAddr, target); err != nil {
+			j.e.loggerf("join offer to %s failed: %v", target, err)
 		}
 		select {
 		case <-ctx.Done():

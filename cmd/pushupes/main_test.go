@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"pushupes/internal/cluster"
 )
 
 func TestParsePeers(t *testing.T) {
@@ -100,5 +102,68 @@ func TestParsePeers(t *testing.T) {
 		} else if !strings.Contains(err.Error(), "bad peer") {
 			t.Errorf("%q: unexpected error %v", bad, err)
 		}
+	}
+}
+
+// Membership is written on first start, so exactly one node may author it: the
+// one leading -peers (or an explicit -bootstrap). Every other configured node
+// starts as a seed and offers itself through the configured members — a second
+// author would write a competing entry at index 1 and split the cluster into
+// raft groups that each commit on their own.
+func TestBootstrapEligible(t *testing.T) {
+	peers := []cluster.Peer{
+		{ID: "node-3", PeerAddr: "127.0.0.1:8393"},
+		{ID: "node-1", PeerAddr: "127.0.0.1:8391"},
+		{ID: "node-2", PeerAddr: "127.0.0.1:8392"},
+	}
+	if got := canonicalFirstPeer(peers); got != "node-1" {
+		t.Fatalf("canonical first = %q, want node-1 (smallest id, whatever the flag order)", got)
+	}
+	if !bootstrapEligible("node-1", peers, false) {
+		t.Fatal("the node leading -peers authors the configuration")
+	}
+	for _, id := range []string{"node-2", "node-3"} {
+		if bootstrapEligible(id, peers, false) {
+			t.Fatalf("%s must not author a competing configuration", id)
+		}
+		if !bootstrapEligible(id, peers, true) {
+			t.Fatalf("%s with an explicit -bootstrap must still author it", id)
+		}
+	}
+	// A lone node (no -peers, or only itself) authors its own cluster.
+	solo := []cluster.Peer{{ID: "node-1", PeerAddr: "127.0.0.1:8391"}}
+	if !bootstrapEligible("node-1", solo, false) {
+		t.Fatal("a single-node cluster must bootstrap")
+	}
+	if canonicalFirstPeer(nil) != "" {
+		t.Fatal("no peers means nobody leads the list")
+	}
+}
+
+func TestJoinTargets(t *testing.T) {
+	peers := []cluster.Peer{
+		{ID: "node-1", PeerAddr: "127.0.0.1:8391"},
+		{ID: "node-2", PeerAddr: "127.0.0.1:8392"},
+		{ID: "node-3", PeerAddr: ""}, // not yet addressed: nothing to dial
+		{ID: "node-4", PeerAddr: "127.0.0.1:8394"},
+	}
+	// No -join: offer through the configured members, never through ourselves.
+	got := joinTargets("node-2", peers, "")
+	want := []string{"127.0.0.1:8391", "127.0.0.1:8394"}
+	if len(got) != len(want) {
+		t.Fatalf("targets = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("targets = %v, want %v", got, want)
+		}
+	}
+	// An explicit -join names one member and nothing else.
+	if got := joinTargets("node-2", peers, " node-1:8391 "); len(got) != 1 || got[0] != "node-1:8391" {
+		t.Fatalf("-join targets = %v", got)
+	}
+	// Nobody to ask.
+	if got := joinTargets("node-1", []cluster.Peer{{ID: "node-1", PeerAddr: "127.0.0.1:8391"}}, ""); len(got) != 0 {
+		t.Fatalf("targets = %v, want none", got)
 	}
 }

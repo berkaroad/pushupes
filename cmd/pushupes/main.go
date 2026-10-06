@@ -67,7 +67,7 @@ func main() {
 		// operator raises it together with typical batch size (a 4MiB cap
 		// carries roughly 4000 records of 1KiB bodies).
 		grpcMaxMsg = byteSize(envIntOr("PUSHUPES_GRPC_MAX_MSG_SIZE", defaultGrpcMaxMsgBytes))
-		bootstrap  = flag.Bool("bootstrap", false, "accepted for compatibility: membership is static and written on first start, so this is a no-op")
+		bootstrap  = flag.Bool("bootstrap", false, "write this cluster's initial configuration from this node. By default the node whose id leads -peers does that and every other configured node starts as a seed that offers itself through the running cluster (env PUSHUPES_BOOTSTRAP not read: this is a startup decision, not a tunable)")
 		raftFlush  = flag.Duration("raft-flush-interval", envDurationOr("PUSHUPES_RAFT_FLUSH_INTERVAL", cluster.DefaultRaftFlushInterval),
 			"consensus WAL group-commit window: appends arriving within it share a single fsync (env PUSHUPES_RAFT_FLUSH_INTERVAL)")
 		raftSegB = byteSize(envIntOr("PUSHUPES_RAFT_SEGMENT_BYTES", cluster.DefaultRaftSegmentBytes))
@@ -139,12 +139,32 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 	if !containsPeer(peers, nodeID) {
 		peers = append(peers, selfPeer)
 	}
-	// A node started with -join is not in the cluster's configuration yet: its
-	// -peers is only the seed of the cluster it is joining (the ids and
-	// addresses it was built with), and it offers itself to the member named
-	// by -join. The seed flag lets it start with that list instead of
-	// refusing.
-	seeding := strings.TrimSpace(joinAddr) != ""
+	// Who authors the cluster's configuration, and who offers itself?
+	//
+	// Membership is written on first start, so exactly ONE node may write it:
+	// the node that leads the configured list (the operator's -bootstrap
+	// overrides that). Every other configured node starts as a SEED — its
+	// -peers is only the list of members it offers itself through, and its
+	// configuration arrives from the cluster it joins.
+	//
+	// The rule matters because a node that bootstraps its own copy writes an
+	// entry at index 1 that competes with the running cluster's (same index,
+	// same term, different content), and the nodes holding each version form
+	// their own raft group, each able to commit on its own — a cluster grown by
+	// starting the new member with the bigger -peers list used to split exactly
+	// that way. With this rule, "start the new node with -peers naming the
+	// existing members" is all an operator has to do: it joins, and -join is
+	// only needed to point at one specific member.
+	seeding := !bootstrapEligible(nodeID, peers, bootstrap)
+	targets := joinTargets(nodeID, peers, joinAddr)
+	if seeding {
+		if strings.TrimSpace(joinAddr) == "" {
+			logger.WithFields(map[string]any{"seeds": targets, "first_id": canonicalFirstPeer(peers)}).
+				Warnf("%s does not lead -peers: starting as a joiner (offering itself through the configured members) instead of writing an initial configuration. To author a brand-new cluster from this node, pass -bootstrap", nodeID)
+		} else {
+			logger.WithField("targets", targets).Info("starting as a joiner: offering itself through the configured members")
+		}
+	}
 
 	// The engine is the Applier the FSM calls into; it also needs the Raft
 	// node to submit commands. Build the engine first with a nil node, then
@@ -177,7 +197,6 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 		AdminAddr:     adminAddr,
 		ClientAddr:    clientAddr,
 		DataDir:       filepath.Join(dataDir, "cluster"),
-		Bootstrap:     bootstrap,
 		Peers:         peers,
 		Seed:          seeding,
 		FlushInterval: raftFlush,
@@ -204,12 +223,12 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 	defer peerSrv.Stop()
 	go eng.NewRegisterAnnouncer().Run(ctx)
 
-	// Runtime join: a node started with -join is not in the cluster's
-	// configuration yet, so it keeps offering itself through the named member
-	// until the leader has added it. A node that is already a member (or the
-	// first node of a brand-new cluster) never sends anything.
+	// Runtime join: a node that does not author the cluster's configuration
+	// (see above) keeps offering itself through the configured members until
+	// the leader has added it. A node that is already a member — the author
+	// itself, or a joiner that has caught up — sends nothing.
 	if seeding {
-		go eng.NewJoiner(joinAddr, adoptInterval).Run(ctx)
+		go eng.NewJoiner(targets, adoptInterval).Run(ctx)
 	}
 
 	srv := api.NewServer(cluster.HostPort(adminAddr), api.New(eng, store), logger)
@@ -348,6 +367,48 @@ func containsPeer(peers []cluster.Peer, id string) bool {
 		}
 	}
 	return false
+}
+
+// canonicalFirstPeer is the id that leads the configured list (the smallest,
+// the same order raft's voter set uses) and therefore authors the cluster's
+// configuration unless the operator says otherwise. "" for an empty list.
+func canonicalFirstPeer(peers []cluster.Peer) string {
+	first := ""
+	for _, p := range peers {
+		if p.ID != "" && (first == "" || p.ID < first) {
+			first = p.ID
+		}
+	}
+	return first
+}
+
+// bootstrapEligible reports whether this node writes the cluster's initial
+// configuration. Exactly one node may: the one leading -peers, or whoever the
+// operator marked with -bootstrap. A second author would write a competing
+// entry at index 1 (same term, same index, different content) and split the
+// cluster into raft groups that each commit on their own.
+func bootstrapEligible(nodeID string, peers []cluster.Peer, explicit bool) bool {
+	if explicit {
+		return true
+	}
+	return canonicalFirstPeer(peers) == nodeID
+}
+
+// joinTargets lists the member addresses this node offers itself through: an
+// explicit -join address when given, otherwise the configured members (never
+// itself). Empty means the node has nobody to ask.
+func joinTargets(nodeID string, peers []cluster.Peer, joinAddr string) []string {
+	if a := strings.TrimSpace(joinAddr); a != "" {
+		return []string{a}
+	}
+	out := make([]string, 0, len(peers))
+	for _, p := range peers {
+		if p.ID == nodeID || p.PeerAddr == "" {
+			continue
+		}
+		out = append(out, p.PeerAddr)
+	}
+	return out
 }
 
 func envOr(k, def string) string {
