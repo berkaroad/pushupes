@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -64,6 +65,22 @@ func (nopLogger) Debugf(string, ...any) {}
 func (nopLogger) Infof(string, ...any)  {}
 func (nopLogger) Warnf(string, ...any)  {}
 func (nopLogger) Errorf(string, ...any) {}
+
+// The consensus timings every node starts with. ElectionTimeout is how long a
+// follower waits for a heartbeat before standing for election, so it has to stay
+// several multiples of the heartbeat: a late heartbeat — a busy apply batch, a
+// CPU-throttled container, a stalled event loop — must not look like a dead
+// leader. Hosts where that happens raise both (-raft-election-timeout /
+// -raft-heartbeat-timeout, PUSHUPES_RAFT_* on the node, RAFT_* in the cluster
+// start script) instead of living with the churn.
+const (
+	DefaultHeartbeatTimeout = 100 * time.Millisecond
+	DefaultElectionTimeout  = 500 * time.Millisecond
+	// minElectionPerHeartbeat is the smallest ratio the two knobs may have:
+	// below it one late heartbeat starts an election, which is the very churn
+	// the caller raising these values is trying to stop.
+	minElectionPerHeartbeat = 2
+)
 
 // Config configures one node. Zero-valued timing knobs fall back to defaults.
 type Config struct {
@@ -128,10 +145,14 @@ func (c *Config) withDefaults() error {
 		c.SnapshotInterval = 30 * time.Second
 	}
 	if c.HeartbeatTimeout <= 0 {
-		c.HeartbeatTimeout = 100 * time.Millisecond
+		c.HeartbeatTimeout = DefaultHeartbeatTimeout
 	}
 	if c.ElectionTimeout <= 0 {
-		c.ElectionTimeout = 500 * time.Millisecond
+		c.ElectionTimeout = DefaultElectionTimeout
+	}
+	if c.ElectionTimeout < minElectionPerHeartbeat*c.HeartbeatTimeout {
+		return fmt.Errorf("raft: election timeout %s is less than %dx the heartbeat timeout %s: one late heartbeat would start an election",
+			c.ElectionTimeout, minElectionPerHeartbeat, c.HeartbeatTimeout)
 	}
 	if c.FlushInterval <= 0 {
 		c.FlushInterval = 200 * time.Microsecond

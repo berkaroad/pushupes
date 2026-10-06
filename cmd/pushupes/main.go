@@ -20,6 +20,7 @@ import (
 	"pushupes/internal/api"
 	"pushupes/internal/cluster"
 	"pushupes/internal/data"
+	"pushupes/internal/raft"
 	"pushupes/internal/storage"
 
 	"github.com/sirupsen/logrus"
@@ -66,9 +67,13 @@ func main() {
 		// BatchAppend asks for one batch to fit inside the cap, so the
 		// operator raises it together with typical batch size (a 4MiB cap
 		// carries roughly 4000 records of 1KiB bodies).
-		grpcMaxMsg = byteSize(envIntOr("PUSHUPES_GRPC_MAX_MSG_SIZE", defaultGrpcMaxMsgBytes))
-		bootstrap  = flag.Bool("bootstrap", false, "write this cluster's initial configuration from this node. By default the node whose id leads -peers does that and every other configured node starts as a seed that offers itself through the running cluster (env PUSHUPES_BOOTSTRAP not read: this is a startup decision, not a tunable)")
-		raftFlush  = flag.Duration("raft-flush-interval", envDurationOr("PUSHUPES_RAFT_FLUSH_INTERVAL", cluster.DefaultRaftFlushInterval),
+		grpcMaxMsg    = byteSize(envIntOr("PUSHUPES_GRPC_MAX_MSG_SIZE", defaultGrpcMaxMsgBytes))
+		bootstrap     = flag.Bool("bootstrap", false, "write this cluster's initial configuration from this node. By default the node whose id leads -peers does that and every other configured node starts as a seed that offers itself through the running cluster (env PUSHUPES_BOOTSTRAP not read: this is a startup decision, not a tunable)")
+		raftHeartbeat = flag.Duration("raft-heartbeat-timeout", envDurationOr("PUSHUPES_RAFT_HEARTBEAT_TIMEOUT", raft.DefaultHeartbeatTimeout),
+			"consensus heartbeat interval (env PUSHUPES_RAFT_HEARTBEAT_TIMEOUT). A leader whose heartbeats do not arrive in time is voted out, so on a host that can delay the consensus event loop raise this together with -raft-election-timeout")
+		raftElection = flag.Duration("raft-election-timeout", envDurationOr("PUSHUPES_RAFT_ELECTION_TIMEOUT", raft.DefaultElectionTimeout),
+			"consensus election timeout: how long a follower waits for a heartbeat before standing for election (env PUSHUPES_RAFT_ELECTION_TIMEOUT). At least 2x -raft-heartbeat-timeout; raise both when the cluster votes leaders out under load")
+		raftFlush = flag.Duration("raft-flush-interval", envDurationOr("PUSHUPES_RAFT_FLUSH_INTERVAL", cluster.DefaultRaftFlushInterval),
 			"consensus WAL group-commit window: appends arriving within it share a single fsync (env PUSHUPES_RAFT_FLUSH_INTERVAL)")
 		raftSegB = byteSize(envIntOr("PUSHUPES_RAFT_SEGMENT_BYTES", cluster.DefaultRaftSegmentBytes))
 	)
@@ -90,12 +95,12 @@ func main() {
 	base.SetLevel(logrus.InfoLevel)
 	logger := logrus.NewEntry(base).WithField("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *dropAfter, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, int64(raftSegB), logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *dropAfter, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
 		logger.WithError(err).Fatal("pushupes exited with error")
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount int, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD, dropAfter time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush time.Duration, raftSegBytes int64, logger *logrus.Entry) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount int, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD, dropAfter time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *logrus.Entry) error {
 	// Canonical form for every stored address: scheme required. A bare
 	// host:port gets the default "http://" prefix; an explicit protocol
 	// is honoured as passed. TCP-level uses (listen/dial) strip it again.
@@ -192,15 +197,17 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 	}
 
 	node, peerGRPC, err := cluster.NewNode(cluster.Config{
-		NodeID:        nodeID,
-		PeerAddr:      peerAddr,
-		AdminAddr:     adminAddr,
-		ClientAddr:    clientAddr,
-		DataDir:       filepath.Join(dataDir, "cluster"),
-		Peers:         peers,
-		Seed:          seeding,
-		FlushInterval: raftFlush,
-		SegmentBytes:  raftSegBytes,
+		NodeID:           nodeID,
+		PeerAddr:         peerAddr,
+		AdminAddr:        adminAddr,
+		ClientAddr:       clientAddr,
+		DataDir:          filepath.Join(dataDir, "cluster"),
+		Peers:            peers,
+		Seed:             seeding,
+		FlushInterval:    raftFlush,
+		SegmentBytes:     raftSegBytes,
+		HeartbeatTimeout: raftHeartbeat,
+		ElectionTimeout:  raftElection,
 	}, eng, logger)
 	if err != nil {
 		return fmt.Errorf("raft node: %w", err)

@@ -26,6 +26,12 @@
 #   PEER_BASE=8391         节点 i 的 peer 端口（Raft + peer gRPC，全部节点间通讯）= PEER_BASE + i - 1
 #   CLIENT_BASE=8591         节点 i 的客户端(gRPC)端口 = CLIENT_BASE + i - 1
 #   SEGMENT_BYTES=256MiB   段大小（默认 256MiB；须为 64MiB 的整数倍，最大 2GiB）
+#   RAFT_ELECTION_TIMEOUT   raft 选举超时（默认 500ms，即节点默认值）：follower 等多久
+#                          没收到心跳就发起选举。必须是 RAFT_HEARTBEAT_TIMEOUT 的
+#                          至少 2 倍，否则一次迟到的心跳就会掀掉 leader（节点会拒绝启动）
+#   RAFT_HEARTBEAT_TIMEOUT  raft 心跳间隔（默认 100ms）。宿主/容器 CPU 紧张导致心跳
+#                          迟到时，把两个值一起放大（例：RAFT_HEARTBEAT_TIMEOUT=500ms
+#                          RAFT_ELECTION_TIMEOUT=3s）
 #   RUN_DIR=$ROOT/.cluster 运行目录（数据、日志、pid）
 #   READY_TIMEOUT=90       等待就绪秒数
 #   BUILD=1                start 前强制重新编译
@@ -62,6 +68,13 @@ CLIENT_BASE="${CLIENT_BASE:-8591}"
 # 段大小：默认 256MiB（须为 64MiB 的整数倍，最大 2GiB；可写字节数或 256MiB/1GiB 带单位）
 SEGMENT_BYTES="${SEGMENT_BYTES:-256MiB}"
 seg_args=(-segment-bytes "$SEGMENT_BYTES")
+# raft 的两个时间旋钮：只在显式设置时才转发，否则用节点自己的默认值（避免把默认值
+# 复制到脚本里，节点改默认值时脚本不需要跟着改）。
+RAFT_ELECTION_TIMEOUT="${RAFT_ELECTION_TIMEOUT:-}"
+RAFT_HEARTBEAT_TIMEOUT="${RAFT_HEARTBEAT_TIMEOUT:-}"
+raft_timing_args=()
+[[ -n "$RAFT_ELECTION_TIMEOUT" ]] && raft_timing_args+=(-raft-election-timeout "$RAFT_ELECTION_TIMEOUT")
+[[ -n "$RAFT_HEARTBEAT_TIMEOUT" ]] && raft_timing_args+=(-raft-heartbeat-timeout "$RAFT_HEARTBEAT_TIMEOUT")
 RUN_DIR="${RUN_DIR:-$ROOT/.cluster}"
 READY_TIMEOUT="${READY_TIMEOUT:-90}"
 BIN="$ROOT/bin/pushupes"
@@ -181,7 +194,7 @@ start_node() {
     -admin "$HOST:$(admin_port "$n")" -peer "$HOST:$(peer_port "$n")" \
     -client "$HOST:$(client_port "$n")" \
     -data ./data -peers "$peers" \
-    "${seg_args[@]}" "${extra[@]}")
+    "${seg_args[@]}" "${raft_timing_args[@]}" "${extra[@]}")
   # fd 全部重定向，否则管道调用永不返回
   if command -v setsid >/dev/null 2>&1; then
     # setsid 让节点脱离本脚本会话

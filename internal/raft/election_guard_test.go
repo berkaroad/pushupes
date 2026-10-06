@@ -29,7 +29,11 @@ func TestSeedWithoutConfigurationDoesNotCampaign(t *testing.T) {
 	// A runtime-joined node: it is not in the voters it was given (that list
 	// is its seed), so it starts knowing no membership at all.
 	cfg.Seed = true
-	cfg.ElectionTimeout = 30 * time.Millisecond
+	// Several election timeouts' worth of waiting, so the timings stay short —
+	// but keep the pair valid (the config refuses an election timeout below
+	// twice the heartbeat).
+	cfg.HeartbeatTimeout = 30 * time.Millisecond
+	cfg.ElectionTimeout = 60 * time.Millisecond
 	n, err := NewNode(cfg, newTestFSM(), tn)
 	if err != nil {
 		t.Fatalf("NewNode: %v", err)

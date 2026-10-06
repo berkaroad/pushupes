@@ -111,6 +111,14 @@ type Config struct {
 	FlushInterval time.Duration
 	// SegmentBytes is the consensus WAL's segment size.
 	SegmentBytes int64
+	// HeartbeatTimeout and ElectionTimeout are the consensus timings
+	// (raft.DefaultHeartbeatTimeout / DefaultElectionTimeout when zero). They
+	// are knobs because they are a RATIO: where the consensus event loop can be
+	// delayed — a heavy apply batch, a CPU-throttled host — the election timeout
+	// has to be raised, otherwise nodes keep voting each other out. The election
+	// timeout must be at least twice the heartbeat.
+	HeartbeatTimeout time.Duration
+	ElectionTimeout  time.Duration
 }
 
 func (c *Config) withDefaults() {
@@ -125,6 +133,12 @@ func (c *Config) withDefaults() {
 	}
 	if c.TrailingLogs == 0 {
 		c.TrailingLogs = 256
+	}
+	if c.HeartbeatTimeout <= 0 {
+		c.HeartbeatTimeout = raft.DefaultHeartbeatTimeout
+	}
+	if c.ElectionTimeout <= 0 {
+		c.ElectionTimeout = raft.DefaultElectionTimeout
 	}
 }
 
@@ -172,6 +186,8 @@ func NewNode(cfg Config, applier Applier, logger *logrus.Entry) (*Node, net.List
 		DataDir:           cfg.DataDir,
 		Voters:            raftVoters(cfg),
 		Seed:              cfg.Seed,
+		HeartbeatTimeout:  cfg.HeartbeatTimeout,
+		ElectionTimeout:   cfg.ElectionTimeout,
 		ApplyTimeout:      cfg.ApplyTimeout,
 		SnapshotThreshold: cfg.SnapshotThreshold,
 		SnapshotInterval:  cfg.SnapshotInterval,
@@ -184,6 +200,15 @@ func NewNode(cfg Config, applier Applier, logger *logrus.Entry) (*Node, net.List
 		mux.Close()
 		return nil, nil, err
 	}
+
+	// One line per start: the timings are a ratio, so an operator tuning them
+	// needs to see what the node actually took (and the node log is where the
+	// cluster's own start script looks).
+	logger.WithFields(logrus.Fields{
+		"heartbeat": cfg.HeartbeatTimeout,
+		"election":  cfg.ElectionTimeout,
+		"ratio":     float64(cfg.ElectionTimeout) / float64(cfg.HeartbeatTimeout),
+	}).Info("raft consensus timings")
 
 	return &Node{cfg: cfg, raft: rn, fsm: fsm, mux: mux, logger: logger}, mux.GRPCListener(), nil
 }
@@ -265,7 +290,25 @@ func (n *Node) PeerAddrs() map[string]string {
 // Stats exposes raft counters for the admin API. Both key spellings
 // ("commit-index" and "commit_index") are provided because callers
 // historically disagreed.
-func (n *Node) Stats() map[string]any { return n.raft.Stats() }
+// Stats is the consensus section of the admin status payload. Besides what the
+// raft layer reports, it carries the timings THIS process took: they are a
+// ratio (the election timeout must stay several multiples of the heartbeat), so
+// an operator who raised -raft-election-timeout has to be able to read back
+// what the node is actually running with — next to the flag they passed, not
+// buried in a startup log line.
+func (n *Node) Stats() map[string]any {
+	st := n.raft.Stats()
+	heartbeat, election := n.cfg.HeartbeatTimeout, n.cfg.ElectionTimeout
+	if heartbeat <= 0 {
+		heartbeat = raft.DefaultHeartbeatTimeout
+	}
+	if election <= 0 {
+		election = raft.DefaultElectionTimeout
+	}
+	st["heartbeat_timeout"] = heartbeat.String()
+	st["election_timeout"] = election.String()
+	return st
+}
 
 // IsMember reports whether id is in the current cluster membership.
 func (n *Node) IsMember(id string) bool { return n.raft.IsMember(id) }
