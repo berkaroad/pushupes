@@ -30,6 +30,11 @@ type Store struct {
 	// acquisitions per tick instead of O(slot count).
 	dirtyMu sync.Mutex
 	dirty   map[int32]bool
+	// flushKick wakes flushLoop when the dirty set gained a slot (its policy
+	// deadline must now be armed) or a slot crossed its record-count threshold
+	// (that append, not the clock, closed the policy). With an empty dirty set
+	// the loop parks holding no timer: an idle store costs zero wakeups.
+	flushKick chan struct{}
 
 	// wakeBus is the store-wide advance signal: every slot's
 	// advanceNotifyLocked closes the current bus handle and installs a
@@ -75,6 +80,7 @@ func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushP
 		slots:        make([]atomic.Pointer[Slot], slotCount),
 		writes:       make([]atomic.Uint64, slotCount),
 		dirty:        map[int32]bool{},
+		flushKick:    make(chan struct{}, 1),
 		stop:         make(chan struct{}),
 		done:         make(chan struct{}),
 		wakeBus:      make(chan struct{}),
@@ -317,10 +323,26 @@ func (st *Store) AppendFrameAtSeq(slotID int32, seq uint64, frame []byte) error 
 
 // markDirty registers a slot as holding unflushed records (flushLoop only
 // visits these; the set is emptied once FlushDue reports nothing pending).
+// A slot JOINING the dirty set kicks the loop so it arms the slot's policy
+// deadline; an already-dirty slot does not — its deadline is armed, and the
+// record-count threshold is closed by the slot's own kick at the crossing.
 func (st *Store) markDirty(slotID int32) {
 	st.dirtyMu.Lock()
+	_, seen := st.dirty[slotID]
 	st.dirty[slotID] = true
 	st.dirtyMu.Unlock()
+	if !seen {
+		st.kickFlush()
+	}
+}
+
+// kickFlush nudges flushLoop to re-evaluate the policy sweep; the signal
+// coalesces (cap 1) because the loop recomputes everything from the dirty set.
+func (st *Store) kickFlush() {
+	select {
+	case st.flushKick <- struct{}{}:
+	default:
+	}
 }
 
 func (st *Store) clearDirty(slotID int32) {
@@ -560,32 +582,69 @@ func (st *Store) Flush() error {
 
 func (st *Store) flushLoop() {
 	defer close(st.done)
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	// The sweep is armed only while some dirty slot has an interval-policy
+	// deadline ahead of it, and a slot that crossed its record-count threshold
+	// (or just joined the dirty set) kicks the loop. With no dirty slots the
+	// loop parks holding no timer at all: an idle store costs zero wakeups —
+	// a standing 1s ticker delivered one per second per node forever.
+	var sweep *time.Timer
+	var sweepC <-chan time.Time
+	rearm := func(now time.Time) {
+		var next time.Time
+		st.dirtyMu.Lock()
+		ids := make([]int32, 0, len(st.dirty))
+		for id := range st.dirty {
+			ids = append(ids, id)
+		}
+		st.dirtyMu.Unlock()
+		for _, id := range ids {
+			s := st.slots[id].Load()
+			if s == nil {
+				st.clearDirty(id)
+				continue
+			}
+			if _, pending := s.FlushDue(now); !pending && !s.HasPending() {
+				// double-check closes the window where a concurrent append
+				// marked the slot dirty during FlushDue; that append lands in
+				// the dirty set and kicks the loop, so nothing slips.
+				st.clearDirty(id)
+			}
+			if d := s.DueAt(now); !d.IsZero() && (next.IsZero() || d.Before(next)) {
+				next = d
+			}
+		}
+		if next.IsZero() {
+			if sweep != nil {
+				sweep.Stop()
+				sweep = nil
+				sweepC = nil
+			}
+			return
+		}
+		if sweep == nil {
+			sweep = time.NewTimer(time.Until(next))
+			sweepC = sweep.C
+		} else {
+			if !sweep.Stop() {
+				select {
+				case <-sweep.C:
+				default:
+				}
+			}
+			sweep.Reset(time.Until(next))
+		}
+	}
+	rearm(time.Now())
 	for {
 		select {
 		case <-st.stop:
 			return
-		case now := <-ticker.C:
-			st.dirtyMu.Lock()
-			ids := make([]int32, 0, len(st.dirty))
-			for id := range st.dirty {
-				ids = append(ids, id)
-			}
-			st.dirtyMu.Unlock()
-			for _, id := range ids {
-				s := st.slots[id].Load()
-				if s == nil {
-					st.clearDirty(id)
-					continue
-				}
-				if _, pending := s.FlushDue(now); !pending && !s.HasPending() {
-					// double-check closes the window where a concurrent append
-					// marked the slot dirty during FlushDue; at worst one
-					// policy cycle slips (Close full-flushes on shutdown).
-					st.clearDirty(id)
-				}
-			}
+		case <-st.flushKick:
+			rearm(time.Now())
+		case <-sweepC:
+			sweep = nil
+			sweepC = nil
+			rearm(time.Now())
 		}
 	}
 }

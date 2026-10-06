@@ -475,7 +475,7 @@ func (s *Slot) Append(rec *data.EventRecord) (*AppendOutcome, error) {
 		Version:     rec.Version,
 		CommandHash: data.HashCommandID(rec.CommandID),
 	})
-	s.pendingFlush++
+	s.noteAppendPending()
 	s.advanceNotifyLocked()
 	return &AppendOutcome{Status: data.StatusSuccess, Seq: seq, Record: rec}, nil
 }
@@ -519,7 +519,7 @@ func (s *Slot) appendAtSeq(seq uint64, rec *data.EventRecord) (bool, error) {
 		Version:     rec.Version,
 		CommandHash: data.HashCommandID(rec.CommandID),
 	})
-	s.pendingFlush++
+	s.noteAppendPending()
 	s.advanceNotifyLocked()
 	return true, nil
 }
@@ -567,7 +567,7 @@ func (s *Slot) appendFrameAtSeq(seq uint64, frame []byte) (bool, error) {
 	s.seqCounter.Store(seq)
 	s.indexMetaLocked(seq, meta)
 	seg.IndexRecord(seq, meta)
-	s.pendingFlush++
+	s.noteAppendPending()
 	s.advanceNotifyLocked()
 	return true, nil
 }
@@ -1205,6 +1205,36 @@ func (s *Slot) HasPending() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.pendingFlush > 0
+}
+
+// noteAppendPending records one more unflushed append. The caller holds s.mu
+// for writing. Crossing the record-count threshold kicks the store's flush
+// loop: for a count-only policy the NEXT append — never the clock — closes the
+// policy, and the store arms no timer for such a slot (see DueAt), so this
+// kick is the slot's only path to its fsync.
+func (s *Slot) noteAppendPending() {
+	s.pendingFlush++
+	if s.flush.IntervalMessages > 0 && s.pendingFlush == s.flush.IntervalMessages && s.store != nil {
+		s.store.kickFlush()
+	}
+}
+
+// DueAt reports when the flush policy's INTERVAL clause next demands an fsync:
+// the zero time when nothing is pending, no interval is configured, or the
+// slot's policy is purely record-counted (the next append — not the clock —
+// closes that one, so the store arms no timer for it and waits for the append
+// to kick the sweep).
+func (s *Slot) DueAt(now time.Time) time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.pendingFlush == 0 || s.flush.Interval <= 0 {
+		return time.Time{}
+	}
+	d := s.lastFlush.Add(s.flush.Interval)
+	if d.Before(now) {
+		return now
+	}
+	return d
 }
 
 // SegmentFile returns the open segment whose file basename is name.
