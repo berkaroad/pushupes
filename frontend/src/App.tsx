@@ -6,7 +6,7 @@ import ClusterPage from './pages/ClusterPage'
 import SlotsPage from './pages/SlotsPage'
 
 const items = [
-  { key: '/cluster', icon: <ClusterOutlined />, label: '集群总览' },
+  { key: '/cluster', icon: <ClusterOutlined />, label: '集群' },
   { key: '/slots', icon: <AppstoreOutlined />, label: '槽位' },
 ]
 

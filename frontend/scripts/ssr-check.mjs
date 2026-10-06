@@ -39,7 +39,7 @@ const assert = (name, cond) => checks.push([name, !!cond])
 
 assert('layout rendered', light.includes('ant-layout'))
 assert('sider brand', light.includes('PushupES'))
-assert('menu 集群总览', light.includes('集群总览'))
+assert('menu 集群', light.includes('集群') && !light.includes('集群总览'))
 assert('menu 槽位', light.includes('槽位'))
 assert('theme switch present', light.includes('Light') && light.includes('Dark'))
 
@@ -57,6 +57,7 @@ assert('slots route renders', renderRoute('/slots', 'light').length > 0)
 // so it works outside the browser too).
 const api = await vite.ssrLoadModule('/src/api.ts')
 assert('fetchSlotStreams exposed', typeof api.fetchSlotStreams === 'function')
+assert('addClusterNode exposed', typeof api.addClusterNode === 'function')
 try {
   const probes = await api.fetchSlotStreams('http://127.0.0.1:9591', 4058)
   assert('live slot streams answer', typeof probes.loaded === 'boolean' && Array.isArray(probes.streams))

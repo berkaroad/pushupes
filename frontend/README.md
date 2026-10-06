@@ -4,7 +4,7 @@ React 18 + Ant Design 5 + Vite 5 + TypeScript，支持 Light / Dark 主题切换
 
 ## 页面
 
-- 集群总览 `/cluster`：节点、槽位数、迁移中槽位、Raft 状态统计与节点卡片（5s 自动刷新）
+- 集群 `/cluster`：节点、槽位数、迁移中槽位、Raft 状态统计与节点卡片（5s 自动刷新），「添加节点」弹窗经控制器把新节点加入 Raft 成员
 - 槽位 `/slots`：128 槽分配表（状态/Leader 过滤），槽详情抽屉（HW/LastSeq/ISR/segments），发起迁移
 - 事件流 `/streams`：追加事件（校验 version/command_id/幂等返回与 1003 MOVED 提示）、按聚合读取事件流
 
@@ -47,7 +47,7 @@ dev server 将 `/api/*` 代理到后端节点（默认 `http://127.0.0.1:8091`�
 
 `node scripts/dev-pool-check.mjs` —— 按用户的 `PUSHUPES_ADMIN_ENDPOINTS=... npm run dev` 场景走一遍 vite 真实转换管线（`import.meta.env` 注入）＋ index.html 的 `window.__PUSHUPES_ADMIN__ = ''`，断言地址池确实来自环境变量（而非退化成 `/api` 单点代理），并杀掉地址池第一个节点验证轮询仍在工作。
 
-`node scripts/auto-refresh-check.mjs` —— 钉住「集群总览」的自动刷新：起两个假 admin 节点，status 里带一个每次请求都变的计数器，断言每次轮询都**真的重新拉取**（不是复用缓存的 promise）且返回**新对象**。React 对引用相等的 state 更新会直接跳过，所以只验证「数据变了」不够，必须验证对象身份也变——否则页面会静默冻在启动那一刻的快照。
+`node scripts/auto-refresh-check.mjs` —— 钉住「集群」页的自动刷新：起两个假 admin 节点，status 里带一个每次请求都变的计数器，断言每次轮询都**真的重新拉取**（不是复用缓存的 promise）且返回**新对象**。React 对引用相等的 state 更新会直接跳过，所以只验证「数据变了」不够，必须验证对象身份也变——否则页面会静默冻在启动那一刻的快照。
 
 ## 构建
 
