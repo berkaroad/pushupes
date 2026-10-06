@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -142,5 +143,51 @@ func TestAddMemberRejectsBadInput(t *testing.T) {
 	// A single-voter cluster cannot remove its last member.
 	if err := leEng.RemoveMember(ctx, leader); err == nil {
 		t.Fatal("removing the last voter must be refused")
+	}
+}
+
+// TestRemoveMemberOnlyOffline pins the offline-only rule of the removal
+// surface: a member the peer directory still marks reachable is refused with
+// ErrOnlineMember before the raft change is even submitted, and the same
+// member becomes removable once the controller's mark_down verdict reaches
+// the table. This is the guard the console mirrors on the card button — the
+// backend is authoritative because the console's status snapshot is polled.
+func TestRemoveMemberOnlyOffline(t *testing.T) {
+	c := newTestRaftCluster(t, []string{"node-1", "node-2", "node-3"}, map[string]Applier{})
+	leader := c.waitLeader(15 * time.Second)
+	leEng, _ := newTestEngine(t, leader)
+	leEng.node = c.nodes[leader]
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// A voter outside the three: added through the ordinary membership path
+	// (a real listener so the change commits without it).
+	added := testListenerAddr(t)
+	if err := leEng.AddMember(ctx, "node-4", added); err != nil {
+		t.Fatalf("AddMember: %v", err)
+	}
+	// The directory learns it with a full registration (join sets all three
+	// plane addresses): online under Peer.Offline, so not removable.
+	join(t, leEng, "node-4", added)
+	err := leEng.RemoveMember(ctx, "node-4")
+	if !errors.Is(err, ErrOnlineMember) {
+		t.Fatalf("RemoveMember on an online member = %v, want ErrOnlineMember", err)
+	}
+
+	// The controller's liveness verdict flips it offline (the mark_down path
+	// keeps the directory entry and its addresses — the same state a dead
+	// node is left in). The guard now lets the removal through.
+	applyCmd(t, leEng, &Command{Op: OpMarkDown, NodeID: "node-4"})
+	if err := leEng.RemoveMember(ctx, "node-4"); err != nil {
+		t.Fatalf("RemoveMember on an offline member: %v", err)
+	}
+	for _, id := range c.ids {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) && c.nodes[id].IsMember("node-4") {
+			time.Sleep(20 * time.Millisecond)
+		}
+		if c.nodes[id].IsMember("node-4") {
+			t.Fatalf("%s still has node-4 as a member after removal", id)
+		}
 	}
 }

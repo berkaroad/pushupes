@@ -7,10 +7,10 @@
 // every voter into a join_node entry, registration fills in its data-plane
 // addresses, and replan_slots tops the replica sets up to the factor).
 //
-// Removing a node reverses it. The consensus layer keeps talking to the removed
-// member until it has the configuration entry in its own log, so it can serve
-// its slots one last time while the controller moves their leadership to live
-// replicas.
+// Removing a node reverses it, with one extra rule: only an offline member can
+// be removed. The consensus layer keeps talking to the removed member until it
+// has the configuration entry in its own log, so it can serve its slots one
+// last time while the controller moves their leadership to live replicas.
 package cluster
 
 import (
@@ -33,6 +33,15 @@ const DefaultAdoptInterval = 3 * time.Second
 // ErrBadMember is a membership change the operator has to fix (missing id,
 // address already in use, removing the last voter).
 var ErrBadMember = errors.New("cluster: invalid membership change")
+
+// ErrOnlineMember is a refused removal: the target still serves clients — it
+// announced its client address and the controller has not marked it down — so
+// the operator has to take it offline first. Removal is reserved for dead
+// members precisely because a live one holds slot leadership and replica seats
+// the cluster is using; evicting it through the raft configuration would move
+// clients onto whatever the reconciler picks next, instead of onto a placement
+// the operator chose.
+var ErrOnlineMember = errors.New("cluster: node is online; only offline members can be removed")
 
 // AddMember adds a node to the running cluster. It is controller-only: a
 // follower refuses with a *NotControllerError naming the controller, so the
@@ -72,7 +81,10 @@ func (e *Engine) AddMember(ctx context.Context, id, peerAddr string) error {
 }
 
 // RemoveMember drops a node from the running cluster. Controller-only, like
-// AddMember. The peer directory entry, its slots' leadership and its replica
+// AddMember. Only an offline member can go: a node the peer directory still
+// marks reachable (ErrOnlineMember) must be taken offline first, so removal is
+// the operator's cleanup of a dead member, never a way to reshuffle live
+// placements. The peer directory entry, its slots' leadership and its replica
 // seats are reconciled by the ordinary controller loop (and the rebalancer)
 // once the configuration change commits.
 func (e *Engine) RemoveMember(ctx context.Context, id string) error {
@@ -84,6 +96,9 @@ func (e *Engine) RemoveMember(ctx context.Context, id string) error {
 	}
 	if !e.node.IsMember(id) {
 		return nil // already gone: idempotent
+	}
+	if p, ok := e.TableSnapshot().Peers[id]; ok && !p.Offline() {
+		return fmt.Errorf("%w: %s", ErrOnlineMember, id)
 	}
 	if err := e.node.RemoveMember(id, AddMemberTimeout); err != nil {
 		if errors.Is(err, raft.ErrNotLeader) {

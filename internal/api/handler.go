@@ -59,7 +59,7 @@ func New(eng *cluster.Engine, store *storage.Store) *Server {
 // "writes") from any browser origin to derive live slot write rates.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
@@ -382,10 +382,12 @@ func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleRemoveMember drops a node from the running cluster. Controller-only,
-// like handleAddMember. The node keeps serving its slots until the
-// configuration change reaches it (the consensus layer waits for it to
-// acknowledge the entry), then the controller moves their leadership to live
-// replicas and the rebalancer refills the replica sets.
+// like handleAddMember. Only an offline member can be removed: the engine
+// refuses a node the cluster can still reach (see Engine.RemoveMember), and
+// that refusal surfaces here as a bad request. The node keeps serving its
+// slots until the configuration change reaches it (the consensus layer waits
+// for it to acknowledge the entry), then the controller moves their leadership
+// to live replicas and the rebalancer refills the replica sets.
 //
 //	DELETE /admin/cluster/nodes/node-4
 func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
@@ -400,7 +402,7 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 		if refuseNotController(w, err) {
 			return
 		}
-		if errors.Is(err, cluster.ErrBadMember) {
+		if errors.Is(err, cluster.ErrBadMember) || errors.Is(err, cluster.ErrOnlineMember) {
 			writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, err.Error())
 			return
 		}

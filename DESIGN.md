@@ -389,7 +389,7 @@ POST /admin/slots/{slot}/remove-replica {node} # 回收副本集里的一个成�
 POST /admin/cluster/plan                       # 触发重新规划（控制器专属，同上）
 GET  /admin/cluster/nodes                      # 列出当前 raft 成员（本节点视角：id/peer/admin/client/down）
 POST /admin/cluster/nodes {id,peer_addr}       # 运行时加成员（控制器专属，同上；admin/client 地址由新节点自报）
-DELETE /admin/cluster/nodes/{id}               # 运行时摘成员（控制器专属，同上）
+DELETE /admin/cluster/nodes/{id}               # 运行时摘成员（控制器专属，同上；仅离线节点，在线回 400）
 GET  /healthz
 ```
 
@@ -411,7 +411,10 @@ Raft 配置（谁投票）与复制的成员目录（槽表里的成员列表）
   日志还是靠装快照追平，推出来的成员表都和集群一致。少了这一条，新节点只知道
   「把自己加进来」那一项，会以「整个集群就我一个」的姿态运行（quorum=1、日志陈旧
   也能自己当选、能确认别人没有的写入）。
-- **摘成员 `DELETE /admin/cluster/nodes/{id}`**：提交 `remove_member`。leader **不会
+- **摘成员 `DELETE /admin/cluster/nodes/{id}`**：提交 `remove_member`。只允许
+  摘**离线**成员（与 `Peer.Offline` 同一条规则：未上报 client 地址或被 controller
+  标记 down）；在线成员回 400（`cluster.ErrOnlineMember`），要摘必须先把它下线
+  ——摘除是死节点的清理动作，不是重新调度在线槽位分布的手段。leader **不会
   立刻断开**被摘节点：它要等该节点确认收到配置项，再发一轮带新 commit 的
   AppendEntries，让被摘方本地也提交该配置后才停复制（否则被摘节点留着未提交的
   尾巴，仍信旧配置、可能对幸存者发起竞选；共识层同时在握手后拒绝非成员的共识流量）。
