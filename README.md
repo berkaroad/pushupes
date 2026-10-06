@@ -202,7 +202,7 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 - `EventService/BatchAppend`：批量写入。一批携带多条 `AppendRequest`（批内
   `aggregate_id` 必须各不相同，重复的那组整组 `fail/1002` 且不执行），逐条
   独立走同一套写入规则，按请求同序返回逐条结果（回显 `aggregate_id`）。
-  服务端同槽串行、异槽并行（并发上限 8×CPU 核数）。单批必须装进 client 面
+  服务端同槽串行、异槽并行（并发上限 2×CPU 核数）。单批必须装进 client 面
   gRPC 消息上限（`-grpc-max-msg-size`，默认 4MiB）。
 - `EventService/ReadStream`：按聚合读取事件流（≤HW 语义）。
 - `EventService/ReadByCommand`：按 `command_id` 查询已写入的记录。

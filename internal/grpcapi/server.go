@@ -187,13 +187,13 @@ func (s *Server) batchSlot(ctx context.Context, slot int32, reqs []*pushupesv1.A
 // ---- BatchAppend -------------------------------------------------------------
 
 // batchSlotParallelism caps how many slots one batch executes concurrently:
-// 8x CPU cores. Different slots take independent write fences and hit
+// 2x CPU cores. Different slots take independent write fences and hit
 // independent WALs; within one slot records execute serially in request
 // order. The cap is about a batch spanning MANY slots (1680 of them) not
 // swamping the node with concurrent WAL writers while a normal batch keeps
 // full slot-level parallelism.
 func batchSlotParallelism() int {
-	n := 8 * runtime.GOMAXPROCS(0)
+	n := 2 * runtime.GOMAXPROCS(0)
 	if n < 1 {
 		n = 1
 	}
