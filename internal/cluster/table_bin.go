@@ -79,6 +79,38 @@ func (t *Table) EncodeTableBinary() []byte {
 	// stable ordering for determinism (snapshots must decode identically)
 	peerIDs := t.PeerIDs()
 
+	// TWO passes over the table: every name the payload can reference must be
+	// in the dictionary BEFORE it is written, because the dictionary is one
+	// block ahead of the entries. A name registered while the entries are
+	// being walked (a placement that names a node the directory no longer
+	// holds — a leave_node that landed while a migration to that node was
+	// committing, or a leader-less slot registering the empty name) would get
+	// an index that never reaches the file, and DecodeTableBinary would refuse
+	// the entire snapshot: every restart of a node holding it dies in Raft's
+	// snapshot restore. Forensics on a real breakage: the table held six peers
+	// (node-1..node-5, node-7) while 238 placements named the removed node-6,
+	// so the dictionary was written with six entries and entry index 6 was
+	// unreadable. Register first, then serialise.
+	for _, id := range peerIDs {
+		nodeID(id)
+	}
+	// entries sorted by slot for deterministic snapshots
+	slots := make([]int, 0, len(t.Slots))
+	for s := range t.Slots {
+		slots = append(slots, int(s))
+	}
+	sort.Ints(slots)
+	for _, s := range slots {
+		p := t.Slots[int32(s)]
+		nodeID(p.Leader)
+		for _, r := range p.Replicas {
+			nodeID(r)
+		}
+		if p.MigratingTo != "" {
+			nodeID(p.MigratingTo)
+		}
+	}
+
 	var body bytes.Buffer
 	body.WriteString(tableMagic)
 	body.WriteByte(tableVer)
@@ -103,22 +135,12 @@ func (t *Table) EncodeTableBinary() []byte {
 			body.WriteByte(0)
 		}
 	}
-	// pre-register peer ids so common case entries hit the dictionary
-	for _, id := range peerIDs {
-		nodeID(id)
-	}
 	n = binary.PutUvarint(tmp[:], uint64(len(names)))
 	body.Write(tmp[:n])
 	for _, name := range names {
 		putStr(&body, name)
 	}
 
-	// entries sorted by slot for deterministic snapshots
-	slots := make([]int, 0, len(t.Slots))
-	for s := range t.Slots {
-		slots = append(slots, int(s))
-	}
-	sort.Ints(slots)
 	n = binary.PutUvarint(tmp[:], uint64(len(slots)))
 	body.Write(tmp[:n])
 	for _, s := range slots {
