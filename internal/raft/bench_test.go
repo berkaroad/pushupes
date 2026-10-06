@@ -8,8 +8,7 @@ import (
 )
 
 // applyCmd is a 256-byte command body — representative of a slot-table
-// command, and the same shape the reference benchmark (internal/raft/ref)
-// applies to hashicorp/raft, so the two are comparable.
+// command, the same shape every benchmark in this package applies.
 var benchCmd = []byte("x" + string(make([]byte, 255)))
 
 type latencySink struct {

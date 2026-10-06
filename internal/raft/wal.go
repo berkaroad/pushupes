@@ -13,8 +13,8 @@
 // is acknowledged waits with Wait(lsn).
 //
 // Crash recovery scans segments in order and truncates at the first record
-// whose framing or CRC is bad, dropping only the tail. That is the property
-// BoltDB could not offer (one bad page made the whole file unreadable).
+// whose framing or CRC is bad, dropping only the tail — records already
+// durably written before the torn point are never lost as a whole.
 //
 // Frame layout (all big-endian):
 //

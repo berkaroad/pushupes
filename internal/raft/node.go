@@ -277,10 +277,10 @@ func (n *Node) publishDurable(lsn uint64) {
 //
 // Every initially configured node writes the identical entry at index 1
 // (canonicalVoters sorts by id, so the order -peers happened to arrive in does
-// not matter), which keeps their logs matching from the first entry on. Term 1
-// is where hashicorp/raft's BootstrapCluster starts for the same reason: the
-// entry is history nobody had to campaign for, the first real election runs at
-// term 2, and no leader can commit it by counting alone — the current-term
+// not matter), which keeps their logs matching from the first entry on. The
+// bootstrap entry opens at term 1 for the same reason the canonical practice
+// does: it is history nobody had to campaign for, the first real election runs
+// at term 2, and no leader can commit it by counting alone — the current-term
 // no-op a fresh leader appends is what commits it.
 func (n *Node) bootstrapConfig(voters []Voter) error {
 	if n.log.LastIndex() != 0 {

@@ -13,8 +13,8 @@ import (
 // entries above it are dropped, possibly committed ones) and the FSM is
 // restored to an older state — while applied/commit only ever move forward, so
 // the node ends up holding a state machine that no configuration and no log
-// supports. hashicorp/raft refuses such a message (ErrSnapshotOutOfDate) for
-// the same reason.
+// supports. The protocol refuses such a message for the same reason: rolling a
+// node backward behind its own commit/applied cursors is never recoverable.
 func TestInstallSnapshotRefusesOutOfDate(t *testing.T) {
 	c := startClusterCfg(t, 3, func(cfg *Config) {
 		cfg.SnapshotThreshold = 1 // snapshot early so the local snapshot index is non-zero

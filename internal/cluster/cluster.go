@@ -6,8 +6,7 @@
 // travels over a dedicated replication protocol and never through the Raft log.
 //
 // The consensus layer is the in-repo simplified Raft (internal/raft), whose log
-// and hard state live in a custom segmented WAL — no third-party raft and no
-// BoltDB.
+// and hard state live in a custom segmented WAL.
 package cluster
 
 import (
