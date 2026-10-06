@@ -443,7 +443,16 @@ gRPC  PeerService/Adopt           新节点自报入编（add_member 提交/转�
 
 # ---- admin 面（HTTP，仅管理）----
 GET  /admin/slots/{slot}/describe              # 本节点视角的槽状态/seq/HW/大小（不代开槽，带 node/role/loaded）
-GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（含 client_addr）
+GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（含 client_addr）；
+                                               #   raft 段里 heartbeat_timeout/election_timeout 是
+                                               #   本进程实际生效的共识时序（见 §8 的比例约束）；
+                                               #   顶层 storage_bytes 是集群存储大小 = 每个槽的
+                                               #   **leader 副本**落盘字节之和（写落在 leader 上，
+                                               #   其它副本是同一份数据晚一个复制轮；按副本求和会把
+                                               #   同一份字节乘以因子）。任何节点都能回答：各节点后台
+                                               #   每 2s 采一次样（自己 leader 的槽本地读，其余问 peer），
+                                               #   status 读缓存值；storage_bytes_complete=false 表示
+                                               #   有 slot leader 没应答，此时该值是下界
 GET  /admin/writes                             # 每槽 durable 计数 + 槽内总字节/事件流数量 + 本节点待清理副本（前端轮询）
 GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本，仅内存索引，不读 WAL）
 POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移（控制器专属，必须发到 Raft leader 的 admin 地址）
@@ -618,6 +627,14 @@ flush.policy    = 每 1000 条或 5s（可关闭为纯页缓存）
 drop_after      = 30s          # 迁移后前源节点本地副本的保留期，到期自动 DropSlot
                               # -drop-after / PUSHUPES_DROP_AFTER：正数=该时长，0=默认 30s，
                               # 负数启动即报错；没有关闭选项（留着会把节点写满）
+raft_heartbeat_timeout = 100ms # -raft-heartbeat-timeout / PUSHUPES_RAFT_HEARTBEAT_TIMEOUT
+                              # （启动脚本里 RAFT_HEARTBEAT_TIMEOUT）：leader 发心跳的间隔
+raft_election_timeout  = 500ms # -raft-election-timeout / PUSHUPES_RAFT_ELECTION_TIMEOUT
+                              # （启动脚本里 RAFT_ELECTION_TIMEOUT）：follower 多久收不到心跳
+                              # 就发起选举。必须 ≥ 2× 心跳，否则一次迟到的心跳就掀掉 leader
+                              # （节点启动即报错）。两个值是一对比例：共识事件循环被慢 apply
+                              # 或紧张的 CPU 拖住时把它们一起放大（例 500ms / 3s），
+                              # 而不是只收窄其中一个
 admin_addr      = http://127.0.0.1:8091   # -admin / PUSHUPES_ADMIN（含 pprof）
 client_addr     = http://127.0.0.1:8591   # -client / PUSHUPES_CLIENT（gRPC）
 peer_addr       = http://127.0.0.1:8391   # -peer / PUSHUPES_PEER（Raft + 注册）
