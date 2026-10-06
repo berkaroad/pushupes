@@ -511,6 +511,29 @@ func (n *Node) onInstallSnapshot(req *installSnapshotReq) {
 	n.leaderID = m.LeaderID
 	resetTimer(n.electionTimer, n.randomElectionTimeout())
 
+	// Refuse a snapshot that is not NEWER than what this node already holds.
+	// Adopting one rolls the node backward in three ways at once: the
+	// snapshot's voter set replaces the live configuration (a member added at
+	// runtime disappears from it while the slot table that named it stays
+	// applied), the log is reset to the snapshot's index (dropping entries
+	// above it — possibly committed ones), and the FSM is restored to an older
+	// state, while applied/commit only ever move forward. The node then holds
+	// a state machine that neither its configuration nor its log supports.
+	// Only a stale leader can send such a message, so refusing is safe; the
+	// sender falls back to ordinary log replication (see onInstallResult).
+	if si, _, _ := n.log.Snapshot(); m.LastIndex <= si {
+		n.logger.Warnf("raft: refusing out-of-date snapshot from %s at index %d/term %d: this node already has a snapshot at index %d",
+			m.LeaderID, m.LastIndex, m.LastTerm, si)
+		req.resp <- installSnapshotResp{Term: n.term, Success: false, LastIndex: n.log.LastIndex()}
+		return
+	}
+	if m.LastIndex < n.commitIndex {
+		n.logger.Warnf("raft: refusing out-of-date snapshot from %s at index %d/term %d: this node already committed to index %d",
+			m.LeaderID, m.LastIndex, m.LastTerm, n.commitIndex)
+		req.resp <- installSnapshotResp{Term: n.term, Success: false, LastIndex: n.log.LastIndex()}
+		return
+	}
+
 	if err := n.fsm.Restore(m.Data); err != nil {
 		n.logger.Errorf("raft: restore installed snapshot at %d: %v", m.LastIndex, err)
 		req.resp <- installSnapshotResp{Term: n.term, Success: false, LastIndex: n.log.LastIndex()}
@@ -557,18 +580,31 @@ func (n *Node) onInstallResult(r installResult) {
 	if n.state != Leader || n.term != r.term {
 		return
 	}
-	if r.resp.Success {
-		if r.resp.LastIndex > n.matchIndex[r.peer] {
-			n.matchIndex[r.peer] = r.resp.LastIndex
-		}
-		n.nextIndex[r.peer] = n.matchIndex[r.peer] + 1
-		n.maybeAdvanceCommit()
-		n.applyCommitted()
-		if n.matchIndex[r.peer] < n.log.LastIndex() {
+	if !r.resp.Success {
+		// The follower refused the snapshot (it was not newer than what it
+		// already holds — see onInstallSnapshot) and reported what it does
+		// have. Re-sending the same file every round would loop forever, so
+		// resume ordinary log replication from there — but only when our log
+		// can still cover that range (the receiver's index must be above our
+		// own snapshot, or AppendEntries has nothing to offer it).
+		// matchIndex is deliberately untouched: only an accepted
+		// AppendEntries raises it.
+		if si, _, _ := n.log.Snapshot(); r.resp.LastIndex+1 > n.nextIndex[r.peer] && r.resp.LastIndex+1 > si {
+			n.nextIndex[r.peer] = r.resp.LastIndex + 1
 			n.kick(r.peer)
 		}
-		n.publishView()
+		return
 	}
+	if r.resp.LastIndex > n.matchIndex[r.peer] {
+		n.matchIndex[r.peer] = r.resp.LastIndex
+	}
+	n.nextIndex[r.peer] = n.matchIndex[r.peer] + 1
+	n.maybeAdvanceCommit()
+	n.applyCommitted()
+	if n.matchIndex[r.peer] < n.log.LastIndex() {
+		n.kick(r.peer)
+	}
+	n.publishView()
 }
 
 // ---- commit / apply ----
