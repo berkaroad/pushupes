@@ -14,6 +14,7 @@ import (
 	"pushupes/internal/data"
 	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
 	"pushupes/internal/lease"
+	"sync"
 	"pushupes/internal/payloadcodec"
 	"pushupes/internal/storage"
 )
@@ -645,3 +646,44 @@ func TestHandleFetchAndReplicateOverPeerPlane(t *testing.T) {
 	}
 	_ = storage.WALHeaderLen
 }
+func TestConcurrentMFetchRoundsDoNotShareTheScanBuffer(t *testing.T) {
+	e, _ := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	pinReplicas(t, e, 2)
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			// Each round covers a different number of slots, so a buffer shared
+			// by two rounds is resized to different lengths while in use.
+			n := 8 + w*40
+			slots := make([]int32, 0, n)
+			froms := make([]uint64, 0, n)
+			for i := 0; i < n; i++ {
+				slots = append(slots, int32(i%8)) // slots 0,2,4,6 are led here
+				froms = append(froms, 1<<40)      // far ahead of every LEO: empty → parks
+			}
+			for iter := 0; iter < 150; iter++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Millisecond)
+				if _, err := e.HandleMFetchCtx(ctx, MFetchRequest{
+					Follower: "node-2", WaitMS: 50, Slots: slots, FromSeqs: froms,
+				}); err != nil && ctx.Err() == nil {
+					t.Errorf("unexpected mfetch error: %v", err)
+				}
+				cancel()
+			}
+		}(w)
+	}
+	wg.Wait()
+}
+
+// TestFailoverPrefersTheControllersPick pins the failover rule's two halves: the
+// controller's pick (the freshest live replica, computed from real LEOs it alone
+// can see) is honoured, and anything that does not hold up as a placement falls
+// back to the deterministic table-only rule (the first live replica). The pick
+// travels in the replicated command, so every node must reach the same verdict
+// from the same table.

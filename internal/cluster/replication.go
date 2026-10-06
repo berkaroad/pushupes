@@ -1436,6 +1436,12 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 		out.Items = append(out.Items, FetchItem{Slot: s, FromSeq: from, NextSeq: next, Payload: payload})
 	}
 	prog.apply(e)
+	// The scan buffer's tenure ENDS here: everything below works off `parked`
+	// (slot, from, wake handle) and re-reads the store by slot. Putting it back a
+	// second time from the wait loop let two concurrent rounds hold the same
+	// buffer — one of them resets/truncates it while the other is still indexing
+	// it, which is an `index out of range [...] with length 0` panic inside
+	// HandleMFetchCtx (observed once under heavy churn). One Put, one owner.
 	e.scanPool.Put(scan.reset())
 	e.orderPool.Put(order[:cap(order)])
 
@@ -1456,7 +1462,6 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 			case <-deadline:
 				break waitLoop // budget spent: answer with whatever we have
 			case <-ctx.Done():
-				e.scanPool.Put(scan.reset())
 				e.parkedPool.Put(parked[:0])
 				e.progressPool.Put(prog.reset())
 				return nil, ctx.Err() // client went away
