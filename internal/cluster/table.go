@@ -364,7 +364,14 @@ func (t *Table) Apply(c *Command) error {
 		t.Slots = PlanSlots(nodes, t.SlotCount, t.Replicas)
 	case OpReplanSlots:
 		// Fill in any slot that is still unassigned, and top up replica
-		// sets that are below the configured factor (late-joining members).
+		// sets that are below the derived factor. The re-layout therefore
+		// happens exactly when that factor moves, which — with the count
+		// derived from the Raft fault tolerance (ReplicaCountForMembers) —
+		// is at the ODD member counts (3 -> 2 copies, 5 -> 3, 7 -> 4...).
+		// Adding an even-numbered member (a 4th, a 6th) leaves the derived
+		// count where it was, so the table is deliberately left alone: the
+		// new member carries no slot until the next odd count is reached.
+		// That is the operator's rule, not an oversight — see DESIGN §4.
 		// Leaders of assigned, stable slots are never moved — adding a
 		// replica is safe because the new replica pulls via fetch. A
 		// marked-down member KEEPS its replica seats (that is how its copy

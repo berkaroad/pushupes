@@ -68,7 +68,8 @@ function startNode(i) {
     '-admin', `127.0.0.1:${port(i)}`, '-peer', `127.0.0.1:${8390 + i}`, '-client', `127.0.0.1:${8590 + i}`,
     '-data', './data',
     '-peers', 'node-1=http://127.0.0.1:8391,node-2=http://127.0.0.1:8392,node-3=http://127.0.0.1:8393',
-    '-replication-factor', '2', '-segment-bytes', '256MiB',
+    // 每槽副本数不是配置项：3 个成员推导出 2 份（ReplicaCountForMembers）。
+    '-segment-bytes', '256MiB',
   ]
   if (i === 1) args.push('-bootstrap')
   const child = spawn(path.join(ROOT, 'bin', 'pushupes'), args, { cwd: dir, stdio: 'ignore', detached: true })

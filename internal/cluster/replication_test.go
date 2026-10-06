@@ -117,6 +117,9 @@ func TestNoteReplicaProgressAdvancesHW(t *testing.T) {
 	e, st := newTestEngine(t, "node-1")
 	join(t, e, "node-1", "127.0.0.1:1")
 	join(t, e, "node-2", "127.0.0.1:2")
+	// The watermark is tracked from replica progress, so the fixture needs a
+	// follower: two members derive ONE copy, hence the explicit two here.
+	pinReplicas(t, e, 2)
 	applyCmd(t, e, &Command{Op: OpPlanSlots})
 
 	// 2 records on the leader, in the slot this node leads (0)

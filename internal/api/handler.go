@@ -215,11 +215,15 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	tbl := s.Engine.TableSnapshot()
 	leaderID, leaderAdmin := s.Engine.Controller()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"node":                  s.Engine.Self(),
-		"raft":                  s.Engine.RaftStats(),
-		"peers":                 tbl.Peers,
-		"slots":                 tbl.Slots,
-		"slot_count":            tbl.SlotCount,
+		"node":       s.Engine.Self(),
+		"raft":       s.Engine.RaftStats(),
+		"peers":      tbl.Peers,
+		"slots":      tbl.Slots,
+		"slot_count": tbl.SlotCount,
+		// replica_factor is the per-slot copy count the controller derives from
+		// the member count (cluster.ReplicaCountForMembers): it is not a knob,
+		// so this is the only place an operator can read it back.
+		"replica_factor":        tbl.Replicas,
 		"controller":            leaderID,
 		"controller_admin_addr": leaderAdmin,
 		// durable writes per slot since this process started; clients diff

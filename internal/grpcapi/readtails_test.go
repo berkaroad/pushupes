@@ -40,6 +40,9 @@ func TestReadTailsMatchesPerAggregateProbe(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Read-path fixture: the copy count is pinned (production derives it from
+	// the member count), so the reads under test see the layout they expect.
+	pinTwoReplicas(t, eng)
 	if _, err := eng.ApplyCommand((&cluster.Command{Op: cluster.OpPlanSlots}).Encode()); err != nil {
 		t.Fatal(err)
 	}

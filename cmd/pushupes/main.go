@@ -48,12 +48,15 @@ func main() {
 		// The slot count is a permanent layout decision (routing, placement,
 		// migration granularity), so it is not a runtime knob — it is fixed at
 		// data.DefaultSlotCount. See DESIGN §7.2.
-		slotCount   = data.DefaultSlotCount
-		replication = flag.Int("replication-factor", cluster.DefaultReplicationFactor, "replicas per slot: every slot is planned and topped up to this many (clamped to the member count)")
-		segmentB    = byteSize(storage.DefaultSegmentBytes)
-		flushN      = flag.Int64("flush-messages", 1000, "fsync every N records (0 disables)")
-		flushD      = flag.Duration("flush-interval", 5*time.Second, "fsync every interval (0 disables)")
-		dropAfter   = flag.Duration("drop-after", envDurationOr("PUSHUPES_DROP_AFTER", cluster.DefaultDropRetention),
+		slotCount = data.DefaultSlotCount
+		// The per-slot replica count is derived from the cluster's own fault
+		// tolerance (ReplicaCountForMembers), so it is not a flag either: a
+		// cluster that grows at runtime raises its own copy count with no
+		// restart and nothing to configure. See DESIGN §4.
+		segmentB  = byteSize(storage.DefaultSegmentBytes)
+		flushN    = flag.Int64("flush-messages", 1000, "fsync every N records (0 disables)")
+		flushD    = flag.Duration("flush-interval", 5*time.Second, "fsync every interval (0 disables)")
+		dropAfter = flag.Duration("drop-after", envDurationOr("PUSHUPES_DROP_AFTER", cluster.DefaultDropRetention),
 			"post-migration retention: how long the FORMER SOURCE keeps its local copy of a migrated slot before dropping it (positive = that window, 0 = the default 30s; negative is rejected; the cleanup cannot be disabled — env PUSHUPES_DROP_AFTER)")
 		rebalanceInterval = flag.Duration("rebalance-interval", envDurationOr("PUSHUPES_REBALANCE_INTERVAL", cluster.DefaultRebalanceInterval),
 			"how often the controller checks the leader layout against the slot ring and hands deviated slots back (a node that died returns to its own slots after failover; 0 disables the rebalancer; negative is rejected — env PUSHUPES_REBALANCE_INTERVAL)")
@@ -87,12 +90,12 @@ func main() {
 	base.SetLevel(logrus.InfoLevel)
 	logger := logrus.NewEntry(base).WithField("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, *replication, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *dropAfter, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, int64(raftSegB), logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *dropAfter, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, int64(raftSegB), logger); err != nil {
 		logger.WithError(err).Fatal("pushupes exited with error")
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount, replicationFactor int, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD, dropAfter time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush time.Duration, raftSegBytes int64, logger *logrus.Entry) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount int, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD, dropAfter time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush time.Duration, raftSegBytes int64, logger *logrus.Entry) error {
 	// Canonical form for every stored address: scheme required. A bare
 	// host:port gets the default "http://" prefix; an explicit protocol
 	// is honoured as passed. TCP-level uses (listen/dial) strip it again.
@@ -148,13 +151,9 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 	// hand it to NewNode and wire the node back in.
 	eng := cluster.NewEngine(nil, store, nodeID, logger)
 	eng.SetDropRetention(dropRetention)
-	// -replication-factor: the controller reconciles the slot table's replica
-	// factor to this value and tops up short replica sets, so a cluster
-	// restarted with a higher factor converges without a manual replan.
-	if replicationFactor < 1 {
-		return fmt.Errorf("-replication-factor %d must be at least 1", replicationFactor)
-	}
-	eng.SetReplicationFactor(replicationFactor)
+	// The per-slot replica count is not configured here: the controller derives
+	// it from the member count every round (cluster.ReplicaCountForMembers), so
+	// a cluster that grows at runtime raises its own copy count.
 	// Leader rebalance: 0 on either knob is the operator's off switch; a
 	// negative value is a startup error (same fail-fast rule as -drop-after).
 	if rebalanceInterval < 0 {
@@ -233,7 +232,9 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 	go func() { errCh <- grpcSrv.Serve(grpcLis) }()
 
 	logger.WithFields(map[string]any{
-		"admin": adminAddr, "client": clientAddr, "peer": peerAddr, "slots": slotCount, "replicas": replicationFactor,
+		// The replica count is not a field here: it is derived from the member
+		// count by the controller and logged when it changes.
+		"admin": adminAddr, "client": clientAddr, "peer": peerAddr, "slots": slotCount,
 	}).Info("pushupes node started")
 
 	select {

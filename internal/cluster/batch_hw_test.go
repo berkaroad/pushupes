@@ -17,6 +17,10 @@ func leadSlot0(t *testing.T, e *Engine) {
 	t.Helper()
 	join(t, e, "node-1", "127.0.0.1:1")
 	join(t, e, "node-2", "127.0.0.1:2")
+	// A leader plus a follower is the premise here; the derived count for two
+	// members is one copy, so this fixture states the two it needs (these
+	// tests exercise the batch/watermark path, not the replica-count policy).
+	pinReplicas(t, e, 2)
 	applyCmd(t, e, &Command{Op: OpPlanSlots})
 	if p, _ := e.TableSnapshot().Slots[0]; p.Leader != "node-1" {
 		applyCmd(t, e, &Command{Op: OpLeaderMove, Slots: []int32{0}, NewLeader: "node-1"})

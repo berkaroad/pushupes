@@ -37,6 +37,9 @@ func TestLeaderReadIsNotCappedByHighWatermark(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Read-path fixtures: the copy count is pinned (production derives it) so
+	// the reads under test see the layout they were written against.
+	pinTwoReplicas(t, eng)
 	if _, err := eng.ApplyCommand((&cluster.Command{Op: cluster.OpPlanSlots}).Encode()); err != nil {
 		t.Fatal(err)
 	}
@@ -129,6 +132,9 @@ func TestSteppedDownReplicaReadsItsOwnLog(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Read-path fixtures: the copy count is pinned (production derives it) so
+	// the reads under test see the layout they were written against.
+	pinTwoReplicas(t, eng)
 	if _, err := eng.ApplyCommand((&cluster.Command{Op: cluster.OpPlanSlots}).Encode()); err != nil {
 		t.Fatal(err)
 	}
@@ -240,6 +246,19 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b[p:])
+}
+
+// pinTwoReplicas pins the table's per-slot copy count for these read-path
+// tests: production derives it from the member count, and a three-member
+// fixture derives two anyway — stating it keeps the tests independent of the
+// policy (they are about ReadTails/reads, not about how many copies a cluster
+// of this size should carry).
+func pinTwoReplicas(t *testing.T, eng *cluster.Engine) {
+	t.Helper()
+	c := &cluster.Command{Op: cluster.OpConfig, Replicas: 2}
+	if _, err := eng.ApplyCommand(c.Encode()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // serveEngine wires a gRPC server onto an engine over an in-memory listener.

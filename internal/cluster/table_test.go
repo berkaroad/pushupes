@@ -26,11 +26,29 @@ func applyCmd(t *testing.T, e *Engine, c *Command) {
 	}
 }
 
+// join adds a peer to the test table and then re-derives the replica factor the
+// way the controller does after every membership change (OpConfig from
+// ReplicaCountForMembers). These tests never run the controller, so without
+// this the table would keep whatever factor it was constructed with and a
+// 3-member table would stay at one copy. See pinReplicas for tests whose
+// premise needs a layout the derivation does not produce.
 func join(t *testing.T, e *Engine, id, addr string) {
+	t.Helper()
 	// tests treat all three plane addresses as one value; peer-plane
 	// dials (fetch/forward/probe) follow whichever address the code under
 	// test consults.
 	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: id, PeerAddr: addr, AdminAddr: addr, ClientAddr: addr}})
+	applyCmd(t, e, &Command{Op: OpConfig, Replicas: ReplicaCountForMembers(len(e.TableSnapshot().Peers))})
+}
+
+// pinReplicas states an explicit replica factor for a test whose premise is a
+// layout the derivation would not produce — "a leader plus a follower" needs
+// two copies, while ReplicaCountForMembers(2 members) is one copy (a 2-voter
+// group survives no failure, so the data is allowed to live in one place).
+// Production never sets the factor by hand: the controller derives it.
+func pinReplicas(t *testing.T, e *Engine, n int) {
+	t.Helper()
+	applyCmd(t, e, &Command{Op: OpConfig, Replicas: n})
 }
 
 func TestPlanSlotsDistribution(t *testing.T) {
@@ -103,6 +121,9 @@ func TestLeaveNodeFailsLeaderOver(t *testing.T) {
 	e, _ := newTestEngine(t, "node-1")
 	join(t, e, "node-1", "127.0.0.1:1")
 	join(t, e, "node-2", "127.0.0.1:2")
+	// Failover moves leadership to a REPLICA, so the fixture needs one: two
+	// members derive a single copy, hence the explicit two.
+	pinReplicas(t, e, 2)
 	applyCmd(t, e, &Command{Op: OpPlanSlots})
 
 	// slot 0: leader node-1, replica node-2. Killing node-1 must move the

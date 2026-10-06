@@ -112,7 +112,8 @@ const child = spawn(path.join(ROOT, 'bin', 'pushupes'), [
   '-client', `127.0.0.1:${8590 + nodeIdx}`,
   '-data', './data',
   '-peers', 'node-1=http://127.0.0.1:8391,node-2=http://127.0.0.1:8392,node-3=http://127.0.0.1:8393',
-  '-replication-factor', '2', '-segment-bytes', '256MiB',
+  // 每槽副本数不是配置项：3 个成员推导出 2 份。
+  '-segment-bytes', '256MiB',
 ], { cwd: dir, stdio: 'ignore', detached: true })
 child.unref()
 execFileSync('sh', ['-c', `echo ${child.pid} > '${dir}/node.pid'`])

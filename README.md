@@ -133,22 +133,23 @@ scripts/cluster.sh clean     # stop 并删除运行目录（含数据，慎用�
 每个节点占用三个端口，按节点序号依次递增（node-i = BASE + i − 1）；数据、日志、
 pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可用环境变量覆盖：
 `REPLICAS`（节点数）、`HOST`、`ADMIN_BASE`、`PEER_BASE`、`CLIENT_BASE`、
-`REPLICATION_FACTOR`、`SEGMENT_BYTES`、`RUN_DIR`、`READY_TIMEOUT`、`BUILD`。
+`SEGMENT_BYTES`、`RUN_DIR`、`READY_TIMEOUT`、`BUILD`。每槽副本数不是配置项：
+按 Raft 集群的容错节点数推导（N 个成员 → floor((N-1)/2)+1 份），扩容时自动追加。
 
 ### 手工启动单个节点
 
 ```bash
 # 首个节点加 -bootstrap；peers 主格式 node-id=host:peerport（等号分隔，只配 peer 端口，
-# admin/client 地址由各节点经注册协议自报进路由表）
+# admin/client 地址由各节点经注册协议自报进路由表；每槽副本数由成员数推导）
 ./bin/pushupes -node node-1 \
   -peer 127.0.0.1:8391 -admin 127.0.0.1:8091 -client 127.0.0.1:8591 \
   -data ./node-1 -bootstrap \
-  -peers 'node-1=127.0.0.1:8391,node-2=127.0.0.1:8392' -replication-factor 2
+  -peers 'node-1=127.0.0.1:8391,node-2=127.0.0.1:8392'
 
 ./bin/pushupes -node node-2 \
   -peer 127.0.0.1:8392 -admin 127.0.0.1:8092 -client 127.0.0.1:8592 \
   -data ./node-2 \
-  -peers 'node-1=127.0.0.1:8391,node-2=127.0.0.1:8392' -replication-factor 2
+  -peers 'node-1=127.0.0.1:8391,node-2=127.0.0.1:8392'
 ```
 
 地址规范：地址统一带 scheme 存储，未写协议时默认补 `http://`；`-peers`
@@ -165,7 +166,7 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 | `-data` | `PUSHUPES_DATA` | `./data` | 数据目录 |
 | `-peers` | `PUSHUPES_PEERS` | 空 | 集群种子 `id=host:peerport,...` |
 | `-bootstrap` | — | false | 兼容保留：成员集合静态，启动时由 `-peers` 写入，此开关已无作用 |
-| `-replication-factor` | — | 2 | 每槽副本数（含 leader）：控制器自动把槽表因子对齐到该值并补齐副本；超过成员数时按成员数截断；改小不裁剪多余副本 |
+| 每槽副本数 | — | 推导 | **不是配置项**：按 Raft 容错节点数推导 `floor((N-1)/2)+1`（1/3/5/7 节点 → 1/2/3/4 份）。控制器每轮按成员数对齐槽表因子，扩容自动追加副本；只读 `GET /admin/cluster/status` 的 `replica_factor` |
 | `-flush-messages` | — | 1000 | 每 N 条 fsync（0 关闭） |
 | `-flush-interval` | — | 5s | 每周期 fsync（0 关闭） |
 | `-segment-bytes` | — | 256MiB | WAL 段滚动大小：64MiB 整数倍，≤2GiB；可写字节数或带单位（`256MiB`/`1GiB`） |

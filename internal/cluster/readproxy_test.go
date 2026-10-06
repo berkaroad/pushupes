@@ -234,6 +234,9 @@ func TestLeaderReplicaRemoteSlot(t *testing.T) {
 	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{
 		ID: "node-2", PeerAddr: "127.0.0.1:8392", AdminAddr: "127.0.0.1:8092", ClientAddr: "127.0.0.1:8592",
 	}})
+	// This test needs a slot led by node-2 with node-1 as a removable replica;
+	// two members derive a single copy, so the fixture pins two.
+	pinReplicas(t, e, 2)
 	applyCmd(t, e, &Command{Op: OpPlanSlots})
 
 	target := int32(-1)
@@ -278,6 +281,9 @@ func TestReadProxyAddrUsesClientPlane(t *testing.T) {
 	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{
 		ID: "node-2", PeerAddr: "127.0.0.1:8392", AdminAddr: "127.0.0.1:8092", ClientAddr: "127.0.0.1:8592",
 	}})
+	// This test needs a slot led by node-2 with node-1 as a removable replica;
+	// two members derive a single copy, so the fixture pins two.
+	pinReplicas(t, e, 2)
 	applyCmd(t, e, &Command{Op: OpPlanSlots})
 
 	// A slot led by node-2 with node-1 removed from its replica set, so this

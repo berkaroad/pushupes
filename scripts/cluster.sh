@@ -23,7 +23,6 @@
 #   ADMIN_BASE=8091         节点 i 的 admin 管理端口（HTTP admin + pprof）= ADMIN_BASE + i - 1
 #   PEER_BASE=8391         节点 i 的 peer 端口（Raft + peer gRPC，全部节点间通讯）= PEER_BASE + i - 1
 #   CLIENT_BASE=8591         节点 i 的客户端(gRPC)端口 = CLIENT_BASE + i - 1
-#   REPLICATION_FACTOR=2   每槽副本数（含 leader；改大后重启集群会自动补齐副本）
 #   SEGMENT_BYTES=256MiB   段大小（默认 256MiB；须为 64MiB 的整数倍，最大 2GiB）
 #   RUN_DIR=$ROOT/.cluster 运行目录（数据、日志、pid）
 #   READY_TIMEOUT=90       等待就绪秒数
@@ -50,7 +49,6 @@ HOST="${HOST:-127.0.0.1}"
 ADMIN_BASE="${ADMIN_BASE:-8091}"
 PEER_BASE="${PEER_BASE:-8391}"
 CLIENT_BASE="${CLIENT_BASE:-8591}"
-REPLICATION_FACTOR="${REPLICATION_FACTOR:-2}"
 # 段大小：默认 256MiB（须为 64MiB 的整数倍，最大 2GiB；可写字节数或 256MiB/1GiB 带单位）
 SEGMENT_BYTES="${SEGMENT_BYTES:-256MiB}"
 seg_args=(-segment-bytes "$SEGMENT_BYTES")
@@ -140,13 +138,13 @@ start_node() {
     setsid "$BIN" -node "node-$n" \
        -admin "$HOST:$(admin_port "$n")" -peer "$HOST:$(peer_port "$n")" \
       -client "$HOST:$(client_port "$n")" \
-      -data ./data -peers "$peers" -replication-factor "$REPLICATION_FACTOR" \
+      -data ./data -peers "$peers" \
       "${seg_args[@]}" "${extra[@]}" >> node.log 2>&1 < /dev/null &
   else
     nohup "$BIN" -node "node-$n" \
        -admin "$HOST:$(admin_port "$n")" -peer "$HOST:$(peer_port "$n")" \
       -client "$HOST:$(client_port "$n")" \
-      -data ./data -peers "$peers" -replication-factor "$REPLICATION_FACTOR" \
+      -data ./data -peers "$peers" \
       "${seg_args[@]}" "${extra[@]}" >> node.log 2>&1 < /dev/null &
   fi
   pid=$!
@@ -170,7 +168,8 @@ wait_ready() {
         local state; state="$(json_field "$body" state)"
         local planned; planned="$(json_count "$body" epoch)"
         if [[ "${state,,}" == "leader" && "$planned" -gt 0 ]]; then
-          info "集群就绪：slot 规划 $planned 槽（每槽 $REPLICATION_FACTOR 副本）"
+          local rf; rf="$(json_field "$body" replica_factor)"
+          info "集群就绪：slot 规划 $planned 槽（每槽 ${rf:-?} 副本，按容错节点数推导）"
           return 0
         fi
       done

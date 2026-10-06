@@ -33,10 +33,27 @@ const (
 	DefaultRaftSegmentBytes  = 64 << 20
 )
 
-// DefaultReplicationFactor is the replica count per slot when the operator
-// does not pass -replication-factor. The controller reconciles the slot
-// table's factor to the configured value and tops up short replica sets.
-const DefaultReplicationFactor = 2
+// ReplicaCountForMembers is the replica count per slot, derived from the Raft
+// cluster's own fault tolerance: a group of N voters survives floor((N-1)/2)
+// failures, and every slot keeps exactly one more copy than that — so the data
+// outlives the same failures the consensus group outlives:
+//
+//	1 voter  -> 0 + 1 = 1 replica
+//	3 voters -> 1 + 1 = 2 replicas
+//	5 voters -> 2 + 1 = 3
+//	7 voters -> 3 + 1 = 4
+//
+// It is NOT an operator knob any more (-replication-factor is gone): the
+// layout follows the membership, so a cluster grown at runtime re-derives it
+// on the next controller round. Even member counts land on the same count as
+// the odd count below them (4 voters -> 2, 6 -> 3), which is the same
+// floor((N-1)/2) arithmetic.
+func ReplicaCountForMembers(members int) int {
+	if members < 1 {
+		return 1
+	}
+	return (members-1)/2 + 1
+}
 
 // Applier is implemented by the engine: it applies replicated slot-table
 // commands and can snapshot/restore that state.

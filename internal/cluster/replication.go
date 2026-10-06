@@ -107,12 +107,6 @@ type Engine struct {
 	rebalanceInterval time.Duration
 	rebalanceBatch    int
 
-	// replicationFactor is the operator's -replication-factor: the replica
-	// count every slot must reach. The controller reconciles the table's
-	// factor to it (clamped to the member count) and then tops up short
-	// replica sets. Set once at startup, before Start.
-	replicationFactor int
-
 	// post-migration local cleanup: slots whose local copy this node is
 	// scheduled to drop after the retention window (slot -> schedule), plus
 	// this node's replica-set membership as of the previous table walk (the
@@ -214,16 +208,14 @@ const (
 // attached later with SetNode (they reference each other).
 func NewEngine(node *Node, store *storage.Store, self string, logger *logrus.Entry) *Engine {
 	e := &Engine{
-		node:   node,
-		store:  store,
-		self:   self,
-		table:  NewTable(store.SlotCount, DefaultReplicationFactor),
+		node:  node,
+		store: store,
+		self:  self,
+		// The table starts on the replica count of a single-voter cluster; the
+		// controller re-derives it from the member count on its first round
+		// (ReplicaCountForMembers), so there is no startup knob to get wrong.
+		table:  NewTable(store.SlotCount, ReplicaCountForMembers(1)),
 		logger: logger,
-		// replicationFactor is overwritten by SetReplicationFactor with the
-		// operator's -replication-factor before Start; the table and this
-		// field start on the same default so a run with no explicit flag is
-		// self-consistent.
-		replicationFactor: DefaultReplicationFactor,
 		// One HTTP/2 connection per leader carries every multiplexed
 		// long-poll fetch round plus progress/replication/leo probes —
 		// gRPC multiplexes them over the single cached conn (the old HTTP
@@ -1951,19 +1943,19 @@ func (e *Engine) RunController(ctx context.Context) {
 				e.submit(&Command{Op: OpLeaveNode, NodeID: id})
 			}
 		}
-		// 2) plan: reconcile the table's replica factor with the configured
-		// one first (OpConfig), then full-replan only when nothing is
-		// assigned; otherwise fill gaps left by member joins and top up
-		// replica sets that are below the factor. The factor must land before
-		// the plan runs, because a fresh plan takes its replica count from
-		// the table.
+		// 2) plan: first re-derive the table's replica factor from the member
+		// count (ReplicaCountForMembers — it is not configurable), because a
+		// fresh plan takes its replica count from the table and a grown
+		// cluster carries more copies of every slot. Then full-replan only
+		// when nothing is assigned; otherwise fill gaps left by member joins
+		// and top up replica sets that are below the factor.
 		tbl = e.TableSnapshot()
 		if len(tbl.Peers) == 0 {
 			continue
 		}
-		if want := e.effectiveReplicationFactor(len(tbl.Peers)); want >= 1 && tbl.Replicas != want {
-			e.loggerf("replica factor: table has %d, configured %d (clamped to %d members) — raising it",
-				tbl.Replicas, e.replicationFactor, want)
+		if want := ReplicaCountForMembers(len(tbl.Peers)); tbl.Replicas != want {
+			e.loggerf("replica factor: table has %d, %d members need %d — changing it",
+				tbl.Replicas, len(tbl.Peers), want)
 			e.submit(&Command{Op: OpConfig, Replicas: want})
 		}
 		if len(tbl.Slots) == 0 {

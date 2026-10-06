@@ -296,6 +296,10 @@ func TestRebalanceHandBackEndToEnd(t *testing.T) {
 		// UNregistered peer would not even be planned — see
 		// TestPlanLeaderRebalanceSkipsOfflinePeers.
 		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-3", AdminAddr: "127.0.0.1:9", ClientAddr: "127.0.0.1:9"}})
+		// The hand-back needs each slot to carry a replica on another node,
+		// which is what the ring layout over three members gives; the
+		// fixture states it instead of relying on a startup default.
+		pinReplicas(t, e, 2)
 		applyCmd(t, e, &Command{Op: OpPlanSlots})
 	}
 
