@@ -2559,8 +2559,11 @@ func (e *Engine) RunController(ctx context.Context) {
 		// count (ReplicaCountForMembers — it is not configurable), because a
 		// fresh plan takes its replica count from the table and a grown
 		// cluster carries more copies of every slot. Then full-replan only
-		// when nothing is assigned; otherwise fill gaps left by member joins
-		// and top up replica sets that are below the factor.
+		// when nothing is assigned; otherwise converge the layout — fill gaps
+		// left by member joins and re-derive replica sets left stale by a
+		// factor change (OpReplanSlots' own function, run on a clone: a replan
+		// is submitted only when it would actually change the table, so the
+		// steady-state table never costs a Raft entry per round).
 		tbl = e.TableSnapshot()
 		if len(tbl.Peers) == 0 {
 			continue
@@ -2568,11 +2571,15 @@ func (e *Engine) RunController(ctx context.Context) {
 		if want := ReplicaCountForMembers(len(tbl.Peers)); tbl.Replicas != want {
 			e.loggerf("replica factor: table has %d, %d members need %d — changing it",
 				tbl.Replicas, len(tbl.Peers), want)
-			e.submit(&Command{Op: OpConfig, Replicas: want})
+			if err := e.submit(&Command{Op: OpConfig, Replicas: want}); err == nil {
+				// Re-read: the probe below plans with the factor this round
+				// just wrote, instead of the one it replaced.
+				tbl = e.TableSnapshot()
+			}
 		}
 		if len(tbl.Slots) == 0 {
 			e.submit(&Command{Op: OpPlanSlots})
-		} else if len(tbl.Slots) < int(tbl.SlotCount) || tableReplicaShortfall(tbl) {
+		} else if probe := tbl.Clone(); probe.applyReplanSlots() {
 			e.submit(&Command{Op: OpReplanSlots})
 		}
 		// 3) liveness sweep: probe peers over the peer plane; a peer that

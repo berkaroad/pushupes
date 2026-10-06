@@ -505,3 +505,141 @@ func TestSlotCopyStatusSeparatesBehindFromDiverged(t *testing.T) {
 			"so the caller rebuilds it, got (%v,%v)", eq, behind)
 	}
 }
+
+// ---- Surplus-seat reclaim: the drop side of a re-layout ---------------------
+
+// TestSurplusSeatForReplan pins the choice: only a seat the ring plan does not
+// prescribe may go, the leader never may (a slot without a writer cannot accept
+// appends), and an oversized set whose extras are all in the plan offers nobody
+// (the re-layout keeps adding, the reclaim only takes away what the ring does
+// not want).
+func TestSurplusSeatForReplan(t *testing.T) {
+	plan := []string{"node-2", "node-3"}
+
+	// Over the factor, one extra seat outside the plan: that one goes.
+	p := &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-3", "node-1"}, State: SlotStable}
+	if got := surplusSeatForReplan(p, 2, plan); got != "node-1" {
+		t.Fatalf("surplus seat = %q, want node-1", got)
+	}
+
+	// The leader is never eligible, even when the plan does not hold it.
+	p = &Placement{Leader: "node-1", Replicas: []string{"node-1", "node-2", "node-3"}, State: SlotStable}
+	if got := surplusSeatForReplan(p, 2, plan); got != "" {
+		t.Fatalf("the leader must never be reclaimed, got %q", got)
+	}
+
+	// At or under the factor there is nothing to reclaim.
+	p = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-3"}, State: SlotStable}
+	if got := surplusSeatForReplan(p, 2, plan); got != "" {
+		t.Fatalf("a set at the factor must not offer a seat, got %q", got)
+	}
+
+	// A migration owns its placement: never a candidate.
+	p = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-3", "node-1"}, State: SlotMigratingOut}
+	if got := surplusSeatForReplan(p, 2, plan); got != "" {
+		t.Fatalf("a non-stable slot must not offer a seat, got %q", got)
+	}
+
+	// Deterministic when several extras are outside the plan: the sorted first.
+	p = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-4", "node-1", "node-3"}, State: SlotStable}
+	if got := surplusSeatForReplan(p, 2, plan); got != "node-1" {
+		t.Fatalf("surplus seat = %q, want the sorted first of the extras (node-1)", got)
+	}
+}
+
+// TestReclaimRoundDropsSurplusSeat drives the reclaim against real stores and a
+// real peer plane, on the two shapes that matter:
+//
+//   - slot 0: the seats that STAY are in sync, so the surplus seat is redundant
+//     and comes off;
+//   - slot 2: a seat that stays is behind (the re-layout's fresh seat has not
+//     caught up), so the surplus seat is still the slot's second home for
+//     acknowledged records and stays until the copy catches up.
+func TestReclaimRoundDropsSurplusSeat(t *testing.T) {
+	ids := []string{"node-1", "node-2", "node-3"}
+	engines := map[string]*Engine{}
+	stores := map[string]*storage.Store{}
+	addrs := map[string]string{}
+	for _, id := range ids {
+		st, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
+		if err != nil {
+			t.Fatalf("open store %s: %v", id, err)
+		}
+		t.Cleanup(func() { st.Close() })
+		engines[id], stores[id], addrs[id] = NewEngine(nil, st, id, nil), st, ""
+	}
+	ctr := engines["node-1"]
+	ctr.node = newTestRaftNode(t, ctr) // the reclaim submits through the controller only
+	for _, id := range ids {
+		addrs[id] = newPeerHarness(t, engines[id])
+	}
+
+	// The production shape of the directory: every member with its real
+	// peer-plane address (the digest probes dial it).
+	for _, id := range ids {
+		e := engines[id]
+		for _, p := range ids {
+			applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: p, PeerAddr: addrs[p]}})
+			applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: p, AdminAddr: addrs[p], ClientAddr: addrs[p]}})
+		}
+		applyCmd(t, e, &Command{Op: OpConfig, Replicas: 2})
+		applyCmd(t, e, &Command{Op: OpPlanSlots})
+	}
+	appendOne := func(st *storage.Store, agg string) {
+		rec := makeRecord(agg, 1, agg+"-1")
+		if _, err := st.Append(rec); err != nil {
+			t.Fatalf("append %s: %v", agg, err)
+		}
+	}
+
+	// Ring pairs at factor 2: slot 0 -> [node-1, node-2] (leader node-1),
+	// slot 2 -> [node-3, node-1] (leader node-3).
+	if p := ctr.TableSnapshot().Slots[0]; p.Leader != "node-1" || p.Replicas[1] != "node-2" {
+		t.Fatalf("slot 0's ring pair: %+v", p)
+	}
+	if p := ctr.TableSnapshot().Slots[2]; p.Leader != "node-3" || p.Replicas[1] != "node-1" {
+		t.Fatalf("slot 2's ring pair: %+v", p)
+	}
+
+	// slot 0: the leader and its pair are in sync; the re-layout's extra seat
+	// (node-3) is the surplus.
+	agg0 := aggInSlot(t, ctr, 0)
+	appendOne(stores["node-1"], agg0)
+	appendOne(stores["node-2"], agg0)
+	applyCmd(t, ctr, &Command{Op: OpSlotAddReplica, Slots: []int32{0}, NodeID: "node-3"})
+
+	// slot 2: the pair's other seat (node-1, the one that stays) is empty while
+	// the leader holds a record, so it is behind — the surplus (node-2) must stay.
+	agg2 := aggInSlot(t, ctr, 2)
+	appendOne(stores["node-3"], agg2)
+	applyCmd(t, ctr, &Command{Op: OpSlotAddReplica, Slots: []int32{2}, NodeID: "node-2"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if done := ctr.reclaimRound(ctx, 8); done != 1 {
+		t.Fatalf("one surplus is redundant and one is not: want 1 reclaim, got %d", done)
+	}
+	if p := ctr.TableSnapshot().Slots[0]; replicaListHas(p.Replicas, "node-3") {
+		t.Fatalf("slot 0's redundant surplus seat must be reclaimed: %v", p.Replicas)
+	}
+	if p := ctr.TableSnapshot().Slots[0]; p.Leader != "node-1" || len(p.Replicas) != 2 {
+		t.Fatalf("slot 0 after the reclaim: %+v", p)
+	}
+	if p := ctr.TableSnapshot().Slots[2]; !replicaListHas(p.Replicas, "node-2") {
+		t.Fatalf("slot 2's surplus must stay while a kept seat is behind: %v", p.Replicas)
+	}
+
+	// The fresh seat catches up (the ordinary fetch loop does this): the surplus
+	// is redundant now and the next round takes it off.
+	appendOne(stores["node-1"], agg2)
+	if done := ctr.reclaimRound(ctx, 8); done != 1 {
+		t.Fatalf("the caught-up pair makes the surplus redundant: want 1 reclaim, got %d", done)
+	}
+	if p := ctr.TableSnapshot().Slots[2]; replicaListHas(p.Replicas, "node-2") {
+		t.Fatalf("slot 2's surplus seat must be reclaimed once its replacement is in sync: %v", p.Replicas)
+	}
+	// Nothing left to reclaim.
+	if done := ctr.reclaimRound(ctx, 8); done != 0 {
+		t.Fatalf("a settled layout must not reclaim anything, got %d", done)
+	}
+}

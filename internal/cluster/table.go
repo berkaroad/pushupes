@@ -146,6 +146,123 @@ func PlanSlots(nodes []string, slotCount int32, replicaFactor int) map[int32]*Pl
 	return out
 }
 
+// layoutStale reports whether the replica sets were laid out for a member count
+// other than the current one: a stable slot whose set size is not the derived
+// replica factor is the fingerprint of a factor change that has not been
+// reconciled yet (a member left, so the factor dropped and the sets now hold
+// surplus seats; or a member joined, so the factor rose and they hold too few).
+// Even member counts reuse the odd count below them ((N-1)/2 + 1 arithmetic),
+// so an even-numbered member leaves the factor AND the sets alone by rule — the
+// layout is deliberately not re-derived for it (DESIGN §4).
+func (t *Table) layoutStale() bool {
+	for _, p := range t.Slots {
+		if p.State == SlotStable && len(p.Replicas) != t.Replicas {
+			return true
+		}
+	}
+	return false
+}
+
+// applyReplanSlots re-derives the slot layout on the current member directory:
+// every unassigned slot is planned, and — while the layout is stale (a factor
+// change is pending, see layoutStale) — every stable slot ADDS the ring's seats
+// it does not hold yet. It reports whether it changed the table, which is also
+// the controller's test for whether a replan is worth a Raft entry (the
+// controller runs it on a clone of the snapshot before submitting; the same
+// function is what OpReplanSlots applies).
+//
+// Adding is what unblocks the layout: the rebalancer hands leadership back to
+// the ring's expected node only when that node is a REPLICA of the slot, so a
+// set left stale by a factor change — too small after seats went with a removed
+// member, or missing the ring's expected leader altogether — strands its slot
+// off the ring for good. Re-seating puts the expected leader back in the set as
+// a follower, and it catches up over the ordinary fetch protocol; the
+// rebalancer can then fence a hand-over to it.
+//
+// A re-seat never REMOVES a seat (the mirror direction is the reclaim, which
+// runs against real copies — see reclaimRound and surplusSeatForReplan). The
+// seats a stale set holds are the ones that have been replicating the slot;
+// dropping one the moment the factor moves would take a slot's only caught-up
+// copy out of its replica set while the ring's seats were still empty, and the
+// failure path picks a slot's new leader from the front of this list
+// (backupLeaderFor) — the same order argument that keeps the inherited seats
+// AHEAD of the ones this function appends. Convergence to the factor is
+// therefore two steps: add here, then reclaim the surplus once the kept copies
+// are in sync.
+//
+// Leaders are never moved: a slot whose current leader leaves the ring layout
+// keeps leading it until the rebalancer's fenced hand-over moves it (the
+// leader's own copy is never surplus while it leads, see copyIsSurplus).
+// Non-stable slots belong to a migration in flight and are never touched.
+func (t *Table) applyReplanSlots() bool {
+	nodes := t.PeerIDs()
+	if len(nodes) == 0 {
+		return false
+	}
+	planned := PlanSlots(nodes, t.SlotCount, t.Replicas)
+	stale := t.layoutStale()
+	changed := false
+	for s, p := range planned {
+		cur, ok := t.Slots[s]
+		if !ok {
+			t.Slots[s] = p
+			changed = true
+			continue
+		}
+		if cur.State != SlotStable || !stale {
+			continue
+		}
+		grown := unionReplicas(cur.Replicas, p.Replicas)
+		if len(grown) != len(cur.Replicas) {
+			cur.Replicas = grown
+			changed = true
+		}
+	}
+	return changed
+}
+
+// unionReplicas returns the current seats with the plan's missing ones appended.
+// The current order is preserved on purpose: the failure path takes a slot's new
+// leader from the front of the list, so the seats that have actually been
+// replicating the slot must stay ahead of the ones this re-layout just added.
+func unionReplicas(cur, want []string) []string {
+	out := append([]string(nil), cur...)
+	for _, w := range want {
+		if !replicaListHas(out, w) {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// surplusSeatForReplan picks the seat a re-layout may drop once the kept copies
+// are caught up, or "" when the placement is not oversized. Pure, so the choice
+// is directly assertable.
+//
+// The surplus is a seat the ring plan does not prescribe: the re-layout added
+// the plan's seats (applyReplanSlots) but never removes any, so a slot whose set
+// outgrew the factor converges on the plan by dropping exactly these. The leader
+// is never eligible (a slot without a writer cannot accept appends), and the
+// choice is sorted so every node replaying the table agrees on it — the same
+// determinism rule the migration's surplusForReclaim follows.
+func surplusSeatForReplan(p *Placement, factor int, plan []string) string {
+	if p == nil || p.State != SlotStable || len(p.Replicas) <= factor {
+		return ""
+	}
+	rest := make([]string, 0, len(p.Replicas))
+	for _, r := range p.Replicas {
+		if r == p.Leader || replicaListHas(plan, r) {
+			continue
+		}
+		rest = append(rest, r)
+	}
+	if len(rest) == 0 {
+		return ""
+	}
+	sort.Strings(rest)
+	return rest[0]
+}
+
 // LeaderMove is one rebalance step: hand slot s from its current leader to
 // To. Pure metadata (a controller-side plan entry, never replicated itself).
 type LeaderMove struct {
@@ -382,38 +499,27 @@ func (t *Table) Apply(c *Command) error {
 		}
 		t.Slots = PlanSlots(nodes, t.SlotCount, t.Replicas)
 	case OpReplanSlots:
-		// Fill in any slot that is still unassigned, and top up replica
-		// sets that are below the derived factor. The re-layout therefore
-		// happens exactly when that factor moves, which — with the count
-		// derived from the Raft fault tolerance (ReplicaCountForMembers) —
-		// is at the ODD member counts (3 -> 2 copies, 5 -> 3, 7 -> 4...).
-		// Adding an even-numbered member (a 4th, a 6th) leaves the derived
-		// count where it was, so the table is deliberately left alone: the
-		// new member carries no slot until the next odd count is reached.
-		// That is the operator's rule, not an oversight — see DESIGN §4.
-		// Leaders of assigned, stable slots are never moved — adding a
-		// replica is safe because the new replica pulls via fetch. A
-		// marked-down member KEEPS its replica seats (that is how its copy
-		// is still home when it returns); the sets are topped from the full
-		// directory for the same reason the plan uses it above.
-		nodes := t.PeerIDs()
-		if len(nodes) == 0 {
+		// Converge the layout on the current member directory: fill in any
+		// slot that is still unassigned, and add the ring's seats to every
+		// stable slot while a factor change is pending (applyReplanSlots).
+		// The re-layout therefore happens exactly when that factor moves,
+		// which — with the count derived from the Raft fault tolerance
+		// (ReplicaCountForMembers) — is at the ODD member counts (3 -> 2
+		// copies, 5 -> 3, 7 -> 4...). Adding an even-numbered member (a 4th,
+		// a 6th) leaves the derived count where it was, so the table is
+		// deliberately left alone: the new member carries no slot until the
+		// next odd count is reached. That is the operator's rule, not an
+		// oversight — see DESIGN §4. Leaders of assigned, stable slots are
+		// never moved — re-seating is safe because every added replica pulls
+		// via fetch before the rebalancer may hand leadership to it, and a
+		// dropped seat is reclaimed by its holder (localdrop). A marked-down
+		// member KEEPS its replica seats (that is how its copy is still home
+		// when it returns); the sets are derived from the full directory for
+		// the same reason the plan uses it above.
+		if len(t.PeerIDs()) == 0 {
 			return fmt.Errorf("replan_slots: no members")
 		}
-		planned := PlanSlots(nodes, t.SlotCount, t.Replicas)
-		for s, p := range planned {
-			cur, ok := t.Slots[s]
-			if !ok {
-				t.Slots[s] = p
-				continue
-			}
-			if cur.State != SlotStable {
-				continue // migration in flight; do not touch
-			}
-			if len(cur.Replicas) < t.Replicas && len(p.Replicas) > len(cur.Replicas) {
-				cur.Replicas = p.Replicas
-			}
-		}
+		t.applyReplanSlots()
 	case OpLeaderMove:
 		// The new leader must be a directory member. A migration staged
 		// before a leave_node and committed after it would otherwise re-seat

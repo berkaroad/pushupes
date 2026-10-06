@@ -109,10 +109,19 @@ func TestReplanFillsGapsOnly(t *testing.T) {
 	if p := tbl.Slots[0]; p.Leader != "node-2" || p.Epoch != beforeEpoch {
 		t.Fatalf("replan disturbed slot 0: %+v", p)
 	}
-	// every slot now has 2 replicas
+	// Every slot now covers the three-member ring's window at the derived
+	// factor — the re-layout ADDS the ring's seats, so a slot may still carry
+	// an extra seat it was already replicating until the reclaim takes it off
+	// (see reclaimRound).
+	nodes := tbl.PeerIDs()
 	for s, p := range tbl.Slots {
-		if len(p.Replicas) != 2 {
-			t.Fatalf("slot %d replicas %d want 2", s, len(p.Replicas))
+		if len(p.Replicas) < 2 {
+			t.Fatalf("slot %d replicas %d want at least 2", s, len(p.Replicas))
+		}
+		for i := 0; i < 2; i++ {
+			if on := nodes[(int(s)+i)%len(nodes)]; !replicaListHas(p.Replicas, on) {
+				t.Fatalf("slot %d does not hold the ring's seat %s: %v", s, on, p.Replicas)
+			}
 		}
 	}
 }

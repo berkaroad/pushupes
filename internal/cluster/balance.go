@@ -2,6 +2,8 @@ package cluster
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"time"
 )
 
@@ -94,6 +96,11 @@ func (e *Engine) RunRebalancer(ctx context.Context) {
 			continue
 		}
 		e.rebalanceRound(ctx, e.rebalanceBatch)
+		// Surplus-seat reclaim: the other half of a re-layout. A re-layout only
+		// ADDS seats (Table.applyReplanSlots), so a set left oversized by a
+		// factor change converges here — one seat per round, and only once the
+		// copies that stay are in sync (see reclaimRound).
+		e.reclaimRound(ctx, e.rebalanceBatch)
 	}
 }
 
@@ -256,11 +263,7 @@ func rebalanceRetryDelay(attempts int) time.Duration {
 func (e *Engine) rebalanceRetryReady(slot int32, from, to string, now time.Time) bool {
 	e.rebMu.Lock()
 	defer e.rebMu.Unlock()
-	cur, ok := e.rebRetry[slot]
-	if !ok || cur.from != from || cur.to != to {
-		return true // nothing recorded, or a different move
-	}
-	return !now.Before(cur.notBefore)
+	return retryReady(e.rebRetry, slot, from, to, now)
 }
 
 // recordRebalanceAttempt counts one attempt of this move and sets when the next
@@ -268,16 +271,184 @@ func (e *Engine) rebalanceRetryReady(slot int32, from, to string, now time.Time)
 func (e *Engine) recordRebalanceAttempt(slot int32, from, to string, now time.Time) {
 	e.rebMu.Lock()
 	defer e.rebMu.Unlock()
-	if e.rebRetry == nil {
-		e.rebRetry = map[int32]rebalanceAttempt{}
+	recordAttempt(&e.rebRetry, slot, from, to, now)
+}
+
+// seatRetryReady / recordSeatAttempt are the same gate for the surplus-seat
+// reclaim (reclaimRound), keyed on the seat being dropped: a copy whose kept
+// peers never converge would otherwise cost one digest round trip per seat per
+// round, forever.
+func (e *Engine) seatRetryReady(slot int32, seat string, now time.Time) bool {
+	e.rebMu.Lock()
+	defer e.rebMu.Unlock()
+	return retryReady(e.seatRetry, slot, seat, "", now)
+}
+
+func (e *Engine) recordSeatAttempt(slot int32, seat string, now time.Time) {
+	e.rebMu.Lock()
+	defer e.rebMu.Unlock()
+	recordAttempt(&e.seatRetry, slot, seat, "", now)
+}
+
+// retryReady reports whether the attempt recorded for this (slot, from, to) key
+// may be tried now. Read-only, so a slot that is merely WAITING (a copy still
+// catching up) does not accumulate backoff.
+func retryReady(m map[int32]rebalanceAttempt, slot int32, from, to string, now time.Time) bool {
+	cur, ok := m[slot]
+	if !ok || cur.from != from || cur.to != to {
+		return true // nothing recorded, or a different move
 	}
-	cur, ok := e.rebRetry[slot]
+	return !now.Before(cur.notBefore)
+}
+
+// recordAttempt counts one attempt of the key and sets when the next one of the
+// SAME key may start. A different key (a different move, a different seat) is a
+// fresh try, not a retry.
+func recordAttempt(m *map[int32]rebalanceAttempt, slot int32, from, to string, now time.Time) {
+	if *m == nil {
+		*m = map[int32]rebalanceAttempt{}
+	}
+	cur, ok := (*m)[slot]
 	if !ok || cur.from != from || cur.to != to {
 		cur = rebalanceAttempt{from: from, to: to}
 	}
 	cur.attempts++
 	cur.notBefore = now.Add(rebalanceRetryDelay(cur.attempts))
-	e.rebRetry[slot] = cur
+	(*m)[slot] = cur
+}
+
+// ---- Surplus-seat reclaim: the other half of a re-layout ---------------------
+
+// reclaimRound drops the seats a re-layout left redundant: one seat per slot,
+// and the round is capped like the hand-overs (a batch per tick, serial), so
+// convergence costs one Raft entry per seat instead of a burst.
+//
+// A re-layout only ADDS seats (Table.applyReplanSlots), because removing one
+// takes a copy out of the slot's replica set and the failure path picks the
+// slot's new leader from the front of that set (backupLeaderFor) — the copies a
+// stale set holds are the ones that have actually been replicating the slot.
+// The surplus therefore comes off here, against real copies: a seat is dropped
+// only when every seat that STAYS already holds a copy equivalent to the
+// leader's (same directory digest, not behind). Until then the extra seat is
+// what keeps the slot's acknowledged records available if the leader dies, so
+// waiting is not a delay but the point.
+//
+// Gates, in order (same shape as the hand-overs):
+//   - controller only, and a round yields while ANY slot is not stable (a live
+//     migration owns the layout);
+//   - the surplus is a seat the ring plan does not prescribe — the plan is the
+//     same one the re-layout adds (Table.PeerIDs, the full directory), so a
+//     member that is merely DOWN keeps its seat and is never reclaimed;
+//   - the leader is never a candidate (Table.surplusSeatForReplan);
+//   - a seat whose kept peers are unreachable, or diverged rather than merely
+//     behind, is skipped with backoff: it will either heal or wait for the
+//     operator (the hand-over path owns repairing a diverged copy).
+func (e *Engine) reclaimRound(ctx context.Context, limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	tbl := e.TableSnapshot()
+	if len(tbl.Peers) < 2 || !layoutSettled(tbl) {
+		return 0
+	}
+	planned := PlanSlots(tbl.PeerIDs(), tbl.SlotCount, tbl.Replicas)
+	slots := make([]int32, 0, 8)
+	for s, p := range tbl.Slots {
+		if surplusSeatForReplan(p, tbl.Replicas, planned[s].Replicas) != "" {
+			slots = append(slots, s)
+		}
+	}
+	if len(slots) == 0 {
+		return 0
+	}
+	sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
+	done := 0
+	for _, s := range slots {
+		if done >= limit || ctx.Err() != nil {
+			break
+		}
+		// Re-read the placement: the round's plan came from a snapshot and a
+		// hand-over or a migration may have moved this slot since.
+		cur, ok := e.TableSnapshot().Slots[s]
+		if !ok {
+			continue
+		}
+		drop := surplusSeatForReplan(cur, tbl.Replicas, planned[s].Replicas)
+		if drop == "" {
+			continue
+		}
+		if !e.seatRetryReady(s, drop, time.Now()) {
+			continue
+		}
+		inSync, behind, err := e.keptCopiesInSync(ctx, s, cur, drop)
+		if err != nil {
+			continue // peer-plane error: it will either heal or be caught next round
+		}
+		if behind {
+			continue // the copies that stay are still fetching: the surplus is not redundant yet
+		}
+		if !inSync {
+			// A kept copy reports the leader's LEO with a different directory.
+			// Fetching cannot repair that (the rebalancer's repair path owns it
+			// when it hands this slot's leadership over), and probing it again
+			// every round buys nothing: back off.
+			e.recordSeatAttempt(s, drop, time.Now())
+			e.logger.WithFields(map[string]any{
+				"slot": s, "seat": drop, "op": "seat_reclaim",
+			}).Warn("surplus seat kept: a copy that stays has the leader's LEO but a different directory")
+			continue
+		}
+		if err := e.RemoveReplica(ctx, s, drop); err != nil {
+			e.recordSeatAttempt(s, drop, time.Now())
+			e.loggerf("surplus seat reclaim: dropping %s from slot %d failed: %v (retried with backoff)", drop, s, err)
+			continue
+		}
+		e.logger.WithFields(map[string]any{
+			"slot": s, "seat": drop, "factor": tbl.Replicas, "op": OpSlotRemoveReplica,
+		}).Info("surplus replica reclaimed: the set is back at the factor")
+		done++
+	}
+	return done
+}
+
+// keptCopiesInSync reports whether every seat the reclaim would KEEP for the
+// slot holds a copy equivalent to the leader's — the condition that makes the
+// dropped seat redundant. It answers the same way as the hand-over gate
+// (slotCopyStatus), including the wait-vs-repair distinction the caller needs:
+//
+//   - (true, false, nil):  every kept seat matches the leader: drop the surplus;
+//   - (false, true, nil):  a kept seat is still fetching (below the leader's
+//     LEO): wait;
+//   - (false, false, nil): a kept seat has the leader's LEO with a different
+//     directory: only a rebuild repairs it, so back off;
+//   - an error is a peer-plane failure and says nothing about the copies.
+func (e *Engine) keptCopiesInSync(ctx context.Context, slot int32, p *Placement, drop string) (inSync, behind bool, err error) {
+	src := e.peerAddr(p.Leader)
+	if p.Leader == e.self {
+		src = "" // read our own copy locally
+	} else if src == "" {
+		return false, false, fmt.Errorf("slot %d: no address for leader %s", slot, p.Leader)
+	}
+	for _, r := range p.Replicas {
+		if r == drop || r == p.Leader {
+			continue
+		}
+		dst := e.peerAddr(r)
+		if dst == "" {
+			return false, false, fmt.Errorf("slot %d: no address for replica %s", slot, r)
+		}
+		equivalent, belowLeader, err := e.slotCopyStatus(ctx, slot, src, dst)
+		if err != nil {
+			return false, false, err
+		}
+		if belowLeader {
+			return false, true, nil
+		}
+		if !equivalent {
+			return false, false, nil
+		}
+	}
+	return true, false, nil
 }
 
 // slotCopyStatus compares the two copies and separates the two ways they can
