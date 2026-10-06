@@ -95,10 +95,11 @@ type Engine struct {
 	// one replication session per slot leader (multiplexed long-poll fetch)
 	sessMu   sync.Mutex
 	sessions map[string]*fetchSession
-	// sessKick wakes replicaLoop to reconcile sessions at once when the table
-	// changes (a leader move makes a follower follow a new leader; waiting for
-	// the 1s ticker left the new leader's watermark without a report for up to
-	// a second, which stalled every acknowledged append to it).
+	// sessKick wakes replicaLoop to reconcile sessions when the table
+	// changes (a leader move makes a follower follow a new leader; the
+	// reconciliation rides the kick immediately, so the new leader's watermark
+	// gets a replica report within one RPC round trip instead of waiting for
+	// any polling cadence).
 	sessKick chan struct{}
 
 	// controller liveness: consecutive health-probe failures per peer.
@@ -109,8 +110,11 @@ type Engine struct {
 
 	// storageMu guards gauge, the cluster storage sample every node refreshes in
 	// the background (any node serves /admin/cluster/status — runStorageSampler).
-	storageMu sync.Mutex
-	gauge     storageGauge
+	// storageKick schedules a refresh; a status read finding the gauge stale
+	// sends it, so sampling runs only while something reads the gauge.
+	storageMu   sync.Mutex
+	gauge       storageGauge
+	storageKick chan struct{}
 
 	// unreach is the controller's witness table for the unreachable reports
 	// observers send (suspect -> reporter -> when). See recordUnreachable.
@@ -414,6 +418,7 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *logrus.Ent
 		fwd:         map[int32]string{},
 		sessions:    map[string]*fetchSession{},
 		sessKick:    make(chan struct{}, 1),
+		storageKick: make(chan struct{}, 1),
 		failStreak:  map[string]int{},
 		migFwdSince: map[int32]time.Time{},
 		ledPrev:     map[int32]bool{},
@@ -2152,8 +2157,6 @@ func (e *Engine) ReplicateRecord(slot int32, seq uint64, payload []byte) error {
 // node following 2731 slots over 2 leaders holds 2 connections, not 2731.
 
 func (e *Engine) replicaLoop(ctx context.Context) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
 	e.syncSessions(ctx)
 	for {
 		select {
@@ -2167,17 +2170,15 @@ func (e *Engine) replicaLoop(ctx context.Context) {
 			return
 		case <-e.sessKick:
 			e.syncSessions(ctx)
-		case <-ticker.C:
-			e.syncSessions(ctx)
 		}
 	}
 }
 
-// kickSessions asks replicaLoop to reconcile its fetch sessions now instead of
-// on the next tick. Called off the Raft apply path (non-blocking) so a leader
-// move re-establishes the follower sessions immediately: the new leader gets
-// its replicas' progress reports within one RPC round trip instead of up to a
-// second later, so its watermark does not stall.
+// kickSessions asks replicaLoop to reconcile its fetch sessions now. Called
+// off the Raft apply path (non-blocking) so a leader move re-establishes the
+// follower sessions immediately: the new leader gets its replicas' progress
+// reports within one RPC round trip instead of up to a second later, so its
+// watermark does not stall.
 func (e *Engine) kickSessions() {
 	select {
 	case e.sessKick <- struct{}{}:
@@ -2715,26 +2716,38 @@ type storageGauge struct {
 	at       time.Time
 }
 
-// storageSampleInterval is how often a node recomputes the cluster storage
-// gauge. It is a background refresh on purpose: the sum needs one peer round
-// trip per other member, and /admin/cluster/status is polled by the console
-// every couple of seconds — the status must answer from the last sample instead
-// of blocking behind a peer that is slow or gone.
+// storageSampleInterval is how stale the cluster storage gauge may get before
+// a reader of /admin/cluster/status triggers a background refresh. The sum
+// needs one peer round trip per other member, so it is never computed inline:
+// the status answers from the last sample, and the read that found the sample
+// stale schedules the next one. A console polling the page therefore keeps the
+// gauge fresh; with no reader at all, an idle node samples nothing.
 const storageSampleInterval = 2 * time.Second
 
-// runStorageSampler keeps the gauge fresh. Every node runs it: the status
-// endpoint is served by all of them, not only by the controller.
+// runStorageSampler keeps the gauge fresh ON DEMAND: only the first sample (at
+// boot) and reader-triggered kicks refresh it. A status read older than
+// storageSampleInterval schedules the next sample (see ClusterStorageBytes),
+// so the gauge converges to the console's polling cadence instead of adding a
+// peer-plane round trip per other member every 2 seconds forever — which is
+// what an idle cluster was paying for a number nobody was looking at.
 func (e *Engine) runStorageSampler(ctx context.Context) {
 	e.refreshStorage() // first sample immediately, so status is not empty for a tick
-	t := time.NewTicker(storageSampleInterval)
-	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-e.storageKick:
 			e.refreshStorage()
 		}
+	}
+}
+
+// kickStorage nudges the sampler to recompute the gauge; the signal coalesces
+// (cap 1) because refreshStorage always samples the current table.
+func (e *Engine) kickStorage() {
+	select {
+	case e.storageKick <- struct{}{}:
+	default:
 	}
 }
 
@@ -2804,11 +2817,19 @@ func (e *Engine) refreshStorage() {
 
 // ClusterStorageBytes reports the last storage sample: the sum of every slot's
 // leader copy, and whether every leader answered. Zero/false until the first
-// sample lands (the sampler runs one immediately on start).
+// sample lands (the sampler runs one immediately on start). A read that finds
+// the sample older than the staleness window kicks the background sampler, so
+// the gauge converges on whoever is reading it and stays untouched while
+// nobody is.
 func (e *Engine) ClusterStorageBytes() (uint64, bool) {
 	e.storageMu.Lock()
-	defer e.storageMu.Unlock()
-	return e.gauge.bytes, e.gauge.complete && !e.gauge.at.IsZero()
+	bytes, complete, at := e.gauge.bytes, e.gauge.complete, e.gauge.at
+	stale := at.IsZero() || time.Since(at) >= storageSampleInterval
+	e.storageMu.Unlock()
+	if stale {
+		e.kickStorage()
+	}
+	return bytes, complete && !at.IsZero()
 }
 
 // SlotSize is a slot's local on-disk footprint (see storage.Store.SlotDiskBytes):
