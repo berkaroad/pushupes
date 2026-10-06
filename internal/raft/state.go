@@ -120,12 +120,13 @@ func (n *Node) run() {
 	n.electionTimer = time.NewTimer(n.randomElectionTimeout())
 	n.heartbeatTimer = time.NewTimer(n.cfg.HeartbeatTimeout)
 	stopTimer(n.heartbeatTimer)
-	snapTick := time.NewTimer(n.cfg.SnapshotInterval)
-	confTick := time.NewTicker(confSweepInterval)
+	stopTimer(n.snapTimer)
+	stopTimer(n.confTimer)
 	defer stopTimer(n.electionTimer)
 	defer stopTimer(n.heartbeatTimer)
-	defer stopTimer(snapTick)
-	defer confTick.Stop()
+	defer stopTimer(n.snapTimer)
+	defer stopTimer(n.confTimer)
+	n.armTimers(time.Now())
 
 	for {
 		select {
@@ -144,14 +145,57 @@ func (n *Node) run() {
 			n.onElectionTimeout()
 		case <-n.heartbeatTimer.C:
 			n.onHeartbeatTick()
-		case <-snapTick.C:
-			if n.applied > 0 {
-				n.maybeSnapshot(true)
-			}
-			resetTimer(snapTick, n.cfg.SnapshotInterval)
-		case now := <-confTick.C:
-			n.sweepConfDeadlines(now)
+		case <-n.snapTimer.C:
+			n.onSnapshotTick()
+		case <-n.confTimer.C:
+			n.sweepConfDeadlines(time.Now())
 		}
+		// Every case above can move `applied` or the conf deadlines, which is
+		// what decides whether the two on-demand timers are needed at all; one
+		// re-evaluation per loop turn keeps them exact without scattering arm
+		// calls through the handlers. Re-arming with a duration measured to the
+		// SAME absolute deadline (or the snapArmed guard) never pushes a timer's
+		// firing time out, so events cannot starve either timer.
+		n.armTimers(time.Now())
+	}
+}
+
+// armTimers re-arms the two on-demand run-loop timers after loop work that can
+// change whether they are needed. The snapshot backstop exists only while
+// applied entries sit ahead of the last snapshot; the membership sweep exists
+// only while a change has an outstanding deadline. An idle node holds neither,
+// so it wakes for no timer at all — these two plus the WAL's group-commit
+// window were the process's entire idle wakeups.
+func (n *Node) armTimers(now time.Time) {
+	si, _, _ := n.log.Snapshot()
+	if n.applied > si {
+		if !n.snapArmed {
+			n.snapArmed = true
+			n.snapTimer.Reset(n.cfg.SnapshotInterval)
+		}
+	} else if n.snapArmed {
+		n.snapArmed = false
+		stopTimer(n.snapTimer)
+	}
+	if n.confNextDeadline.IsZero() {
+		stopTimer(n.confTimer)
+		return
+	}
+	d := n.confNextDeadline.Sub(now)
+	if d < confSweepInterval {
+		d = confSweepInterval
+	}
+	n.confTimer.Reset(d)
+}
+
+// onSnapshotTick is the time backstop: snapshot what has been applied even if
+// the entry-count threshold was never reached. The loop's armTimers re-arms
+// (the async snapshot has not landed yet) or disarms (nothing sits ahead of
+// the snapshot) after this case returns.
+func (n *Node) onSnapshotTick() {
+	n.snapArmed = false
+	if n.applied > 0 {
+		n.maybeSnapshot(true)
 	}
 }
 
@@ -298,12 +342,17 @@ func (n *Node) becomeLeader() {
 }
 
 func (n *Node) onHeartbeatTick() {
-	if n.state == Leader {
-		n.kickAll()
-		n.advancePendingAdd()
-		n.maybeAdvanceCommit()
-		n.applyCommitted()
+	// The heartbeat timer exists only to drive a leader's periodic kick. A
+	// follower must not re-arm it: it is started by becomeLeader, and without
+	// this guard a node that once led (then stepped down) would keep waking
+	// every heartbeat interval doing nothing.
+	if n.state != Leader {
+		return
 	}
+	n.kickAll()
+	n.advancePendingAdd()
+	n.maybeAdvanceCommit()
+	n.applyCommitted()
 	resetTimer(n.heartbeatTimer, n.cfg.HeartbeatTimeout)
 }
 

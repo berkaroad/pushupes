@@ -85,6 +85,16 @@ type Node struct {
 	confWaiters      map[uint64]confWaiter
 	confNextDeadline time.Time
 	confSeq          atomic.Uint64
+	// confTimer is the run loop's on-demand membership-deadline sweep: armed
+	// only while a change has an outstanding deadline (waitConf arms it to the
+	// earliest deadline; the sweep re-arms it to the next one or stops it), so
+	// an idle node holds no 200ms ticker. snapTimer is the snapshot time
+	// backstop, armed by applyCommitted only while applied entries sit ahead of
+	// the last snapshot and disarmed once none do; snapArmed guards the arm so a
+	// steady write stream does not keep pushing the backstop out.
+	confTimer *time.Timer
+	snapTimer *time.Timer
+	snapArmed bool
 	// pendingAdd is the learner waiting to be promoted: the change is held
 	// back until the learner's log reaches pendingCommit, or the budget runs
 	// out.
@@ -151,6 +161,8 @@ func NewNode(cfg Config, fsm FSM, tr Transport) (*Node, error) {
 		matchIndex:   map[string]uint64{},
 		replicators:  map[string]*replicator{},
 		confWaiters:  map[uint64]confWaiter{},
+		snapTimer:    time.NewTimer(cfg.SnapshotInterval),
+		confTimer:    time.NewTimer(confSweepInterval),
 		pendingAddrs: map[string]string{},
 		closing:      map[string]bool{},
 		confPending:  map[string]uint64{},
