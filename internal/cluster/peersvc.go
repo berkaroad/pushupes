@@ -69,6 +69,13 @@ func (s *peerServer) Register(_ context.Context, req *pushupesv1.RegisterRequest
 	return &pushupesv1.RegisterResponse{}, nil
 }
 
+func (s *peerServer) Adopt(ctx context.Context, req *pushupesv1.AdoptRequest) (*pushupesv1.AdoptResponse, error) {
+	if err := s.e.acceptAdoption(ctx, &Adoption{ID: req.Id, PeerAddr: req.PeerAddr}); err != nil {
+		return nil, err
+	}
+	return &pushupesv1.AdoptResponse{}, nil
+}
+
 func (s *peerServer) MFetch(ctx context.Context, req *pushupesv1.MFetchRequest) (*pushupesv1.MFetchResponse, error) {
 	internal := &MFetchRequest{Follower: req.Follower, WaitMS: req.WaitMs, Slots: req.Slots, FromSeqs: req.FromSeqs, Sweep: req.Sweep}
 	resp, err := s.e.HandleMFetchCtx(ctx, *internal)

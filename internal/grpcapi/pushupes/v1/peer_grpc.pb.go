@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	PeerService_Ping_FullMethodName            = "/pushupes.v1.PeerService/Ping"
 	PeerService_Register_FullMethodName        = "/pushupes.v1.PeerService/Register"
+	PeerService_Adopt_FullMethodName           = "/pushupes.v1.PeerService/Adopt"
 	PeerService_MFetch_FullMethodName          = "/pushupes.v1.PeerService/MFetch"
 	PeerService_ReplicaProgress_FullMethodName = "/pushupes.v1.PeerService/ReplicaProgress"
 	PeerService_Replicate_FullMethodName       = "/pushupes.v1.PeerService/Replicate"
@@ -49,6 +50,12 @@ type PeerServiceClient interface {
 	// Register announces a node's admin/client addresses into the routing
 	// table (leader commits an OpRegister; non-leaders relay).
 	Register(ctx context.Context, in *RegisterRequest, opts ...grpc.CallOption) (*RegisterResponse, error)
+	// Adopt is a node announcing itself to the cluster it is joining: the node
+	// is running but is not a voter yet, so it names itself (id + peer address)
+	// and the leader adds it to the configuration. Without it a node started
+	// after the cluster was formed would have to be typed into an operator's
+	// admin call by hand. Non-leaders relay to the leader, like Register.
+	Adopt(ctx context.Context, in *AdoptRequest, opts ...grpc.CallOption) (*AdoptResponse, error)
 	// MFetch is the multiplexed replica fetch: every slot this follower
 	// copies from the serving leader is one item; the call long-polls when
 	// everything is empty (wait_ms budget, server-held).
@@ -114,6 +121,16 @@ func (c *peerServiceClient) Register(ctx context.Context, in *RegisterRequest, o
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RegisterResponse)
 	err := c.cc.Invoke(ctx, PeerService_Register_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *peerServiceClient) Adopt(ctx context.Context, in *AdoptRequest, opts ...grpc.CallOption) (*AdoptResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AdoptResponse)
+	err := c.cc.Invoke(ctx, PeerService_Adopt_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -230,6 +247,12 @@ type PeerServiceServer interface {
 	// Register announces a node's admin/client addresses into the routing
 	// table (leader commits an OpRegister; non-leaders relay).
 	Register(context.Context, *RegisterRequest) (*RegisterResponse, error)
+	// Adopt is a node announcing itself to the cluster it is joining: the node
+	// is running but is not a voter yet, so it names itself (id + peer address)
+	// and the leader adds it to the configuration. Without it a node started
+	// after the cluster was formed would have to be typed into an operator's
+	// admin call by hand. Non-leaders relay to the leader, like Register.
+	Adopt(context.Context, *AdoptRequest) (*AdoptResponse, error)
 	// MFetch is the multiplexed replica fetch: every slot this follower
 	// copies from the serving leader is one item; the call long-polls when
 	// everything is empty (wait_ms budget, server-held).
@@ -286,6 +309,9 @@ func (UnimplementedPeerServiceServer) Ping(context.Context, *PingRequest) (*Ping
 }
 func (UnimplementedPeerServiceServer) Register(context.Context, *RegisterRequest) (*RegisterResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Register not implemented")
+}
+func (UnimplementedPeerServiceServer) Adopt(context.Context, *AdoptRequest) (*AdoptResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Adopt not implemented")
 }
 func (UnimplementedPeerServiceServer) MFetch(context.Context, *MFetchRequest) (*MFetchResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method MFetch not implemented")
@@ -367,6 +393,24 @@ func _PeerService_Register_Handler(srv interface{}, ctx context.Context, dec fun
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(PeerServiceServer).Register(ctx, req.(*RegisterRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PeerService_Adopt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AdoptRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerServiceServer).Adopt(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerService_Adopt_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerServiceServer).Adopt(ctx, req.(*AdoptRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -536,6 +580,10 @@ var PeerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Register",
 			Handler:    _PeerService_Register_Handler,
+		},
+		{
+			MethodName: "Adopt",
+			Handler:    _PeerService_Adopt_Handler,
 		},
 		{
 			MethodName: "MFetch",

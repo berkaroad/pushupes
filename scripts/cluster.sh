@@ -7,6 +7,9 @@
 #
 #   scripts/cluster.sh start     启动集群（编译、逐个拉起、等待选主与槽规划，并打印管理台多地址启动命令）
 #   scripts/cluster.sh status    查看各节点 Raft 角色、Leader 槽数、迁移中槽数
+#   scripts/cluster.sh join N    运行时扩一个节点：先拉起 node-N（-join 指向现有成员），再 POST 到 controller 加成员
+#   scripts/cluster.sh remove N  运行时摘掉 node-N（DELETE 到 controller；槽主自动迁到存活副本，副本集自动补齐）
+#   scripts/cluster.sh members   列出当前 raft 成员（GET /admin/cluster/nodes）
 #   scripts/cluster.sh smoke     端到端冒烟：MOVED 重定向 → v1/v2 写入 → 幂等 exists → 版本冲突 fail/1001 → 回读
 #   scripts/cluster.sh slotcheck 副本一致性体检：逐槽比较 leader 与各副本摘要（有发散副本时退出码 1）
 #   scripts/cluster.sh logs [N]  跟踪某个节点日志（默认 node-1）
@@ -15,7 +18,7 @@
 #   scripts/cluster.sh clean     stop 并删除运行目录（含数据，慎用）
 #
 # 脚本可用环境变量覆盖：
-#   REPLICAS=3             节点数
+#   REPLICAS=3             起始节点数
 #   HOST=127.0.0.1         绑定与广播地址
 #   ADMIN_BASE=8091         节点 i 的 admin 管理端口（HTTP admin + pprof）= ADMIN_BASE + i - 1
 #   PEER_BASE=8391         节点 i 的 peer 端口（Raft + peer gRPC，全部节点间通讯）= PEER_BASE + i - 1
@@ -28,6 +31,15 @@
 #
 # 客户端入口：任意节点都能收写请求（非 leader 返回 err_id=1003 带目标节点
 # 地址，smoke 里演示了跟随重定向）；读走各节点本地 ≤HW 副本。
+#
+# 运行时成员变更（不重启、不丢数据）：
+#   扩：scripts/cluster.sh join 4
+#       node-4 用 -peers（初始 3 成员的种子）+ -join（指向 node-1）启动，
+#       自己向 leader 报名；leader 把它加进 raft 配置，槽表 replan 后
+#       副本集自动补齐。也可以在已有节点上手动 POST /admin/cluster/nodes。
+#   缩：scripts/cluster.sh remove 2
+#       提交 raft 配置删除；该节点收到配置项后才停复制，槽主先迁到存活
+#       副本，再自动补副本。数据目录仍在，可手动清理。
 
 set -uo pipefail
 
@@ -96,9 +108,12 @@ build_binary() {
 
 # 全集群共享的 peers 表：node-id=host:peerport（单端口形式）。
 # admin/client 地址不配置——各节点通过 peer 端口上的注册协议自报。
+# SEED_MAX 限定种子范围：运行时加入的节点（join N，N > REPLICAS）只把
+# 已存在的成员（1..REPLICAS）当种子，绝不含自己——否则它一启动就以为自己是
+# 成员，不会去报名。
 peers_csv() {
-  local list="" i
-  for i in $(seq 1 "$REPLICAS"); do
+  local list="" i max="${SEED_MAX:-$REPLICAS}"
+  for i in $(seq 1 "$max"); do
     list+="${list:+,}node-$i=http://$HOST:$(peer_port "$i")"
   done
   printf '%s' "$list"
@@ -111,6 +126,11 @@ start_node() {
   peers="$(peers_csv)"
   : > "$dir/node.log"
   local extra=()
+  # 运行时加入的节点（join N）不是初始成员：它用 -peers 当种子、用 -join
+  # 指向现有成员报名。start_node 只负责拉起进程，成员变更由 cmd_join 提交。
+  if [[ -n "${JOIN_TARGET:-}" ]]; then
+    extra+=(-join "$JOIN_TARGET")
+  fi
   # -bootstrap 已废弃：成员集合静态，每个节点启动时按 -peers 写入同一 voter 集，
   # 不再有「先 bootstrap 再 join」的差异。
 
@@ -212,14 +232,96 @@ cmd_start() {
 cmd_slotcheck() {
   build_binary
   local list="" i
-  for i in $(seq 1 "$REPLICAS"); do list+="${list:+,}$HOST:$(admin_port "$i")"; done
+  for i in $(cluster_node_indexes); do list+="${list:+,}$HOST:$(admin_port "$i")"; done
   "$ROOT/bin/slotcheck" -admins "$list" "$@"
+}
+
+# controller_admin 找到当前 raft leader 的 admin 端口（成员变更必须发到它）。
+# 从任一节点的 status 里取 controller_admin_addr；读不到就回退到 admin 端口轮询。
+controller_admin() {
+  local i body ctrl
+  for i in $(seq 1 "$REPLICAS"); do
+    body="$(curl -s --max-time 2 "$(base_url "$i")/admin/cluster/status" 2>/dev/null)" || continue
+    ctrl="$(json_field "$body" controller_admin_addr)"
+    if [[ -n "$ctrl" ]]; then
+      printf '%s' "${ctrl#http://}"
+      return 0
+    fi
+  done
+  die "找不到 controller（raft leader），集群可能还没选主"
+}
+
+# cmd_join N：运行时扩一个节点。先拉起进程（-join 指向现有成员），等它
+# 自己报名进 raft 配置，再等它出现在成员表里。
+cmd_join() {
+  local n="${1:-}"
+  [[ -n "$n" && "$n" =~ ^[0-9]+$ ]] || die "用法: $0 join <节点序号>"
+  build_binary
+  if node_pid_alive "$n"; then
+    info "node-$n 已在运行，跳过启动"
+  else
+    rm -f "$(pid_file "$n")"
+    # 报名入口：指向 node-1 的 peer 端口（启动时至少 node-1 已在跑）。
+    JOIN_TARGET="$HOST:$(peer_port 1)" start_node "$n"
+  fi
+  local deadline=$((SECONDS + READY_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    local members
+    members="$(curl -s --max-time 3 "$(base_url 1)/admin/cluster/nodes" 2>/dev/null)" || members=""
+    if printf '%s' "$members" | grep -q "\"id\":\"node-$n\""; then
+      info "node-$n 已加入 raft 配置（成员变更自动 replan 槽表）"
+      cmd_members
+      return 0
+    fi
+    sleep 1
+  done
+  warn "等待 node-$n 加入超时；日志尾部："
+  tail -n 10 "$(log_file "$n")" 2>/dev/null || warn "  （无日志）"
+  return 1
+}
+
+# cmd_remove N：运行时摘掉一个节点。DELETE 必须发到 controller。
+cmd_remove() {
+  local n="${1:-}"
+  [[ -n "$n" && "$n" =~ ^[0-9]+$ ]] || die "用法: $0 remove <节点序号>"
+  local ctrl; ctrl="$(controller_admin)"
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+    --max-time 40 "http://$ctrl/admin/cluster/nodes/node-$n" 2>/dev/null)"
+  case "$code" in
+    200) info "node-$n 已从 raft 配置移除（槽主迁移 + 副本补齐已由 controller 接管）" ;;
+    *)   die "移除 node-$n 失败（HTTP $code）：curl -X DELETE http://$ctrl/admin/cluster/nodes/node-$n" ;;
+  esac
+  cmd_members
+}
+
+# cmd_members：列出当前 raft 成员（任一节点的本地视图）。
+cmd_members() {
+  local i body
+  for i in $(seq 1 "$REPLICAS"); do
+    body="$(curl -s --max-time 3 "$(base_url "$i")/admin/cluster/nodes" 2>/dev/null)" || continue
+    [[ -n "$body" ]] || continue
+    info "成员（自 node-$i 的视图）：$(json_field "$body" members 2>/dev/null)"
+    printf '%s\n' "$body" | tr ',' '\n' | grep -o '"id":"[^"]*"' | sed 's/"id":"/  - /; s/"$//'
+    return 0
+  done
+  die "没有节点响应 /admin/cluster/nodes"
+}
+
+# cluster_node_indexes 列出要呈现/体检的节点序号：REPLICAS 里的初始成员，加上
+# 运行时扩进来的（node-N，N > REPLICAS，从成员表读）。写死 1..REPLICAS 会让 join
+# 进来的节点在 status/smoke/slotcheck 里凭空消失。
+cluster_node_indexes() {
+  local extra=""
+  extra="$(curl -s --max-time 3 "$(base_url 1)/admin/cluster/nodes" 2>/dev/null \
+    | grep -o '"id":"node-[0-9]*"' | grep -o '[0-9]*')" || extra=""
+  printf '%s\n' $(seq 1 "$REPLICAS") $extra | sort -n -u
 }
 
 cmd_status() {
   local i body state leader leaders migrating
   info "=== PushupES 集群（REPLICAS=$REPLICAS）==="
-  for i in $(seq 1 "$REPLICAS"); do
+  for i in $(cluster_node_indexes); do
     body="$(curl -s --max-time 3 "$(base_url "$i")/admin/cluster/status" 2>/dev/null)"
     if [[ -z "$body" ]]; then
       info "  node-$i: 无响应（$(node_pid_alive "$i" && echo 进程存活 || echo 未运行)）"
@@ -238,7 +340,7 @@ cmd_status() {
 cmd_smoke() {
   local addrs="" i
   [[ -x "$ROOT/bin/grpccheck" ]] || die "缺少 bin/grpccheck，先 BUILD=1 scripts/cluster.sh start"
-  for i in $(seq 1 "$REPLICAS"); do
+  for i in $(cluster_node_indexes); do
     addrs+="${addrs:+,}$HOST:$(client_port "$i")"
   done
   "$ROOT/bin/grpccheck" -addrs "$addrs" || die "gRPC 冒烟失败（scripts/cluster.sh logs 查日志）"
@@ -303,11 +405,14 @@ case "${1:-}" in
   start)   cmd_start ;;
   stop)    cmd_stop ;;
   status)  cmd_status ;;
+  join)    shift; cmd_join "$@" ;;
+  remove)  shift; cmd_remove "$@" ;;
+  members) cmd_members ;;
   smoke)   cmd_smoke ;;
   slotcheck) shift; cmd_slotcheck "$@" ;;
   logs)    cmd_logs "${2:-1}" ;;
   restart) cmd_stop; sleep 1; cmd_start ;;
   clean)   cmd_clean ;;
   ""|-h|--help|help) usage ;;
-  *)       die "未知命令 '$1'（可用: start stop status smoke slotcheck logs restart clean）" ;;
+  *)       die "未知命令 '$1'（可用: start stop status join remove members smoke slotcheck logs restart clean）" ;;
 esac

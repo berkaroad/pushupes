@@ -47,6 +47,9 @@ func New(eng *cluster.Engine, store *storage.Store) *Server {
 	s.mux.HandleFunc("POST /admin/slots/{slot}/migrate", s.handleMigrate)
 	s.mux.HandleFunc("POST /admin/slots/{slot}/remove-replica", s.handleRemoveReplica)
 	s.mux.HandleFunc("POST /admin/cluster/plan", s.handlePlan)
+	s.mux.HandleFunc("GET /admin/cluster/nodes", s.handleMembers)
+	s.mux.HandleFunc("POST /admin/cluster/nodes", s.handleAddMember)
+	s.mux.HandleFunc("DELETE /admin/cluster/nodes/{id}", s.handleRemoveMember)
 
 	return s
 }
@@ -328,6 +331,79 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleMembers lists the cluster's raft membership. It is local view, like
+// the rest of the admin surface: a node that has just been added shows up here
+// once the configuration change has reached this node's log.
+func (s *Server) handleMembers(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"node":    s.Engine.Self(),
+		"members": s.Engine.Members(),
+	})
+}
+
+// handleAddMember adds a node to the running cluster. Controller-only: a
+// follower refuses with the controller's node id and admin address (the client
+// retries there) — nothing is forwarded, exactly like the other cluster
+// commands.
+//
+//	POST /admin/cluster/nodes  {"id":"node-4","peer_addr":"10.0.0.4:8394"}
+//
+// Only the peer (consensus) address is given: the node announces its admin and
+// client addresses itself once it is a member.
+func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID       string `json:"id"`
+		PeerAddr string `json:"peer_addr"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" || req.PeerAddr == "" {
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "id and peer_addr required")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), cluster.AddMemberTimeout+5_000_000_000)
+	defer cancel()
+	if err := s.Engine.AddMember(ctx, req.ID, req.PeerAddr); err != nil {
+		if refuseNotController(w, err) {
+			return
+		}
+		if errors.Is(err, cluster.ErrBadMember) {
+			writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, 0, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"node": s.Engine.Self(), "member": req.ID, "change": "added"})
+}
+
+// handleRemoveMember drops a node from the running cluster. Controller-only,
+// like handleAddMember. The node keeps serving its slots until the
+// configuration change reaches it (the consensus layer waits for it to
+// acknowledge the entry), then the controller moves their leadership to live
+// replicas and the rebalancer refills the replica sets.
+//
+//	DELETE /admin/cluster/nodes/node-4
+func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "id required")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), cluster.AddMemberTimeout+5_000_000_000)
+	defer cancel()
+	if err := s.Engine.RemoveMember(ctx, id); err != nil {
+		if refuseNotController(w, err) {
+			return
+		}
+		if errors.Is(err, cluster.ErrBadMember) {
+			writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, 0, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"node": s.Engine.Self(), "member": id, "change": "removed"})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

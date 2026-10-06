@@ -366,6 +366,7 @@ gRPC  PeerService/PushSegments    迁移段拷贝（client-streaming，≤4MiB �
 gRPC  PeerService/TriggerSnapshot 迁移快照（源端向目标推封段）
 gRPC  PeerService/Ping            探活（controller 故障切换）
 gRPC  PeerService/Register        数据面地址自报（OpRegister 提交/转发）
+gRPC  PeerService/Adopt           新节点自报入编（add_member 提交/转发，见 §6.1）
 
 # ---- admin 面（HTTP，仅管理）----
 GET  /admin/slots/{slot}/describe              # 本节点视角的槽状态/seq/HW/大小（不代开槽，带 node/role/loaded）
@@ -375,8 +376,43 @@ GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最
 POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移（控制器专属，必须发到 Raft leader 的 admin 地址）
 POST /admin/slots/{slot}/remove-replica {node} # 回收副本集里的一个成员（控制器专属，同上）
 POST /admin/cluster/plan                       # 触发重新规划（控制器专属，同上）
+GET  /admin/cluster/nodes                      # 列出当前 raft 成员（本节点视角：id/peer/admin/client/down）
+POST /admin/cluster/nodes {id,peer_addr}       # 运行时加成员（控制器专属，同上；admin/client 地址由新节点自报）
+DELETE /admin/cluster/nodes/{id}               # 运行时摘成员（控制器专属，同上）
 GET  /healthz
 ```
+
+### 6.1 运行时成员变更（扩/缩集群）
+
+Raft 配置（谁投票）与复制的成员目录（槽表里的成员列表）是两件事，这一节把它们
+绑在一起。**接口只在 admin 面，且只有 controller（Raft leader）能执行**：follower
+拒绝并回 `controller`/`controller_admin_addr`（客户端改投），admin 面从不转发。
+
+- **加成员 `POST /admin/cluster/nodes {"id":"node-4","peer_addr":"10.0.0.4:8394"}`**：
+  只给 peer（共识）地址。leader 先把新节点当 **learner**（只收日志、不计入
+  quorum）复制，追到 leader 当时的 commit index 后才把 `add_member` 配置项写进日志
+  （20s 追不上也放行，避免死节点卡住操作）——否则新成员可能空日志就参与 quorum，
+  leader 被它替换后读不出数据。配置项提交后：目录同步自动补 `join_node`，
+  它自己通过注册协议补 admin/client 地址，`replan_slots` 按副本因子补齐副本集，
+  回切器把环上的槽主交给它。幂等：加已在编成员是 no-op。
+- **成员表从日志里推**：初始配置是日志第 1 条 `conf` 条目（不只写在每个节点自己的
+  配置记录里），快照与 `InstallSnapshot` 也带上快照点的成员表——新节点无论是靠复制
+  日志还是靠装快照追平，推出来的成员表都和集群一致。少了这一条，新节点只知道
+  「把自己加进来」那一项，会以「整个集群就我一个」的姿态运行（quorum=1、日志陈旧
+  也能自己当选、能确认别人没有的写入）。
+- **摘成员 `DELETE /admin/cluster/nodes/{id}`**：提交 `remove_member`。leader **不会
+  立刻断开**被摘节点：它要等该节点确认收到配置项，再发一轮带新 commit 的
+  AppendEntries，让被摘方本地也提交该配置后才停复制（否则被摘节点留着未提交的
+  尾巴，仍信旧配置、可能对幸存者发起竞选；共识层同时在握手后拒绝非成员的共识流量）。
+  之后 controller 把它的槽主迁到存活副本、`replan_slots` 补副本。幂等；拒绝摘掉
+  最后一个成员（否则集群会把自己配没了）。
+- **开局节点 `-join`**：不是初始成员的节点用 `-peers`（初始集群的种子）+ `-join
+  host:peerport`（指向现有成员）启动；它向 leader 报名，leader 走上面的加成员流程。
+  **有 conf 记录的节点永远以记录为准**（`-peers` 只当种子，不再拒绝启动），因此
+  扩过容的集群重启不需要改每个成员的 `-peers`。替代做法：运维直接 POST 加成员，
+  再拉起新节点。
+- 节点自报与手动加成员都走 peer 面的 `Adopt` RPC（`PeerService/Adopt`，非
+  leader 转发），与 `Register` 同一套 relay 语义。
 
 读语义只暴露 `seq ≤ HW` 的记录：查询不读未达高水位的数据，防止副本回滚后
 出现脏读。

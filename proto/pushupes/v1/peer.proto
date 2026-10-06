@@ -17,6 +17,12 @@ service PeerService {
   // Register announces a node's admin/client addresses into the routing
   // table (leader commits an OpRegister; non-leaders relay).
   rpc Register(RegisterRequest) returns (RegisterResponse);
+  // Adopt is a node announcing itself to the cluster it is joining: the node
+  // is running but is not a voter yet, so it names itself (id + peer address)
+  // and the leader adds it to the configuration. Without it a node started
+  // after the cluster was formed would have to be typed into an operator's
+  // admin call by hand. Non-leaders relay to the leader, like Register.
+  rpc Adopt(AdoptRequest) returns (AdoptResponse);
   // MFetch is the multiplexed replica fetch: every slot this follower
   // copies from the serving leader is one item; the call long-polls when
   // everything is empty (wait_ms budget, server-held).
@@ -69,6 +75,15 @@ message RegisterRequest {
   string client_addr = 3; // client-facing gRPC base (scheme carried)
 }
 message RegisterResponse {}
+
+// AdoptRequest is a node offering itself to the cluster. peer_addr is its
+// consensus endpoint — the only address membership needs; admin/client
+// addresses arrive later through the ordinary registration heartbeat.
+message AdoptRequest {
+  string id = 1;
+  string peer_addr = 2;
+}
+message AdoptResponse {}
 
 // FetchItem: response entries only (requests use packed parallel arrays in
 // MFetchRequest). ReplicaProgress reuses slot/from_seq for durable positions.

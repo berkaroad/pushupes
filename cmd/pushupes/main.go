@@ -42,6 +42,9 @@ func main() {
 		peerAddr   = flag.String("peer", envOr("PUSHUPES_PEER", "http://127.0.0.1:8391"), "Raft transport + peer gRPC listen address: all node-to-node traffic (env PUSHUPES_PEER)")
 		dataDir    = flag.String("data", envOr("PUSHUPES_DATA", "./data"), "data directory (env PUSHUPES_DATA)")
 		peers      = flag.String("peers", envOr("PUSHUPES_PEERS", ""), "comma list (env PUSHUPES_PEERS) of id=http://host:peerport (admin/client addrs are self-registered; legacy id:peerport:adminport:clientport also accepted)")
+		joinAddr   = flag.String("join", envOr("PUSHUPES_JOIN", ""), "peer address of a running cluster's member (host:peerport) for a node joining at runtime: the node offers itself through it on start. Its -peers must still name the initial cluster (the seed); this is how a node that is NOT in that seed joins")
+		adoptTo    = flag.Duration("adopt-interval", envDurationOr("PUSHUPES_ADOPT_INTERVAL", cluster.DefaultAdoptInterval),
+			"how often a node that is not a cluster member yet retries offering itself through -join (env PUSHUPES_ADOPT_INTERVAL)")
 		// The slot count is a permanent layout decision (routing, placement,
 		// migration granularity), so it is not a runtime knob — it is fixed at
 		// data.DefaultSlotCount. See DESIGN §7.2.
@@ -84,12 +87,12 @@ func main() {
 	base.SetLevel(logrus.InfoLevel)
 	logger := logrus.NewEntry(base).WithField("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, slotCount, *replication, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *dropAfter, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, int64(raftSegB), logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, *replication, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *dropAfter, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, int64(raftSegB), logger); err != nil {
 		logger.WithError(err).Fatal("pushupes exited with error")
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slotCount, replicationFactor int, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD, dropAfter time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush time.Duration, raftSegBytes int64, logger *logrus.Entry) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount, replicationFactor int, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD, dropAfter time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush time.Duration, raftSegBytes int64, logger *logrus.Entry) error {
 	// Canonical form for every stored address: scheme required. A bare
 	// host:port gets the default "http://" prefix; an explicit protocol
 	// is honoured as passed. TCP-level uses (listen/dial) strip it again.
@@ -133,6 +136,12 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slot
 	if !containsPeer(peers, nodeID) {
 		peers = append(peers, selfPeer)
 	}
+	// A node started with -join is not in the cluster's configuration yet: its
+	// -peers is only the seed of the cluster it is joining (the ids and
+	// addresses it was built with), and it offers itself to the member named
+	// by -join. The seed flag lets it start with that list instead of
+	// refusing.
+	seeding := strings.TrimSpace(joinAddr) != ""
 
 	// The engine is the Applier the FSM calls into; it also needs the Raft
 	// node to submit commands. Build the engine first with a nil node, then
@@ -171,6 +180,7 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slot
 		DataDir:       filepath.Join(dataDir, "cluster"),
 		Bootstrap:     bootstrap,
 		Peers:         peers,
+		Seed:          seeding,
 		FlushInterval: raftFlush,
 		SegmentBytes:  raftSegBytes,
 	}, eng, logger)
@@ -194,6 +204,14 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV string, slot
 	peerSrv := eng.ServePeer(peerGRPC)
 	defer peerSrv.Stop()
 	go eng.NewRegisterAnnouncer().Run(ctx)
+
+	// Runtime join: a node started with -join is not in the cluster's
+	// configuration yet, so it keeps offering itself through the named member
+	// until the leader has added it. A node that is already a member (or the
+	// first node of a brand-new cluster) never sends anything.
+	if seeding {
+		go eng.NewJoiner(joinAddr, adoptInterval).Run(ctx)
+	}
 
 	srv := api.NewServer(cluster.HostPort(adminAddr), api.New(eng, store), logger)
 	errCh := make(chan error, 2)

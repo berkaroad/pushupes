@@ -73,13 +73,18 @@ func (p Peer) Offline() bool { return p.Down || p.ClientAddr == "" }
 
 // Config configures one Raft node.
 type Config struct {
-	NodeID            string
-	PeerAddr          string
-	AdminAddr         string
-	ClientAddr        string
-	DataDir           string
-	Bootstrap         bool
-	Peers             []Peer
+	NodeID     string
+	PeerAddr   string
+	AdminAddr  string
+	ClientAddr string
+	DataDir    string
+	Bootstrap  bool
+	Peers      []Peer
+	// Seed marks Peers as a bootstrap seed rather than an authoritative
+	// membership: a node started with -join is not in the cluster it is
+	// joining, and this tells the consensus layer to start with the seed
+	// instead of refusing.
+	Seed              bool
 	ApplyTimeout      time.Duration
 	SnapshotThreshold uint64
 	SnapshotInterval  time.Duration
@@ -149,6 +154,7 @@ func NewNode(cfg Config, applier Applier, logger *logrus.Entry) (*Node, net.List
 		NodeID:            cfg.NodeID,
 		DataDir:           cfg.DataDir,
 		Voters:            raftVoters(cfg),
+		Seed:              cfg.Seed,
 		ApplyTimeout:      cfg.ApplyTimeout,
 		SnapshotThreshold: cfg.SnapshotThreshold,
 		SnapshotInterval:  cfg.SnapshotInterval,
@@ -169,7 +175,7 @@ func NewNode(cfg Config, applier Applier, logger *logrus.Entry) (*Node, net.List
 }
 
 // raftVoters projects the configured peer directory onto the consensus
-// layer's static voter set.
+// layer's member set.
 func raftVoters(cfg Config) []raft.Voter {
 	out := make([]raft.Voter, 0, len(cfg.Peers))
 	for _, p := range cfg.Peers {
@@ -246,6 +252,25 @@ func (n *Node) PeerAddrs() map[string]string {
 // ("commit-index" and "commit_index") are provided because callers
 // historically disagreed.
 func (n *Node) Stats() map[string]any { return n.raft.Stats() }
+
+// IsMember reports whether id is in the current cluster membership.
+func (n *Node) IsMember(id string) bool { return n.raft.IsMember(id) }
+
+// Members returns the current membership (id + consensus address).
+func (n *Node) Members() []raft.Voter { return n.raft.Members() }
+
+// AddMember adds a node to the cluster membership at runtime (leader only).
+func (n *Node) AddMember(id, addr string, timeout time.Duration) error {
+	return n.raft.AddMember(id, addr, timeout)
+}
+
+// RemoveMember drops a node from the cluster membership at runtime (leader only).
+func (n *Node) RemoveMember(id string, timeout time.Duration) error {
+	return n.raft.RemoveMember(id, timeout)
+}
+
+// Voters reports whether id currently counts towards quorum.
+func (n *Node) IsVoter(id string) bool { return n.raft.IsVoter(id) }
 
 // Close shuts the node down.
 func (n *Node) Close() error {
