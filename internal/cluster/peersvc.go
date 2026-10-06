@@ -34,8 +34,14 @@ const (
 	// with an RPC version byte (0), so the classification never collides.
 	grpcMagicByte = byte('P')
 
-	peerRPCTimeout  = 30 * time.Second
-	peerPingTimeout = 2 * time.Second
+	peerRPCTimeout = 30 * time.Second
+	// failoverPickTimeout bounds ONE round of "what is your LEO for these
+	// slots?" asked of the failover candidates. The pick is best effort (a
+	// candidate that does not answer just drops out of the running), so it gets
+	// a healthy-peer budget rather than the general peer RPC timeout — a
+	// failover must not wait 30s for a dying node's answer.
+	failoverPickTimeout = 1 * time.Second
+	peerPingTimeout     = 2 * time.Second
 
 	// peerMaxMsgBytes bounds gRPC messages on the peer plane. Snapshot
 	// segments stream in <=4MiB chunks and fetch rounds cap at
@@ -61,6 +67,16 @@ func (s *peerServer) Ping(context.Context, *pushupesv1.PingRequest) (*pushupesv1
 	return &pushupesv1.PingResponse{Node: s.e.self}, nil
 }
 
+// ReportUnreachable takes one observer's evidence that a node stopped answering
+// at the transport level. It is a witness, not a verdict: only the controller
+// acts, and only on a quorum (see recordUnreachable); a report that lands on a
+// follower is dropped, because the observer keeps reporting while the failure
+// lasts and the liveness sweep remains the fallback.
+func (s *peerServer) ReportUnreachable(_ context.Context, req *pushupesv1.ReportUnreachableRequest) (*pushupesv1.ReportUnreachableResponse, error) {
+	s.e.recordUnreachable(req.Reporter, req.Suspect)
+	return &pushupesv1.ReportUnreachableResponse{}, nil
+}
+
 func (s *peerServer) Register(_ context.Context, req *pushupesv1.RegisterRequest) (*pushupesv1.RegisterResponse, error) {
 	reg := &Registration{ID: req.Id, AdminAddr: req.AdminAddr, ClientAddr: req.ClientAddr}
 	if err := s.e.acceptRegistration(reg); err != nil {
@@ -79,7 +95,19 @@ func (s *peerServer) Adopt(ctx context.Context, req *pushupesv1.AdoptRequest) (*
 func (s *peerServer) MFetch(ctx context.Context, req *pushupesv1.MFetchRequest) (*pushupesv1.MFetchResponse, error) {
 	internal := &MFetchRequest{Follower: req.Follower, WaitMS: req.WaitMs, Slots: req.Slots, FromSeqs: req.FromSeqs, Sweep: req.Sweep}
 	resp, err := s.e.HandleMFetchCtx(ctx, *internal)
+	if err == nil && ctx.Err() != nil {
+		// The round produced an answer, but the caller was already gone: the
+		// response cannot reach it either. (A handler that gave up on a
+		// cancelled context returns an error itself, but a round that had data
+		// ready returns normally — and that is the common shape on a busy
+		// leader, so this must be checked too.)
+		s.e.noteFollowerSessionLost(req.Follower, req.Slots)
+	}
 	if err != nil {
+		// The follower's long poll ended without an answer: its connection is
+		// gone (a clean round returns a response). The slots it was reporting
+		// for must stop waiting on it at once — see noteFollowerSessionLost.
+		s.e.noteFollowerSessionLost(req.Follower, req.Slots)
 		return nil, err
 	}
 	return &pushupesv1.MFetchResponse{Follower: resp.Follower, Items: protoItems(resp.Items)}, nil
@@ -399,4 +427,33 @@ func (e *Engine) ServePeer(d net.Listener) *grpc.Server {
 	pushupesv1.RegisterPeerServiceServer(srv, e.NewPeerServer())
 	go func() { _ = srv.Serve(d) }()
 	return srv
+}
+
+// SlotLeos answers the durable LEO of many slots (see the proto comment): the
+// controller's failover pick needs to know which replica actually holds what was
+// acknowledged. Slots this node does not hold answer 0.
+func (s *peerServer) SlotLeos(_ context.Context, req *pushupesv1.SlotLeosRequest) (*pushupesv1.SlotLeosResponse, error) {
+	resp := &pushupesv1.SlotLeosResponse{Slots: req.Slots, Leos: make([]uint64, len(req.Slots))}
+	for i, slot := range req.Slots {
+		resp.Leos[i] = s.e.HandleLEO(slot)
+	}
+	return resp, nil
+}
+
+// peerSlotLeos asks a peer for the durable LEOs of the given slots.
+func (e *Engine) peerSlotLeos(ctx context.Context, addr string, slots []int32) ([]uint64, error) {
+	c, err := e.peerRPC(addr)
+	if err != nil {
+		return nil, err
+	}
+	cctx, cancel := context.WithTimeout(ctx, peerRPCTimeout)
+	defer cancel()
+	resp, err := c.SlotLeos(cctx, &pushupesv1.SlotLeosRequest{Slots: slots})
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Leos) != len(slots) {
+		return nil, fmt.Errorf("slot leos: got %d answers for %d slots", len(resp.Leos), len(slots))
+	}
+	return resp.Leos, nil
 }

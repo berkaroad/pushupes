@@ -5,12 +5,18 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"pushupes/internal/data"
+	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
 	"pushupes/internal/storage"
 
 	"github.com/sirupsen/logrus"
@@ -101,6 +107,11 @@ type Engine struct {
 	failMu     sync.Mutex
 	failStreak map[string]int
 
+	// unreach is the controller's witness table for the unreachable reports
+	// observers send (suspect -> reporter -> when). See recordUnreachable.
+	unreachMu sync.Mutex
+	unreach   map[string]map[string]time.Time
+
 	// leader rebalance (balance.go): how often the controller re-checks the
 	// ring layout and how many leader hand-overs one round may execute.
 	// Set from the -rebalance-interval / -rebalance-batch flags.
@@ -112,6 +123,25 @@ type Engine struct {
 	// converge is repaired (a full slot rebuild) once per round, forever.
 	rebMu    sync.Mutex
 	rebRetry map[int32]rebalanceAttempt
+
+	// retry backoff for surplus-seat reclaims (balance.go): also per slot, keyed
+	// on the seat being dropped. A seat whose kept copies are still catching up
+	// costs one digest round trip per seat per round until it converges.
+	seatRetry map[int32]rebalanceAttempt
+
+	// seated records when each replica seat first appeared in a slot's set as
+	// seen by THIS node (the table is replicated, so every node observes the
+	// same transitions — including one that is not leading the slot).
+	// syncSeats uses it to tell, at a takeover, a seat that is still being built
+	// from one that was already an established member of the promise.
+	seated map[seatKey]time.Time
+
+	// goneSess records, per follower, when its fetch long poll last ended
+	// without an answer — i.e. its connection died (see
+	// noteFollowerSessionLost). Reports that predate that moment stop feeding the
+	// high watermark: a replica that is no longer being served must not pin a
+	// slot's writes. Cleared as soon as the follower reports again.
+	goneSess map[string]time.Time
 
 	// post-migration local cleanup: slots whose local copy this node is
 	// scheduled to drop after the retention window (slot -> schedule), plus
@@ -149,6 +179,138 @@ type slotRepl struct {
 	leo    []uint64
 	lastOK []time.Time
 	hw     uint64
+
+	// seats is the slot's replica set as of the last table walk while this node
+	// led it, and building lists the seats that APPEARED in that set since —
+	// copies being built (a re-layout's new seats) that have not reached this
+	// leader's LEO since. They do not gate the watermark: a seat that just
+	// joined has nothing to acknowledge yet, and letting its empty log pin HW
+	// would block every append to that slot until it finished fetching (the
+	// same stall the migration target's exclusion fixes, generalized to the
+	// seats a re-layout adds). The mark clears the moment the seat's LEO
+	// reaches the leader's LEO; from then on it is an ordinary ISR member and
+	// gates again.
+	//
+	// The seats present when this node TOOK THE SLOT OVER are deliberately NOT
+	// marked: they are the set the write confirmation already rests on, and a
+	// replica of that set which is behind must keep holding the watermark back
+	// — that gating is the acknowledged-write promise, not a stall to fix.
+	seats    []string
+	building []string
+}
+
+// seatKey identifies one replica seat: a node's membership of one slot's set.
+type seatKey struct {
+	slot int32
+	node string
+}
+
+// seatBuildGrace bounds how long a seat counts as "being built" for a leader
+// that takes the slot over mid-catch-up (see takeover). A copy that is still
+// fetching after this window is treated as an ordinary member — the promise
+// must not stay relaxed for a seat that is simply slow, and a fetch that long
+// means something else is wrong.
+const seatBuildGrace = time.Minute
+
+// takeover starts this leader's view of a slot it just gained. The seats present
+// are recorded (they are the set the promise rests on) and so are the "building"
+// marks: a seat seated within seatBuildGrace is a copy that is plausibly still
+// fetching, and the new leader has no leadership history to tell it apart from
+// an established member — so it must NOT gate this leader's writes (that is what
+// turns a hand-over of a slot with a seat mid-catch-up into a full-watermark
+// stall: every write waits for a whole slot transfer). A seat that is already
+// caught up clears its mark on its first report, within one fetch round.
+func (sr *slotRepl) takeover(seats, young []string) {
+	sr.seats = append(sr.seats[:0], seats...)
+	sr.building = append(sr.building[:0], young...)
+}
+
+// noteSeatAges refreshes, for every slot and seat in the table, the moment this
+// node first saw that seat. Seats that left their set are dropped, and a node
+// that comes back is a fresh seat again.
+func (e *Engine) noteSeatAges() {
+	now := time.Now()
+	e.replMu.Lock()
+	e.tableMu.RLock()
+	next := make(map[seatKey]time.Time, len(e.table.Slots)*2)
+	for s, p := range e.table.Slots {
+		for _, r := range p.Replicas {
+			k := seatKey{s, r}
+			if at, ok := e.seated[k]; ok {
+				next[k] = at
+				continue
+			}
+			next[k] = now
+		}
+	}
+	e.tableMu.RUnlock()
+	e.seated = next
+	e.replMu.Unlock()
+}
+
+// youngSeats returns the seats of a slot that were seated recently enough to
+// still be fetching (see takeover). Caller holds replMu.
+func (e *Engine) youngSeats(slot int32, seats []string, now time.Time) []string {
+	var out []string
+	for _, s := range seats {
+		if at, ok := e.seated[seatKey{slot, s}]; ok && now.Sub(at) < seatBuildGrace {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// syncSeats folds the slot's current replica set into this leader's view: the
+// seats that appeared since the last walk become "building" and the ones that
+// left the set lose their mark.
+func (sr *slotRepl) syncSeats(now []string) {
+	// Seats that left the set are no longer copies to build (and a seat that
+	// comes back later is a fresh transition: it gets marked again).
+	if len(sr.building) > 0 {
+		kept := sr.building[:0]
+		for _, b := range sr.building {
+			if seatListHas(now, b) {
+				kept = append(kept, b)
+			}
+		}
+		sr.building = kept
+	}
+	for _, n := range now {
+		if !seatListHas(sr.seats, n) && !sr.isBuilding(n) {
+			sr.building = append(sr.building, n)
+		}
+	}
+	sr.seats = append(sr.seats[:0], now...)
+}
+
+// isBuilding reports whether the seat is still being built (its entry may not
+// even exist yet: a seat is marked before its first fetch report arrives).
+func (sr *slotRepl) isBuilding(node string) bool { return seatListHas(sr.building, node) }
+
+// dropBuilding clears a seat's mark: it has caught up, so it is an ordinary
+// in-sync replica from now on and gates the watermark like every other one.
+func (sr *slotRepl) dropBuilding(node string) {
+	if len(sr.building) == 0 {
+		return
+	}
+	kept := sr.building[:0]
+	for _, b := range sr.building {
+		if b != node {
+			kept = append(kept, b)
+		}
+	}
+	sr.building = kept
+}
+
+// seatListHas reports whether a seat list holds a node (the lists hold at most
+// the replica factor plus one or two seats a re-layout is adding).
+func seatListHas(list []string, id string) bool {
+	for _, v := range list {
+		if v == id {
+			return true
+		}
+	}
+	return false
 }
 
 // find returns the array index of one follower, or -1.
@@ -194,6 +356,14 @@ type fetchSession struct {
 	// because idle rounds each last the full long-poll wait, so a count
 	// cadence would sweep every N*fetchWait and brush isrStaleAfter).
 	lastSweep time.Time
+	// unreachable counts CONSECUTIVE transport-level failures of this session's
+	// rounds (a dead leader's connection), and lastReport throttles the
+	// witnesses this session sends the controller: one per suspect per
+	// unreachableWindow, so a leader that stays dead does not turn its
+	// followers into a report stream (see reportLeaderUnreachable). Touched only
+	// by this session's own goroutine.
+	unreachable int
+	lastReport  time.Time
 }
 
 // Fetch cadence per session: a productive round restarts immediately
@@ -289,7 +459,35 @@ func (e *Engine) ApplyCommand(cmd []byte) ([]byte, error) {
 		return nil, err
 	}
 	e.syncMigrationState()
+	// A table change that takes a node out of a slot's picture (marked down, out
+	// of the directory, or dropped from a replica set) may be holding that
+	// slot's watermark back: re-derive it now rather than waiting for the next
+	// unrelated progress report to notice.
+	switch c.Op {
+	case OpMarkDown, OpLeaveNode, OpSlotRemoveReplica:
+		e.releaseWatermarksFor(c.NodeID)
+	}
 	return nil, nil
+}
+
+// releaseWatermarksFor re-derives the high watermark of every slot that names
+// the node (as leader or replica). advanceHW skips positions that are down or no
+// longer in the set, so the watermarks such a position was pinning move up now.
+func (e *Engine) releaseWatermarksFor(node string) {
+	if node == "" {
+		return
+	}
+	e.tableMu.RLock()
+	var slots []int32
+	for s, p := range e.table.Slots {
+		if p.Leader == node || replicaListHas(p.Replicas, node) {
+			slots = append(slots, s)
+		}
+	}
+	e.tableMu.RUnlock()
+	for _, s := range slots {
+		e.advanceHW(s)
+	}
 }
 
 // SnapshotState implements cluster.Applier (binary: ~350KB JSON -> a few KB
@@ -450,21 +648,39 @@ func (e *Engine) syncMigrationState() {
 	// one fetch round and the watermark jumps straight to the true min.
 	e.tableMu.RLock()
 	led := make(map[int32]bool, len(e.table.Slots))
+	ledSeats := make(map[int32][]string, 8) // replica sets of the slots THIS node leads
 	for s, p := range e.table.Slots {
 		if p.Leader == e.self {
 			led[s] = true
+			// Copy: the walk is consumed later (under replMu) and a table
+			// command compacts replica sets in place (removeString).
+			ledSeats[s] = append([]string(nil), p.Replicas...)
 		}
 	}
 	e.tableMu.RUnlock()
+	// Seat ages are node-global (not leadership-scoped): a leader that takes a
+	// slot over needs them for seats it never tracked itself.
+	e.noteSeatAges()
 	e.ledMu.Lock()
 	prevLed := e.ledPrev
 	e.ledPrev = led
 	e.ledMu.Unlock()
 	e.replMu.Lock()
 	for s := range led {
+		sr := e.repl[s]
 		if !prevLed[s] {
-			delete(e.repl, s)
+			// Just took the slot over: start from a clean slate of positions (the
+			// previous term's are stale) while recording the seats we inherit and
+			// the ones still being built (see slotRepl.takeover).
+			sr = &slotRepl{}
+			e.repl[s] = sr
+			sr.takeover(ledSeats[s], e.youngSeats(s, ledSeats[s], time.Now()))
+			continue
 		}
+		if sr == nil {
+			continue // no report has arrived yet: nothing to mark against
+		}
+		sr.syncSeats(ledSeats[s])
 	}
 	e.replMu.Unlock()
 
@@ -852,11 +1068,19 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 		if sr != nil {
 			hw = sr.hw
 			cutoff := time.Now().Add(-isrStaleAfter)
-			for i := range sr.lastOK {
-				if sr.lastOK[i].After(cutoff) {
-					inSync = true
-					break
+			for i, node := range sr.node {
+				if !sr.lastOK[i].After(cutoff) {
+					continue
 				}
+				// A replica whose connection died (or that the controller
+				// marked down) is not being served: count it as out of ISR, so
+				// the append falls back to "no in-sync replica to wait for"
+				// instead of blocking on a watermark that was pinned by it.
+				if e.sessionGone(node, sr.lastOK[i]) || e.peerDown(node) {
+					continue
+				}
+				inSync = true
+				break
 			}
 		}
 		e.replMu.Unlock()
@@ -921,7 +1145,20 @@ func (e *Engine) replicaCount(slot int32) int {
 	return len(p.Replicas)
 }
 
-// isr returns in-sync replicas: followers whose LEO is within the lag window.
+// peerDown reports whether the replicated directory has this peer marked down
+// (the controller's liveness verdict): a node whose slots have already failed
+// over must not hold this leader's watermark back either. Caller holds replMu.
+func (e *Engine) peerDown(node string) bool {
+	e.tableMu.RLock()
+	defer e.tableMu.RUnlock()
+	return e.table.Peers[node].Down
+}
+
+// isr returns in-sync replicas: followers whose LEO is within the lag window,
+// minus the seats this leader is still building (a re-layout's new copy is a
+// replica of the slot but not yet an in-sync one — it is excluded from the
+// watermark for exactly that reason, see slotRepl.building, and the console
+// must not show it as an ack holder).
 func (e *Engine) isr(slot int32) []string {
 	e.replMu.Lock()
 	defer e.replMu.Unlock()
@@ -932,11 +1169,330 @@ func (e *Engine) isr(slot int32) []string {
 	cutoff := time.Now().Add(-isrStaleAfter)
 	var out []string
 	for i, node := range sr.node {
-		if sr.lastOK[i].After(cutoff) {
-			out = append(out, node)
+		if !sr.lastOK[i].After(cutoff) || sr.isBuilding(node) {
+			continue
+		}
+		if e.sessionGone(node, sr.lastOK[i]) || e.peerDown(node) {
+			continue // not being served / marked down: not an in-sync replica
+		}
+		out = append(out, node)
+	}
+	return out
+}
+
+// sessionGone reports whether the position of a follower is one this leader is
+// no longer serving: its fetch long poll ended without an answer after that
+// position was last reported. Such a replica is not in sync any more, so it
+// neither feeds the high watermark nor reads as ISR. Caller holds replMu.
+func (e *Engine) sessionGone(follower string, lastReport time.Time) bool {
+	gone, ok := e.goneSess[follower]
+	return ok && gone.After(lastReport)
+}
+
+// noteFollowerSessionLost records that a follower's fetch long poll ended
+// without an answer — its connection is gone — and re-derives the watermark of
+// every slot it was reporting for, so appends already waiting on that replica's
+// position stop waiting now.
+//
+// This is the fast half of "a replica that is not being served must not pin the
+// writes": the transport says so the moment the connection dies, while the
+// replicated liveness verdict (mark_down) needs consecutive probe rounds and the
+// staleness cutoff (isrStaleAfter) is a ten-second window. Without it a killed
+// node's frozen LEO pins every slot it replicated until its seats leave the
+// table — observed as an eight-second 0 msg/s window in a batch workload, since
+// one pinned slot stalls a whole batch (the batch waits for every slot's
+// watermark).
+//
+// A clean round is not a loss: the handler answers and the follower re-posts.
+// Only an error/cancellation lands here, and a follower that reconnects clears
+// the mark with its next report (noteReplicaProgress), so a blip costs at most
+// the interval until then.
+func (e *Engine) noteFollowerSessionLost(follower string, slots []int32) {
+	if follower == "" || follower == e.self {
+		return
+	}
+	now := time.Now()
+	e.replMu.Lock()
+	if e.goneSess == nil {
+		e.goneSess = map[string]time.Time{}
+	}
+	// Re-deriving a whole session's watermarks is O(slots) locks: a follower
+	// that flaps must not pay for that per flap.
+	verbose := !e.goneSess[follower].After(now.Add(-sessionLossRecheck))
+	e.goneSess[follower] = now
+	e.replMu.Unlock()
+	if !verbose {
+		return
+	}
+	if e.logger != nil {
+		e.logger.WithFields(map[string]any{"follower": follower, "slots": len(slots)}).
+			Info("follower fetch session lost: its positions stop gating the watermark until it reports again")
+	}
+	for _, s := range slots {
+		e.advanceHW(s)
+	}
+}
+
+// sessionLossRecheck throttles the watermark re-derivation a session loss
+// triggers (see noteFollowerSessionLost): at most one per interval per follower.
+const sessionLossRecheck = 200 * time.Millisecond
+
+// ---- Unreachable witnesses: followers' evidence, the controller's verdict -----
+//
+// A slot leader that is KILLED is visible to every node fetching from it the
+// moment its connection dies — much earlier than the controller's own liveness
+// sweep can conclude anything (three probe rounds, ~3s, during which its frozen
+// LEO pins the watermark of every slot it replicated and its slots stay routed
+// to a dead leader). So the observers report what they saw and the controller
+// acts on a QUORUM of distinct witnesses instead of waiting out its threshold:
+// one observer's broken link is not evidence, several observers' is.
+//
+// The cost is event-driven and tiny: one small unary RPC per observer per
+// unreachableWindow (the connection is already pooled, the body is two node
+// ids), then the one OpMarkDown the probe path would have submitted anyway. The
+// sweep stays as the fallback — nobody may be watching a node that hosts no
+// replicated slots, and a partitioned observer cannot report at all.
+const (
+	// unreachableQuorum is how many DISTINCT observers must report the same
+	// node within unreachableWindow before it is marked down ahead of the probe
+	// threshold. Two is the smallest number that cannot be a single broken
+	// link; it is deliberately not a majority: the witnesses are the nodes
+	// actively fetching from the suspect, which is every other member in
+	// practice, and waiting for a majority would give back the latency the
+	// scheme exists to remove.
+	unreachableQuorum = 2
+	// unreachableWindow is how long a witness counts, and how often one
+	// observer may report the same suspect.
+	unreachableWindow = time.Second
+	// unreachableReportAfter is how many CONSECUTIVE transport failures make a
+	// session's observer speak up: one failure can be a blip (a table-driven
+	// session restart, a hiccup), two in a row at fetch cadence cannot.
+	unreachableReportAfter = 2
+)
+
+// transportUnreachable reports whether a fetch round failed at the TRANSPORT
+// level — the peer's connection is gone (a dead process, a broken link), which
+// is evidence a node is unreachable. A deadline (a slow server), a cancellation
+// (this node stopping the session) or an application/routing answer are not.
+func transportUnreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if code := status.Code(err); code == codes.Unavailable {
+		return true
+	}
+	return status.Code(errors.Unwrap(err)) == codes.Unavailable
+}
+
+// reportLeaderUnreachable tells the controller that a slot leader this node
+// fetches from has stopped answering at the transport level. Fire and forget: a
+// lost report only costs a probe round, and the caller throttles per session.
+func (e *Engine) reportLeaderUnreachable(suspect string) {
+	if suspect == "" || suspect == e.self || e.node == nil {
+		return
+	}
+	if e.node.IsLeader() {
+		// We ARE the controller: the evidence is local. (A node never fetches
+		// from itself, so in practice this is the path a follower takes when the
+		// controller changed under it.)
+		e.recordUnreachable(e.self, suspect)
+		return
+	}
+	addr := e.peerAddr(e.node.LeaderID())
+	if addr == "" {
+		return
+	}
+	reporter := e.self
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), peerPingTimeout)
+		defer cancel()
+		c, err := e.peerRPC(addr)
+		if err != nil {
+			return
+		}
+		if _, err := c.ReportUnreachable(ctx, &pushupesv1.ReportUnreachableRequest{Reporter: reporter, Suspect: suspect}); err != nil && e.logger != nil {
+			e.logger.WithField("suspect", suspect).Debug("unreachable report: controller did not take it (it will probe)")
+		}
+	}()
+}
+
+// failoverPeer marks a peer down and moves the leadership of the slots it led to
+// the FRESHEST live replica of each (§failoverLeader): a replica that is behind
+// does not hold the records the dead leader acknowledged, so handing it
+// leadership loses them silently. The pick is computed here (only the controller
+// can ask the replicas for their offsets), travels in the command so every node
+// applies the same verdict, and falls back to the table-only rule when a
+// candidate cannot be reached.
+func (e *Engine) failoverPeer(id string) {
+	cmd := &Command{Op: OpMarkDown, NodeID: id}
+	if leaders := e.freshestReplicas(id); len(leaders) > 0 {
+		cmd.NewLeaders = leaders
+		e.loggerf("failover of %s: %d slot(s) pinned to the freshest live replica", id, len(leaders))
+	}
+	if err := e.submit(cmd); err != nil {
+		e.loggerf("failover of %s: %v (the sweep retries)", id, err)
+	}
+}
+
+// freshestReplicas asks the live replicas of every slot the node LED for their
+// durable LEO and returns, per slot, the one holding the most. One batched query
+// per candidate (a failover touches one node's slots, and its replicas are the
+// same handful of nodes for all of them), so the cost is a single peer round
+// trip per candidate — paid once, on a failover.
+//
+// Candidates are the slot's replicas minus the failed node, minus peers already
+// marked down, and minus peers the controller has been failing to probe (they
+// are on their way down and must not be handed a slot). A slot whose candidates
+// cannot be reached, or where they tie, is left to the table rule; ties resolve
+// to the replica-set order there, which is what the pick would have said anyway.
+func (e *Engine) freshestReplicas(down string) map[int32]string {
+	tbl := e.TableSnapshot()
+	slots := make([]int32, 0, 64)
+	for s, p := range tbl.Slots {
+		if p.Leader == down {
+			slots = append(slots, s)
+		}
+	}
+	if len(slots) == 0 {
+		return nil
+	}
+	sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
+
+	// Per candidate: the slots it replicates and could take over + its probe
+	// streak (a peer the sweep is already failing is not a candidate).
+	type candidate struct {
+		slots []int32
+		pos   map[int32]int // slot -> index in the replica-set order (tie-break)
+	}
+	cands := map[string]*candidate{}
+	e.failMu.Lock()
+	streak := make(map[string]int, len(tbl.Peers))
+	for id, n := range e.failStreak {
+		streak[id] = n
+	}
+	e.failMu.Unlock()
+	for _, s := range slots {
+		p := tbl.Slots[s]
+		for i, r := range p.Replicas {
+			if r == down {
+				continue
+			}
+			if peer, ok := tbl.Peers[r]; !ok || peer.Offline() || streak[r] > 0 {
+				continue
+			}
+			c := cands[r]
+			if c == nil {
+				c = &candidate{pos: map[int32]int{}}
+				cands[r] = c
+			}
+			c.slots = append(c.slots, s)
+			c.pos[s] = i
+		}
+	}
+	if len(cands) == 0 {
+		return nil
+	}
+	// Candidates are asked in PARALLEL and under a short deadline: the pick is a
+	// best-effort freshness probe on the failover path (a healthy peer answers in
+	// a millisecond), so a hanging candidate must not hold up the failover — it
+	// simply drops out of the running and the table rule covers its slots.
+	ctx, cancel := context.WithTimeout(context.Background(), failoverPickTimeout)
+	defer cancel()
+	type answer struct {
+		id   string
+		leos []uint64
+	}
+	leos := make(map[string]map[int32]uint64, len(cands))
+	reached := map[string]bool{}
+	answers := make(chan answer, len(cands))
+	var wg sync.WaitGroup
+	for id, c := range cands {
+		addr := e.peerAddr(id)
+		if addr == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(id, addr string, slots []int32) {
+			defer wg.Done()
+			got, err := e.peerSlotLeos(ctx, addr, slots)
+			if err != nil {
+				return // unreachable candidate: the table rule decides this slot
+			}
+			answers <- answer{id, got}
+		}(id, addr, c.slots)
+	}
+	wg.Wait()
+	close(answers)
+	for a := range answers {
+		reached[a.id] = true
+		m := make(map[int32]uint64, len(cands[a.id].slots))
+		for i, s := range cands[a.id].slots {
+			if i < len(a.leos) {
+				m[s] = a.leos[i]
+			}
+		}
+		leos[a.id] = m
+	}
+	out := map[int32]string{}
+	for _, s := range slots {
+		best, bestLEO := "", uint64(0)
+		for id, c := range cands {
+			if !reached[id] {
+				continue
+			}
+			leo := leos[id][s]
+			if best == "" || leo > bestLEO || (leo == bestLEO && c.pos[s] < cands[best].pos[s]) {
+				best, bestLEO = id, leo
+			}
+		}
+		if best != "" {
+			out[s] = best
 		}
 	}
 	return out
+}
+
+// recordUnreachable folds one observer's report into the controller's witness
+// table and, on a quorum within the window, marks the suspect down — the same
+// OpMarkDown the probe sweep would submit, just earlier. Only the controller
+// acts: a report that lands on a follower is dropped (the observer keeps
+// reporting while the failure lasts, and the sweep is the fallback).
+func (e *Engine) recordUnreachable(reporter, suspect string) {
+	if reporter == "" || suspect == "" || reporter == suspect || e.node == nil || !e.node.IsLeader() {
+		return
+	}
+	tbl := e.TableSnapshot()
+	p, ok := tbl.Peers[suspect]
+	if !ok || p.Down {
+		return // unknown member, or already the controller's verdict
+	}
+	now := time.Now()
+	e.unreachMu.Lock()
+	if e.unreach == nil {
+		e.unreach = map[string]map[string]time.Time{}
+	}
+	seen := e.unreach[suspect]
+	if seen == nil {
+		seen = map[string]time.Time{}
+		e.unreach[suspect] = seen
+	}
+	for r, at := range seen {
+		if now.Sub(at) > unreachableWindow {
+			delete(seen, r) // a stale witness is not a witness
+		}
+	}
+	seen[reporter] = now
+	n := len(seen)
+	acted := n >= unreachableQuorum
+	if acted {
+		delete(e.unreach, suspect)
+	}
+	e.unreachMu.Unlock()
+	if !acted {
+		return
+	}
+	e.loggerf("peer %s reported unreachable by %d observers at the transport level, marking it down ahead of the probe threshold", suspect, n)
+	go e.failoverPeer(suspect)
 }
 
 // advanceHW recomputes the slot high watermark as the min LEO across the
@@ -950,6 +1506,13 @@ func (e *Engine) isr(slot int32) []string {
 // every append block to the 10s wait deadline: the seconds-long pause
 // around a migration. The slot's ordinary replicas still gate normally, so
 // the acknowledged write still rests on in-sync copies.
+//
+// A seat a RE-LAYOUT added is excluded on the same reasoning (see
+// slotRepl.building): a member that just joined a grown replica set is a copy
+// being built, not yet one the promise rests on, and it starts gating the
+// moment it reaches this leader's LEO. A seat that was already in the set when
+// this node took the slot over keeps gating even while behind — that is the
+// promise, not a stall to fix.
 func (e *Engine) advanceHW(slot int32) {
 	target := e.migrationTargetOf(slot)
 
@@ -969,6 +1532,18 @@ func (e *Engine) advanceHW(slot int32) {
 		i := sr.find(node)
 		if i < 0 || !sr.lastOK[i].After(cutoff) {
 			continue // unknown or out of ISR: excluded from HW computation
+		}
+		if e.sessionGone(node, sr.lastOK[i]) {
+			continue // its connection died after that report: not in sync any more
+		}
+		if e.peerDown(node) {
+			continue // the controller marked it down: leadership has moved off it
+		}
+		if sr.isBuilding(node) {
+			if sr.leo[i] < leaderLEO {
+				continue // still being built: not an ack holder yet
+			}
+			sr.dropBuilding(node) // caught up: an ordinary ISR member from now on
 		}
 		if node == target && sr.leo[i] < leaderLEO {
 			continue // still catching up: not an ack holder yet
@@ -1082,6 +1657,9 @@ func (e *Engine) noteReplicaProgress(slot int32, follower string, leo uint64, no
 		prev, wasFresh = sr.leo[i], now.Sub(sr.lastOK[i]) <= isrStaleAfter
 	}
 	sr.touch(follower, leo, now)
+	// A report means this follower IS being served again: its earlier session
+	// loss (if any) no longer excludes it from the watermark.
+	delete(e.goneSess, follower)
 	e.replMu.Unlock()
 	if leo > prev || !wasFresh {
 		e.advanceHW(slot)
@@ -1676,6 +2254,19 @@ func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
 		_, err := e.fetchRound(ctx, sess.leader, slots, sweep)
 		if err != nil {
 			e.logger.WithField("leader", sess.leader).WithError(err).Warn("fetch round failed")
+			// Evidence, not a verdict: a transport-level failure repeated twice
+			// tells the controller this leader looks dead so it can skip its own
+			// probe threshold (see reportLeaderUnreachable). A slow server, a
+			// routing answer or a session stopped by the table is NOT evidence.
+			if transportUnreachable(err) {
+				sess.unreachable++
+				if sess.unreachable >= unreachableReportAfter && time.Since(sess.lastReport) >= unreachableWindow {
+					sess.lastReport = time.Now()
+					e.reportLeaderUnreachable(sess.leader)
+				}
+			} else {
+				sess.unreachable = 0
+			}
 			// Transport/leader trouble: back off so a dead leader does not
 			// spin. An *empty* round is NOT backed off — the long-poll made
 			// it zero-CPU, and sleeping between rounds is exactly what
@@ -1692,7 +2283,8 @@ func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
 			}
 			continue
 		}
-		backoff = 0 // healthy round (data or absorbed-idle): re-park at once
+		sess.unreachable = 0 // a round that answered says nothing is broken
+		backoff = 0          // healthy round (data or absorbed-idle): re-park at once
 	}
 }
 
@@ -2002,16 +2594,33 @@ func (e *Engine) RunController(ctx context.Context) {
 			e.failMu.Lock()
 			if !e.alive(p.PeerAddr) {
 				e.failStreak[id]++
-				if e.failStreak[id] >= livenessFailThreshold && !p.Down {
-					e.loggerf("peer %s unreachable (%d consecutive probes), marking it down", id, e.failStreak[id])
-					e.submit(&Command{Op: OpMarkDown, NodeID: id})
+				// A probe that fails because NOTHING IS LISTENING is not a slow
+				// node: the process is gone, and the deeper question the strike
+				// threshold exists for (is it slow or is it dead?) is already
+				// answered. Mark it down on this round instead of three — every
+				// round it stays in the table as an up member, its frozen LEO
+				// pins the watermark of every slot it replicated and its slots
+				// stay routed to a dead leader, which a batch workload sees as
+				// seconds of 0 msg/s.
+				refused := dialRefused(p.PeerAddr)
+				markDown := (e.failStreak[id] >= livenessFailThreshold || refused) && !p.Down
+				if markDown {
+					e.loggerf("peer %s unreachable (%d consecutive probes, refused connection: %t), marking it down",
+						id, e.failStreak[id], refused)
 				}
-			} else {
-				e.failStreak[id] = 0
-				if p.Down {
-					e.loggerf("peer %s answers probes again, marking it up", id)
-					e.submit(&Command{Op: OpMarkUp, NodeID: id})
+				e.failMu.Unlock()
+				if markDown {
+					// The pick asks the replicas for their LEOs (peer round
+					// trips), so it runs WITHOUT the liveness lock: the sweep
+					// must not stall behind one failover.
+					e.failoverPeer(id)
 				}
+				continue
+			}
+			e.failStreak[id] = 0
+			if p.Down {
+				e.loggerf("peer %s answers probes again, marking it up", id)
+				e.submit(&Command{Op: OpMarkUp, NodeID: id})
 			}
 			e.failMu.Unlock()
 		}
@@ -2029,6 +2638,26 @@ func (e *Engine) alive(addr string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), peerPingTimeout)
 	defer cancel()
 	return e.peerPing(ctx, addr) == nil
+}
+
+// dialRefusedTimeout bounds the fast "is anything listening" dial. A refused
+// connection comes back immediately; only a black-holed address (a firewall
+// dropping SYN) waits this long.
+const dialRefusedTimeout = 300 * time.Millisecond
+
+// dialRefused reports whether the peer's port actively REFUSES connections —
+// ECONNREFUSED, i.e. nothing is listening there. That is the unambiguous "the
+// process is gone" signal the liveness sweep can act on within one round: the
+// app-level probe (and its strike threshold) exists to tell a dead node from a
+// slow one, and a refused connect answers that question outright. A timeout, a
+// reset from a half-open socket or any other error is NOT this signal.
+func dialRefused(addr string) bool {
+	c, err := net.DialTimeout("tcp", addr, dialRefusedTimeout)
+	if err == nil {
+		c.Close()
+		return false
+	}
+	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
 // submit commits a command through Raft. Every command submission funnels

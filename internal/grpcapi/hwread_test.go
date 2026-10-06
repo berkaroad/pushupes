@@ -76,9 +76,11 @@ func TestLeaderReadIsNotCappedByHighWatermark(t *testing.T) {
 		t.Fatalf("test setup: node-1 should lead slot %d", slot)
 	}
 
-	// Three durable records, then pin the watermark at 1 as a lagging replica
-	// would. Before the fix a leader read stopped at seq 1.
-	for v := 1; v <= 3; v++ {
+	// Three durable records, and the replica catches up to them (a seat that
+	// has not caught up once is still a copy being built and never gates). Then
+	// a fourth record it reports late pins the watermark at 3. Before the fix a
+	// leader read stopped at the watermark.
+	appendV := func(v int) {
 		if _, err := store.Append(&data.EventRecord{
 			AggregateID: agg, Version: uint32(v),
 			CommandID: "hw-cmd-" + itoa(v),
@@ -87,9 +89,14 @@ func TestLeaderReadIsNotCappedByHighWatermark(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	eng.NoteReplicaProgress(slot, follower, 1)
-	if hw := eng.HW(slot); hw != 1 {
-		t.Fatalf("test setup: want watermark 1, got %d", hw)
+	for v := 1; v <= 3; v++ {
+		appendV(v)
+	}
+	eng.NoteReplicaProgress(slot, follower, 3)
+	appendV(4)
+	eng.NoteReplicaProgress(slot, follower, 3)
+	if hw := eng.HW(slot); hw != 3 {
+		t.Fatalf("test setup: want the watermark pinned at 3 by the lagging replica, got %d", hw)
 	}
 
 	cli := serveEngine(t, eng, store)
@@ -99,8 +106,8 @@ func TestLeaderReadIsNotCappedByHighWatermark(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if len(resp.Records) != 3 {
-		t.Fatalf("leader read returned %d records, want 3 (the durable log must not be capped by HW=%d)",
+	if len(resp.Records) != 4 {
+		t.Fatalf("leader read returned %d records, want 4 (the durable log must not be capped by HW=%d)",
 			len(resp.Records), eng.HW(slot))
 	}
 }
@@ -176,14 +183,14 @@ func TestSteppedDownReplicaReadsItsOwnLog(t *testing.T) {
 		}
 	}
 
-	// Three versions while node-1 leads, with the watermark pinned low (seq 1)
-	// by a lagging replica: this is the value that freezes at step-down.
+	// Three versions while node-1 leads, with a live watermark (the replica
+	// caught up to 3): this is the value that freezes at step-down.
 	for v := 1; v <= 3; v++ {
 		appendV(v)
 	}
-	eng.NoteReplicaProgress(slot, follower, 1)
-	if hw := eng.HW(slot); hw != 1 {
-		t.Fatalf("test setup: want live watermark 1 while leading, got %d", hw)
+	eng.NoteReplicaProgress(slot, follower, 3)
+	if hw := eng.HW(slot); hw != 3 {
+		t.Fatalf("test setup: want live watermark 3 while leading, got %d", hw)
 	}
 
 	// node-1 steps down: the table hands the slot to the follower and node-1

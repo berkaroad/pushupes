@@ -11,12 +11,17 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+	"net"
 	"pushupes/internal/data"
 	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
 	"pushupes/internal/lease"
-	"sync"
 	"pushupes/internal/payloadcodec"
 	"pushupes/internal/storage"
+	"sync"
 )
 
 // aggInSlot finds an aggregate id that routes to the given slot.
@@ -133,13 +138,24 @@ func TestNoteReplicaProgressAdvancesHW(t *testing.T) {
 	if hw := e.HW(0); hw != 0 {
 		t.Fatalf("initial hw %d want 0", hw)
 	}
-	e.NoteReplicaProgress(0, "node-2", 1)
-	if hw := e.HW(0); hw != 1 {
-		t.Fatalf("hw after lagging replica %d want 1", hw)
-	}
+	// A seat is a copy being built until it reaches the leader's LEO once; from
+	// then on it is an ordinary ISR member and its LEO gates the watermark.
 	e.NoteReplicaProgress(0, "node-2", 2)
 	if hw := e.HW(0); hw != 2 {
 		t.Fatalf("hw after catch-up %d want 2", hw)
+	}
+	// A third record, and the follower reports it late: that lag holds the
+	// watermark back — the promise, not a stall to remove.
+	if _, err := st.Append(makeRecord(aggH, 3, "h-3")); err != nil {
+		t.Fatal(err)
+	}
+	e.NoteReplicaProgress(0, "node-2", 2)
+	if hw := e.HW(0); hw != 2 {
+		t.Fatalf("hw after a lagging ordinary replica %d want 2 (leader LEO 3)", hw)
+	}
+	e.NoteReplicaProgress(0, "node-2", 3)
+	if hw := e.HW(0); hw != 3 {
+		t.Fatalf("hw after catch-up %d want 3", hw)
 	}
 	if got := e.ISR(0); len(got) != 1 || got[0] != "node-2" {
 		t.Fatalf("ISR %v want [node-2]", got)
@@ -491,10 +507,14 @@ func TestLeaderGainDropsStaleFollowerHW(t *testing.T) {
 		t.Fatalf("setup: slot 0 not back on node-1: %q", p.Leader)
 	}
 	e.replMu.Lock()
-	_, kept := e.repl[0]
+	sr := e.repl[0]
+	positions, hw := 0, uint64(0)
+	if sr != nil {
+		positions, hw = len(sr.node), sr.hw
+	}
 	e.replMu.Unlock()
-	if kept {
-		t.Fatal("a newly gained leader must drop the previous term's stale follower positions")
+	if positions != 0 || hw != 0 {
+		t.Fatalf("a newly gained leader must drop the previous term's stale follower positions: %d position(s), hw %d", positions, hw)
 	}
 }
 
@@ -575,9 +595,16 @@ func TestMigrationTargetDoesNotGateHW(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	e.NoteReplicaProgress(3, "node-2", 2)
-	if hw := e.HW(3); hw != 2 {
-		t.Fatalf("an ordinary lagging replica must still gate HW, got %d want 2", hw)
+	// It has to catch up ONCE first: until then it is a copy being built and is
+	// excluded by design (see TestReLayoutSeatDoesNotGateHW). Afterwards a lag
+	// does hold the watermark back.
+	e.NoteReplicaProgress(3, "node-2", 5)
+	if _, err := st.Append(makeRecord(agg3, 6, "hw3-6")); err != nil {
+		t.Fatal(err)
+	}
+	e.NoteReplicaProgress(3, "node-2", 5)
+	if hw := e.HW(3); hw != 5 {
+		t.Fatalf("an ordinary lagging replica must still gate HW, got %d want 5 (leader LEO 6)", hw)
 	}
 }
 
@@ -646,6 +673,537 @@ func TestHandleFetchAndReplicateOverPeerPlane(t *testing.T) {
 	}
 	_ = storage.WALHeaderLen
 }
+func TestFailoverPicksTheFreshestReplica(t *testing.T) {
+	ctrl, _ := newTestEngine(t, "node-1")
+	ctrl.node = newTestRaftNode(t, ctrl)
+
+	// Three replicas for slot 0, which node-2 leads: node-3 holds records,
+	// node-4 holds none, node-5 is unreachable (no peer harness at all).
+	var addrs = map[string]string{}
+	for _, id := range []string{"node-3", "node-4"} {
+		e, st := newTestEngine(t, id)
+		agg := aggInSlot(t, e, 0)
+		n := 5
+		if id == "node-4" {
+			n = 1
+		}
+		for v := 1; v <= n; v++ {
+			if _, err := st.Append(makeRecord(agg, uint32(v), fmt.Sprintf("%s-%d", id, v))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		addrs[id] = newPeerHarness(t, e)
+	}
+	for _, id := range []string{"node-2", "node-3", "node-4", "node-5"} {
+		p := Peer{ID: id, PeerAddr: addrs[id], ClientAddr: addrs[id]}
+		if _, ok := addrs[id]; !ok {
+			// node-5 announced addresses nobody serves: it is a candidate that
+			// cannot be reached, so the pick must skip it.
+			p = Peer{ID: id, PeerAddr: "127.0.0.1:1", ClientAddr: "http://127.0.0.1:1"}
+		}
+		applyCmd(t, ctrl, &Command{Op: OpJoinNode, Peer: &p})
+	}
+	applyCmd(t, ctrl, &Command{Op: OpConfig, Replicas: 3})
+	applyCmd(t, ctrl, &Command{Op: OpPlanSlots})
+	// One slot of our own, led by node-2 with the three others as replicas.
+	applyCmd(t, ctrl, &Command{Op: OpLeaderMove, Slots: []int32{0}, NewLeader: "node-2"})
+	if p := ctrl.TableSnapshot().Slots[0]; p.Leader != "node-2" {
+		t.Fatalf("setup: slot 0 leader %q", p.Leader)
+	}
+	ctrl.tableMu.Lock()
+	ctrl.table.Slots[0].Leader = "node-2"
+	ctrl.table.Slots[0].Replicas = []string{"node-2", "node-3", "node-4", "node-5"}
+	ctrl.tableMu.Unlock()
+
+	picks := ctrl.freshestReplicas("node-2")
+	if got := picks[0]; got != "node-3" {
+		t.Fatalf("freshest replica for slot 0 = %q, want node-3 (node-4 has less, node-5 is unreachable)", got)
+	}
+	ctrl.failoverPeer("node-2")
+	tbl := ctrl.TableSnapshot()
+	if !tbl.Peers["node-2"].Down {
+		t.Fatal("node-2 must be marked down")
+	}
+	if got := tbl.Slots[0].Leader; got != "node-3" {
+		t.Fatalf("slot 0 moved to %q, want the freshest replica node-3", got)
+	}
+}
+func TestFailoverPrefersTheControllersPick(t *testing.T) {
+	tbl := NewTable(8, 3)
+	for _, id := range []string{"node-1", "node-2", "node-3", "node-4", "node-5"} {
+		tbl.Peers[id] = Peer{ID: id, ClientAddr: "http://" + id + ":8591"}
+	}
+	tbl.Slots[0] = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-3", "node-4"}, Epoch: 1, State: SlotStable}
+	tbl.Slots[1] = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-3", "node-4"}, Epoch: 1, State: SlotStable}
+
+	// A valid pick wins over the replica-set order: node-4 holds what node-2
+	// acknowledged, node-3 does not.
+	if err := tbl.Apply(&Command{Op: OpMarkDown, NodeID: "node-2", NewLeaders: map[int32]string{0: "node-4"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := tbl.Slots[0].Leader; got != "node-4" {
+		t.Fatalf("pick ignored: slot 0 leader %q, want node-4", got)
+	}
+	if e := tbl.Slots[0].Epoch; e != 2 {
+		t.Fatalf("epoch %d want 2 (a leader change bumps it)", e)
+	}
+	// No pick for slot 1: the table rule decides (first live replica after the
+	// failed node).
+	if got := tbl.Slots[1].Leader; got != "node-3" {
+		t.Fatalf("slot 1 leader %q, want the table rule's node-3", got)
+	}
+
+	// Invalid picks fall back: an unknown member, a member that is not a replica,
+	// the failed node itself, and an offline replica.
+	tbl.Peers["node-4"] = Peer{ID: "node-4"} // drops its announced client addr -> offline
+	for i, pick := range []string{"node-9", "node-5", "node-2", "node-4"} {
+		s := int32(10 + i)
+		tbl.Slots[s] = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-3", "node-4"}, Epoch: 1, State: SlotStable}
+		if err := tbl.Apply(&Command{Op: OpMarkDown, NodeID: "node-2", NewLeaders: map[int32]string{s: pick}}); err != nil {
+			t.Fatal(err)
+		}
+		if got := tbl.Slots[s].Leader; got != "node-3" {
+			t.Fatalf("pick %q accepted for slot %d (leader %q): it must fall back to the table rule node-3", pick, s, got)
+		}
+	}
+}
+
+// TestFailoverPicksTheFreshestReplica drives the whole path on real engines: the
+// controller asks the candidates for their LEOs over the peer plane, picks the
+// one that holds the most, and the mark_down command carries that pick — so the
+// slot does not land on a replica that is behind (which would lose the records
+// its dead leader had already acknowledged).
+func TestFollowerReportReachesController(t *testing.T) {
+	ctrl, _ := newTestEngine(t, "node-1")
+	ctrl.node = newTestRaftNode(t, ctrl)
+	for _, id := range []string{"node-1", "node-2", "node-3"} {
+		join(t, ctrl, id, "127.0.0.1:1")
+	}
+	ctrlAddr := newPeerHarness(t, ctrl)
+
+	// A node that is a FOLLOWER in its own consensus group: it must report to
+	// the controller rather than record the evidence itself.
+	foll, _ := newTestEngine(t, "node-9")
+	follNode, leaderID := newFollowerRaftNode(t)
+	foll.node = follNode
+	// Its directory maps the controller id it knows to the controller's peer
+	// plane; the rest is irrelevant to this hop.
+	applyCmd(t, foll, &Command{Op: OpJoinNode, Peer: &Peer{ID: leaderID, PeerAddr: ctrlAddr}})
+	applyCmd(t, foll, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-9", PeerAddr: "127.0.0.1:1"}})
+
+	foll.reportLeaderUnreachable("node-3")
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		ctrl.unreachMu.Lock()
+		witnesses := len(ctrl.unreach["node-3"])
+		ctrl.unreachMu.Unlock()
+		if witnesses > 0 {
+			return // the controller holds the witness
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("the follower's unreachable report never reached the controller")
+}
+
+// TestConcurrentMFetchRoundsDoNotShareTheScanBuffer is the regression net for
+// the fetch round's pooled scan buffer: returning it to the pool while a round
+// still owns it lets two rounds hold the same buffer, and the one that resizes
+// or resets it truncates it under the other's feet — an
+// "index out of range [N] with length 0" panic inside HandleMFetchCtx (seen once
+// under real churn, which is what this test reproduces: concurrent PARKED
+// rounds of different sizes, cancelled at different moments). It panics when the
+// ownership is broken rather than failing an assertion, so it is run as a plain
+// test — the fetch path's contract is "one buffer, one owner".
+func TestUnreachableQuorumMarksPeerDown(t *testing.T) {
+	ctrl, _ := newTestEngine(t, "node-1")
+	ctrl.node = newTestRaftNode(t, ctrl) // the controller acts on its own Raft log
+	for _, id := range []string{"node-1", "node-2", "node-3", "node-4"} {
+		join(t, ctrl, id, "127.0.0.1:1")
+	}
+	addr := newPeerHarness(t, ctrl)
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	cli := pushupesv1.NewPeerServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	report := func(reporter, suspect string) {
+		t.Helper()
+		if _, err := cli.ReportUnreachable(ctx, &pushupesv1.ReportUnreachableRequest{Reporter: reporter, Suspect: suspect}); err != nil {
+			t.Fatalf("report %s -> %s: %v", reporter, suspect, err)
+		}
+	}
+	down := func(id string) bool { return ctrl.TableSnapshot().Peers[id].Down }
+
+	// One witness: not enough, the node is left alone.
+	report("node-2", "node-3")
+	if down("node-3") {
+		t.Fatal("a single witness must not mark a node down")
+	}
+
+	// A second, different observer: quorum. The verdict is submitted off the
+	// RPC path (the controller asks the candidates for their LEOs first, so the
+	// pick can travel with the command), hence the wait.
+	report("node-4", "node-3")
+	waitFor(t, 3*time.Second, func() bool { return down("node-3") },
+		"two distinct witnesses must mark the node down")
+
+	// The suspect itself, an unknown id, and an already-down node are all
+	// ignored (no report storms, no phantom members).
+	report("node-3", "node-3")
+	report("node-2", "node-99")
+	report("node-2", "node-3")
+	if !down("node-3") {
+		t.Fatal("node-3 must stay down")
+	}
+
+	// A witness older than the window must not count towards a quorum.
+	ctrl.unreachMu.Lock()
+	ctrl.unreach["node-4"] = map[string]time.Time{"node-2": time.Now().Add(-2 * unreachableWindow)}
+	ctrl.unreachMu.Unlock()
+	report("node-4", "node-4") // self-report: ignored, and must not refresh the table
+	if down("node-4") {
+		t.Fatal("a stale witness plus an ignored report must not mark node-4 down")
+	}
+	report("node-2", "node-4")
+	if down("node-4") {
+		t.Fatalf("one fresh witness must not be a quorum even with a stale one present (window is %s)", unreachableWindow)
+	}
+	report("node-3", "node-4")
+	// (Only the verdict is handed off the RPC path; the quorum decision itself is
+	// synchronous, which is why the "not yet down" checks above can read directly.)
+	waitFor(t, 3*time.Second, func() bool { return down("node-4") },
+		"two fresh witnesses within the window must mark node-4 down")
+}
+
+// TestFollowerReportReachesController closes the loop on the sender side: a
+// follower that saw a leader's connection die sends its evidence to the
+// CONTROLLER (resolved through its own table), and the controller records that
+// witness. Everything before the quorum is reached depends on this hop.
+func TestTransportUnreachableOnlyCountsTransport(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"connection gone", status.Error(codes.Unavailable, "connection error: connection refused"), true},
+		{"wrapped connection gone", fmt.Errorf("fetch round: %w", status.Error(codes.Unavailable, "x")), true},
+		{"slow server", status.Error(codes.DeadlineExceeded, "context deadline exceeded"), false},
+		{"session stopped here", status.Error(codes.Canceled, "context canceled"), false},
+		{"application error", status.Error(codes.Internal, "mfetch: invalid"), false},
+		{"routing answer", data.ErrNotLeader, false},
+		{"no error", nil, false},
+	}
+	for _, c := range cases {
+		if got := transportUnreachable(c.err); got != c.want {
+			t.Errorf("%s: transportUnreachable = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestUnreachableQuorumMarksPeerDown drives the witness path through the real
+// peer plane: one observer is not evidence, two distinct observers within the
+// window are, and the controller submits the same mark_down the probe sweep
+// would have submitted — just seconds earlier.
+func TestDialRefusedDistinguishesDeadFromSlow(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	if dialRefused(ln.Addr().String()) {
+		t.Fatalf("a listening port must not read as refused (%s)", ln.Addr())
+	}
+	dead := ln.Addr().String()
+	ln.Close() // nothing listens there any more
+	if !dialRefused(dead) {
+		t.Fatalf("a closed port must read as refused (%s): the sweep is what turns that into an immediate mark_down", dead)
+	}
+}
+
+// TestTransportUnreachableOnlyCountsTransport pins which fetch-round failures
+// count as evidence that a node is unreachable: the connection itself failing.
+// A slow server (deadline), a session this node stopped (cancellation), a
+// routing answer or an application error are not — reporting those would mark a
+// healthy leader down, which is exactly what the probe threshold guards against.
+func TestTakeoverKeepsBuildingSeatsOutOfTheHW(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	join(t, e, "node-3", "127.0.0.1:3")
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	// slot 0 (led by node-1) gains a third seat: a copy being built.
+	applyCmd(t, e, &Command{Op: OpSlotAddReplica, Slots: []int32{0}, NodeID: "node-3"})
+	agg := aggInSlot(t, e, 0)
+	for v := uint32(1); v <= 5; v++ {
+		if _, err := st.Append(makeRecord(agg, v, fmt.Sprintf("take-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.NoteReplicaProgress(0, "node-2", 5)
+	e.NoteReplicaProgress(0, "node-3", 0) // still fetching
+	if hw := e.HW(0); hw != 5 {
+		t.Fatalf("setup: a seat being built must not gate, HW %d want the leader LEO 5", hw)
+	}
+
+	// The slot changes leaders and comes back: that is a takeover for node-1.
+	applyCmd(t, e, &Command{Op: OpLeaderMove, Slots: []int32{0}, NewLeader: "node-2"})
+	applyCmd(t, e, &Command{Op: OpLeaderMove, Slots: []int32{0}, NewLeader: "node-1"})
+
+	// The new term's positions arrive — the still-fetching seat reports first,
+	// as a real fetch round does — and the next write follows it.
+	e.NoteReplicaProgress(0, "node-3", 0)
+	e.NoteReplicaProgress(0, "node-2", 5)
+	if _, err := st.Append(makeRecord(agg, 6, "take-6")); err != nil {
+		t.Fatal(err)
+	}
+	e.NoteReplicaProgress(0, "node-2", 6)
+	if hw := e.HW(0); hw != 6 {
+		t.Fatalf("after a takeover a still-fetching seat pinned HW at %d, want the leader LEO 6", hw)
+	}
+}
+
+// TestDialRefusedDistinguishesDeadFromSlow pins the fast liveness signal the
+// controller's sweep acts on: a port with nothing listening REFUSES the
+// connection (that node's process is gone, act now), while a port that is
+// accepting is not a failure at all. Anything else — a timeout, a drop — must
+// NOT read as "dead": those are what the strike threshold is for.
+func TestMarkedDownPeerReleasesHW(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	pinReplicas(t, e, 2) // a leader plus a follower needs two copies (see pinReplicas)
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	agg := aggInSlot(t, e, 0)
+	for v := uint32(1); v <= 5; v++ {
+		if _, err := st.Append(makeRecord(agg, v, fmt.Sprintf("down-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Catch it up once (a copy being built never gates), then let it fall behind:
+	// an ordinary ISR member gates.
+	e.NoteReplicaProgress(0, "node-2", 5)
+	if _, err := st.Append(makeRecord(agg, 6, "down-6")); err != nil {
+		t.Fatal(err)
+	}
+	e.NoteReplicaProgress(0, "node-2", 5)
+	if hw := e.HW(0); hw != 5 {
+		t.Fatalf("setup: HW %d want 5 (leader LEO 6)", hw)
+	}
+	if p, _ := e.TableSnapshot().Slots[0]; !replicaListHas(p.Replicas, "node-2") {
+		t.Fatalf("setup: node-2 must still hold its seat: %v", p.Replicas)
+	}
+
+	applyCmd(t, e, &Command{Op: OpMarkDown, NodeID: "node-2"})
+	if hw := e.HW(0); hw != 6 {
+		t.Fatalf("a marked-down peer pinned HW at %d, want the leader LEO 6", hw)
+	}
+	if p, _ := e.TableSnapshot().Slots[0]; !replicaListHas(p.Replicas, "node-2") {
+		t.Fatalf("mark_down must keep the seat (only its vote on the watermark goes away): %v", p.Replicas)
+	}
+}
+
+// TestTakeoverKeepsBuildingSeatsOutOfTheHW pins the takeover half of the
+// building-seat rule. A slot can change leaders while one of its seats is still
+// fetching — the rebalancer's hand-over gate checks the TARGET's copy, not the
+// other seats' — and the new leader inherits those positions with no leadership
+// history of its own. If it counts a still-fetching seat as an ordinary in-sync
+// replica, the very stall the mark removes comes back at every hand-over.
+func TestFollowerSessionLossReleasesHW(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	pinReplicas(t, e, 2) // a leader plus a follower needs two copies (see pinReplicas)
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	// slot 0 is led by node-1 with node-2 as its in-sync replica.
+	agg := aggInSlot(t, e, 0)
+	for v := uint32(1); v <= 5; v++ {
+		if _, err := st.Append(makeRecord(agg, v, fmt.Sprintf("loss-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// node-2 catches up once (a copy still being built never gates), then falls
+	// one record behind: now it is an ordinary ISR member and it gates.
+	e.NoteReplicaProgress(0, "node-2", 5)
+	if _, err := st.Append(makeRecord(agg, 6, "loss-6")); err != nil {
+		t.Fatal(err)
+	}
+	e.NoteReplicaProgress(0, "node-2", 5)
+	if hw := e.HW(0); hw != 5 {
+		t.Fatalf("setup: a live lagging replica must gate, HW %d want 5 (leader LEO 6)", hw)
+	}
+
+	// node-2 is killed: its session ends without an answer.
+	e.noteFollowerSessionLost("node-2", []int32{0})
+	if hw := e.HW(0); hw != 6 {
+		t.Fatalf("a dead follower's position pinned HW at %d, want the leader LEO 6", hw)
+	}
+	if isr := e.ISR(0); seatListHas(isr, "node-2") {
+		t.Fatalf("a follower whose session died must not read as in-sync: %v", isr)
+	}
+
+	// It comes back and reports: it is in-sync again and gates again.
+	e.NoteReplicaProgress(0, "node-2", 5)
+	if isr := e.ISR(0); !seatListHas(isr, "node-2") {
+		t.Fatalf("a reconnected replica must read as in-sync again: %v", isr)
+	}
+	if _, err := st.Append(makeRecord(agg, 7, "loss-7")); err != nil {
+		t.Fatal(err)
+	}
+	e.NoteReplicaProgress(0, "node-2", 6)
+	if hw := e.HW(0); hw != 6 {
+		t.Fatalf("a live lagging replica must gate again, HW %d want 6 (leader LEO 7)", hw)
+	}
+}
+
+// TestMarkedDownPeerReleasesHW: the replicated liveness verdict is the slow half
+// (it takes consecutive probe rounds), and when it lands the marked-down peer's
+// seats are still in the replica sets — it must stop holding the watermark back
+// from that moment, without waiting for its seats to be removed or for the
+// staleness window to close.
+func TestReLayoutSeatDoesNotGateHW(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	join(t, e, "node-3", "127.0.0.1:3")
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	// slot 0 is led by node-1 with node-2 as its in-sync replica.
+	agg := aggInSlot(t, e, 0)
+	for v := uint32(1); v <= 5; v++ {
+		if _, err := st.Append(makeRecord(agg, v, fmt.Sprintf("relayout-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// counter-case FIRST, before any re-layout: a seat that was already in the
+	// set is an ordinary ISR member — behind, it gates (the acknowledged-write
+	// promise). slot 3 is on the same terms.
+	agg3 := aggInSlot(t, e, 3)
+	for v := uint32(1); v <= 5; v++ {
+		if _, err := st.Append(makeRecord(agg3, v, fmt.Sprintf("relayout3-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// It catches up once (until then it is a copy being built, by design), and
+	// from then on it is an ordinary ISR member: a lag holds the watermark back.
+	e.NoteReplicaProgress(3, "node-2", 5)
+	if _, err := st.Append(makeRecord(agg3, 6, "relayout3-6")); err != nil {
+		t.Fatal(err)
+	}
+	e.NoteReplicaProgress(3, "node-2", 5)
+	if hw := e.HW(3); hw != 5 {
+		t.Fatalf("a seat that was in the set from the start must gate while behind, got HW %d want 5 (leader LEO 6)", hw)
+	}
+
+	// The re-layout adds node-3 to slot 0 (OpReplanSlots adds the ring's missing
+	// seats; the command is the same one it submits).
+	applyCmd(t, e, &Command{Op: OpSlotAddReplica, Slots: []int32{0}, NodeID: "node-3"})
+
+	// The fresh seat reports an empty log: the watermark must follow the
+	// leader's LEO instead of waiting for the copy to be built.
+	e.NoteReplicaProgress(0, "node-3", 0)
+	if hw := e.HW(0); hw != 5 {
+		t.Fatalf("a seat being built pinned HW at %d, want the leader LEO 5", hw)
+	}
+	if isr := e.ISR(0); seatListHas(isr, "node-3") {
+		t.Fatalf("a seat being built must not read as in-sync: %v", isr)
+	}
+
+	// It catches up: the mark clears, it reads as in-sync again...
+	e.NoteReplicaProgress(0, "node-3", 5)
+	if hw := e.HW(0); hw != 5 {
+		t.Fatalf("HW after the catch-up %d, want 5", hw)
+	}
+	if isr := e.ISR(0); !seatListHas(isr, "node-3") {
+		t.Fatalf("a caught-up seat must read as in-sync: %v", isr)
+	}
+
+	// ...and from now on it gates like any other in-sync replica.
+	if _, err := st.Append(makeRecord(agg, 6, "relayout-6")); err != nil {
+		t.Fatal(err)
+	}
+	e.NoteReplicaProgress(0, "node-3", 5)
+	if hw := e.HW(0); hw != 5 {
+		t.Fatalf("a replica that caught up and fell behind again must gate, got HW %d want 5", hw)
+	}
+}
+
+// TestFollowerSessionLossReleasesHW pins the fast half of "a replica that is no
+// longer being served must not pin the writes": a killed node's fetch long poll
+// ends without an answer, and from that moment its frozen LEO must stop gating
+// the slot's watermark — otherwise every slot it replicated stays pinned until
+// its seats leave the table (a batch workload shows that as seconds of 0 msg/s,
+// because one pinned slot stalls a whole batch).
+
+// TestSlotReplSeatBookkeeping pins the marker itself: which seats a re-layout
+// marks as "being built" and when the mark goes away.
+func TestSlotReplSeatBookkeeping(t *testing.T) {
+	sr := &slotRepl{}
+
+	// Taking the slot over records the seats present and marks the ones still
+	// young (seated within the grace: plausibly still fetching) as copies being
+	// built — this leader has no history to tell them from established members.
+	sr.takeover([]string{"node-1", "node-2"}, []string{"node-2"})
+	if !sr.isBuilding("node-2") {
+		t.Fatalf("a young seat at takeover is a copy being built: seats=%v building=%v", sr.seats, sr.building)
+	}
+	if sr.isBuilding("node-1") {
+		t.Fatalf("only the young seats are marked: %v", sr.building)
+	}
+	sr.dropBuilding("node-2") // it caught up: an ordinary member from now on
+
+	// A seat that appears LATER (a re-layout adding the ring's seats) is a copy
+	// being built.
+	sr.syncSeats([]string{"node-1", "node-2", "node-3"})
+	if !sr.isBuilding("node-3") {
+		t.Fatalf("a seat added while this node leads must be marked as building: seats=%v building=%v", sr.seats, sr.building)
+	}
+	if sr.isBuilding("node-2") {
+		t.Fatalf("an inherited seat must stay unmarked: %v", sr.building)
+	}
+
+	// Caught up: the mark clears and a LATER lag gates like any other replica.
+	sr.dropBuilding("node-3")
+	if sr.isBuilding("node-3") {
+		t.Fatalf("a caught-up seat must lose its mark: %v", sr.building)
+	}
+
+	// A seat that leaves the set loses its mark; the same node coming back is a
+	// fresh transition and is marked again (its data may be stale by then).
+	sr.syncSeats([]string{"node-1", "node-3"})
+	if sr.isBuilding("node-3") {
+		t.Fatalf("a seat that stays in the set must not be re-marked: %v", sr.building)
+	}
+	sr.syncSeats([]string{"node-1", "node-3", "node-2"})
+	if !sr.isBuilding("node-2") {
+		t.Fatalf("a seat that re-joined the set is a copy being built again: %v", sr.building)
+	}
+	if len(sr.seats) != 3 {
+		t.Fatalf("the recorded set must mirror the table's: %v", sr.seats)
+	}
+}
+
+// TestReLayoutSeatDoesNotGateHW pins the behaviour the marker exists for: a
+// seat a re-layout added must not hold the slot's watermark back while it
+// fetches, and must gate again once it has caught up.
 func TestConcurrentMFetchRoundsDoNotShareTheScanBuffer(t *testing.T) {
 	e, _ := newTestEngine(t, "node-1")
 	join(t, e, "node-1", "127.0.0.1:1")

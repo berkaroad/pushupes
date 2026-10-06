@@ -19,18 +19,20 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	PeerService_Ping_FullMethodName            = "/pushupes.v1.PeerService/Ping"
-	PeerService_Register_FullMethodName        = "/pushupes.v1.PeerService/Register"
-	PeerService_Adopt_FullMethodName           = "/pushupes.v1.PeerService/Adopt"
-	PeerService_MFetch_FullMethodName          = "/pushupes.v1.PeerService/MFetch"
-	PeerService_ReplicaProgress_FullMethodName = "/pushupes.v1.PeerService/ReplicaProgress"
-	PeerService_Replicate_FullMethodName       = "/pushupes.v1.PeerService/Replicate"
-	PeerService_SlotLeo_FullMethodName         = "/pushupes.v1.PeerService/SlotLeo"
-	PeerService_FenceSlot_FullMethodName       = "/pushupes.v1.PeerService/FenceSlot"
-	PeerService_SlotLeader_FullMethodName      = "/pushupes.v1.PeerService/SlotLeader"
-	PeerService_PushSegments_FullMethodName    = "/pushupes.v1.PeerService/PushSegments"
-	PeerService_TriggerSnapshot_FullMethodName = "/pushupes.v1.PeerService/TriggerSnapshot"
-	PeerService_DropSlot_FullMethodName        = "/pushupes.v1.PeerService/DropSlot"
+	PeerService_Ping_FullMethodName              = "/pushupes.v1.PeerService/Ping"
+	PeerService_Register_FullMethodName          = "/pushupes.v1.PeerService/Register"
+	PeerService_Adopt_FullMethodName             = "/pushupes.v1.PeerService/Adopt"
+	PeerService_MFetch_FullMethodName            = "/pushupes.v1.PeerService/MFetch"
+	PeerService_ReplicaProgress_FullMethodName   = "/pushupes.v1.PeerService/ReplicaProgress"
+	PeerService_Replicate_FullMethodName         = "/pushupes.v1.PeerService/Replicate"
+	PeerService_SlotLeo_FullMethodName           = "/pushupes.v1.PeerService/SlotLeo"
+	PeerService_FenceSlot_FullMethodName         = "/pushupes.v1.PeerService/FenceSlot"
+	PeerService_SlotLeader_FullMethodName        = "/pushupes.v1.PeerService/SlotLeader"
+	PeerService_PushSegments_FullMethodName      = "/pushupes.v1.PeerService/PushSegments"
+	PeerService_TriggerSnapshot_FullMethodName   = "/pushupes.v1.PeerService/TriggerSnapshot"
+	PeerService_DropSlot_FullMethodName          = "/pushupes.v1.PeerService/DropSlot"
+	PeerService_ReportUnreachable_FullMethodName = "/pushupes.v1.PeerService/ReportUnreachable"
+	PeerService_SlotLeos_FullMethodName          = "/pushupes.v1.PeerService/SlotLeos"
 )
 
 // PeerServiceClient is the client API for PeerService service.
@@ -97,6 +99,19 @@ type PeerServiceClient interface {
 	// the copy is rebuilt from the source instead. The caller owns the slot's
 	// placement and must not be asking a node that serves it.
 	DropSlot(ctx context.Context, in *DropSlotRequest, opts ...grpc.CallOption) (*DropSlotResponse, error)
+	// ReportUnreachable is a follower's evidence that a node it fetches slot
+	// data from stopped answering at the transport level. It is sent to the
+	// CONTROLLER (a follower's report is a witness, not a verdict): the
+	// controller acts on a quorum of witnesses instead of waiting out its own
+	// probe threshold. Best effort — a dropped report costs a probe round, and
+	// the liveness sweep remains the fallback when nobody is watching.
+	ReportUnreachable(ctx context.Context, in *ReportUnreachableRequest, opts ...grpc.CallOption) (*ReportUnreachableResponse, error)
+	// SlotLeos answers the durable LEO of many slots at once. The controller asks
+	// it of every candidate before failing a node over: the failover must hand a
+	// slot's leadership to a replica that HOLDS what was acknowledged, and only
+	// the replicas themselves know their LEO (the slot table carries no offsets).
+	// A slot this node does not hold reports 0.
+	SlotLeos(ctx context.Context, in *SlotLeosRequest, opts ...grpc.CallOption) (*SlotLeosResponse, error)
 }
 
 type peerServiceClient struct {
@@ -230,6 +245,26 @@ func (c *peerServiceClient) DropSlot(ctx context.Context, in *DropSlotRequest, o
 	return out, nil
 }
 
+func (c *peerServiceClient) ReportUnreachable(ctx context.Context, in *ReportUnreachableRequest, opts ...grpc.CallOption) (*ReportUnreachableResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportUnreachableResponse)
+	err := c.cc.Invoke(ctx, PeerService_ReportUnreachable_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *peerServiceClient) SlotLeos(ctx context.Context, in *SlotLeosRequest, opts ...grpc.CallOption) (*SlotLeosResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SlotLeosResponse)
+	err := c.cc.Invoke(ctx, PeerService_SlotLeos_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PeerServiceServer is the server API for PeerService service.
 // All implementations must embed UnimplementedPeerServiceServer
 // for forward compatibility.
@@ -294,6 +329,19 @@ type PeerServiceServer interface {
 	// the copy is rebuilt from the source instead. The caller owns the slot's
 	// placement and must not be asking a node that serves it.
 	DropSlot(context.Context, *DropSlotRequest) (*DropSlotResponse, error)
+	// ReportUnreachable is a follower's evidence that a node it fetches slot
+	// data from stopped answering at the transport level. It is sent to the
+	// CONTROLLER (a follower's report is a witness, not a verdict): the
+	// controller acts on a quorum of witnesses instead of waiting out its own
+	// probe threshold. Best effort — a dropped report costs a probe round, and
+	// the liveness sweep remains the fallback when nobody is watching.
+	ReportUnreachable(context.Context, *ReportUnreachableRequest) (*ReportUnreachableResponse, error)
+	// SlotLeos answers the durable LEO of many slots at once. The controller asks
+	// it of every candidate before failing a node over: the failover must hand a
+	// slot's leadership to a replica that HOLDS what was acknowledged, and only
+	// the replicas themselves know their LEO (the slot table carries no offsets).
+	// A slot this node does not hold reports 0.
+	SlotLeos(context.Context, *SlotLeosRequest) (*SlotLeosResponse, error)
 	mustEmbedUnimplementedPeerServiceServer()
 }
 
@@ -339,6 +387,12 @@ func (UnimplementedPeerServiceServer) TriggerSnapshot(context.Context, *TriggerS
 }
 func (UnimplementedPeerServiceServer) DropSlot(context.Context, *DropSlotRequest) (*DropSlotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DropSlot not implemented")
+}
+func (UnimplementedPeerServiceServer) ReportUnreachable(context.Context, *ReportUnreachableRequest) (*ReportUnreachableResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportUnreachable not implemented")
+}
+func (UnimplementedPeerServiceServer) SlotLeos(context.Context, *SlotLeosRequest) (*SlotLeosResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SlotLeos not implemented")
 }
 func (UnimplementedPeerServiceServer) mustEmbedUnimplementedPeerServiceServer() {}
 func (UnimplementedPeerServiceServer) testEmbeddedByValue()                     {}
@@ -566,6 +620,42 @@ func _PeerService_DropSlot_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PeerService_ReportUnreachable_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportUnreachableRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerServiceServer).ReportUnreachable(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerService_ReportUnreachable_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerServiceServer).ReportUnreachable(ctx, req.(*ReportUnreachableRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PeerService_SlotLeos_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SlotLeosRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerServiceServer).SlotLeos(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerService_SlotLeos_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerServiceServer).SlotLeos(ctx, req.(*SlotLeosRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // PeerService_ServiceDesc is the grpc.ServiceDesc for PeerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -616,6 +706,14 @@ var PeerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DropSlot",
 			Handler:    _PeerService_DropSlot_Handler,
+		},
+		{
+			MethodName: "ReportUnreachable",
+			Handler:    _PeerService_ReportUnreachable_Handler,
+		},
+		{
+			MethodName: "SlotLeos",
+			Handler:    _PeerService_SlotLeos_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

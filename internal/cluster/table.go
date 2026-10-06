@@ -251,6 +251,13 @@ type Command struct {
 	NewLeader   string    `json:"new_leader,omitempty"`
 	State       SlotState `json:"state,omitempty"`
 	MigratingTo string    `json:"migrating_to,omitempty"`
+	// For OpMarkDown: the controller's per-slot failover pick (slot -> leader),
+	// computed from the replicas' reported LEOs — the freshest live replica holds
+	// what was acknowledged, and the table itself cannot know that (no offsets in
+	// it). Absent or invalid entries fall back to the table-only rule
+	// (backupLeaderFor), so the command stays a deterministic function of the
+	// replicated state on every node that applies it.
+	NewLeaders map[int32]string `json:"new_leaders,omitempty"`
 	// For OpConfig:
 	SlotCount int32 `json:"slot_count,omitempty"`
 	Replicas  int   `json:"replicas,omitempty"`
@@ -342,11 +349,11 @@ func (t *Table) Apply(c *Command) error {
 			p.Down = true
 			t.Peers[c.NodeID] = p
 		}
-		for _, pl := range t.Slots {
+		for s, pl := range t.Slots {
 			if pl.Leader != c.NodeID {
 				continue
 			}
-			if next := t.backupLeaderFor(pl, c.NodeID); next != "" {
+			if next := t.failoverLeader(pl, c.NodeID, c.NewLeaders[s]); next != "" {
 				pl.Leader = next
 				pl.Epoch++
 			}
@@ -529,6 +536,34 @@ func removeString(list []string, s string) []string {
 		}
 	}
 	return out
+}
+
+// failoverLeader picks the new leader of a slot whose leader just failed over.
+//
+// preferred is the controller's pick (Command.NewLeaders): the replica whose
+// reported LEO was the highest among the live ones. Honouring it matters because
+// the alternative — the first live replica in the replica-set order — can be a
+// copy that is BEHIND, and the records the dead leader had already acknowledged
+// live only in the leader's log: handing those slots to a lagging replica loses
+// them silently. The controller is the only node that can see the replicas'
+// offsets, so the pick travels in the command and is validated here (pure table
+// state, so every node applies the same verdict):
+//
+//   - a directory member,
+//   - a replica of THIS slot,
+//   - not the failed node itself,
+//   - not itself offline (a second dead node is not a leader).
+//
+// Anything else falls back to backupLeaderFor, the deterministic table-only
+// rule, so a command without a pick (or with one that no longer applies, e.g.
+// after a leave_node raced it) still converges.
+func (t *Table) failoverLeader(p *Placement, down, preferred string) string {
+	if preferred != "" && preferred != down && replicaListHas(p.Replicas, preferred) {
+		if peer, ok := t.Peers[preferred]; ok && !peer.Offline() {
+			return preferred
+		}
+	}
+	return t.backupLeaderFor(p, down)
 }
 
 // backupLeaderFor picks the new leader of a slot whose leader just went down:
