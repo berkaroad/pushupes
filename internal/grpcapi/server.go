@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
 	"sync"
 	"time"
@@ -42,6 +43,14 @@ type Server struct {
 
 // NewServer wires the gRPC facade onto the engine + store.
 func NewServer(eng *cluster.Engine, store *storage.Store, logger *logrus.Entry) *Server {
+	// A nil logger must not panic a handler half-way through: the read path
+	// logs (and continues) on a proxy failure, and a panic there replaces a
+	// "proxy dial failed" warning with a crash that hides the real reason.
+	if logger == nil {
+		l := logrus.New()
+		l.SetOutput(io.Discard)
+		logger = logrus.NewEntry(l)
+	}
 	return &Server{engine: eng, store: store, logger: logger,
 		leaders: map[string]pushupesv1.EventServiceClient{}}
 }
