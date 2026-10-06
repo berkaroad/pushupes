@@ -213,6 +213,9 @@ type rpcServer struct {
 	selfID string
 	tr     Transport
 	handle func(typ byte, payload []byte) (byte, []byte, error)
+	// member reports whether a handshaked peer is allowed to speak the
+	// consensus protocol here (a current member or an accepted learner).
+	member func(id string) bool
 	log    Logger
 
 	closeCh   chan struct{}
@@ -223,11 +226,12 @@ type rpcServer struct {
 	conns map[net.Conn]struct{}
 }
 
-func newRPCServer(selfID string, tr Transport, handle func(byte, []byte) (byte, []byte, error), log Logger) *rpcServer {
+func newRPCServer(selfID string, tr Transport, handle func(byte, []byte) (byte, []byte, error), member func(string) bool, log Logger) *rpcServer {
 	return &rpcServer{
 		selfID:  selfID,
 		tr:      tr,
 		handle:  handle,
+		member:  member,
 		log:     log,
 		closeCh: make(chan struct{}),
 		conns:   map[net.Conn]struct{}{},
@@ -289,6 +293,16 @@ func (s *rpcServer) serve(conn net.Conn) {
 		return
 	}
 	if err := writeHandshake(conn, s.selfID, handshakeTimeout); err != nil {
+		return
+	}
+	if s.member != nil && s.member(peer) == false && peer != "" {
+		// A node that left the cluster (or one that has not joined yet) must
+		// not be able to talk the consensus protocol at this node: a removed
+		// member that kept its old configuration would otherwise keep
+		// campaigning and mutating this node's vote. The connection is served
+		// read-only for nothing — it is dropped after an explanatory debug
+		// line, so the sender sees a closed connection rather than silence.
+		s.log.Debugf("raft: refusing consensus traffic from %s: not a member", peer)
 		return
 	}
 	s.log.Debugf("raft: serving peer %s", peer)

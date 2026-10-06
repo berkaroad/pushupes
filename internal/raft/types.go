@@ -16,6 +16,11 @@ const (
 )
 
 // Entry kinds carried inside a log entry.
+//
+// KindConf is a membership change (add_voter / remove_voter): it is the only
+// kind that moves the voter set, is applied to the local configuration when it
+// becomes committed, and — unlike a command — is never handed to the FSM. Its
+// payload is a confChange.
 const (
 	KindCommand uint8 = 0
 	KindNoop    uint8 = 1
@@ -64,7 +69,19 @@ func (nopLogger) Errorf(string, ...any) {}
 type Config struct {
 	NodeID  string
 	DataDir string
-	Voters  []Voter
+	// Voters is the configured membership — normally the -peers set of every
+	// member. It is used as-is on a first start (written to the WAL as the
+	// initial configuration). A node that already has a recorded
+	// configuration keeps it: Voters then only has to contain this node, and
+	// is remembered as the bootstrap seed so a grown cluster whose -peers
+	// files are still the original three can still start (see Members).
+	Voters []Voter
+	// Seed marks Voters as a bootstrap seed list rather than an
+	// authoritative membership. It is what a runtime-added member starts
+	// with: such a node is not in the voters its -peers names, so it joins
+	// through the admin endpoint and learns the real membership from the
+	// leader.
+	Seed bool
 
 	ApplyTimeout      time.Duration
 	SnapshotThreshold uint64
@@ -98,7 +115,7 @@ func (c *Config) withDefaults() error {
 			found = true
 		}
 	}
-	if !found {
+	if !found && !c.Seed {
 		return errors.New("raft: this node is not in the voter set")
 	}
 	if c.ApplyTimeout <= 0 {
@@ -128,6 +145,10 @@ func (c *Config) withDefaults() error {
 	return nil
 }
 
+// voterAddr resolves a member id to its peer address: the live membership
+// first (runtime-added members are in it but not in the configured seed), then
+// the configured list a node that has not learned the membership yet can still
+// index.
 func (c *Config) voterAddr(id string) string {
 	for _, v := range c.Voters {
 		if v.ID == id {
@@ -142,6 +163,11 @@ var (
 	ErrNotLeader = errors.New("raft: not the leader")
 	ErrClosed    = errors.New("raft: node is shut down")
 	ErrTimeout   = errors.New("raft: timed out waiting for the leader")
+	// ErrBadChange marks a membership change the caller has to fix — a missing
+	// id or address, an address that already belongs to another member, or
+	// removing the last voter. Callers map it onto their own bad-request
+	// class instead of reporting it as a server failure.
+	ErrBadChange = errors.New("raft: invalid membership change")
 )
 
 func quorum(n int) int { return n/2 + 1 }

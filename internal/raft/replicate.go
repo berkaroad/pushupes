@@ -94,12 +94,13 @@ func (n *Node) buildRound(peer string) replicateRound {
 		next = 1
 	}
 	if si, _, file := n.log.Snapshot(); si > 0 && next <= si && file != "" {
-		if idx, term, data, err := readSnapshot(file); err == nil {
+		if idx, term, voters, data, err := readSnapshot(file); err == nil {
 			rd.install = &installSnapshot{
 				Term:      n.term,
 				LeaderID:  n.cfg.NodeID,
 				LastIndex: idx,
 				LastTerm:  term,
+				Voters:    voters,
 				Data:      data,
 			}
 			return rd
@@ -113,7 +114,7 @@ func (n *Node) buildRound(peer string) replicateRound {
 }
 
 func (n *Node) sendRound(peer string, rd replicateRound) {
-	c := n.clients[peer]
+	c := n.peerClientOf(peer)
 	if c == nil {
 		return
 	}
@@ -153,7 +154,7 @@ func (n *Node) sendRound(peer string, rd replicateRound) {
 }
 
 func (n *Node) sendRequestVote(peer string, term, lastIdx, lastTerm uint64) {
-	c := n.clients[peer]
+	c := n.peerClientOf(peer)
 	if c == nil {
 		n.post(voteResult{peer: peer, term: term, err: errors.New("raft: unknown peer")})
 		return

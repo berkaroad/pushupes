@@ -121,9 +121,11 @@ func (n *Node) run() {
 	n.heartbeatTimer = time.NewTimer(n.cfg.HeartbeatTimeout)
 	stopTimer(n.heartbeatTimer)
 	snapTick := time.NewTimer(n.cfg.SnapshotInterval)
+	confTick := time.NewTicker(confSweepInterval)
 	defer stopTimer(n.electionTimer)
 	defer stopTimer(n.heartbeatTimer)
 	defer stopTimer(snapTick)
+	defer confTick.Stop()
 
 	for {
 		select {
@@ -134,6 +136,8 @@ func (n *Node) run() {
 			n.handleEvent(ev)
 		case req := <-n.applyCh:
 			n.onApplyBatch(req)
+		case req := <-n.confCh:
+			n.onConfRequest(req)
 		case <-n.durableSig:
 			n.onDurable(n.durableSeq.Load())
 		case <-n.electionTimer.C:
@@ -145,6 +149,8 @@ func (n *Node) run() {
 				n.maybeSnapshot(true)
 			}
 			resetTimer(snapTick, n.cfg.SnapshotInterval)
+		case now := <-confTick.C:
+			n.sweepConfDeadlines(now)
 		}
 	}
 }
@@ -242,14 +248,19 @@ func (n *Node) becomeLeader() {
 		if v.ID == n.cfg.NodeID {
 			continue
 		}
-		n.nextIndex[v.ID] = last + 1
-		n.matchIndex[v.ID] = 0
-		if n.replicators[v.ID] == nil {
-			n.replicators[v.ID] = newReplicator(v.ID, n)
-			go n.runReplicator(n.replicators[v.ID])
-		}
+		n.startReplicator(v.ID, v.Addr)
 	}
-
+	// Learners that were accepted before this node became leader keep being
+	// replicated to: dropping them here would strand a half-added member.
+	n.learnerMu.RLock()
+	learners := append([]Voter(nil), n.learners...)
+	n.learnerMu.RUnlock()
+	for _, l := range learners {
+		if l.ID == n.cfg.NodeID || n.isVoter(l.ID) {
+			continue
+		}
+		n.startReplicator(l.ID, l.Addr)
+	}
 	// Commit an entry from the current term (a no-op) so entries left over
 	// from previous terms can be committed safely.
 	if err := n.log.appendEntries([]Entry{{Index: last + 1, Term: n.term, Kind: KindNoop}}); err != nil {
@@ -264,6 +275,7 @@ func (n *Node) becomeLeader() {
 func (n *Node) onHeartbeatTick() {
 	if n.state == Leader {
 		n.kickAll()
+		n.advancePendingAdd()
 		n.maybeAdvanceCommit()
 		n.applyCommitted()
 	}
@@ -460,6 +472,8 @@ func (n *Node) onAppendResult(r appendResult) {
 			n.matchIndex[r.peer] = mi
 		}
 		n.nextIndex[r.peer] = n.matchIndex[r.peer] + 1
+		n.finishConf(r.peer)
+		n.advancePendingAdd()
 		n.maybeAdvanceCommit()
 		n.applyCommitted()
 		if n.matchIndex[r.peer] < n.log.LastIndex() {
@@ -502,11 +516,23 @@ func (n *Node) onInstallSnapshot(req *installSnapshotReq) {
 		req.resp <- installSnapshotResp{Term: n.term, Success: false, LastIndex: n.log.LastIndex()}
 		return
 	}
-	file, err := saveSnapshot(n.cfg.DataDir, m.LastIndex, m.LastTerm, m.Data)
+	file, err := saveSnapshot(n.cfg.DataDir, m.LastIndex, m.LastTerm, m.Voters, m.Data)
 	if err != nil {
 		n.logger.Errorf("raft: persist installed snapshot at %d: %v", m.LastIndex, err)
 		req.resp <- installSnapshotResp{Term: n.term, Success: false, LastIndex: n.log.LastIndex()}
 		return
+	}
+	// The snapshot carries the configuration of the point it was taken at, and
+	// the log that held it is being replaced wholesale — so adopt it, and
+	// persist it the same way a committed conf entry does. Without this a node
+	// whose first catch-up is a snapshot (the entries it lacks are already
+	// compacted on the leader) would know no voters at all, and the only
+	// configuration entry it would ever apply is the one that adds itself.
+	if len(m.Voters) > 0 {
+		n.applyConfLocally(confChange{op: confSet, voters: m.Voters}, m.LastIndex)
+		if serr := n.log.setVoters(n.Voters()); serr != nil {
+			n.logger.Errorf("raft: persist membership from installed snapshot: %v", serr)
+		}
 	}
 	n.log.resetToSnapshot(m.LastIndex, m.LastTerm, file)
 	n.commitIndex = maxU64(n.commitIndex, m.LastIndex)
@@ -591,8 +617,14 @@ func (n *Node) applyCommitted() {
 			continue
 		}
 		var res any
-		if e.Kind == KindCommand {
+		switch e.Kind {
+		case KindCommand:
 			res = n.fsm.Apply(e)
+		case KindConf:
+			// A membership change is local configuration, not FSM state: the
+			// consensus layer applies it to itself, and nothing is handed to
+			// the state machine.
+			n.onConfCommitted(e, next)
 		}
 		n.applied = next
 		n.respondAt(next, res)
@@ -717,9 +749,17 @@ func (n *Node) maybeSnapshot(force bool) {
 		return
 	}
 	index, term := n.applied, n.log.Term(n.applied)
+	// The configuration in force at the snapshot point rides the snapshot: a
+	// node that catches up from it never sees the log entries that carried it.
+	voters := n.Voters()
 	n.snapRunning = true
+	// Tracked so Close can wait for it: the write lands in the node's data
+	// directory, and a shutdown that returns while a file is still being
+	// renamed into place leaves a snapshot nobody accounted for.
+	n.snapWG.Add(1)
 	go func() {
-		file, serr := saveSnapshot(n.cfg.DataDir, index, term, data)
+		defer n.snapWG.Done()
+		file, serr := saveSnapshot(n.cfg.DataDir, index, term, voters, data)
 		select {
 		case n.events <- snapshotDone{index: index, term: term, file: file, err: serr}:
 		case <-n.done:

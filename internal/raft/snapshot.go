@@ -8,7 +8,15 @@
 //
 // File layout:
 //
-//	magic "PURF" (4) | ver (1) | index u64 | term u64 | dataLen u64 | crc32c(data) u32 | data
+//	magic "PURF" (4) | ver (1) | index u64 | term u64
+//	| confLen u32 | voters | dataLen u64 | crc32c(data) u32 | data
+//
+// The voter set is part of the snapshot because the configuration is part of
+// the log: a snapshot replaces the log up to its index, so a node that catches
+// up from one (a member added at runtime, either because the leader has already
+// compacted the entries it lacks or because it is far behind) would otherwise
+// lose the configuration that log carried. The set stored here is the one in
+// force at the snapshot's index.
 package raft
 
 import (
@@ -22,8 +30,11 @@ import (
 )
 
 const (
-	snapshotMagic  = "PURF"
-	snapshotHeader = 4 + 1 + 8 + 8 + 8 + 4
+	snapshotMagic   = "PURF"
+	snapshotVersion = 2
+	// snapshotHeader is the fixed part of the header; the voter set it points
+	// at (confLen bytes) sits between it and the payload's length/crc.
+	snapshotHeader = 4 + 1 + 8 + 8 + 4 + 8 + 4
 	snapshotSuffix = ".snap"
 	snapshotKeep   = 2
 )
@@ -31,18 +42,22 @@ const (
 func snapshotDir(raftDir string) string { return filepath.Join(raftDir, "snapshot") }
 
 // saveSnapshot writes a snapshot file atomically and prunes older ones.
-func saveSnapshot(raftDir string, index, term uint64, data []byte) (string, error) {
+func saveSnapshot(raftDir string, index, term uint64, voters []Voter, data []byte) (string, error) {
 	dir := snapshotDir(raftDir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	hdr := make([]byte, snapshotHeader)
+	conf := encodeVoters(voters)
+	hdr := make([]byte, snapshotHeader+len(conf))
 	copy(hdr[0:4], snapshotMagic)
-	hdr[4] = 1
+	hdr[4] = snapshotVersion
 	binary.BigEndian.PutUint64(hdr[5:13], index)
 	binary.BigEndian.PutUint64(hdr[13:21], term)
-	binary.BigEndian.PutUint64(hdr[21:29], uint64(len(data)))
-	binary.BigEndian.PutUint32(hdr[29:33], crc32c(data))
+	binary.BigEndian.PutUint32(hdr[21:25], uint32(len(conf)))
+	copy(hdr[25:25+len(conf)], conf)
+	off := 25 + len(conf)
+	binary.BigEndian.PutUint64(hdr[off:off+8], uint64(len(data)))
+	binary.BigEndian.PutUint32(hdr[off+8:off+12], crc32c(data))
 
 	final := filepath.Join(dir, fmt.Sprintf("%020d%s", index, snapshotSuffix))
 	tmp := final + ".tmp"
@@ -81,14 +96,14 @@ func saveSnapshot(raftDir string, index, term uint64, data []byte) (string, erro
 }
 
 // loadLatestSnapshot returns the newest valid snapshot, if any.
-func loadLatestSnapshot(raftDir string) (index, term uint64, file string, data []byte, ok bool, err error) {
+func loadLatestSnapshot(raftDir string) (index, term uint64, file string, voters []Voter, data []byte, ok bool, err error) {
 	dir := snapshotDir(raftDir)
 	ents, rerr := os.ReadDir(dir)
 	if rerr != nil {
 		if os.IsNotExist(rerr) {
-			return 0, 0, "", nil, false, nil
+			return 0, 0, "", nil, nil, false, nil
 		}
-		return 0, 0, "", nil, false, rerr
+		return 0, 0, "", nil, nil, false, rerr
 	}
 	var idxs []uint64
 	for _, e := range ents {
@@ -105,38 +120,53 @@ func loadLatestSnapshot(raftDir string) (index, term uint64, file string, data [
 	sort.Slice(idxs, func(i, j int) bool { return idxs[i] > idxs[j] })
 	for _, n := range idxs {
 		path := filepath.Join(dir, fmt.Sprintf("%020d%s", n, snapshotSuffix))
-		i, t, d, rerr := readSnapshot(path)
+		i, t, vs, d, rerr := readSnapshot(path)
 		if rerr != nil {
 			continue // skip a corrupt snapshot and try the next one
 		}
-		return i, t, path, d, true, nil
+		return i, t, path, vs, d, true, nil
 	}
-	return 0, 0, "", nil, false, nil
+	return 0, 0, "", nil, nil, false, nil
 }
 
-func readSnapshot(path string) (index, term uint64, data []byte, err error) {
+func readSnapshot(path string) (index, term uint64, voters []Voter, data []byte, err error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return 0, 0, nil, err
+		return 0, 0, nil, nil, err
 	}
 	if len(raw) < snapshotHeader {
-		return 0, 0, nil, fmt.Errorf("raft: snapshot %s is truncated", path)
+		return 0, 0, nil, nil, fmt.Errorf("raft: snapshot %s is truncated", path)
 	}
 	if string(raw[0:4]) != snapshotMagic {
-		return 0, 0, nil, fmt.Errorf("raft: snapshot %s has a bad magic", path)
+		return 0, 0, nil, nil, fmt.Errorf("raft: snapshot %s has a bad magic", path)
+	}
+	if raw[4] != snapshotVersion {
+		return 0, 0, nil, nil, fmt.Errorf("raft: snapshot %s is version %d, this build writes %d (delete the data directory and restart if it predates the format)", path, raw[4], snapshotVersion)
 	}
 	index = binary.BigEndian.Uint64(raw[5:13])
 	term = binary.BigEndian.Uint64(raw[13:21])
-	dlen := binary.BigEndian.Uint64(raw[21:29])
-	want := binary.BigEndian.Uint32(raw[29:33])
-	if uint64(len(raw)-snapshotHeader) != dlen {
-		return 0, 0, nil, fmt.Errorf("raft: snapshot %s length mismatch", path)
+	clen := int(binary.BigEndian.Uint32(raw[21:25]))
+	off := 25
+	if len(raw) < off+clen+12 {
+		return 0, 0, nil, nil, fmt.Errorf("raft: snapshot %s is truncated", path)
 	}
-	data = raw[snapshotHeader:]
+	if clen > 0 {
+		if voters, err = decodeVoters(raw[off : off+clen]); err != nil {
+			return 0, 0, nil, nil, fmt.Errorf("raft: snapshot %s: %w", path, err)
+		}
+	}
+	off += clen
+	dlen := binary.BigEndian.Uint64(raw[off : off+8])
+	want := binary.BigEndian.Uint32(raw[off+8 : off+12])
+	off += 12
+	if uint64(len(raw)-off) != dlen {
+		return 0, 0, nil, nil, fmt.Errorf("raft: snapshot %s length mismatch", path)
+	}
+	data = raw[off:]
 	if crc32c(data) != want {
-		return 0, 0, nil, fmt.Errorf("raft: snapshot %s failed crc", path)
+		return 0, 0, nil, nil, fmt.Errorf("raft: snapshot %s failed crc", path)
 	}
-	return index, term, data, nil
+	return index, term, voters, data, nil
 }
 
 // pruneSnapshots keeps the newest snapshotKeep snapshots and removes the rest.

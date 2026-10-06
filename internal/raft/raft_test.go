@@ -124,11 +124,12 @@ type testNode struct {
 }
 
 type testCluster struct {
-	t      testing.TB
-	voters []Voter
-	nodes  map[string]*testNode
-	order  []string
-	mutate func(*Config)
+	t       testing.TB
+	voters  []Voter
+	nodes   map[string]*testNode
+	order   []string
+	mutate  func(*Config)
+	seedIDs map[string]bool
 }
 
 func testConfig(id string, dir string, voters []Voter, log Logger) Config {
@@ -152,7 +153,7 @@ func startCluster(t testing.TB, n int) *testCluster {
 
 func startClusterCfg(t testing.TB, n int, mutate func(*Config)) *testCluster {
 	t.Helper()
-	c := &testCluster{t: t, nodes: map[string]*testNode{}, mutate: mutate}
+	c := &testCluster{t: t, nodes: map[string]*testNode{}, mutate: mutate, seedIDs: map[string]bool{}}
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("node-%d", i+1)
 		tn := newTestNet(t)
@@ -175,6 +176,11 @@ func (c *testCluster) start(id string, reuseDir bool) {
 	}
 	fsm := newTestFSM()
 	cfg := testConfig(id, dir, c.voters, testLogger{c.t})
+	if c.seedIDs[id] {
+		// A node that is not in the configured membership yet starts as a
+		// seed, exactly like a runtime-joined node.
+		cfg.Seed = true
+	}
 	if c.mutate != nil {
 		c.mutate(&cfg)
 	}
@@ -361,12 +367,27 @@ func TestTermIsPersistedAcrossRestart(t *testing.T) {
 		t.Fatalf("term went backwards: %d -> %d", term, got)
 	}
 	c.leader(3 * time.Second)
-	if v, ok := c.nodes[id].fsm.get("a"); !ok || v != "1" {
-		t.Fatalf("committed data did not come back after restart: %q %v", v, ok)
+	// Re-electing is not the same moment as re-applying: commit and applied are
+	// rebuilt from the log after a restart, and the leader's own no-op has to
+	// commit before the entries under it are applied again. Reading the FSM the
+	// instant a leader appears loses that race under load.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if v, ok := c.nodes[id].fsm.get("a"); ok && v == "1" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	n := c.nodes[id].node
+	t.Fatalf("committed data did not come back after restart: stats=%v voters=%v lastIndex=%d", n.Stats(), n.Voters(), n.LastIndex())
 }
 
-func TestConfigMismatchIsRefused(t *testing.T) {
+// TestMembershipIsRecoveredNotRevalidated pins the runtime-membership rule: a
+// node keeps the configuration it recorded, even when -peers has changed. That
+// is what lets a cluster grown at runtime restart without editing every
+// member's flags — the recorded configuration is authoritative and only a first
+// start takes the configured list.
+func TestMembershipIsRecoveredNotRevalidated(t *testing.T) {
 	dir := t.TempDir()
 	voters := []Voter{{ID: "a", Addr: "127.0.0.1:1"}, {ID: "b", Addr: "127.0.0.1:2"}}
 	netA := newTestNet(t)
@@ -377,10 +398,39 @@ func TestConfigMismatchIsRefused(t *testing.T) {
 	}
 	node.Close()
 
+	// The configured list differs (a peer moved); the recorded configuration
+	// still names this node, so the node starts with the RECORDED membership.
 	changed := []Voter{{ID: "a", Addr: "127.0.0.1:1"}, {ID: "b", Addr: "127.0.0.1:9"}}
-	if _, err := NewNode(testConfig("a", dir, changed, testLogger{t}), newTestFSM(), netA); err == nil {
-		t.Fatalf("started with a changed membership")
+	again, err := NewNode(testConfig("a", dir, changed, testLogger{t}), newTestFSM(), netA)
+	if err != nil {
+		t.Fatalf("restart with a changed -peers must keep the recorded membership: %v", err)
 	}
+	defer again.Close()
+	got := again.Voters()
+	if len(got) != 2 || got[1].Addr != "127.0.0.1:2" {
+		t.Fatalf("membership = %+v, want the recorded set (peer b at 127.0.0.1:2)", got)
+	}
+
+	// A node the configuration does not contain refuses to start unless it is
+	// started as a seed (see Config.Seed).
+	again.Close()
+	seedDir := t.TempDir()
+	cfg := testConfig("c", seedDir, []Voter{{ID: "c", Addr: "127.0.0.1:3"}}, testLogger{t})
+	first, err := NewNode(cfg, newTestFSM(), newTestNet(t))
+	if err != nil {
+		t.Fatalf("a first start takes the configured list: %v", err)
+	}
+	first.Close()
+
+	// Now make it look like a node whose recorded configuration does NOT name
+	// it: a seed start with someone else's configuration.
+	seedCfg := testConfig("c", seedDir, []Voter{{ID: "a", Addr: "127.0.0.1:1"}}, testLogger{t})
+	seedCfg.Seed = true
+	seeded, err := NewNode(seedCfg, newTestFSM(), newTestNet(t))
+	if err != nil {
+		t.Fatalf("a non-member started as a seed must come up (waiting to be joined): %v", err)
+	}
+	seeded.Close()
 }
 
 func TestSnapshotKeepsLogBoundedAndSurvivesRestart(t *testing.T) {

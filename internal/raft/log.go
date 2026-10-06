@@ -36,6 +36,9 @@ type raftLog struct {
 	snapIndex uint64
 	snapTerm  uint64
 	snapFile  string
+	// snapVoters is the voter set recorded in the snapshot: the configuration
+	// in force at snapIndex, which is the base a recovered node starts from.
+	snapVoters []Voter
 
 	hs      hardState
 	voters  []Voter
@@ -44,12 +47,12 @@ type raftLog struct {
 
 func openLog(raftDir string, opts WALOptions) (*raftLog, error) {
 	l := &raftLog{}
-	idx, term, file, _, ok, err := loadLatestSnapshot(raftDir)
+	idx, term, file, voters, _, ok, err := loadLatestSnapshot(raftDir)
 	if err != nil {
 		return nil, err
 	}
 	if ok {
-		l.snapIndex, l.snapTerm, l.snapFile = idx, term, file
+		l.snapIndex, l.snapTerm, l.snapFile, l.snapVoters = idx, term, file, voters
 	}
 	wal, err := OpenWAL(filepath.Join(raftDir, "wal"), opts)
 	if err != nil {
@@ -194,7 +197,10 @@ func (l *raftLog) setHardState(hs hardState) error {
 	return nil
 }
 
-// setVoters persists the static voter set (written once at bootstrap).
+// setVoters persists the current voter set. It is written on a first start
+// (the configured membership) and again whenever a membership change commits —
+// confLSN is the replay seed's answer to "what is the configuration", so every
+// such change must be persisted with it.
 func (l *raftLog) setVoters(vs []Voter) error {
 	lsn, err := l.wal.Append(RecordConf, encodeVoters(vs))
 	if err != nil {
@@ -293,6 +299,21 @@ func (l *raftLog) Entry(i uint64) (Entry, bool) {
 	return l.entries[i-base], true
 }
 
+// EntryLSN returns the LSN of an in-memory entry (0 when it is not in the
+// slice, e.g. already compacted).
+func (l *raftLog) EntryLSN(index uint64) uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.entries) == 0 {
+		return 0
+	}
+	base := l.entries[0].Index
+	if index < base || index > l.entries[len(l.entries)-1].Index {
+		return 0
+	}
+	return l.lsns[index-base]
+}
+
 // Entries returns up to max entries starting at from.
 func (l *raftLog) Entries(from uint64, max int) []Entry {
 	l.mu.Lock()
@@ -386,6 +407,14 @@ func (l *raftLog) Snapshot() (index, term uint64, file string) {
 	return l.snapIndex, l.snapTerm, l.snapFile
 }
 
+// SnapshotVoters is the configuration recorded in the snapshot (empty when the
+// node has no snapshot).
+func (l *raftLog) SnapshotVoters() []Voter {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]Voter(nil), l.snapVoters...)
+}
+
 // compact deletes WAL segments that only hold records below what is still
 // needed: the first in-memory entry, plus the newest conf/hardstate/truncate
 // markers (which must survive for replay).
@@ -476,25 +505,108 @@ func encodeVoters(vs []Voter) []byte {
 }
 
 func decodeVoters(b []byte) ([]Voter, error) {
+	vs, _, err := decodeVotersRest(b)
+	return vs, err
+}
+
+// decodeVotersRest decodes a voter list from the front of b and returns the
+// bytes after it — the InstallSnapshot message continues with the payload, so
+// its parser needs the remainder rather than a second length prefix.
+func decodeVotersRest(b []byte) ([]Voter, []byte, error) {
 	if len(b) < 4 {
-		return nil, fmt.Errorf("raft: bad conf record")
+		return nil, nil, fmt.Errorf("raft: bad conf record")
 	}
 	n := int(binary.BigEndian.Uint32(b[0:4]))
+	// Each voter needs at least a length byte, an id and a two-byte length for
+	// the empty address, so a count larger than the remaining bytes is a
+	// corrupt (or hostile) record — refuse it before allocating for it.
+	if n < 0 || n > len(b)-4 {
+		return nil, nil, fmt.Errorf("raft: conf record claims %d voters in %d bytes", n, len(b)-4)
+	}
 	rest := b[4:]
 	vs := make([]Voter, 0, n)
 	for i := 0; i < n; i++ {
 		id, r, err := readLenBytes(rest, 1)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		addr, r2, err := readLenBytes(r, 2)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		vs = append(vs, Voter{ID: string(id), Addr: string(addr)})
 		rest = r2
 	}
-	return vs, nil
+	return vs, rest, nil
+}
+
+// ---- membership change payload ----
+//
+// A conf change rides a log entry as its Data. The leader encodes it; every
+// node decodes it and applies it to its own voter set when the entry commits.
+// Unknown op bytes are rejected rather than ignored: silently skipping a
+// membership change would leave the node with the wrong quorum.
+//
+// confAdd/confRemove are the operator's changes. confSet installs a whole voter
+// list and is never issued by an operator: it is how the configuration enters
+// the log at bootstrap, and how a snapshot carries the configuration of the
+// point it was taken at. The initial configuration has to be in the log — the
+// per-node conf record is enough for the nodes that were configured at the
+// start (each writes its own copy) and for nobody else: a member added at
+// runtime catches up by replicating the leader's log or a snapshot, and would
+// otherwise see no configuration entry except the one adding itself.
+
+const (
+	confAdd    byte = 1
+	confRemove byte = 2
+	confSet    byte = 3
+)
+
+type confChange struct {
+	op byte
+	v  Voter
+	// voters is the complete voter set, for confSet only.
+	voters []Voter
+}
+
+func encodeConfChange(c confChange) []byte {
+	b := []byte{c.op}
+	if c.op == confSet {
+		return append(b, encodeVoters(c.voters)...)
+	}
+	b = appendLenBytes(b, []byte(c.v.ID), 1)
+	b = appendLenBytes(b, []byte(c.v.Addr), 2)
+	return b
+}
+
+func decodeConfChange(b []byte) (confChange, error) {
+	if len(b) < 1 {
+		return confChange{}, fmt.Errorf("raft: empty conf change")
+	}
+	op := b[0]
+	switch op {
+	case confSet:
+		vs, err := decodeVoters(b[1:])
+		if err != nil {
+			return confChange{}, err
+		}
+		if len(vs) == 0 {
+			return confChange{}, fmt.Errorf("raft: empty voter set in conf change")
+		}
+		return confChange{op: op, voters: vs}, nil
+	case confAdd, confRemove:
+	default:
+		return confChange{}, fmt.Errorf("raft: unknown conf change op %d", op)
+	}
+	id, rest, err := readLenBytes(b[1:], 1)
+	if err != nil {
+		return confChange{}, err
+	}
+	addr, _, err := readLenBytes(rest, 2)
+	if err != nil {
+		return confChange{}, err
+	}
+	return confChange{op: op, v: Voter{ID: string(id), Addr: string(addr)}}, nil
 }
 
 func appendLenBytes(b, v []byte, lenSize int) []byte {

@@ -81,7 +81,11 @@ type installSnapshot struct {
 	LeaderID  string
 	LastIndex uint64
 	LastTerm  uint64
-	Data      []byte
+	// Voters is the configuration in force at LastIndex, as recorded in the
+	// snapshot file being sent: the receiver adopts it, because the log
+	// entries that carried it are not part of what it is being given.
+	Voters []Voter
+	Data   []byte
 }
 
 type installSnapshotResp struct {
@@ -310,6 +314,7 @@ func encodeInstallSnapshot(m installSnapshot) []byte {
 	b = appendLenBytes(b, []byte(m.LeaderID), 1)
 	b = binary.BigEndian.AppendUint64(b, m.LastIndex)
 	b = binary.BigEndian.AppendUint64(b, m.LastTerm)
+	b = append(b, encodeVoters(m.Voters)...)
 	b = binary.BigEndian.AppendUint32(b, uint32(len(m.Data)))
 	b = append(b, m.Data...)
 	return b
@@ -331,12 +336,17 @@ func decodeInstallSnapshot(b []byte) (installSnapshot, error) {
 	}
 	m.LastIndex = binary.BigEndian.Uint64(rest[0:8])
 	m.LastTerm = binary.BigEndian.Uint64(rest[8:16])
-	dlen := int(binary.BigEndian.Uint32(rest[16:20]))
-	if len(rest) < 20+dlen {
+	voters, rest, err := decodeVotersRest(rest[16:])
+	if err != nil {
+		return m, err
+	}
+	m.Voters = voters
+	dlen := int(binary.BigEndian.Uint32(rest[0:4]))
+	if len(rest) < 4+dlen {
 		return m, fmt.Errorf("raft: short InstallSnapshot data")
 	}
 	if dlen > 0 {
-		m.Data = append([]byte(nil), rest[20:20+dlen]...)
+		m.Data = append([]byte(nil), rest[4:4+dlen]...)
 	}
 	return m, nil
 }

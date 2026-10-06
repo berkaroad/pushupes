@@ -38,8 +38,9 @@
 
 ### 1.3 明确不做（简化版边界）
 
-- **不做动态成员变更**：成员集合 = `-peers` 在启动时确定并写入日志第 1 条
-  （conf 记录）。运维增减节点 = 全集群重启并带上新 `-peers`。
+- **成员变更只做「一次一条」**：不加 joint consensus / 多步变更队列，leader 把一条
+  `conf` 条目写进日志、正常复制、**提交时**各节点各自落表；加节点先走 learner
+  阶段（追平才转 voter）。运维侧见 `DESIGN.md` §6.1 的 admin 接口。
 - **不做 PreVote、不做 ReadIndex/租约读**：本项目的读全部走数据面
   （客户端按槽 leader 读本地 ≤HW 副本），共识层不承担读一致性职责。
 - 不做 TransferLeadership、不做快照分块流式（表快照只有几 KB）。
@@ -131,11 +132,36 @@ Wait(lsn)            → 阻塞到自己的 LSN 落盘
 
 - 触发：`applied - snapIndex >= SnapshotThreshold`（默认 1024）或 30s 间隔到点且
   有新增应用。
-- 形式：`snapshot/<index>.snap`，头部 `magic ver index term len crc`；写完
-  `fsync 文件 → rename → fsync 目录`；保留最近 2 份。**无 meta.json 指针**——
+- 形式：`snapshot/<index>.snap`，头部 `magic ver index term confLen conf dataLen crc`；
+  写完 `fsync 文件 → rename → fsync 目录`；保留最近 2 份。**无 meta.json 指针**——
   最新快照 = 目录里编号最大且 CRC 通过的那个，少一个会互相矛盾的原子写。
+- **conf 段是快照点的成员表**：配置本身在日志里（见 §4.1），而快照把 `≤ index`
+  的日志换掉了，所以快照必须自带那一刻的 voter 集，否则从快照追平的节点（运行时
+  新加的成员正好落在「leader 已压缩掉它缺的那段日志」时）只会在日志里看到「把自己
+  加进来」这一条 conf 条目，然后以「整个集群就我一个」的姿态（quorum=1、日志任意
+  陈旧也能自己当选）跑起来。`InstallSnapshot` 消息里也带同一份（直接取自被发送的
+  快照文件，两者不会分叉），接收方 `setVoters` + 落 `conf` 记录。
 - **不变式**：快照基线只能裁掉日志的**前缀**（≤ 基线的内存条目），基线之上的
   条目一律保留；`commitIndex` 不得超过 `LastIndex`。
+
+### 4.1 成员表就是日志的一部分
+
+- **初始配置写进日志第 1 条**（`conf` 条目，op=`confSet`，term 1，voter 按 id 排序
+  保证各节点写出的字节一致），同时写一条 `conf` WAL 记录。只写记录（每个初始节点
+  各写一份自己那份）对**后来加入**的节点毫无用处：它的成员表要从 leader 复制的
+  日志或快照里推出来。
+- **运行时的 add/remove 也是日志条目**（op=`confAdd`/`confRemove`），提交时才落表；
+  重启重放同一份日志必得同一份成员表。`confSet` 只由 bootstrap 与快照写入，不接受
+  运维调用。
+- **加节点先 learner**：leader 起复制、等 `matchIndex ≥ 接变时的 commitIndex`
+  （墙钟 20s 上限）才 append 那条 add；否则空日志的新成员可能参与计票并当选。
+- **删节点不提前摘复制器**：先提交、继续复制，等它 ack 到该条目、再发一轮带新
+  commitIndex 的 AppendEntries 让它自己也提交，然后才摘复制器——否则被删节点停在
+  「有日志、未提交」，仍信旧配置、仍能竞选。
+- **成员表并发**：loop 写、读侧 `votersMu` 取副本；**写侧也必须持同一把锁**
+  （`publishVoters`），否则 `Members()` 复制到一半的切片会与 loop 的重建并发
+  （`-race` 会抓）。同理 `clients` 映射由 `clientsMu` 保护：loop 改成员、replicator
+  goroutine 每轮读它。
 
 ---
 
@@ -200,10 +226,14 @@ Wait(lsn)            → 阻塞到自己的 LSN 落盘
 ## 8. 测试与验证方案
 
 - 单元：WAL（崩溃截断只丢尾部、跨段重放、flock 互斥、CRC 篡改检出、组提交合并）、
-  内存日志、快照与日志自洽、term/vote 跨重启、成员集合不匹配拒绝启动。
+  内存日志、快照与日志自洽（含快照携带的成员表）、term/vote 跨重启、种子节点启动。
+- 成员变更（`raft_membership_test.go`）：运行时加节点后**每个节点**（尤其新节点自己）
+  的 voter 集都收敛到 N+1、加/删幂等、删到只剩一个被拒、follower 上调用被拒并指出
+  leader、leader 日志已压缩时新节点从**快照**学到的成员表、被加节点单独存活时
+  **不能自己当选**（1/4 不是多数派）。
 - 进程内真实 TCP 集群：拓扑 1/3/5/7 各跑「选主 → 写批 → 杀 leader → 幸存者选主
   → 再写 → 全体 applied 与 last 一致」，**每拓扑多轮**；`-race` 全绿。
-- 端到端：`scripts/cluster.sh` 三段（见 §10.3）。
+- 端到端：`scripts/cluster.sh` 三段（见 §10.3），扩缩由 `join N` / `remove N` 覆盖。
 
 ---
 
@@ -238,6 +268,15 @@ Wait(lsn)            → 阻塞到自己的 LSN 落盘
      每个后续 Apply 都白等满超时。
    - `commitIndex ≤ LastIndex` 每次 apply 前 clamp。
 5. `-bootstrap` 保留为 no-op。
+6. 运行时成员变更（§4.1）落地时踩到并修掉的两个真 bug：
+   - **新节点的成员表只有它自己**：初始配置原先只写进每个节点自己的 `conf` WAL
+     记录，后来加入的节点从 leader 的日志/快照里推不出这份配置，于是它以 quorum=1
+     跑起来（可自己当选、可在陈旧日志上确认写入）。修法：初始配置写进日志第 1 条
+     （`confSet`），快照与 `InstallSnapshot` 都带上快照点的成员表。
+   - **成员表/连接表读写竞态**：loop 无锁写 `n.voters`、`n.clients`，读侧
+     （`Members()`）与 replicator goroutine 并发读 → `-race` 抓到。修法：
+     `publishVoters`（写侧持 `votersMu`）+ `clientsMu` 保护连接表；成员表重建一律
+     换成新切片，不再原地改元素。
 
 ### 10.3 验证（实跑）
 
