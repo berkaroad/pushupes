@@ -246,13 +246,18 @@ export function isNotControllerError(e: any): boolean {
 // to the new leader — and retry against it; if that also refuses, the caller
 // gets a readable error ("控制器已切到 X，请重试") instead of a raw transport
 // error. A transport failure on the target (it died between the two reads)
-// likewise falls through to one fresh pool-walking status refresh + retry.
+// likewise falls through to one fresh pool-walking status refresh + retry —
+// but when the retry STILL only fails at transport level, the message says
+// the target is unreachable (with the original error): misreporting a
+// network/CORS block as "the leader moved" sends the operator chasing a
+// leadership change that never happened.
 export async function withController<T>(
   call: (addr: string) => Promise<T>,
   status: ClusterStatus | null = null,
   refresh: () => Promise<ClusterStatus> = getClusterStatus,
 ): Promise<T> {
   let st = status
+  let lastTransport: unknown = null
   for (let attempt = 0; attempt < 2; attempt++) {
     let addr: string
     try {
@@ -268,7 +273,13 @@ export async function withController<T>(
       const refused = isNotControllerError(e)
       const unreachable = !refused && /network|timeout|ECONN|status code 0/i.test(String((e as any)?.message ?? ''))
       if (!refused && !unreachable) throw e
+      if (refused) lastTransport = null
+      else lastTransport = e
       if (attempt >= 1) {
+        if (!refused && lastTransport) {
+          const msg = String((lastTransport as any)?.message ?? lastTransport)
+          throw new Error(`无法连接控制器 ${addr}（${msg}），请检查节点与浏览器到 admin 端口的连通性`)
+        }
         throw new Error(`控制器已切到 ${st?.controller || st?.raft?.leader || '(未知)'}，请重试`)
       }
       st = await refresh() // the leader moved (or died) between the status read and the request
@@ -291,6 +302,26 @@ export async function addClusterNode(
     (addr) => axios.post(
       `${normalizeAdminBase(addr)}/admin/cluster/nodes`,
       { id, peer_addr: peerAddr },
+      { timeout: 40000 },
+    ),
+    status,
+  )
+}
+
+// removeClusterNode drops a node from the running Raft membership, addressed to
+// the controller: like every membership change it is controller-only (a
+// follower refuses with err_id 1005, nothing is forwarded). Only an OFFLINE
+// member can be removed — the backend refuses a node the peer directory still
+// marks reachable with a 400 whose message names it, and the console guards
+// the same rule before sending (see ClusterPage). The backend waits for the
+// configuration change to commit (AddMemberTimeout = 30s), so the request
+// budget is that plus margin.
+export async function removeClusterNode(
+  id: string, status: ClusterStatus | null = null,
+): Promise<void> {
+  await withController(
+    (addr) => axios.delete(
+      `${normalizeAdminBase(addr)}/admin/cluster/nodes/${encodeURIComponent(id)}`,
       { timeout: 40000 },
     ),
     status,

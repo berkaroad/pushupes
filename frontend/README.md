@@ -4,7 +4,7 @@ React 18 + Ant Design 5 + Vite 5 + TypeScript，支持 Light / Dark 主题切换
 
 ## 页面
 
-- 集群 `/cluster`：节点、槽位数、迁移中槽位、Raft 状态统计与节点卡片（5s 自动刷新），「添加节点」弹窗经控制器把新节点加入 Raft 成员
+- 集群 `/cluster`：节点、槽位数、迁移中槽位、Raft 状态统计与节点卡片（5s 自动刷新），「添加节点」弹窗经控制器把新节点加入 Raft 成员；离线节点卡片底部有「移除」按钮（确认弹窗后经控制器把它摘出 Raft 成员，仅离线节点，前后端同规则）
 - 槽位 `/slots`：128 槽分配表（状态/Leader 过滤），槽详情抽屉（HW/LastSeq/ISR/segments），发起迁移
 - 事件流 `/streams`：追加事件（校验 version/command_id/幂等返回与 1003 MOVED 提示）、按聚合读取事件流
 

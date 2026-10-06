@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Alert, Button, Card, Col, Form, Input, Modal, Row, Space, Statistic, Switch, Typography } from 'antd'
+import { Alert, App, Button, Card, Col, Form, Input, Modal, Row, Space, Statistic, Switch, Typography } from 'antd'
 import { PlusOutlined } from '@ant-design/icons'
 import type { ClusterStatus } from '../types'
-import { addClusterNode, ensureLeader } from '../api'
+import { addClusterNode, ensureLeader, removeClusterNode } from '../api'
 import { PeerCard, isOnlinePeer } from '../PeerCard'
 
 export default function ClusterPage() {
@@ -18,6 +18,15 @@ export default function ClusterPage() {
   const [addBusy, setAddBusy] = useState(false)
   const [aForm] = Form.useForm<{ id: string; peer_addr: string }>()
   const statusRef = useRef<ClusterStatus | null>(null)
+
+  // The remove-node action. The confirm modal names the target; removal is
+  // offline-only on BOTH sides: the button reaches the page only for offline
+  // peers (PeerCard gets onRemove only when !isOnlinePeer), and the backend
+  // re-checks the replicated table (Engine.RemoveMember refuses an online
+  // member with a 400) — a stale 5s snapshot must never be the only gate.
+  // removingId marks the in-flight target so only its card shows a spinner.
+  const { modal, message } = App.useApp()
+  const [removingId, setRemovingId] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
     try {
@@ -58,6 +67,47 @@ export default function ClusterPage() {
     }
   }
 
+  const askRemove = (id: string) => {
+    modal.confirm({
+      title: `确认移除节点 ${id}？`,
+      content: (
+        <div>
+          该操作把 <Typography.Text code>{id}</Typography.Text> 从 Raft
+          成员列表移除，仅离线节点允许。移除后控制器会把它的槽主迁到存活副本并自动补齐副本集；
+          节点进程本身不受影响，若之后重新拉起会再次自动报名入集群。
+        </div>
+      ),
+      okText: '移除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: () => doRemove(id),
+    })
+  }
+
+  const doRemove = async (id: string) => {
+    // Guard the offline rule again at action time (from the freshest snapshot),
+    // not only at render time: auto-refresh may have raced a node back online
+    // between the paint and the click.
+    const peer = statusRef.current?.peers?.[id]
+    if (peer && isOnlinePeer(peer)) {
+      message.warning(`节点 ${id} 当前在线，只能移除离线节点`)
+      return
+    }
+    setRemovingId(id)
+    try {
+      await removeClusterNode(id, statusRef.current)
+      message.success(`节点 ${id} 已提交移除`)
+      refresh()
+    } catch (e: any) {
+      // The backend's own reason (still online / not the controller after two
+      // tries) is the actionable text; show it instead of a generic failure.
+      const msg = e?.response?.data?.error ?? e?.message ?? String(e)
+      message.error(`移除节点 ${id} 失败：${msg}`)
+    } finally {
+      setRemovingId(null)
+    }
+  }
+
   const leaderCount = useMemo(() => {
     if (!status) return {} as Record<string, number>
     const m: Record<string, number> = {}
@@ -92,10 +142,17 @@ export default function ClusterPage() {
           添加节点
         </Button>
       }>
-        <Row gutter={16}>
+        {/* [16, 16]: the second value is the row gap — without it cards that
+            wrap onto a second line touch the row above edge to edge. */}
+        <Row gutter={[16, 16]}>
           {peers.map((p) => (
             <Col span={8} key={p.id}>
-              <PeerCard peer={p} current={p.id === status.node} slots={leaderCount[p.id] ?? 0} />
+              {/* 移除 only on offline cards, never on this answering node — the
+                  same offline rule the backend enforces, rendered before the
+                  click instead of failing inside it. */}
+              <PeerCard peer={p} current={p.id === status.node} slots={leaderCount[p.id] ?? 0}
+                onRemove={isOnlinePeer(p) || p.id === status.node ? undefined : askRemove}
+                removing={removingId === p.id} />
             </Col>
           ))}
         </Row>
