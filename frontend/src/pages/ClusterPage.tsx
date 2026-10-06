@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, App, Button, Card, Col, Form, Input, Modal, Row, Space, Statistic, Switch, Typography } from 'antd'
 import { PlusOutlined } from '@ant-design/icons'
 import type { ClusterStatus } from '../types'
+import { humanBytes } from '../format'
 import { addClusterNode, ensureLeader, removeClusterNode } from '../api'
 import { PeerCard, isOnlinePeer } from '../PeerCard'
 
@@ -122,6 +123,10 @@ export default function ClusterPage() {
   const migrating = slots.filter((s) => s.state !== 'stable').length
   const peers = Object.values(status.peers)
   const online = peers.filter(isOnlinePeer).length
+  // The cluster storage sample: every slot counted once, at its leader. A node
+  // that does not serve the field yet (or has not sampled) renders '-'.
+  const storageBytes = status.storage_bytes
+  const storageLowerBound = storageBytes !== undefined && status.storage_bytes_complete === false
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -130,12 +135,17 @@ export default function ClusterPage() {
         <Switch checked={auto} onChange={setAuto} size="small" />
       </Space>
       {err ? <Alert type="warning" closable message={err} onClose={() => setErr(null)} /> : null}
+      {/* Four cards, one row of the 24-column grid. (A fifth would not divide
+          it evenly, so it would drop onto a line of its own.) */}
       <Row gutter={16}>
         <Col span={6}><Card><Statistic title="节点（在线 / 总数）" value={`${online} / ${peers.length}`}
           valueStyle={online < peers.length ? { color: '#cf1322' } : undefined} /></Card></Col>
         <Col span={6}><Card><Statistic title="槽位总数" value={status.slot_count} /></Card></Col>
         <Col span={6}><Card><Statistic title="迁移中槽位" value={migrating} valueStyle={{ color: migrating ? '#faad14' : undefined }} /></Card></Col>
-        <Col span={6}><Card><Statistic title="Raft 状态" value={status.raft.state} valueStyle={{ color: String(status.raft.state).toLowerCase() === 'leader' ? '#3f8600' : undefined }} /></Card></Col>
+        <Col span={6}><Card><Statistic title="存储大小"
+          value={storageBytes === undefined ? '-' : humanBytes(storageBytes)}
+          valueStyle={storageLowerBound ? { color: '#faad14' } : undefined}
+          suffix={storageLowerBound ? '（下界）' : undefined} /></Card></Col>
       </Row>
       <Card title="节点" extra={
         <Button type="primary" size="small" icon={<PlusOutlined />} onClick={() => setAdding(true)}>

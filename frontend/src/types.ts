@@ -34,6 +34,13 @@ export interface ClusterStatus {
   slot_count: number
   replicas?: number
   writes?: number[]
+  // Cluster storage: the sum of every slot's LEADER copy (bytes on disk). It is
+  // a background sample the backend refreshes every couple of seconds, so it
+  // lags the write path slightly; storage_bytes_complete=false means a slot
+  // leader did not answer and the number is a lower bound. Absent on older
+  // nodes — the card renders '-' then.
+  storage_bytes?: number
+  storage_bytes_complete?: boolean
   // Machine-readable leader redirect (every node answers it): the Raft
   // controller's node id and its admin address from the replicated peer
   // directory. Empty while no leader is elected / registered yet. The console

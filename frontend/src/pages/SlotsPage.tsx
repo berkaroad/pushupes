@@ -4,6 +4,7 @@ import type { ColumnsType } from 'antd/es/table'
 import type { ClusterStatus, NodeWrites, Placement, SlotDescribe, SlotStream, SlotStreams } from '../types'
 import { ensureLeader, fetchNodeWrites, fetchSlotDescribe, fetchSlotStreams, migrateSlot } from '../api'
 import { RATE_POINTS, RateChart, type RatePoint } from '../RateChart'
+import { humanBytes } from '../format'
 import { ReplicaTags, dropHint } from '../ReplicaTags'
 
 const RATE_POLL_MS = 2000
@@ -29,19 +30,6 @@ type StreamDrawer = {
   total: number
   list: SlotStream[]
   nextAfter: string
-}
-
-// humanBytes renders a byte count for the table (exact value in the title).
-function humanBytes(n: number): string {
-  if (n < 1024) return `${n} B`
-  const units = ['KiB', 'MiB', 'GiB', 'TiB']
-  let v = n / 1024
-  let i = 0
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024
-    i++
-  }
-  return `${v.toFixed(v >= 100 ? 0 : 1)} ${units[i]}`
 }
 
 const stateColor: Record<string, string> = {

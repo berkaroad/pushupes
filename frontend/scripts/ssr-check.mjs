@@ -66,6 +66,39 @@ try {
   console.log(`  (live probe skipped: ${e?.message ?? e})`)
 }
 
+// The cluster page's "存储大小" card reads status.storage_bytes (the sum of
+// every slot's leader copy). The page's SSR render is the no-data branch (its
+// status comes from a fetch SSR does not run), so this is checked in two
+// halves: the WIRING in the compiled page module (property access survives the
+// transform, so it pins that the card reads what the backend sends) and the
+// CONTRACT against a reachable node (the field exists, is a number, and the
+// completeness flag is a boolean).
+const { default: ClusterPage } = await vite.ssrLoadModule('/src/pages/ClusterPage.tsx')
+const pageSrc = String(ClusterPage)
+assert('cluster page shows the storage card', pageSrc.includes('存储大小'))
+// The Raft-state card was removed from the stat row: the leader/commit line
+// under the node cards already carries what an operator needs, and the state
+// was the only thing that card said. Pinned so it cannot come back by accident.
+assert('the Raft-state card is gone', !pageSrc.includes('Raft 状态'))
+assert('storage card reads storage_bytes', pageSrc.includes('storage_bytes'))
+assert('storage card flags a lower bound', pageSrc.includes('storage_bytes_complete'))
+const { humanBytes } = await vite.ssrLoadModule('/src/format.ts')
+assert('byte formatter renders sizes', humanBytes(0) === '0 B' && humanBytes(1536) === '1.5 KiB' && humanBytes(70496329) === '67.2 MiB')
+const liveAdmin = (process.env.PUSHUPES_ADMIN ?? '').trim()
+if (liveAdmin) {
+  try {
+    const st = await (await fetch(`${liveAdmin}/admin/cluster/status`)).json()
+    assert('live status carries storage_bytes', typeof st.storage_bytes === 'number')
+    assert('live status carries storage_bytes_complete', typeof st.storage_bytes_complete === 'boolean')
+    console.log(`  (live probe: storage_bytes=${st.storage_bytes} → ${humanBytes(st.storage_bytes)}, complete=${st.storage_bytes_complete})`)
+  } catch (e) {
+    assert('live status reachable', false)
+    console.log(`  (live probe failed: ${e?.message ?? e})`)
+  }
+} else {
+  console.log('  (live storage probe skipped: set PUSHUPES_ADMIN=http://host:port to run it)')
+}
+
 // Every command that mutates Raft state (migrate / remove-replica / plan) is
 // controller-only: it must be posted to the Raft leader's admin address, never
 // to a follower (a follower refuses with 429 + err_id 1005 naming the
@@ -251,11 +284,15 @@ const pc = (props) => renderToString(
 )
 const offlineCard = pc({ peer: { id: 'node-2', peer_addr: 'http://h:8392', admin_addr: '', client_addr: '' }, current: false, slots: 5 })
 assert('an offline peer is tagged 离线', offlineCard.includes('离线'))
-assert('an offline card is weakened (dashed border)', /border-style:dashed/.test(offlineCard))
+// Offline is a STATE, not a frame style: every card keeps the same solid
+// border and the 离线 tag carries the state (a faded/dashed card read as a
+// broken frame). The assertion below is the one that used to demand the dashed
+// variant — it now pins the opposite, so a re-introduced dash is caught.
+assert('an offline card keeps the same frame (state carried by the tag)', !/border-style:dashed/.test(offlineCard) && offlineCard.includes('ant-card'))
 assert('an offline peer shows - for the missing admin addr', offlineCard.includes('>-<'))
 const downCard = pc({ peer: { id: 'node-3', peer_addr: 'http://h:8393', admin_addr: 'http://h:8093', client_addr: 'http://h:8593', down: true }, current: false, slots: 0 })
 assert('a marked-down peer with announced addresses is still tagged 离线',
-  downCard.includes('离线') && downCard.includes('http://h:8593') && /border-style:dashed/.test(downCard))
+  downCard.includes('离线') && downCard.includes('http://h:8593') && !/border-style:dashed/.test(downCard))
 const onlineCard = pc({ peer: { id: 'node-1', peer_addr: 'http://h:8391', admin_addr: 'http://h:8091', client_addr: 'http://h:8591' }, current: true, slots: 561 })
 assert('an online peer renders no 离线 tag', !onlineCard.includes('离线') && onlineCard.includes('当前') && !/border-style:dashed/.test(onlineCard))
 
