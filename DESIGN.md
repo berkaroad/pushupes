@@ -166,8 +166,11 @@ Body: Record*，每条记录：
 - **控制面（自研 Raft）**：集群共识层是**仓库内自研的简化 Raft**
   （`internal/raft`：选主/日志复制/提交推进/快照），日志与 term/vote 存于
   **自研分段 WAL**（`internal/raft/wal.go`，组提交 + CRC + 崩溃截断恢复），
-  不再依赖 `hashicorp/raft` 与 BoltDB。成员集合**静态**（启动时由 `-peers`
-  写入 WAL 首条，增减节点=全集群重启），不支持运行时 AddVoter/PreVote/ReadIndex。
+  不再依赖 `hashicorp/raft` 与 BoltDB。成员集合在**首次启动**时由 `-peers`
+  写入 WAL 首条（同一次启动的节点写同一份），此后由运行时成员变更维护
+  （`-join`/`Adopt` 报名、admin 加删成员，见下文 §运行时成员变更；有 conf
+  记录的节点一律以记录为准，`-peers` 只当种子——因此扩容后的集群重启不必改
+  每个成员的 `-peers`）。不支持 PreVote/ReadIndex。
   它只复制元数据——
   slot 分配表（`slot → {leader, replicas[], epoch, state}`）、集群成员、
   节点数据面地址（`OpRegister`，见 §6 peer 面）。FSM 模型：
@@ -415,6 +418,14 @@ Raft 配置（谁投票）与复制的成员目录（槽表里的成员列表）
   **有 conf 记录的节点永远以记录为准**（`-peers` 只当种子，不再拒绝启动），因此
   扩过容的集群重启不需要改每个成员的 `-peers`。替代做法：运维直接 POST 加成员，
   再拉起新节点。
+- **`scripts/cluster.sh start` 自己区分冷启动与扩容**：没有任何节点在跑、也没有任何
+  节点持有 raft 日志时是全新冷启动，各节点按 `-peers` 写下同一份初始配置；否则本次
+  要拉起、又没有本地 raft 日志的节点改用 `-join` 指向现有成员报名加入（等同逐个
+  `join N`）。**这条区分必须有**：首启时让每个节点各写一份初始配置只在「同一次启动、
+  同一份 `-peers`」下才成立，而扩容时新节点拿到的 `-peers` 与老成员记录的配置不同 ——
+  每个新节点会在 index 1 写下内容不同的配置项（同 term、同 index、内容不同），
+  集群随之劈成多个各自成多数派、彼此都不完整的 raft 组，各自提交出分歧的状态机
+  （实测 `REPLICAS=1 → 3 → 5 → 7` 依次 `start` 得到 4 个互不隶属的组）。
 - 节点自报与手动加成员都走 peer 面的 `Adopt` RPC（`PeerService/Adopt`，非
   leader 转发），与 `Register` 同一套 relay 语义。
 

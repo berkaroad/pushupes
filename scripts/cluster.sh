@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # PushupES 集群启停脚本
 #
-# 默认拉起 3 节点（成员集合静态：各节点启动时按 -peers 写入同一 voter 集，
-# 无 bootstrap/join 差异），每个节点独立的
+# 默认拉起 3 节点（冷启动：各节点启动时按 -peers 写入同一 voter 集，无
+# bootstrap/join 差异 —— 前提是它们同一次启动、拿到同一份 -peers；start 在
+# 集群已经存在时改把新节点 -join 进来，见下），每个节点独立的
 # admin / peer(Raft) / client(gRPC) 端口与数据目录，槽位自动均衡。
 #
 #   scripts/cluster.sh start     启动集群（编译、逐个拉起、等待选主与槽规划，并打印管理台多地址启动命令）
@@ -18,7 +19,8 @@
 #   scripts/cluster.sh clean     stop 并删除运行目录（含数据，慎用）
 #
 # 脚本可用环境变量覆盖：
-#   REPLICAS=3             起始节点数
+#   REPLICAS=3             节点数：冷启动时是要拉起的全部节点，start 在集群
+#                          已经存在时只拉起缺的，并把它们 -join 进现有集群
 #   HOST=127.0.0.1         绑定与广播地址
 #   ADMIN_BASE=8091         节点 i 的 admin 管理端口（HTTP admin + pprof）= ADMIN_BASE + i - 1
 #   PEER_BASE=8391         节点 i 的 peer 端口（Raft + peer gRPC，全部节点间通讯）= PEER_BASE + i - 1
@@ -32,6 +34,11 @@
 # 地址，smoke 里演示了跟随重定向）；读走各节点本地 ≤HW 副本。
 #
 # 运行时成员变更（不重启、不丢数据）：
+#   扩：REPLICAS=7 scripts/cluster.sh start
+#       集群已经存在（有节点在跑，或数据目录里已有 raft 日志）时，缺的节点
+#       会用 -join 指向现有成员启动并自己报名；只有全新冷启动（无进程、无
+#       raft 日志）才让各节点按 -peers 写下同一份初始配置。
+#       所以扩容用这条或下面的 join 都行，改用 join N 时它只动一个节点。
 #   扩：scripts/cluster.sh join 4
 #       node-4 用 -peers（初始 3 成员的种子）+ -join（指向 node-1）启动，
 #       自己向 leader 报名；leader 把它加进 raft 配置，槽表 replan 后
@@ -78,6 +85,18 @@ node_pid_alive() {
   pid=$(tr -d '[:space:]' < "$f")
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null
+}
+
+# 节点是否已经持有本地 raft 日志（＝它已经属于某个集群：启动时按自己记录的
+# 配置起来，不会再写一份初始配置）。用于区分「全新冷启动」与「往现有集群里
+# 加节点」：只有前者能让节点按 -peers 写初始 voter 集，后者必须用 -join 报名，
+# 否则每个新节点写一份内容不同的 index 1 配置，集群会劈成多个互不隶属的 raft 组。
+node_has_raft_data() {
+  local f
+  for f in "$(node_dir "$1")/data/cluster/wal"/*.wal; do
+    [[ -s "$f" ]] && return 0
+  done
+  return 1
 }
 
 # 从 JSON 里取标量字段值（不依赖 python/jq；status JSON 中 raft 排在 slots
@@ -214,7 +233,41 @@ cmd_start() {
     [[ -n "$busy" ]] && die "端口被占用:$busy。换 ADMIN_BASE/PEER_BASE 或先停掉占用进程"
   fi
 
-  for i in "${to_start[@]}"; do start_node "$i"; done
+  # 冷启动还是往现有集群里加节点？判据：有没有节点在跑、有没有节点已经持有
+  # raft 日志。两者皆无 = 全新冷启动，各节点按 -peers 写下同一份初始配置；
+  # 否则本次要拉起、且没有本地 raft 日志的节点必须用 -join 报名加入 ——
+  # 让它自己 bootstrap 会用它那份 -peers 写出内容不同的 index 1 配置，和现有
+  # 集群分裂成各自成多数派的 raft 组（实测 REPLICAS 1->3->5->7 依次 start 会
+  # 得到四个互不隶属的组，配置在同一个 term/index 上分歧，随之快照互相不可读）。
+  local cold=1
+  for i in $(seq 1 "$REPLICAS"); do
+    node_pid_alive "$i" && cold=0
+    node_has_raft_data "$i" && cold=0
+  done
+  local join_to=""
+  if (( cold == 0 )); then
+    # 报名入口：优先一个已在运行的成员；都在停机但数据还在时，取序号最小、
+    # 持有 raft 日志的那个（它在本次启动里会起来，先报名的节点会按 adopt
+    # 周期重试到它可连为止）。
+    for i in $(seq 1 "$REPLICAS"); do
+      node_pid_alive "$i" && { join_to="$HOST:$(peer_port "$i")"; break; }
+    done
+    if [[ -z "$join_to" ]]; then
+      for i in $(seq 1 "$REPLICAS"); do
+        node_has_raft_data "$i" && { join_to="$HOST:$(peer_port "$i")"; break; }
+      done
+    fi
+  fi
+
+  for i in "${to_start[@]}"; do
+    if (( cold == 1 )) || node_has_raft_data "$i"; then
+      # 冷启动：按 -peers 写同一份初始配置；已有日志：按它记录的配置起来。
+      start_node "$i"
+      continue
+    fi
+    info "node-$i 没有本地 raft 日志：以 -join $join_to 报名加入现有集群（不写初始配置）"
+    JOIN_TARGET="$join_to" start_node "$i"
+  done
   wait_ready || exit 1
   info ""
   local admin_list="" i

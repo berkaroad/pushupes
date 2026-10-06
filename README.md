@@ -135,21 +135,32 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 `REPLICAS`（节点数）、`HOST`、`ADMIN_BASE`、`PEER_BASE`、`CLIENT_BASE`、
 `SEGMENT_BYTES`、`RUN_DIR`、`READY_TIMEOUT`、`BUILD`。每槽副本数不是配置项：
 按 Raft 集群的容错节点数推导（N 个成员 → floor((N-1)/2)+1 份），扩容时自动追加。
+扩节点两种做法等价：`REPLICAS=<新总数> cluster.sh start`（集群已存在时，缺的节点
+自动以 `-join` 报名加入）或逐个 `cluster.sh join N`；只有全新冷启动（没有节点在跑、
+数据目录里也没有 raft 日志）才让各节点按 `-peers` 写下同一份初始配置。
 
 ### 手工启动单个节点
 
 ```bash
-# 首个节点加 -bootstrap；peers 主格式 node-id=host:peerport（等号分隔，只配 peer 端口，
-# admin/client 地址由各节点经注册协议自报进路由表；每槽副本数由成员数推导）
+# 全新集群：所有初始节点同一次拉起、给同一份 -peers（各自写入同一份初始 voter 集；
+# 之后加/减成员走运行时变更，见下）。peers 主格式 node-id=host:peerport（等号分隔，
+# 只配 peer 端口，admin/client 地址由各节点经注册协议自报进路由表；每槽副本数由成员数推导）
 ./bin/pushupes -node node-1 \
   -peer 127.0.0.1:8391 -admin 127.0.0.1:8091 -client 127.0.0.1:8591 \
-  -data ./node-1 -bootstrap \
+  -data ./node-1 \
   -peers 'node-1=127.0.0.1:8391,node-2=127.0.0.1:8392'
 
 ./bin/pushupes -node node-2 \
   -peer 127.0.0.1:8392 -admin 127.0.0.1:8092 -client 127.0.0.1:8592 \
   -data ./node-2 \
   -peers 'node-1=127.0.0.1:8391,node-2=127.0.0.1:8392'
+
+# 已有集群上加一个节点：-peers 只当种子，-join 指向任一现有成员，节点自己报名
+./bin/pushupes -node node-3 \
+  -peer 127.0.0.1:8393 -admin 127.0.0.1:8093 -client 127.0.0.1:8593 \
+  -data ./node-3 \
+  -peers 'node-1=127.0.0.1:8391,node-2=127.0.0.1:8392' \
+  -join 127.0.0.1:8391
 ```
 
 地址规范：地址统一带 scheme 存储，未写协议时默认补 `http://`；`-peers`
