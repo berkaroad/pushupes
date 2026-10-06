@@ -9,7 +9,7 @@
 #   scripts/cluster.sh start     启动集群（编译、逐个拉起、等待选主与槽规划，并打印管理台多地址启动命令）
 #   scripts/cluster.sh status    查看各节点 Raft 角色、Leader 槽数、迁移中槽数
 #   scripts/cluster.sh join N    运行时扩一个节点：先拉起 node-N（-join 指向现有成员），再 POST 到 controller 加成员
-#   scripts/cluster.sh remove N  运行时摘掉 node-N（只允许离线节点：进程在跑会先停，等探活标离线后再 DELETE 到 controller；槽主自动迁到存活副本，副本集自动补齐）
+#   scripts/cluster.sh remove N  运行时摘掉 node-N（只允许离线节点：进程在跑会先停，等探活标离线后再 DELETE 到 controller；槽主自动迁到存活副本，副本集按新成员数重排为因子个席位）
 #   scripts/cluster.sh members   列出当前 raft 成员（GET /admin/cluster/nodes）
 #   scripts/cluster.sh smoke     端到端冒烟：MOVED 重定向 → v1/v2 写入 → 幂等 exists → 版本冲突 fail/1001 → 回读
 #   scripts/cluster.sh slotcheck 副本一致性体检：逐槽比较 leader 与各副本摘要（有发散副本时退出码 1）
@@ -47,7 +47,8 @@
 #   缩：scripts/cluster.sh remove 2
 #       只允许移除离线节点（与后端同规则）：node-2 进程还在跑时脚本先停掉它，
 #       等 controller 探活把它标离线后提交 raft 配置删除；该节点收到配置项后才
-#       停复制，槽主先迁到存活副本，再自动补副本。数据目录仍在，可手动清理。
+#       停复制，槽主先迁到存活副本，副本集按剩余成员数重排（补环上的席位、
+#       等留下的副本追平后回收多余席位）。数据目录仍在，可手动清理。
 
 set -uo pipefail
 
@@ -171,24 +172,33 @@ start_node() {
   # 不再有「先 bootstrap 再 join」的差异。
 
   cd "$dir" || die "无法进入 $dir"
-  # setsid 让节点脱离本脚本会话；fd 全部重定向，否则管道调用永不返回
+  # pid 文件必须由节点进程自己写。setsid 在调用方已是进程组长时会 fork，于是
+  # $! 是那个 fork 出来、随即退出的包装进程 —— 记录它会让 pid 文件指向死 pid 而
+  # 节点仍在跑，stop/remove/status 从此认不出活着的节点（实测：stop 报「记录的
+  # 进程已不存在」而集群照旧在跑）。所以让内层 shell 先写自己的 $$ 再 exec 节点：
+  # exec 不换 pid，写下的 pid 与最终跑 pushupes 的 pid 恒等。
+  local launch=(node.pid "$BIN" -node "node-$n" \
+    -admin "$HOST:$(admin_port "$n")" -peer "$HOST:$(peer_port "$n")" \
+    -client "$HOST:$(client_port "$n")" \
+    -data ./data -peers "$peers" \
+    "${seg_args[@]}" "${extra[@]}")
+  # fd 全部重定向，否则管道调用永不返回
   if command -v setsid >/dev/null 2>&1; then
-    setsid "$BIN" -node "node-$n" \
-       -admin "$HOST:$(admin_port "$n")" -peer "$HOST:$(peer_port "$n")" \
-      -client "$HOST:$(client_port "$n")" \
-      -data ./data -peers "$peers" \
-      "${seg_args[@]}" "${extra[@]}" >> node.log 2>&1 < /dev/null &
+    # setsid 让节点脱离本脚本会话
+    setsid "${BASH:-bash}" -c 'printf "%s\n" "$$" > "$1"; shift; exec "$@"' _ \
+      "${launch[@]}" >> node.log 2>&1 < /dev/null &
   else
-    nohup "$BIN" -node "node-$n" \
-       -admin "$HOST:$(admin_port "$n")" -peer "$HOST:$(peer_port "$n")" \
-      -client "$HOST:$(client_port "$n")" \
-      -data ./data -peers "$peers" \
-      "${seg_args[@]}" "${extra[@]}" >> node.log 2>&1 < /dev/null &
+    nohup "${BASH:-bash}" -c 'printf "%s\n" "$$" > "$1"; shift; exec "$@"' _ \
+      "${launch[@]}" >> node.log 2>&1 < /dev/null &
   fi
-  pid=$!
-  echo "$pid" > node.pid
   cd "$ROOT"
-  info "node-$n 启动中: admin=$(admin_port "$n") peer=$(peer_port "$n") client=$(client_port "$n") pid=$pid"
+  # 等节点自己写下 pid（毫秒级）：这样紧接着的启动/停止就不会读到空文件
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    pid="$(tr -d '[:space:]' < "$(pid_file "$n")" 2>/dev/null)"
+    [[ -n "$pid" ]] && break
+    sleep 0.1
+  done
+  info "node-$n 启动中: admin=$(admin_port "$n") peer=$(peer_port "$n") client=$(client_port "$n") pid=${pid:-未知}"
 }
 
 wait_ready() {
@@ -363,9 +373,13 @@ cmd_remove() {
   fi
   local ctrl; ctrl="$(controller_admin)"
   # 等该成员在 controller 视角离线（down=true；目录里没有它或它从未注册也算离线）。
+  # body 先压成一行：这个端点的 JSON 是缩进过的，逐行的 grep 只能看到条目的一部分，
+  # 于是「条目里没有 client_addr」会立刻为真 —— 脚本会在 mark_down 落地前就去 DELETE，
+  # 后端按「只允许移除离线成员」直接回 400（node 已停但还没被判离线的那 1~2 秒就是这窗口）。
   local deadline=$((SECONDS + 30)) body entry
   while (( SECONDS < deadline )); do
     body="$(curl -s --max-time 3 "http://$ctrl/admin/cluster/nodes" 2>/dev/null)" || body=""
+    body="$(printf '%s' "$body" | tr -d ' \t\n')"
     if ! printf '%s' "$body" | grep -q "\"id\":\"node-$n\""; then
       break   # 已不在成员表：DELETE 会幂等成功
     fi
@@ -378,14 +392,26 @@ cmd_remove() {
     fi
     sleep 1
   done
-  local resp code
-  resp="$(curl -s -w '\n%{http_code}' -X DELETE --max-time 40 \
-    "http://$ctrl/admin/cluster/nodes/node-$n" 2>/dev/null)"
-  code="${resp##*$'\n'}"
-  case "$code" in
-    200) info "node-$n 已从 raft 配置移除（槽主迁移 + 副本补齐已由 controller 接管）" ;;
-    *)   die "移除 node-$n 失败（HTTP $code）：$(printf '%s' "${resp%$'\n'*}" | head -c 400)" ;;
-  esac
+  # 「member is online」不是永久失败：node 进程已停，但 controller 判它离线（探活 3 轮，
+  # 或有见证者上报）有一个 1~2s 窗口，DELETE 撞上它只是早了一步。等一拍再试，别把
+  # 「node 还在跑」的错觉丢给运维。
+  local resp code attempt=0
+  while :; do
+    attempt=$((attempt + 1))
+    resp="$(curl -s -w '\n%{http_code}' -X DELETE --max-time 40 \
+      "http://$ctrl/admin/cluster/nodes/node-$n" 2>/dev/null)"
+    code="${resp##*$'\n'}"
+    if [[ "$code" == "200" ]]; then
+      info "node-$n 已从 raft 配置移除（槽主迁移 + 副本补齐已由 controller 接管）"
+      break
+    fi
+    if (( attempt < 5 )) && printf '%s' "${resp%$'\n'*}" | grep -q 'online'; then
+      info "node-$n 仍被判在线，等 controller 标记离线后重试（第 $attempt 次）"
+      sleep 1
+      continue
+    fi
+    die "移除 node-$n 失败（HTTP $code）：$(printf '%s' "${resp%$'\n'*}" | head -c 400)"
+  done
   cmd_members
 }
 
