@@ -9,7 +9,7 @@
 #   scripts/cluster.sh start     启动集群（编译、逐个拉起、等待选主与槽规划，并打印管理台多地址启动命令）
 #   scripts/cluster.sh status    查看各节点 Raft 角色、Leader 槽数、迁移中槽数
 #   scripts/cluster.sh join N    运行时扩一个节点：先拉起 node-N（-join 指向现有成员），再 POST 到 controller 加成员
-#   scripts/cluster.sh remove N  运行时摘掉 node-N（DELETE 到 controller；槽主自动迁到存活副本，副本集自动补齐）
+#   scripts/cluster.sh remove N  运行时摘掉 node-N（只允许离线节点：进程在跑会先停，等探活标离线后再 DELETE 到 controller；槽主自动迁到存活副本，副本集自动补齐）
 #   scripts/cluster.sh members   列出当前 raft 成员（GET /admin/cluster/nodes）
 #   scripts/cluster.sh smoke     端到端冒烟：MOVED 重定向 → v1/v2 写入 → 幂等 exists → 版本冲突 fail/1001 → 回读
 #   scripts/cluster.sh slotcheck 副本一致性体检：逐槽比较 leader 与各副本摘要（有发散副本时退出码 1）
@@ -45,8 +45,9 @@
 #       自己向 leader 报名；leader 把它加进 raft 配置，槽表 replan 后
 #       副本集自动补齐。也可以在已有节点上手动 POST /admin/cluster/nodes。
 #   缩：scripts/cluster.sh remove 2
-#       提交 raft 配置删除；该节点收到配置项后才停复制，槽主先迁到存活
-#       副本，再自动补副本。数据目录仍在，可手动清理。
+#       只允许移除离线节点（与后端同规则）：node-2 进程还在跑时脚本先停掉它，
+#       等 controller 探活把它标离线后提交 raft 配置删除；该节点收到配置项后才
+#       停复制，槽主先迁到存活副本，再自动补副本。数据目录仍在，可手动清理。
 
 set -uo pipefail
 
@@ -86,6 +87,23 @@ node_pid_alive() {
   pid=$(tr -d '[:space:]' < "$f")
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null
+}
+
+# stop_node N：停掉单个节点进程（判定与 cmd_stop 同源：只认 pid 文件，且
+# 确认命令行是 pushupes 才杀）。没有运行中的进程时静默成功。
+stop_node() {
+  local f pid
+  f=$(pid_file "$1")
+  [[ -f "$f" ]] || return 0
+  pid=$(tr -d '[:space:]' < "$f")
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null \
+     && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'pushupes'; then
+    kill "$pid" 2>/dev/null
+    local t=0
+    while (( t < 50 )); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; t=$((t + 1)); done
+    kill -9 "$pid" 2>/dev/null
+  fi
+  rm -f "$f"
 }
 
 # 节点是否已经持有本地 raft 日志（＝它已经属于某个集群：启动时按自己记录的
@@ -333,17 +351,40 @@ cmd_join() {
   return 1
 }
 
-# cmd_remove N：运行时摘掉一个节点。DELETE 必须发到 controller。
+# cmd_remove N：运行时摘掉一个节点。只允许移除离线节点：node-N 进程还在跑
+# 时脚本先停掉它，再等 controller 的探活把它标成离线（连续 3 轮探测失败，
+# 约数秒），最后提交 DELETE（必须发到 controller）。数据目录不动。
 cmd_remove() {
   local n="${1:-}"
   [[ -n "$n" && "$n" =~ ^[0-9]+$ ]] || die "用法: $0 remove <节点序号>"
+  if node_pid_alive "$n"; then
+    info "node-$n 进程仍在运行：只允许移除离线节点，先停掉它的进程"
+    stop_node "$n"
+  fi
   local ctrl; ctrl="$(controller_admin)"
-  local code
-  code="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-    --max-time 40 "http://$ctrl/admin/cluster/nodes/node-$n" 2>/dev/null)"
+  # 等该成员在 controller 视角离线（down=true；目录里没有它或它从未注册也算离线）。
+  local deadline=$((SECONDS + 30)) body entry
+  while (( SECONDS < deadline )); do
+    body="$(curl -s --max-time 3 "http://$ctrl/admin/cluster/nodes" 2>/dev/null)" || body=""
+    if ! printf '%s' "$body" | grep -q "\"id\":\"node-$n\""; then
+      break   # 已不在成员表：DELETE 会幂等成功
+    fi
+    entry="$(printf '%s' "$body" | grep -o "\"id\":\"node-$n\"[^}]*" | head -1)"
+    if ! printf '%s' "$entry" | grep -q '"client_addr"'; then
+      break   # 未注册过数据面地址：本就是离线
+    fi
+    if printf '%s' "$entry" | grep -q '"down":true'; then
+      break
+    fi
+    sleep 1
+  done
+  local resp code
+  resp="$(curl -s -w '\n%{http_code}' -X DELETE --max-time 40 \
+    "http://$ctrl/admin/cluster/nodes/node-$n" 2>/dev/null)"
+  code="${resp##*$'\n'}"
   case "$code" in
     200) info "node-$n 已从 raft 配置移除（槽主迁移 + 副本补齐已由 controller 接管）" ;;
-    *)   die "移除 node-$n 失败（HTTP $code）：curl -X DELETE http://$ctrl/admin/cluster/nodes/node-$n" ;;
+    *)   die "移除 node-$n 失败（HTTP $code）：$(printf '%s' "${resp%$'\n'*}" | head -c 400)" ;;
   esac
   cmd_members
 }
