@@ -136,6 +136,13 @@ func (e *Engine) rebalanceRound(ctx context.Context, limit int) int {
 			continue // the move-back target must be reachable (its liveness
 			// is also what failover is about to re-shape: do not race it)
 		}
+		// A move that keeps not sticking is throttled before anything is
+		// probed or shipped: without this a target that cannot converge (a
+		// diverged copy) is REPAIRED once per round — a full slot snapshot
+		// every two seconds, forever.
+		if !e.rebalanceRetryReady(m.Slot, m.From, m.To, time.Now()) {
+			continue
+		}
 		// Gate the move on the target's copy. Two different refusals live
 		// here, and they must not be conflated:
 		//
@@ -172,8 +179,9 @@ func (e *Engine) rebalanceRound(ctx context.Context, limit int) int {
 				"slot": m.Slot, "from": m.From, "to": m.To, "op": "rebalance_repair",
 			}).Warn("rebalance: target copy has the source's LEO but a different directory; rebuilding it before handing leadership back")
 		}
+		e.recordRebalanceAttempt(m.Slot, m.From, m.To, time.Now())
 		if err := e.StartMigration(ctx, m.Slot, m.To); err != nil {
-			e.loggerf("rebalance: moving slot %d back to %s failed: %v (retried next round)", m.Slot, m.To, err)
+			e.loggerf("rebalance: moving slot %d back to %s failed: %v (retried with backoff)", m.Slot, m.To, err)
 			continue
 		}
 		e.logger.WithFields(map[string]any{
@@ -205,6 +213,71 @@ func (e *Engine) rebalanceRound(ctx context.Context, limit int) int {
 func (e *Engine) slotCopyEquivalent(ctx context.Context, slot int32, srcAddr, dstAddr string) (bool, error) {
 	equivalent, _, err := e.slotCopyStatus(ctx, slot, srcAddr, dstAddr)
 	return equivalent, err
+}
+
+// ---- Retry backoff for hand-overs that do not stick --------------------------
+
+// A hand-over that fails costs real work. A target whose copy is DIVERGED (the
+// source's LEO with a different directory) is rebuilt — the source re-ships the
+// whole slot under the commit fence — and a move that aborts is re-planned. Both
+// used to happen again the very next round, i.e. a full slot snapshot every
+// DefaultRebalanceInterval for as long as the target cannot converge. Failed
+// attempts therefore back off per slot: the first retry is the next round (as
+// before), and each further one doubles up to a cap. The record is keyed on the
+// move's endpoints, so a failover (a different from/to) gets a fresh try — it
+// is a different move, not a retry.
+const (
+	rebalanceRetryBase = DefaultRebalanceInterval
+	rebalanceRetryMax  = time.Minute
+)
+
+type rebalanceAttempt struct {
+	from, to  string
+	attempts  int
+	notBefore time.Time
+}
+
+// rebalanceRetryDelay is the wait after the given attempt number: 2s, 4s, 8s,
+// ... capped. Pure, so the escalation is assertable on its own.
+func rebalanceRetryDelay(attempts int) time.Duration {
+	d := rebalanceRetryBase
+	for i := 1; i < attempts; i++ {
+		d *= 2
+		if d >= rebalanceRetryMax {
+			return rebalanceRetryMax
+		}
+	}
+	return d
+}
+
+// rebalanceRetryReady reports whether this move may be attempted now. Read-only:
+// it never counts an attempt, so a slot that is merely WAITING (its target still
+// catching up) does not accumulate backoff.
+func (e *Engine) rebalanceRetryReady(slot int32, from, to string, now time.Time) bool {
+	e.rebMu.Lock()
+	defer e.rebMu.Unlock()
+	cur, ok := e.rebRetry[slot]
+	if !ok || cur.from != from || cur.to != to {
+		return true // nothing recorded, or a different move
+	}
+	return !now.Before(cur.notBefore)
+}
+
+// recordRebalanceAttempt counts one attempt of this move and sets when the next
+// one may start.
+func (e *Engine) recordRebalanceAttempt(slot int32, from, to string, now time.Time) {
+	e.rebMu.Lock()
+	defer e.rebMu.Unlock()
+	if e.rebRetry == nil {
+		e.rebRetry = map[int32]rebalanceAttempt{}
+	}
+	cur, ok := e.rebRetry[slot]
+	if !ok || cur.from != from || cur.to != to {
+		cur = rebalanceAttempt{from: from, to: to}
+	}
+	cur.attempts++
+	cur.notBefore = now.Add(rebalanceRetryDelay(cur.attempts))
+	e.rebRetry[slot] = cur
 }
 
 // slotCopyStatus compares the two copies and separates the two ways they can

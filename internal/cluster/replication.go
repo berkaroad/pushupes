@@ -107,6 +107,12 @@ type Engine struct {
 	rebalanceInterval time.Duration
 	rebalanceBatch    int
 
+	// retry backoff for hand-overs that do not stick (balance.go): one record
+	// per slot, keyed on the move's endpoints. Without it a target that cannot
+	// converge is repaired (a full slot rebuild) once per round, forever.
+	rebMu    sync.Mutex
+	rebRetry map[int32]rebalanceAttempt
+
 	// post-migration local cleanup: slots whose local copy this node is
 	// scheduled to drop after the retention window (slot -> schedule), plus
 	// this node's replica-set membership as of the previous table walk (the
