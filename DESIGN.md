@@ -165,8 +165,8 @@ Body: Record*，每条记录：
 
 - **控制面（自研 Raft）**：集群共识层是**仓库内自研的简化 Raft**
   （`internal/raft`：选主/日志复制/提交推进/快照），日志与 term/vote 存于
-  **自研分段 WAL**（`internal/raft/wal.go`，组提交 + CRC + 崩溃截断恢复），
-  不再依赖 `hashicorp/raft` 与 BoltDB。集群配置在**首次启动**时由 `-peers` 写进 WAL
+  **自研分段 WAL**（`internal/raft/wal.go`，组提交 + CRC + 崩溃截断恢复）。
+  集群配置在**首次启动**时由 `-peers` 写进 WAL
   首条，且**只由一个节点写**：`-peers` 里 id 最小的那个（`-bootstrap` 可显式指定
   别的节点）。其余配置了 `-peers` 的节点一律以种子身份启动、向这些成员**报名加入**
   （`Adopt`），配置由 leader 的日志/快照带过来 —— 因此「新节点带更大的 `-peers`
@@ -179,11 +179,10 @@ Body: Record*，每条记录：
   `Applier` 接口 + 快照/恢复（快照为二进制表编码 `table_bin.go`，1680 槽
   ~350KB JSON → 几 KB）。成员集合由静态 voter 集唯一决定；路由表里每个成员
   同时记 `PeerAddr/AdminAddr/ClientAddr` 三个地址。
-  设计稿与实测见 `docs/raft-自研设计.md`。与替换前的 A/B 实测（256B 命令、
-  真实 TCP、3s×3 取中位）：单节点顺序 Apply 2.10ms→1.46ms（+43%，p99 2.87ms→1.94ms）、
-  单节点并发 2.08ms→1.45ms、3 节点顺序 5.01ms→5.52ms（−9%，p99 7.64ms→6.68ms
-  仍优于旧实现），每 op 分配 108→17 allocs；依赖树去掉 hashicorp/raft、
-  raft-boltdb、go-hclog 及其带进的 bbolt/msgpack/metrics 等。
+  设计稿见本文 §11。基准实测（256B 命令、真实 TCP、
+  3s×3 取中位）：单节点顺序 Apply 1.46ms/op（p50 1.40ms、p99 1.94ms）、
+  单节点并发 1.45ms/op（p50 2.84ms、p99 3.72ms）、3 节点顺序 5.52ms/op
+  （p99 6.68ms）；每 op 分配 17 allocs、2KB 级。
 - **数据面（专用拉取）**：
   - 客户端把 `Append` 发给槽 leader 的 gRPC client 面；leader 追加本地
     WAL 得到 seq。
@@ -727,3 +726,293 @@ max/mean ≤ 1.008），所以均衡不是选 K 的理由，这个不变性才�
 - 5/7 节点同参数下峰值只有 3 节点的约 60% / 45%，**按 3 节点规划即可覆盖所有规模**。
 - 不要用 4096：它破坏 3/5/7 的 N|K 不变性，且要压到同样内存得把段缩到 128MiB
   （段数翻倍）。K 的上限是 65535（`SlotOf` 里 `uint16(slotCount)`）。
+
+---
+
+## 11. 控制面共识层（自研 Raft 设计）
+
+> 状态：**已实现并验收**（见 §11.10）。
+> 范围：控制面**共识层**（选主 / 日志复制 / 提交推进 / 快照）自研实现。
+> 业务状态机（槽位分配表 `Table`）、数据面复制（mfetch / ISR / HW）、六步热迁移
+> 全部不动，接口边界也不动（`Applier`、`Node` 的导出方法、FSM 语义）。
+
+### 11.1 定位与目标
+
+#### 11.1.1 共识层承担的能力
+
+| 能力 | 提供模块 |
+| --- | --- |
+| 节点状态机（Follower/Candidate/Leader）、随机选主、心跳、term | `internal/raft`（state.go） |
+| 日志复制（AppendEntries 一致性检查、冲突截断、prevLogTerm/commitIndex） | `internal/raft`（replicate.go / log.go） |
+| 提交推进（多数派 matchIndex → commitIndex） | `internal/raft`（state.go） |
+| 成员变更（初始配置 / 运行时加删 voter） | `internal/raft`（raft.go / log.go） |
+| 日志与稳定状态存储（term/vote） | 自研分段 WAL（`internal/raft/wal.go`） |
+| 快照存储 | 自研单文件快照（`internal/raft/snapshot.go`） |
+| 传输 | 自研 TCP（`internal/raft/transport.go`），跑在 `peerMux` 之上，与 peer gRPC 共用一个端口 |
+
+Raft 的 API 面很窄，只有 4 个文件与它打交道（`cluster.go`、`fsm.go`、
+`peer_mux.go`、`register.go` 一行 + `migration.go` 一处 Stats）+ 3 个测试文件，
+所以业务逻辑和共识实现能干净地隔开。
+
+#### 11.1.2 目标
+
+1. 共识层做成**独立自包含的包**：`internal/raft` 不认识业务，只通过 `FSM`
+   接口与装配层交互。
+2. Raft 自己的日志与稳定状态（term/vote）用**自研 WAL 文件**存（分段、CRC、
+   崩溃可恢复）。
+3. 对外接口面小而稳：`Node.Apply / IsLeader / LeaderID / Peers /
+   PeerAddrs / Stats / Close`；peer 端口一个端口同时承载共识与 peer gRPC；
+   `-peers` 是唯一的成员配置入口。
+
+#### 11.1.3 明确不做（简化版边界）
+
+- **成员变更只做「一次一条」**：不加 joint consensus / 多步变更队列，leader 把一条
+  `conf` 条目写进日志、正常复制、**提交时**各节点各自落表；加节点先走 learner
+  阶段（追平才转 voter）。运维侧见 §6.1 的 admin 接口。
+- **不做 PreVote、不做 ReadIndex/租约读**：本项目的读全部走数据面
+  （客户端按槽 leader 读本地 ≤HW 副本），共识层不承担读一致性职责。
+- 不做 TransferLeadership、不做快照分块流式（表快照只有几 KB）。
+
+#### 11.1.4 安全前提
+
+1. **提交前 fsync**：leader 把条目写进 WAL 并落盘后才计入多数派；follower 先落盘
+   再 ack。否则多数派 ack 的日志可能在崩溃后消失。
+2. **peer 端口分流的谜面冲突**：`peerMux` 靠「首字节 = 'P' → gRPC，其余 → 共识」
+   分类，自研握手魔数**首字节必须 ≠ 'P'**，取 `0x9E`。
+
+### 11.2 架构
+
+```
+internal/raft/             ← 自研共识层（不认识 pushupes 业务）
+  ├── types.go        Config / Entry / Voter / State / FSM / Logger
+  ├── node.go         Node 门面：Apply/Barrier/Stats/WaitForLeader/Close
+  ├── state.go        runLoop 状态机（唯一写者）+ 全部协议迁移
+  ├── handlers.go     RPC 入口（投事件 + 等回复）
+  ├── replicate.go    每 follower 一个 replicator（攒批 + 流控 + 退避）
+  ├── log.go          内存日志 + WAL 绑定 + 截断标记
+  ├── wal.go          分段 WAL：组提交 + CRC + 崩溃截断恢复 + flock
+  ├── snapshot.go     单文件快照（无 meta 指针）
+  ├── transport.go    TCP：per-peer 长连接 + 请求/响应复用 + accept 服务
+  └── wire.go         握手魔数 + 长度前缀帧 + 消息编解码
+
+internal/cluster/          ← 业务装配层，只认 FSM 接口，接口边界稳定
+  ├── cluster.go     Node 包装 raft.Node，装配静态 voter 集
+  ├── fsm.go         Apply(raft.Entry) any / Snapshot() []byte / Restore([]byte)
+  └── peer_mux.go    实现自研 raft.Transport（首字节分流共识与 peer gRPC）
+```
+
+分层原则：**共识包不认识业务语义**，只认 `[]byte` 命令 + `FSM` 接口。
+
+### 11.3 持久化：自研 WAL
+
+#### 11.3.1 目录布局
+
+```
+<DataDir>/
+├── wal/
+│   ├── 000000000000000001.wal   # 段名 = 零填充段序号（不解析 entry）
+│   └── 000000000000000002.wal
+├── snapshot/
+│   └── 000000000000000123.snap  # 单文件快照，文件名 = index
+└── wal/LOCK                     # flock 目标
+```
+
+#### 11.3.2 记录帧
+
+```
+len u32 | type u8 | crc32c u32 | payload[len]      # crc32c 覆盖 type+len+payload
+```
+
+记录类型：`1=entry(index/term/kind/data)`、`2=hardstate(term/vote)`、
+`3=conf(voters)`、`4=truncate(index)`。
+
+- **term/vote 与日志同一条流**：不引入第二个文件，恢复时取最后一条 hardstate，
+  从根上杜绝「重启 term 归零」。
+- **truncate 标记**：WAL 是 append-only，follower 冲突截断不能在中间删记录，
+  改为写一条 `truncate(index)` 标记；重放时先丢弃 ≥ index 的内存条目再继续。
+
+#### 11.3.3 崩溃恢复
+
+- 启动按段序号顺序扫描，遇到读失败 / CRC 不符 / 长度越界 → **截断该段到最后一
+  条有效记录**，删除更后面的段，记 WARN。只丢尾部，已落盘的前缀记录不整库报废。
+- `flock(LOCK_EX|LOCK_NB)` 锁 WAL 目录：拿不到锁**立即报错**（不是无限等），
+  `Close()` 保证释放——这是进程内重启必须能重开的前提。
+
+#### 11.3.4 组提交（性能关键）
+
+```
+Append(typ, payload) → 编码入 buffer，返回 LSN（不落盘）
+flusher goroutine    → 等 dirty 信号或 200µs tick → write + fdatasync → 唤醒
+                       LSN ≤ durable 的等待者，并回调 OnDurable(durableLSN)
+Wait(lsn)            → 阻塞到自己的 LSN 落盘
+```
+
+- 顺序写路径：1 命令 1 fsync。
+- 并发/批量路径：N 条摊成 1 次 fsync（实测 200 条 / 1 次）。
+
+### 11.4 快照
+
+- 触发：`applied - snapIndex >= SnapshotThreshold`（默认 1024）或 30s 间隔到点且
+  有新增应用。
+- 形式：`snapshot/<index>.snap`，头部 `magic ver index term confLen conf dataLen crc`；
+  写完 `fsync 文件 → rename → fsync 目录`；保留最近 2 份。**无 meta.json 指针**——
+  最新快照 = 目录里编号最大且 CRC 通过的那个，少一个会互相矛盾的原子写。
+- **conf 段是快照点的成员表**：配置本身在日志里（见 §11.4.1），而快照把 `≤ index`
+  的日志换掉了，所以快照必须自带那一刻的 voter 集，否则从快照追平的节点（运行时
+  新加的成员正好落在「leader 已压缩掉它缺的那段日志」时）只会在日志里看到「把自己
+  加进来」这一条 conf 条目，然后以「整个集群就我一个」的姿态（quorum=1、日志任意
+  陈旧也能自己当选）跑起来。`InstallSnapshot` 消息里也带同一份（直接取自被发送的
+  快照文件，两者不会分叉），接收方 `setVoters` + 落 `conf` 记录。
+- **不变式**：快照基线只能裁掉日志的**前缀**（≤ 基线的内存条目），基线之上的
+  条目一律保留；`commitIndex` 不得超过 `LastIndex`。
+
+#### 11.4.1 成员表就是日志的一部分
+
+- **初始配置写进日志第 1 条**（`conf` 条目，op=`confSet`，term 1，voter 按 id 排序
+  保证各节点写出的字节一致），同时写一条 `conf` WAL 记录。只写记录（每个初始节点
+  各写一份自己那份）对**后来加入**的节点毫无用处：它的成员表要从 leader 复制的
+  日志或快照里推出来。
+- **运行时的 add/remove 也是日志条目**（op=`confAdd`/`confRemove`），提交时才落表；
+  重启重放同一份日志必得同一份成员表。`confSet` 只由 bootstrap 与快照写入，不接受
+  运维调用。
+- **加节点先 learner**：leader 起复制、等 `matchIndex ≥ 接变时的 commitIndex`
+  （墙钟 20s 上限）才 append 那条 add；否则空日志的新成员可能参与计票并当选。
+- **删节点不提前摘复制器**：先提交、继续复制，等它 ack 到该条目、再发一轮带新
+  commitIndex 的 AppendEntries 让它自己也提交，然后才摘复制器——否则被删节点停在
+  「有日志、未提交」，仍信旧配置、仍能竞选。
+- **成员表并发**：loop 写、读侧 `votersMu` 取副本；**写侧也必须持同一把锁**
+  （`publishVoters`），否则 `Members()` 复制到一半的切片会与 loop 的重建并发
+  （`-race` 会抓）。同理 `clients` 映射由 `clientsMu` 保护：loop 改成员、replicator
+  goroutine 每轮读它。
+
+### 11.5 共识：线程与不变式
+
+- **单写者 runLoop**：一个 goroutine 独占全部可变状态（state/term/vote/leaderID/
+  commit/applied/nextIndex/matchIndex），RPC handler 与 replicator 只投事件；
+  外部读走原子发布的 `view` 快照。协议状态**不用 mutex 保护**，从结构上消灭
+  「两把锁互咬」。
+- **replicator 不碰 loop 状态**：loop 把一轮所需的全部信息（term / prev* /
+  entries / leaderCommit / 需要的话整份快照）打包进 `replicateRound` 交给它，
+  结果以事件回来。
+- **提交规则**：`N` 可提交 ⇔ `N > commitIndex` ∧ 多数派 `matchIndex ≥ N` ∧
+  `log[N].term == currentTerm`（只算当前 term 的条目）；leader 上任立即追加一条
+  当前 term 的 **no-op** 把前任尾巴顶进提交。
+- **冲突回退**：`prevIndex/prevTerm` 不匹配 → `success=false` + `conflictIndex`
+  （冲突 term 的**首** index），leader 一次跳到该点重试，不退化成逐条退。
+- **Apply 语义**：注册 waiter 必须在可能推进 commit 之前；已 applied 的直接应答；
+  **每条推进 applied 的分支都必须应答 waiter**（含条目已被快照裁掉的情况）。
+  Apply 请求走独立 channel，loop 一次 drain 整批、**一次 append + 一次 fsync**。
+- **follower 的 ack 异步化**：follower 不在 loop 里等 fsync，而是异步追加 + 落盘
+  通知到达后再应答（`WAL.OnDurable` → 原子量 + cap-1 信号唤醒 loop）。
+- **leader 的 Apply 顺序**：先追加并立即 kick 复制，**再**等本地 fsync —— 本地
+  落盘与 follower 往返重叠。
+- RPC 集：`RequestVote/Resp`、`AppendEntries/Resp`、`InstallSnapshot/Resp`。
+  选举超时 500ms~1s 随机、心跳 100ms（`cluster.Config` 未传时用默认值）。
+
+### 11.6 线上协议（peer 端口）
+
+- **分流不变**：`'P'` → HTTP/2 前导 → gRPC；其余 → 共识层。自研握手首字节
+  `0x9E`，**断言 ≠ 'P'**（有单元测试守着）。
+- **握手**：`magic(1) | version(1) | nodeID(u8 长度 + bytes)`；acceptor 回同样格式
+  的 ACK。没有 role 字节——一条连接是**双向**请求/响应复用，双方都可能在同一条
+  连接上发请求。
+- **帧**：`len u32 | reqID u64 | kind(0=req 1=resp) u8 | type u8 | payload`。
+- **连接模型**：per-peer **长连接**（懒拨号、写互斥、按 reqID 分发响应、断开即
+  失败在途请求）；acceptor 侧只回不该连接上的请求，实现对称且简单。
+
+### 11.7 模块边界与装配
+
+| 位置 | 职责 |
+| --- | --- |
+| `internal/raft/`（10 文件） | 共识层全部实现，不认识业务 |
+| `internal/cluster/cluster.go` | 包装 `*raft.Node`；装配静态 voter 集；种子节点 `Adopt` 加入 |
+| `internal/cluster/fsm.go` | `Apply(raft.Entry) any` / `Snapshot() ([]byte,error)` / `Restore([]byte) error` |
+| `internal/cluster/peer_mux.go` | 实现自研 `raft.Transport`；`Addr() string`；首字节分流 |
+| `internal/cluster/register.go` | 用 `LeaderID()` 读当前 leader |
+| `internal/cluster/migration.go` | 读 `Stats` key（连字符/下划线两种写法兼容） |
+| `cmd/pushupes/main.go` | `-raft-flush-interval`(200µs) / `-raft-segment-bytes`(64MiB) |
+| `scripts/cluster.sh` | 启动传 `-peers`（`-bootstrap` 为 no-op 兼容位） |
+
+**共识层不碰**：`internal/storage/*`、`internal/data/*`、`internal/grpcapi/*`、
+`internal/api/*`、六步热迁移、ISR/HW、再平衡。
+
+### 11.8 测试与验证方案
+
+- 单元：WAL（崩溃截断只丢尾部、跨段重放、flock 互斥、CRC 篡改检出、组提交合并）、
+  内存日志、快照与日志自洽（含快照携带的成员表）、term/vote 跨重启、种子节点启动。
+- 成员变更（`raft_membership_test.go`）：运行时加节点后**每个节点**（尤其新节点自己）
+  的 voter 集都收敛到 N+1、加/删幂等、删到只剩一个被拒、follower 上调用被拒并指出
+  leader、leader 日志已压缩时新节点从**快照**学到的成员表、被加节点单独存活时
+  **不能自己当选**（1/4 不是多数派）。
+- 进程内真实 TCP 集群：拓扑 1/3/5/7 各跑「选主 → 写批 → 杀 leader → 幸存者选主
+  → 再写 → 全体 applied 与 last 一致」，**每拓扑多轮**；`-race` 全绿。
+- 端到端：`scripts/cluster.sh` 三段（见 §11.10.3），扩缩由 `join N` / `remove N` 覆盖。
+
+### 11.9 用户拍板记录
+
+（2026-10-05）
+
+1. 成员集合**静态**固定 —— 接受。
+2. WAL **自己写**，不剥 `internal/storage` 的 Segment —— 采纳。
+3. 传输用 **per-peer 长连接**复用 —— 采纳。
+4. 快照**单文件 + 扫目录取最新**，不做分块流式 —— 可以。
+5. `kill -9` 故障切换 + 重启追平作为**硬性验收**，基准数字写进文档 —— 照此执行。
+
+### 11.10 实现结果
+
+#### 11.10.1 交付物
+
+见 §11.2 的目录清单；共识层从状态机、日志、WAL、快照到传输、编解码全部在
+`internal/raft` 内实现。
+
+#### 11.10.2 与设计稿的偏差（实现中改进）
+
+1. 握手去掉 role 字节（见 §11.6）。
+2. WAL 段名改为零填充段序号，而非 baseIndex；压缩按「段 lastLSN < 目标 LSN」整段删。
+3. follower 的 ack 异步化；leader 的 Apply 先复制再等本地 fsync（见 §11.5）。
+4. 两条防御性不变式（都是本轮踩到的真 bug）：
+   - 快照基线只能裁日志**前缀**；裁成后缀会把 applied 游标推过日志末尾，
+     每个后续 Apply 都白等满超时。
+   - `commitIndex ≤ LastIndex` 每次 apply 前 clamp。
+5. `-bootstrap` 保留为 no-op。
+6. 运行时成员变更（§11.4.1）落地时踩到并修掉的两个真 bug：
+   - **新节点的成员表只有它自己**：初始配置原先只写进每个节点自己的 `conf` WAL
+     记录，后来加入的节点从 leader 的日志/快照里推不出这份配置，于是它以 quorum=1
+     跑起来（可自己当选、可在陈旧日志上确认写入）。修法：初始配置写进日志第 1 条
+     （`confSet`），快照与 `InstallSnapshot` 都带上快照点的成员表。
+   - **成员表/连接表读写竞态**：loop 无锁写 `n.voters`、`n.clients`，读侧
+     （`Members()`）与 replicator goroutine 并发读 → `-race` 抓到。修法：
+     `publishVoters`（写侧持 `votersMu`）+ `clientsMu` 保护连接表；成员表重建一律
+     换成新切片，不再原地改元素。
+
+#### 11.10.3 验证（实跑）
+
+- `go build ./... && go vet ./...` 通过；`go test ./... -count=1` 全绿
+  （含 1/3/5/7 拓扑多轮与快照回归用例）。
+- `go test -race ./internal/raft` 全绿。race detector 曾抓出 `peerClient.write()`
+  无锁读 conn 字段与 `close()` 并发写 → 改为把连接句柄按值传入。
+- 端到端（3 进程真实集群）：`clean → start → smoke → slotcheck` 全绿；
+  `kill -9` leader → 2s 内新 leader 选出 → 重启被杀节点 → 追平，
+  `slotcheck` diverged=0、`smoke` 通过；`restart`（保留数据）后槽表不乱。
+
+#### 11.10.4 基准实测
+
+环境：容器 2 核（GOMAXPROCS=2，并发档实际最多 2 路并列），命令体 256B，真实 TCP，
+`-benchtime 3s -count 3` 取中位数。被测：自研 `internal/raft` + 自研 WAL。
+
+| 场景 | ns/op | p50 | p99 | B/op | allocs/op |
+| --- | --- | --- | --- | --- | --- |
+| 单节点顺序 | 1 464 000 | 1.40ms | 1.94ms | 2 135 | 17 |
+| 单节点并发16 | 1 454 000 | 2.84ms | 3.72ms | 2 135 | 17 |
+| 3 节点顺序 | 5 521 000 | 5.55ms | 6.68ms | 16 022 | — |
+
+- 每命令 fsync：顺序档 1 次/命令，批量/并发档由组提交摊薄（实测 200 条并发写入
+  在 5ms 窗口只产生 1 次 fsync）。
+- 判据核对：单节点 Apply p99 < 2ms、3 节点 p99 < 7ms、每 op 分配 2KB 级 —— **达标**。
+
+#### 11.10.5 已知边界（不在本次范围）
+
+- `InstallSnapshot` 仍在 runLoop 内同步写盘（仅 follower 落后到基线时才走，表快照
+  几 KB）。
+- WAL 写失败的极端情况下，已挂起的 follower ack 靠 RPC 超时回收（写失败即节点
+  不可用，不做额外降级）。

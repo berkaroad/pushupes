@@ -47,7 +47,7 @@ Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分
 ### 高可用与复制
 
 - 控制面：**自研简化 Raft**（`internal/raft`，日志与 term/vote 存于自研分段
-  WAL `internal/raft/wal.go`；不依赖 hashicorp/raft 与 BoltDB）复制槽位分配表
+  WAL `internal/raft/wal.go`）复制槽位分配表
   （`slot → {leader, replicas[], epoch, state}`）与成员；成员集合静态（由
   `-peers` 启动时写入）；路由表快照为二进制编码（几 KB 级）。
 - 数据面：follower 把要跟随的槽按 leader 分组，**每个 leader 维持一条常驻的
