@@ -107,6 +107,11 @@ type Engine struct {
 	failMu     sync.Mutex
 	failStreak map[string]int
 
+	// storageMu guards gauge, the cluster storage sample every node refreshes in
+	// the background (any node serves /admin/cluster/status — runStorageSampler).
+	storageMu sync.Mutex
+	gauge     storageGauge
+
 	// unreach is the controller's witness table for the unreachable reports
 	// observers send (suspect -> reporter -> when). See recordUnreachable.
 	unreachMu sync.Mutex
@@ -2693,4 +2698,124 @@ func (e *Engine) Start(ctx context.Context) {
 	go e.replicaLoop(ctx)
 	go e.RunController(ctx)
 	go e.RunRebalancer(ctx)
+	go e.runStorageSampler(ctx)
+}
+
+// ---- cluster storage gauge -----------------------------------------------------
+
+// storageGauge is one sample of the cluster's stored volume: the sum of the
+// on-disk bytes of every slot's LEADER copy. Counting leaders (not "some copy
+// somewhere") is what keeps the number meaningful across a replica-set change or
+// a migration: the writes landed on the leader, and the other copies are the
+// same data one replication round behind — so summing every copy would multiply
+// the same bytes by the replica factor.
+type storageGauge struct {
+	bytes    uint64
+	complete bool // every slot leader answered; false makes bytes a lower bound
+	at       time.Time
+}
+
+// storageSampleInterval is how often a node recomputes the cluster storage
+// gauge. It is a background refresh on purpose: the sum needs one peer round
+// trip per other member, and /admin/cluster/status is polled by the console
+// every couple of seconds — the status must answer from the last sample instead
+// of blocking behind a peer that is slow or gone.
+const storageSampleInterval = 2 * time.Second
+
+// runStorageSampler keeps the gauge fresh. Every node runs it: the status
+// endpoint is served by all of them, not only by the controller.
+func (e *Engine) runStorageSampler(ctx context.Context) {
+	e.refreshStorage() // first sample immediately, so status is not empty for a tick
+	t := time.NewTicker(storageSampleInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			e.refreshStorage()
+		}
+	}
+}
+
+// refreshStorage samples the on-disk size of every slot's leader copy: the slots
+// this node leads are read locally, every other leader is asked over the peer
+// plane in parallel under storageQueryTimeout. A leader that does not answer
+// leaves the sample incomplete (the sum is then a lower bound) rather than
+// failing the refresh — a dead node must not hide the size of everything else.
+func (e *Engine) refreshStorage() {
+	tbl := e.TableSnapshot()
+	byLeader := map[string][]int32{}
+	var total uint64
+	for s, p := range tbl.Slots {
+		switch {
+		case p.Leader == "":
+			continue
+		case p.Leader == e.self:
+			total += uint64(e.SlotSize(s))
+		default:
+			byLeader[p.Leader] = append(byLeader[p.Leader], s)
+		}
+	}
+	complete := true
+	if len(byLeader) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), storageQueryTimeout)
+		defer cancel()
+		type answer struct {
+			slots []int32
+			bytes []uint64
+		}
+		answers := make(chan answer, len(byLeader))
+		var wg sync.WaitGroup
+		for id, slots := range byLeader {
+			addr := e.peerAddr(id)
+			if addr == "" {
+				complete = false
+				continue
+			}
+			wg.Add(1)
+			go func(addr string, slots []int32) {
+				defer wg.Done()
+				got, err := e.peerSlotSizes(ctx, addr, slots)
+				if err != nil {
+					return
+				}
+				answers <- answer{slots, got}
+			}(addr, slots)
+		}
+		wg.Wait()
+		close(answers)
+		n := 0
+		for a := range answers {
+			n++
+			for _, b := range a.bytes {
+				total += b
+			}
+		}
+		// Every leader that was asked and did not answer makes the sum partial.
+		if n < len(byLeader) {
+			complete = false
+		}
+	}
+	e.storageMu.Lock()
+	e.gauge = storageGauge{bytes: total, complete: complete, at: time.Now()}
+	e.storageMu.Unlock()
+}
+
+// ClusterStorageBytes reports the last storage sample: the sum of every slot's
+// leader copy, and whether every leader answered. Zero/false until the first
+// sample lands (the sampler runs one immediately on start).
+func (e *Engine) ClusterStorageBytes() (uint64, bool) {
+	e.storageMu.Lock()
+	defer e.storageMu.Unlock()
+	return e.gauge.bytes, e.gauge.complete && !e.gauge.at.IsZero()
+}
+
+// SlotSize is a slot's local on-disk footprint (see storage.Store.SlotDiskBytes):
+// a loaded copy answers from its own accounting, a cold one from its directory.
+func (e *Engine) SlotSize(slot int32) int64 {
+	if e.store == nil {
+		return 0
+	}
+	return e.store.SlotDiskBytes(slot)
 }

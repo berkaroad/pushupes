@@ -33,6 +33,7 @@ const (
 	PeerService_DropSlot_FullMethodName          = "/pushupes.v1.PeerService/DropSlot"
 	PeerService_ReportUnreachable_FullMethodName = "/pushupes.v1.PeerService/ReportUnreachable"
 	PeerService_SlotLeos_FullMethodName          = "/pushupes.v1.PeerService/SlotLeos"
+	PeerService_SlotSizes_FullMethodName         = "/pushupes.v1.PeerService/SlotSizes"
 )
 
 // PeerServiceClient is the client API for PeerService service.
@@ -112,6 +113,11 @@ type PeerServiceClient interface {
 	// the replicas themselves know their LEO (the slot table carries no offsets).
 	// A slot this node does not hold reports 0.
 	SlotLeos(ctx context.Context, in *SlotLeosRequest, opts ...grpc.CallOption) (*SlotLeosResponse, error)
+	// SlotSizes answers the on-disk size of many slots at once, for the cluster
+	// storage gauge: the sum an operator watches counts each slot's LEADER copy
+	// (the copy the writes landed on), and only the holder of a copy can report
+	// its bytes. A slot this node does not hold answers 0.
+	SlotSizes(ctx context.Context, in *SlotSizesRequest, opts ...grpc.CallOption) (*SlotSizesResponse, error)
 }
 
 type peerServiceClient struct {
@@ -265,6 +271,16 @@ func (c *peerServiceClient) SlotLeos(ctx context.Context, in *SlotLeosRequest, o
 	return out, nil
 }
 
+func (c *peerServiceClient) SlotSizes(ctx context.Context, in *SlotSizesRequest, opts ...grpc.CallOption) (*SlotSizesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SlotSizesResponse)
+	err := c.cc.Invoke(ctx, PeerService_SlotSizes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PeerServiceServer is the server API for PeerService service.
 // All implementations must embed UnimplementedPeerServiceServer
 // for forward compatibility.
@@ -342,6 +358,11 @@ type PeerServiceServer interface {
 	// the replicas themselves know their LEO (the slot table carries no offsets).
 	// A slot this node does not hold reports 0.
 	SlotLeos(context.Context, *SlotLeosRequest) (*SlotLeosResponse, error)
+	// SlotSizes answers the on-disk size of many slots at once, for the cluster
+	// storage gauge: the sum an operator watches counts each slot's LEADER copy
+	// (the copy the writes landed on), and only the holder of a copy can report
+	// its bytes. A slot this node does not hold answers 0.
+	SlotSizes(context.Context, *SlotSizesRequest) (*SlotSizesResponse, error)
 	mustEmbedUnimplementedPeerServiceServer()
 }
 
@@ -393,6 +414,9 @@ func (UnimplementedPeerServiceServer) ReportUnreachable(context.Context, *Report
 }
 func (UnimplementedPeerServiceServer) SlotLeos(context.Context, *SlotLeosRequest) (*SlotLeosResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SlotLeos not implemented")
+}
+func (UnimplementedPeerServiceServer) SlotSizes(context.Context, *SlotSizesRequest) (*SlotSizesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SlotSizes not implemented")
 }
 func (UnimplementedPeerServiceServer) mustEmbedUnimplementedPeerServiceServer() {}
 func (UnimplementedPeerServiceServer) testEmbeddedByValue()                     {}
@@ -656,6 +680,24 @@ func _PeerService_SlotLeos_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PeerService_SlotSizes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SlotSizesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerServiceServer).SlotSizes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerService_SlotSizes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerServiceServer).SlotSizes(ctx, req.(*SlotSizesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // PeerService_ServiceDesc is the grpc.ServiceDesc for PeerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -714,6 +756,10 @@ var PeerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SlotLeos",
 			Handler:    _PeerService_SlotLeos_Handler,
+		},
+		{
+			MethodName: "SlotSizes",
+			Handler:    _PeerService_SlotSizes_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

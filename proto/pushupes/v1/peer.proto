@@ -77,6 +77,11 @@ service PeerService {
   // the replicas themselves know their LEO (the slot table carries no offsets).
   // A slot this node does not hold reports 0.
   rpc SlotLeos(SlotLeosRequest) returns (SlotLeosResponse);
+  // SlotSizes answers the on-disk size of many slots at once, for the cluster
+  // storage gauge: the sum an operator watches counts each slot's LEADER copy
+  // (the copy the writes landed on), and only the holder of a copy can report
+  // its bytes. A slot this node does not hold answers 0.
+  rpc SlotSizes(SlotSizesRequest) returns (SlotSizesResponse);
 }
 
 message PingRequest {}
@@ -97,6 +102,14 @@ message SlotLeosRequest { repeated int32 slots = 1; }
 message SlotLeosResponse {
   repeated int32 slots = 1;
   repeated uint64 leos = 2;
+}
+
+// SlotSizes asks one node for the on-disk bytes of many slots (same parallel
+// array shape). Slots it does not hold answer 0.
+message SlotSizesRequest { repeated int32 slots = 1; }
+message SlotSizesResponse {
+  repeated int32 slots = 1;
+  repeated uint64 bytes = 2;
 }
 
 message RegisterRequest {

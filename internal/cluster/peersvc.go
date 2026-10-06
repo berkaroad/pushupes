@@ -42,6 +42,11 @@ const (
 	// failover must not wait 30s for a dying node's answer.
 	failoverPickTimeout = 1 * time.Second
 	peerPingTimeout     = 2 * time.Second
+	// storageQueryTimeout bounds ONE round of "what are your slot sizes?"
+	// (the cluster storage gauge, see runStorageSampler). Shorter than the
+	// general peer RPC budget: a peer that does not answer costs the gauge one
+	// sample, not the whole refresh.
+	storageQueryTimeout = 2 * time.Second
 
 	// peerMaxMsgBytes bounds gRPC messages on the peer plane. Snapshot
 	// segments stream in <=4MiB chunks and fetch rounds cap at
@@ -438,6 +443,35 @@ func (s *peerServer) SlotLeos(_ context.Context, req *pushupesv1.SlotLeosRequest
 		resp.Leos[i] = s.e.HandleLEO(slot)
 	}
 	return resp, nil
+}
+
+// SlotSizes answers the on-disk bytes of many slots (see the proto comment): the
+// cluster storage gauge counts each slot's leader copy, and only the holder can
+// report its size.
+func (s *peerServer) SlotSizes(_ context.Context, req *pushupesv1.SlotSizesRequest) (*pushupesv1.SlotSizesResponse, error) {
+	resp := &pushupesv1.SlotSizesResponse{Slots: req.Slots, Bytes: make([]uint64, len(req.Slots))}
+	for i, slot := range req.Slots {
+		resp.Bytes[i] = uint64(s.e.SlotSize(slot))
+	}
+	return resp, nil
+}
+
+// peerSlotSizes asks a peer for the on-disk bytes of the given slots.
+func (e *Engine) peerSlotSizes(ctx context.Context, addr string, slots []int32) ([]uint64, error) {
+	c, err := e.peerRPC(addr)
+	if err != nil {
+		return nil, err
+	}
+	cctx, cancel := context.WithTimeout(ctx, storageQueryTimeout)
+	defer cancel()
+	resp, err := c.SlotSizes(cctx, &pushupesv1.SlotSizesRequest{Slots: slots})
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Bytes) != len(slots) {
+		return nil, fmt.Errorf("slot sizes: got %d answers for %d slots", len(resp.Bytes), len(slots))
+	}
+	return resp.Bytes, nil
 }
 
 // peerSlotLeos asks a peer for the durable LEOs of the given slots.

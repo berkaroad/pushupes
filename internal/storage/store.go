@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -170,6 +171,36 @@ func (st *Store) SlotPresent(slotID int32) bool {
 	}
 	entries, err := os.ReadDir(st.slotDir(slotID))
 	return err == nil && len(entries) > 0
+}
+
+// SlotDiskBytes is a slot's on-disk footprint: the sum of its segment files.
+// A copy this process holds answers from its own accounting (it knows the tail
+// this process wrote); one it has not opened — the directory appeared after
+// startup (a migration push before its reload) — is stat'ed from disk, because
+// reporting 0 there would silently shrink whatever watches the number.
+// Deliberately the same accounting as Slot.TotalSize (segment files only: the
+// auxiliary files are small and not what an operator is watching).
+func (st *Store) SlotDiskBytes(slotID int32) int64 {
+	if slotID < 0 || slotID >= st.SlotCount {
+		return 0
+	}
+	if s := st.slots[slotID].Load(); s != nil {
+		return s.TotalSize()
+	}
+	entries, err := os.ReadDir(st.slotDir(slotID))
+	if err != nil {
+		return 0
+	}
+	var n int64
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".wal") {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			n += info.Size()
+		}
+	}
+	return n
 }
 
 // ReloadSlot reopens a slot from disk (after migration segments were pushed

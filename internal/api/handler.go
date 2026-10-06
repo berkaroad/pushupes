@@ -214,6 +214,7 @@ func (s *Server) handleSlotStreams(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	tbl := s.Engine.TableSnapshot()
 	leaderID, leaderAdmin := s.Engine.Controller()
+	storageBytes, storageComplete := s.Engine.ClusterStorageBytes()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"node":       s.Engine.Self(),
 		"raft":       s.Engine.RaftStats(),
@@ -229,6 +230,14 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 		// durable writes per slot since this process started; clients diff
 		// successive snapshots to derive write rates (msg/sec).
 		"writes": s.Engine.WriteCounts(),
+		// storage_bytes is the cluster's stored volume: the sum of the on-disk
+		// size of every slot's LEADER copy (the copy the writes landed on — see
+		// cluster.Engine.refreshStorage). It is a background sample, so it lags
+		// the write path by up to storageSampleInterval, and
+		// storage_bytes_complete=false means a slot leader did not answer, i.e.
+		// the number is a lower bound.
+		"storage_bytes":          storageBytes,
+		"storage_bytes_complete": storageComplete,
 	})
 }
 
