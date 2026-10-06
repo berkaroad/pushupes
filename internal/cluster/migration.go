@@ -69,6 +69,14 @@ func (e *Engine) StartMigration(ctx context.Context, slot int32, toNode string) 
 	// like a replica that joined late — it follows the slot and pulls the
 	// remainder over the same fetch protocol — and the six steps proceed
 	// unchanged.
+	//
+	// From here on this slot is OURS: the stage below is replicated state that
+	// outlives this call (and this process), and the controller round must
+	// know the difference between driving it and inheriting it. See
+	// reconcileOrphanMigrations.
+	e.markMigrationInFlight(slot)
+	defer e.clearMigrationInFlight(slot)
+
 	inSet := false
 	for _, r := range p.Replicas {
 		if r == toNode {
@@ -492,6 +500,85 @@ func (e *Engine) awaitApplied(ctx context.Context, timeout time.Duration) error 
 // rollbackMigration returns a failed migration to stable.
 func (e *Engine) rollbackMigration(slot int32) {
 	_ = e.submit(&Command{Op: OpSlotState, Slots: []int32{slot}, State: SlotStable})
+}
+
+// ---- Abandoned migrations ------------------------------------------------------
+
+// markMigrationInFlight / clearMigrationInFlight track the slots this
+// controller is running StartMigration on. The stage a migration writes
+// (migrating_out) is replicated table state and outlives the call — and the
+// process — that wrote it, so "which migration is mine" cannot be read off the
+// table alone.
+func (e *Engine) markMigrationInFlight(slot int32) {
+	e.migMu.Lock()
+	if e.migrating == nil {
+		e.migrating = map[int32]struct{}{}
+	}
+	e.migrating[slot] = struct{}{}
+	e.migMu.Unlock()
+}
+
+func (e *Engine) clearMigrationInFlight(slot int32) {
+	e.migMu.Lock()
+	delete(e.migrating, slot)
+	e.migMu.Unlock()
+}
+
+func (e *Engine) migrationsInFlight() map[int32]struct{} {
+	e.migMu.Lock()
+	defer e.migMu.Unlock()
+	out := make(map[int32]struct{}, len(e.migrating))
+	for s := range e.migrating {
+		out[s] = struct{}{}
+	}
+	return out
+}
+
+// orphanedMigrations lists the slots abandoned mid-hand-over: their placement
+// is not stable, yet no migration in this process is driving them.
+//
+// A migration's state is written to the replicated table by StartMigration's
+// first step, and only that goroutine ever clears it again (commit or
+// rollback). Lose it and the slot stays non-stable forever: replan_slots
+// deliberately skips non-stable slots, and the leader rebalancer yields to
+// them (layoutSettled) — so the ring layout for every other slot freezes too,
+// and the leadership a failover moved away is never handed back. Observed on a
+// cluster restarted while the rebalancer was mid-hand-over: one slot stuck in
+// migrating_out, the raft log frozen, and one node left leading 958 of 1680
+// slots for good.
+//
+// Nothing can resume such a migration — its progress (snapshot, catch-up,
+// fence) was never persisted — so it is abandoned instead: the slot returns to
+// stable and the ordinary machinery (failover, rebalancer, replan_slots) takes
+// it from there. Pure, so the decision is directly assertable.
+func orphanedMigrations(t *Table, inFlight map[int32]struct{}) []int32 {
+	var out []int32
+	for s, p := range t.Slots {
+		if p.State == SlotStable {
+			continue
+		}
+		if _, mine := inFlight[s]; mine {
+			continue
+		}
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// reconcileOrphanMigrations abandons the migrations whose controller is gone.
+// Runs in the controller round (leader only), so exactly one node ever does it,
+// and it is idempotent: the slots it clears are stable from then on.
+func (e *Engine) reconcileOrphanMigrations() {
+	slots := orphanedMigrations(e.TableSnapshot(), e.migrationsInFlight())
+	if len(slots) == 0 {
+		return
+	}
+	e.logger.WithField("slots", slots).Warn("abandoned slot migrations (their controller is gone): returning the slots to stable")
+	if err := e.submit(&Command{Op: OpSlotState, Slots: slots, State: SlotStable}); err != nil {
+		e.logger.WithError(err).WithField("slots", slots).
+			Warn("abandoned slot migrations: could not return the slots to stable; retried next round")
+	}
 }
 
 // remoteLEO asks a peer for its LEO of a slot over the peer plane.

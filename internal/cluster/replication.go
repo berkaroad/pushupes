@@ -122,6 +122,14 @@ type Engine struct {
 	dropGen      uint64
 	pendingDrops map[int32]pendingDrop
 	replicaOf    map[int32]bool
+
+	// The slots THIS controller is driving through StartMigration right now.
+	// The controller round uses it to tell a migration it owns from one a
+	// controller that is gone left staged: a slot's migrating_out state is
+	// replicated and outlives the goroutine that staged it, so without this
+	// the orphan is never revisited. See reconcileOrphanMigrations.
+	migMu     sync.Mutex
+	migrating map[int32]struct{}
 }
 
 // slotRepl tracks follower LEOs and the high watermark for one slot's
@@ -230,6 +238,7 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *logrus.Ent
 		ledPrev:     map[int32]bool{},
 		fenceSet:    map[int32]bool{},
 		diverged:    map[int32]string{},
+		migrating:   map[int32]struct{}{},
 		// post-migration cleanup: the former source keeps its copy for this
 		// long once it sees the hand-over committed (-drop-after).
 		dropAfter: DefaultDropRetention,
@@ -1995,6 +2004,12 @@ func (e *Engine) RunController(ctx context.Context) {
 			}
 			e.failMu.Unlock()
 		}
+		// 4) abandoned migrations: a controller that dies mid-hand-over leaves
+		// the slot's replicated state in migrating_out with nobody to clear
+		// it. Nothing else revisits a non-stable slot (replan_slots skips it,
+		// the rebalancer yields to it), so the layout would stay frozen for
+		// good. Return the ones this process is not driving to stable.
+		e.reconcileOrphanMigrations()
 	}
 }
 
