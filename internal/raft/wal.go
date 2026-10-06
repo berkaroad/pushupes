@@ -418,19 +418,36 @@ func (w *WAL) Flush() error {
 	return w.Wait(target)
 }
 
+// flushLoop runs the group-commit window as a one-shot timer that exists only
+// while there is work: an append opens the window, the window's expiry closes
+// it with a single fsync over everything buffered meanwhile, and once pending
+// is empty the loop parks on the dirty signal holding no timer at all. An
+// idle WAL therefore never wakes the scheduler — a standing ticker would
+// deliver one netpoll-breaking timer every FlushInterval (5000/s at the
+// default 200µs) whether or not anything was appended, and at rest that alone
+// was most of the process's CPU.
 func (w *WAL) flushLoop() {
 	defer close(w.doneCh)
-	t := time.NewTicker(w.opts.FlushInterval)
-	defer t.Stop()
+	var window *time.Timer
+	var windowC <-chan time.Time
 	for {
 		select {
 		case <-w.dirty:
-		case <-t.C:
+			if window == nil {
+				window = time.NewTimer(w.opts.FlushInterval)
+				windowC = window.C
+			}
+		case <-windowC:
+			window = nil
+			windowC = nil
+			w.flush()
 		case <-w.closeReq:
+			if window != nil {
+				window.Stop()
+			}
 			w.flush()
 			return
 		}
-		w.flush()
 	}
 }
 
