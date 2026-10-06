@@ -302,9 +302,21 @@ func (t *Table) Apply(c *Command) error {
 		p.AdminAddr, p.ClientAddr = c.Peer.AdminAddr, c.Peer.ClientAddr
 		t.Peers[c.Peer.ID] = p
 	case OpLeaveNode:
+		// Purge the node from the directory AND from every placement that
+		// still names it — leader, replica seat and the migration label. A
+		// dangling name is not cosmetic: the slot stays owned by a node the
+		// cluster does not know, and a slot left in migrating_out towards a
+		// removed node never settles (layoutSettled stays false, so the
+		// rebalancer yields to a migration that can never commit).
 		delete(t.Peers, c.NodeID)
 		for _, p := range t.Slots {
 			p.Replicas = removeString(p.Replicas, c.NodeID)
+			if p.MigratingTo == c.NodeID {
+				p.MigratingTo = ""
+				if p.State == SlotMigratingOut || p.State == SlotImportingIn {
+					p.State = SlotStable // the migration's target is gone: abandon it
+				}
+			}
 			if p.Leader == c.NodeID {
 				if len(p.Replicas) > 0 {
 					p.Leader = p.Replicas[0]
@@ -396,6 +408,16 @@ func (t *Table) Apply(c *Command) error {
 			}
 		}
 	case OpLeaderMove:
+		// The new leader must be a directory member. A migration staged
+		// before a leave_node and committed after it would otherwise re-seat
+		// the removed node as the slot's leader — and append it to the
+		// replica set below — leaving a placement that names a node the
+		// directory (and the Raft configuration) no longer holds. That is
+		// exactly how a real cluster ended up with 238 slots led by a node
+		// that had been removed, and with a snapshot no node could restore.
+		if _, ok := t.Peers[c.NewLeader]; !ok {
+			return fmt.Errorf("leader_move: unknown node %q", c.NewLeader)
+		}
 		for _, s := range c.Slots {
 			p, ok := t.Slots[s]
 			if !ok {
@@ -427,6 +449,12 @@ func (t *Table) Apply(c *Command) error {
 		// catch-up steps only work against a node that follows the slot.
 		if c.NodeID == "" {
 			return fmt.Errorf("slot_add_replica: missing node")
+		}
+		// Same invariant as leader_move: only a directory member may be
+		// seated (a staged admission whose target was removed in the
+		// meantime must not re-create a phantom member).
+		if _, ok := t.Peers[c.NodeID]; !ok {
+			return fmt.Errorf("slot_add_replica: unknown node %q", c.NodeID)
 		}
 		for _, s := range c.Slots {
 			p, ok := t.Slots[s]
