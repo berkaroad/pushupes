@@ -42,9 +42,9 @@ func main() {
 		peerAddr   = flag.String("peer", envOr("PUSHUPES_PEER", "http://127.0.0.1:8391"), "Raft transport + peer gRPC listen address: all node-to-node traffic (env PUSHUPES_PEER)")
 		dataDir    = flag.String("data", envOr("PUSHUPES_DATA", "./data"), "data directory (env PUSHUPES_DATA)")
 		peers      = flag.String("peers", envOr("PUSHUPES_PEERS", ""), "comma list (env PUSHUPES_PEERS) of id=http://host:peerport (admin/client addrs are self-registered; legacy id:peerport:adminport:clientport also accepted)")
-		joinAddr   = flag.String("join", envOr("PUSHUPES_JOIN", ""), "peer address of a running cluster's member (host:peerport) for a node joining at runtime: the node offers itself through it on start. Its -peers must still name the initial cluster (the seed); this is how a node that is NOT in that seed joins")
+		joinAddr   = flag.String("join", envOr("PUSHUPES_JOIN", ""), "peer address of one specific cluster member (host:peerport) to offer this node to on start. Optional: a node that does not lead its -peers list joins automatically and offers itself through the configured members in rotation — pass -join to name one instead")
 		adoptTo    = flag.Duration("adopt-interval", envDurationOr("PUSHUPES_ADOPT_INTERVAL", cluster.DefaultAdoptInterval),
-			"how often a node that is not a cluster member yet retries offering itself through -join (env PUSHUPES_ADOPT_INTERVAL)")
+			"how often a node that is not a cluster member yet retries offering itself through the members it was configured with (-join when given, else -peers) (env PUSHUPES_ADOPT_INTERVAL)")
 		// The slot count is a permanent layout decision (routing, placement,
 		// migration granularity), so it is not a runtime knob — it is fixed at
 		// data.DefaultSlotCount. See DESIGN §7.2.
