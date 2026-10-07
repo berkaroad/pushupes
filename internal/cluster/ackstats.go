@@ -165,6 +165,17 @@ type ackDiag struct {
 	waitersNow atomic.Int64  // calls parked in waitForHW right now
 	stalls     atomic.Uint64 // waits that hit the deadline (fail/1005)
 	slots      []slotAck
+
+	// The replication-side terms behind hw_wait, so its residual can be
+	// attributed instead of guessed at:
+	//   reportRTT      follower: the round trip of posting its new positions
+	//   progressHandle leader:   entry of the progress handler -> watermark
+	//                            advanced (the work a report costs the leader)
+	//   wakeLag        leader:   last watermark advance -> the parked call
+	//                            returned (the wake and the scheduling after it)
+	reportRTT      ackHist
+	progressHandle ackHist
+	wakeLag        ackHist
 }
 
 // AckTiming is one step's latency distribution, in milliseconds (the lag
@@ -212,7 +223,14 @@ type AckView struct {
 	HwStalls     uint64    `json:"hw_stalls"`
 	HwLagRecords AckTiming `json:"hw_lag_records"`
 
-	Worst []AckSlotView `json:"worst,omitempty"`
+	// The pieces hw_wait is made of (see ackDiag): a follower's report round
+	// trip, what that report costs the leader, and how long a released call
+	// took to actually return after the watermark moved.
+	ReportRTT      AckTiming `json:"report_rtt"`
+	ProgressHandle AckTiming `json:"progress_handle"`
+	WakeLag        AckTiming `json:"wake_lag"`
+
+	Worst []AckSlotView `json:"worst"`
 }
 
 // AckStats snapshots the ack chain.
@@ -244,6 +262,10 @@ func (e *Engine) AckStatsTop(worstN int) AckView {
 		WaitersNow:   d.waitersNow.Load(),
 		HwStalls:     d.stalls.Load(),
 		HwLagRecords: d.lag.view(),
+
+		ReportRTT:      d.reportRTT.view(),
+		ProgressHandle: d.progressHandle.view(),
+		WakeLag:        d.wakeLag.view(),
 	}
 
 	if worstN <= 0 {

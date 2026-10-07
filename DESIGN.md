@@ -940,6 +940,10 @@ waiters_now=0  hw_stalls=0  水位落后(条) p50=0 p99=1 max=3
 也没有撞过 10s 截止。反过来，如果 p99 高而 `hw_wait` 低，嫌疑就在客户端/重定向；
 如果 `hw_stalls` 上升，看 `repl` 段的每副本上报新鲜度与 LEO 落后。
 
+`hw_wait` 还可以再拆：`report_rtt`（副本上报自己新位置的往返，副本侧测）、
+`progress_handle`（leader 处理该上报到水位推进的耗时）、`wake_lag`（水位推进到被唤醒的调用真正
+返回之间的时间）——三者都很小 ⇒ 残余就是「数据送到副本 + 副本落盘」这一段本身，不是上报或唤醒。
+
 `fail` 进一步按原因拆分（`fail_hw_timeout` / `fail_version_conflict` / `fail_other`），
 因为「有写入失败」只有分清「复制没跟上」还是「客户端请求本身不合规」才可行动：实测
 那 186 例失败全部是 `version_conflict`（业务规则 1001），`fail_hw_timeout` 为 0。

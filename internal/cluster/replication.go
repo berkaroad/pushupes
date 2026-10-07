@@ -1159,9 +1159,11 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 		e.replMu.Lock()
 		sr := e.repl[slot]
 		hw := uint64(0)
+		var hwAt time.Time
 		inSync := false
 		if sr != nil {
 			hw = sr.hw
+			hwAt = sr.hwAt
 			cutoff := time.Now().Add(-isrStaleAfter)
 			for i, node := range sr.node {
 				if !sr.lastOK[i].After(cutoff) {
@@ -1197,6 +1199,12 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 			hw = e.store.LastSeqOf(slot)
 		}
 		if hw >= seq {
+			// Only a watermark that came from a replica report says anything
+			// about the wake path; the no-ISR fallback takes the leader's own
+			// log and its stamp would be meaningless here.
+			if inSync && !hwAt.IsZero() {
+				e.ack.wakeLag.observe(time.Since(hwAt))
+			}
 			return hw, nil
 		}
 		if time.Now().After(deadline) {
@@ -2835,7 +2843,11 @@ func (e *Engine) reportProgress(addr string, slots []int32, froms []uint64, stam
 	e.diag.reportsSent.Add(1)
 	e.diag.reportsSlots.Add(uint64(len(slots)))
 	e.diag.lastReportNS.Store(time.Now().UnixNano())
+	t0 := time.Now()
 	_ = e.peerProgress(ctx, addr, e.self, slots, froms, stamp)
+	// The follower's half of the acknowledgement hop: how long posting the new
+	// positions takes to come back (see ackDiag.reportRTT).
+	e.ack.reportRTT.observe(time.Since(t0))
 }
 
 // LeaderReplica reports, from this node's placement view and under a single

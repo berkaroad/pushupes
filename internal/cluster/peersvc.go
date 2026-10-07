@@ -119,6 +119,7 @@ func (s *peerServer) MFetch(ctx context.Context, req *pushupesv1.MFetchRequest) 
 }
 
 func (s *peerServer) ReplicaProgress(_ context.Context, req *pushupesv1.ReplicaProgressRequest) (*pushupesv1.ReplicaProgressResponse, error) {
+	t0 := time.Now()
 	prog := progressBatch{follower: req.Follower, stamp: req.Stamp, now: time.Now()}
 	for i, slot := range req.Slots {
 		if i < len(req.FromSeqs) && slot >= 0 && req.FromSeqs[i] > 0 {
@@ -126,6 +127,9 @@ func (s *peerServer) ReplicaProgress(_ context.Context, req *pushupesv1.ReplicaP
 		}
 	}
 	prog.apply(s.e)
+	// The leader's half of the acknowledgement hop: what a follower's report
+	// costs before the parked calls can see the new watermark.
+	s.e.ack.progressHandle.observe(time.Since(t0))
 	return &pushupesv1.ReplicaProgressResponse{}, nil
 }
 

@@ -137,6 +137,19 @@ func TestAdminStatsMergesFlushAndRepl(t *testing.T) {
 			t.Fatalf("flush section missing %q: %v", k, flush)
 		}
 	}
+	// The ack chain is the third section of the merged view: its steps and the
+	// replication-side terms behind them are part of the admin surface.
+	ack, _ := body["ack"].(map[string]any)
+	if ack == nil {
+		t.Fatalf("no ack section in %v", body)
+	}
+	for _, k := range []string{"appends", "calls", "success", "redirects", "fence_route", "wal_land",
+		"hw_wait", "total", "waiters_now", "hw_stalls", "hw_lag_records",
+		"report_rtt", "progress_handle", "wake_lag", "worst"} {
+		if _, ok := ack[k]; !ok {
+			t.Fatalf("ack section missing %q: %v", k, ack)
+		}
+	}
 	repl, _ := body["repl"].(map[string]any)
 	if repl == nil {
 		t.Fatalf("no repl section in %v", body)

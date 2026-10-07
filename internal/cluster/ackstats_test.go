@@ -238,6 +238,15 @@ func TestWaitForHWWakesOnAdvance(t *testing.T) {
 	if w := e.AckStats().WaitersNow; w != 0 {
 		t.Fatalf("waiters_now = %d after the wait returned, want 0", w)
 	}
+	// The release must also be attributed: the call came back after the
+	// watermark moved, so the wake lag has an observation and it is short.
+	v := e.AckStats()
+	if v.WakeLag.P50MS <= 0 {
+		t.Fatalf("wake_lag = %+v, want the release after the advance to be booked", v.WakeLag)
+	}
+	if v.WakeLag.MaxMS > 200 {
+		t.Fatalf("wake_lag max = %v, want a prompt release once the watermark moved", v.WakeLag.MaxMS)
+	}
 }
 
 // TestAckStatsFastPathStaysClean: with the watermark already past the record
