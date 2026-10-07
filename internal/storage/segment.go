@@ -34,11 +34,15 @@ const (
 	WALHeaderLen = 20
 	// indexIntervalB is how sparsely seq -> file offset is remembered in memory
 	// and in the segment's .spx file. It is a seek hint: a lookup lands at the
-	// nearest earlier entry and walks forward, so a coarser interval costs at
-	// most one interval of frames per seek and buys back the memory the fine
-	// 4 KiB grid used to hold (0.33% of the data, 101 MiB of a 439 MiB heap at
-	// 31 GiB).
-	indexIntervalB = int64(1 << 20) // one entry per ~1MiB
+	// nearest earlier entry and walks frames forward, so the interval bounds
+	// how many frames a seek decodes — including the replica-fetch read path,
+	// which seeks from the sparse hint to the slot's tail on every round.
+	//
+	// One entry costs 16 B, so the interval sets what the table holds: one
+	// entry per interval of data, i.e. 16 B per 64 KiB, which is 0.25 B per
+	// 1 KiB record and ~253 MiB on a 1 TiB node. A coarser interval trades
+	// that memory back for a longer walk per seek.
+	indexIntervalB = int64(64 << 10) // one entry per 64KiB
 )
 
 // DefaultSegmentBytes is the 256MiB roll threshold from the design.
