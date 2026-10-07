@@ -512,6 +512,14 @@ func (s *Segment) ScanHeaders(fromSeq uint64, fn func(uint64, data.RecordMeta) b
 // ReadRange returns contiguous byte ranges (for zero-copy fetch/migration)
 // covering records with fromSeq <= seq < untilSeq. total bytes capped by
 // maxBytes (the last record that crosses the cap is skipped, not truncated).
+//
+// The walk runs through the shared window reader: the sparse index entry it
+// starts from can sit a whole indexIntervalB behind fromSeq, and the per-frame
+// form of this walk (a 4-byte pread per record to find the next frame) made
+// every replica fetch pay hundreds to thousands of syscalls on the leader —
+// the dominant cost of the replication path. One window read covers the same
+// frames; the frames before fromSeq are still skipped, just without a syscall
+// each.
 func (s *Segment) ReadRange(fromSeq, untilSeq uint64, maxBytes int64) ([]data.ByteRange, uint64, error) {
 	if s.RecordCnt == 0 {
 		return nil, fromSeq, nil
@@ -522,55 +530,50 @@ func (s *Segment) ReadRange(fromSeq, untilSeq uint64, maxBytes int64) ([]data.By
 	if fromSeq > s.LastSeq {
 		return nil, fromSeq, nil
 	}
-	off := s.indexPos(fromSeq)
-	seq := s.indexSeqAt(off)
+	start := s.indexPos(fromSeq)
+	seq := s.indexSeqAt(start)
 	var ranges []data.ByteRange
 	var total int64
 	next := fromSeq
-	buf := make([]byte, 64<<10)
-	for off < s.sizeBytes {
+	w := newFrameWalkerPooled(s.File, start, s.sizeBytes)
+	defer w.release()
+	for {
+		frame, frameOff, err := w.next()
+		if err == errShortTail || err == errBadRecordLen {
+			break // torn tail: stop at the last complete frame
+		}
+		if err != nil {
+			return ranges, next, err
+		}
 		if untilSeq > 0 && seq >= untilSeq {
 			break
 		}
+		recLen := int64(len(frame))
 		if seq < fromSeq {
-			// sparse index started before fromSeq: skip forward without collecting
-			h := buf[:4]
-			if _, err := s.File.ReadAt(h, off); err != nil {
-				return ranges, next, err
-			}
-			recLen := int64(binary.BigEndian.Uint32(h))
-			if recLen < 30 || off+4+recLen > s.sizeBytes {
-				break
-			}
-			off += 4 + recLen
+			// sparse index started before fromSeq: skip forward without
+			// collecting
 			seq++
 			continue
 		}
-		h := buf[:4]
-		if _, err := s.File.ReadAt(h, off); err != nil {
-			return ranges, next, err
-		}
-		recLen := int64(binary.BigEndian.Uint32(h))
-		if recLen < 30 || off+4+recLen > s.sizeBytes {
-			break // torn tail
-		}
-		if total > 0 && total+4+recLen > maxBytes {
+		if total > 0 && total+recLen > maxBytes {
 			break
 		}
-		if len(ranges) > 0 && ranges[len(ranges)-1].End == off {
-			ranges[len(ranges)-1].End = off + 4 + recLen
+		if len(ranges) > 0 && ranges[len(ranges)-1].End == frameOff {
+			ranges[len(ranges)-1].End = frameOff + recLen
 		} else {
 			ranges = append(ranges, data.ByteRange{
-				Segment: filepath.Base(s.Path), Start: off, End: off + 4 + recLen,
+				Segment: filepath.Base(s.Path), Start: frameOff, End: frameOff + recLen,
 			})
 		}
-		total += 4 + recLen
+		total += recLen
 		next = seq + 1
-		off += 4 + recLen
 		seq++
 		if total >= maxBytes {
 			break
 		}
+	}
+	if w.err != nil {
+		return ranges, next, w.err
 	}
 	return ranges, next, nil
 }
@@ -678,12 +681,36 @@ type frameWalker struct {
 	base int64 // file offset of buf[0]
 	n    int   // valid bytes in buf
 	done int64 // end offset of the last complete frame
+	err  error // first real read error (EOF is not one)
+	// pooled marks buf as coming from frameWindowPool: it must go back
+	// through release when the walk ends.
+	pooled bool
 }
 
 const frameWindow = 1 << 20
 
 func newFrameWalker(f *os.File, from, end int64) *frameWalker {
 	return &frameWalker{f: f, pos: from, end: end, buf: make([]byte, frameWindow), done: from}
+}
+
+// frameWindowPool serves the walker of ReadRange, which runs once per slot per
+// replica-fetch round: a fresh 1MiB window per call there is pure garbage.
+// Only the pooled walker's buffer goes back (release); the startup walks keep
+// their own.
+var frameWindowPool = sync.Pool{New: func() any { return make([]byte, frameWindow) }}
+
+func newFrameWalkerPooled(f *os.File, from, end int64) *frameWalker {
+	w := &frameWalker{f: f, pos: from, end: end, done: from, pooled: true}
+	w.buf = frameWindowPool.Get().([]byte)
+	return w
+}
+
+// release returns the pooled window. The walker is unusable afterwards.
+func (w *frameWalker) release() {
+	if w.pooled {
+		frameWindowPool.Put(w.buf[:frameWindow])
+		w.pooled = false
+	}
 }
 
 // lastComplete is the offset just past the last whole frame seen.
@@ -697,7 +724,13 @@ func (w *frameWalker) refill() bool {
 	if n > 0 {
 		return true
 	}
-	_ = err
+	// A read that returns nothing is the end of the file, except when the
+	// kernel reported a real failure: that one is kept so a caller whose
+	// contract forbids a silent short read can surface it (the recovery walk
+	// treats it as any other stop).
+	if err != nil && !errors.Is(err, io.EOF) && w.err == nil {
+		w.err = err
+	}
 	return false
 }
 
