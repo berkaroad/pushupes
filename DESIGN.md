@@ -159,11 +159,18 @@ Body: Record*，每条记录：
 - **刷盘策略**：flush.policy 可配（每 N 条 / 每 T 毫秒 fsync；默认组提交
   依赖页缓存）。写入确认的是**复制**（ISR 高水位覆盖该 seq），不是逐条
   本地 fsync——持久化边界与刷盘策略挂钩，见 §4。
-- **刷盘路径自视**：一条槽的 fsync 在槽写锁内执行，设备变慢时它就直接
-  落在 append 上；`GET /admin/stats` 的 `flush` 段把这件事变成可读的数字——脏槽数
-  与最老脏槽年龄（对照 `-flush-interval`：稳态就是该间隔量级）、采样时
-  正持锁的槽数（`busy_locked`，即当场在 fsync 而挡着自己的 append）、
-  以及已发出的 fsync 次数/均值/最大值直方图。这台设备上 4K+fdatasync 的
+- **刷盘执行：全局单线程、段级队项**（`internal/storage/flusher.go`）：
+  全存储一个刷盘 goroutine，队列单元是「（槽，段）」并按入队时间老先出；
+  每次 fsync 分三相——锁内快照（`prepareFlushLocked`）→ **锁外** `File.Sync()`
+  逐次计时 → 锁内按快照做减法结算（`settleFlush`，fsync 期间新写入的记录仍
+  算未刷），同时最多一个 fsync 在飞。策略触发（`IntervalMessages`/`Interval`）、
+  封段滚动（封段即入队）与显式 `Flush()`/`Close`（入队 + 等完成）三个入口
+  都收敛到这条队列。
+- **刷盘路径自视**：`GET /admin/stats` 的 `flush` 段给出脏槽数与最老脏槽年龄
+  （对照 `-flush-interval`：稳态就是该间隔量级）、队列长度 `queue_units`、
+  在飞数 `inflight`、排队等待 `fsync_wait_ms{p50,p99,avg,max}` 与 syscall
+  服务时间 `fsync_svc_ms{p50,p99}`、单次覆盖字节 `fsync_bytes_avg/max`——
+  把「等在哪」与「设备多慢」分成两条统计量。这台设备上 4K+fdatasync 的
   参照：盘空闲时 p50 ≈ 2ms、邻租户打满时 ≈ 7ms。
 
 ## 4. 高可用（复制设计）
@@ -482,7 +489,7 @@ GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（�
                                                #   status 读缓存值；storage_bytes_complete=false 表示
                                                #   有 slot leader 没应答，此时该值是下界
 GET  /admin/writes                             # 每槽 durable 计数 + 槽内总字节/事件流数量 + 本节点待清理副本（前端轮询）
-GET  /admin/stats[?worst=N]                    # 两个「等在哪里」自视合一：flush = 脏槽数/最老脏槽年龄/正持锁 fsync 的槽数与待刷条数/fsync 次数与耗时直方图；repl = `hw < LEO` 的槽数与最老等待时长（?worst=N 列出最久的槽）/每副本上报新鲜度与 LEO 落后/fetch 轮次与「按数据唤醒 vs 按等待预算到期」计数
+GET  /admin/stats[?worst=N]                    # 两个「等在哪里」自视合一：flush = 脏槽数/最老脏槽年龄/刷盘队列长度与在飞数/fsync 排队等待与 syscall 服务时间分位/单次覆盖字节；repl = `hw < LEO` 的槽数与最老等待时长（?worst=N 列出最久的槽）/每副本上报新鲜度与 LEO 落后/fetch 轮次与「按数据唤醒 vs 按等待预算到期」计数
 GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本，仅内存索引，不读 WAL）
 POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移（控制器专属，必须发到 Raft leader 的 admin 地址）
 POST /admin/slots/{slot}/remove-replica {node} # 回收副本集里的一个成员（控制器专属，同上）
@@ -850,6 +857,61 @@ max/mean ≤ 1.008），所以均衡不是选 K 的理由，这个不变性才�
   （段数翻倍）。K 的上限是 65535（`SlotOf` 里 `uint16(slotCount)`）。
 
 ---
+
+## 7.3 全局单线程刷盘：实现与实测
+
+机制见 §3：fsync 移出槽写锁，全存储一条段级队列串行执行，写路径只在队尾追加
+一个段项；显式 `Flush()`/`Close` 拿刷盘互斥锁在调用方线程内完成，因此任何路径
+都不必等刷盘 goroutine（这条性质由 `TestFlusherCloseIsIdempotent` 固定：第二次
+`Close()` 必须立刻返回）。
+
+测量口径：`cmd/bench --duration 1m --size 1024 --conns 4 --aggs 10000 --batch 100`。
+**每轮重建数据目录**（1m 级一轮写入 GB 量级，设备回写只有几 MB/s，连跑会测到上
+一轮的脏页），**每轮记录设备探针**（4K pwrite+fdatasync 写/s），每轮开测前断言
+集群成员数与标签一致。前后各 4 轮交错（B A A B B A A B）。
+
+单节点（`bench1`，7191，REPLICAS=1）：
+
+| 轮 | 吞吐 msg/s | p50 | p99 | 设备探针 |
+|---|---|---|---|---|
+| before1 | 58316 | 5.60ms | 20.02ms | 1987 |
+| before2 | 77108 | 4.16ms | 15.62ms | 318 |
+| before3 | 73103 | 4.25ms | 17.68ms | 302 |
+| before4 | 78155 | 4.15ms | 15.48ms | 305 |
+| after1 | 95483 | 3.38ms | 11.57ms | 1458 |
+| after2 | 97962 | 3.25ms | 15.85ms | 1533 |
+| after3 | 99435 | 3.12ms | 14.78ms | 1348 |
+| after4 | 93233 | 3.00ms | 17.68ms | 318 |
+
+均值 71670 → **96528 msg/s（+34.7%）**，p50 4.54 → **3.19ms（−29.8%）**，
+p99 17.20 → **14.97ms（−13.0%）**；4 个 after 轮全部高于 4 个 before 轮，
+且设备最差的 after 轮（318 写/s）仍高于设备最好的 before 轮（1987 写/s），
+说明差值不是设备侧波动给的。p99 ≤ 30ms 目标两版均达标（各 4/4）。
+
+3 节点（`bench3`，7091，REPLICAS=3）：
+
+| 轮 | 吞吐 msg/s | p50 | p99 | 设备探针 |
+|---|---|---|---|---|
+| before1 | 14476 | 24.46ms | 91.20ms | 1478 |
+| before2 | 16368 | 21.82ms | 77.55ms | 1434 |
+| before3 | 16523 | 21.87ms | 69.82ms | 1400 |
+| before4 | 17249 | 21.49ms | 55.76ms | 1664 |
+| after1 | 17096 | 21.58ms | 56.82ms | 1643 |
+| after2 | 20375 | 17.24ms | 52.48ms | 1386 |
+| after3 | 20238 | 17.31ms | 69.88ms | 1386 |
+| after4 | 20722 | 17.18ms | 48.07ms | 1290 |
+
+均值 16154 → **19608 msg/s（+23.5%）**，p50 22.41 → **18.33ms（−18.2%）**，
+p99 73.58 → **56.81ms（−22.8%）**；after 侧设备探针均值（1426 写/s）不高于
+before 侧（1494 写/s）。3 节点的 ack 延迟由复制那一跳（副本取数 → apply →
+上报 → 水位推进）主导，刷盘只占其中一小段，所以收益小于单节点；
+**p99 ≤ 30ms 在两版都不达标**（48~70ms），达标要另做复制跳的延迟专项。
+
+**没有变化的东西**：协议、存储格式（新增仅 `Segment.syncedSize` 内存字段）、
+`-flush-interval`/`IntervalMessages` 的触发语义、`cmd/bench`、写入确认语义
+（leader 等 ISR 高水位覆盖该 seq）都未改动；Raft WAL 的 fsync 未并入本次改造；
+段索引文件（`segidx`/`segcidx`/`segaidx`）在封段与关闭时各一次 fsync 的频率
+≈ 段滚动，仍未并入。
 
 ## 11. 控制面共识层（自研 Raft 设计）
 

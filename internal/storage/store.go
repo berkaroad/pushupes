@@ -22,8 +22,6 @@ type Store struct {
 
 	slots []atomic.Pointer[Slot] // lock-free reads; mu guards lazy open/reload
 	mu    sync.RWMutex
-	stop  chan struct{}
-	done  chan struct{}
 
 	// dirtyMu guards the set of slots with unflushed records; flushLoop
 	// consults only this set, so an idle node costs O(active) lock
@@ -34,19 +32,9 @@ type Store struct {
 	// oldest entry is how long a record has been sitting unflushed — the
 	// number that says whether the flush loop is keeping up.
 	dirtySince map[int32]time.Time
-	// flushStats book what the periodic fsyncs cost. A flush holds the slot's
-	// write lock across its fsync (see Slot.flushSegments), so a slow disk
-	// lands directly on appends; without these counters that showed up only
-	// as client-side latency on an otherwise idle-looking node.
-	fsyncCount  atomic.Uint64
-	fsyncNs     atomic.Uint64
-	fsyncMaxNs  atomic.Uint64
-	fsyncBucket [fsyncBuckets]atomic.Uint64
-	// flushKick wakes flushLoop when the dirty set gained a slot (its policy
-	// deadline must now be armed) or a slot crossed its record-count threshold
-	// (that append, not the clock, closed the policy). With an empty dirty set
-	// the loop parks holding no timer: an idle store costs zero wakeups.
-	flushKick chan struct{}
+	// flusher owns every segment fsync: one goroutine, one fsync in flight at
+	// a time, with no slot write lock held across the syscall (see flusher.go).
+	flusher *flusher
 
 	// wakeBus is the store-wide advance signal: every slot's
 	// advanceNotifyLocked closes the current bus handle and installs a
@@ -93,11 +81,9 @@ func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushP
 		writes:       make([]atomic.Uint64, slotCount),
 		dirty:        map[int32]bool{},
 		dirtySince:   map[int32]time.Time{},
-		flushKick:    make(chan struct{}, 1),
-		stop:         make(chan struct{}),
-		done:         make(chan struct{}),
 		wakeBus:      make(chan struct{}),
 	}
+	st.flusher = newFlusher(st)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -150,7 +136,7 @@ func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushP
 	if openErr != nil {
 		return nil, openErr
 	}
-	go st.flushLoop()
+	go st.flusher.run()
 	return st, nil
 }
 
@@ -352,14 +338,9 @@ func (st *Store) markDirty(slotID int32) {
 	}
 }
 
-// kickFlush nudges flushLoop to re-evaluate the policy sweep; the signal
-// coalesces (cap 1) because the loop recomputes everything from the dirty set.
-func (st *Store) kickFlush() {
-	select {
-	case st.flushKick <- struct{}{}:
-	default:
-	}
-}
+// kickFlush nudges the flusher to re-evaluate the flush policy; the signal
+// channel's buffer keeps a burst to one wakeup.
+func (st *Store) kickFlush() { st.flusher.kick() }
 
 func (st *Store) clearDirty(slotID int32) {
 	st.dirtyMu.Lock()
@@ -392,11 +373,25 @@ type FlushStats struct {
 	FsyncAvgMS      float64  `json:"fsync_avg_ms"`
 	FsyncMaxMS      float64  `json:"fsync_max_ms"`
 	FsyncBuckets    []uint64 `json:"fsync_buckets_ms"`
+
+	// The flusher's own view (flusher.go). Previous accounts could not tell a
+	// slow device from a long queue: fsync_wait_ms is the time a unit spent in
+	// the queue before its syscall, fsync_svc_ms is the syscall itself, and
+	// inflight is 0 or 1 by construction (the single-fsync invariant).
+	QueueUnits     int     `json:"queue_units"`
+	Inflight       int64   `json:"inflight"`
+	FsyncWaitAvgMS float64 `json:"fsync_wait_avg_ms"`
+	FsyncWaitMaxMS float64 `json:"fsync_wait_max_ms"`
+	FsyncWaitP50MS float64 `json:"fsync_wait_p50_ms"`
+	FsyncWaitP99MS float64 `json:"fsync_wait_p99_ms"`
+	FsyncSvcP50MS  float64 `json:"fsync_svc_p50_ms"`
+	FsyncSvcP99MS  float64 `json:"fsync_svc_p99_ms"`
+	FsyncBytesAvg  float64 `json:"fsync_bytes_avg"`
+	FsyncBytesMax  uint64  `json:"fsync_bytes_max"`
 }
 
 // FlushStats snapshots the flush path. It never waits on a slot: a slot whose
-// write lock is held (one that is fsyncing right now, and therefore blocking
-// its own appends) is counted as busy instead — that count is the point.
+// write lock is held right now is counted as busy instead of being sampled.
 func (st *Store) FlushStats() FlushStats {
 	var out FlushStats
 	st.dirtyMu.Lock()
@@ -428,35 +423,18 @@ func (st *Store) FlushStats() FlushStats {
 		out.Sampled++
 		s.mu.Unlock()
 	}
-	out.FsyncCount = st.fsyncCount.Load()
-	if out.FsyncCount > 0 {
-		out.FsyncAvgMS = float64(st.fsyncNs.Load()) / float64(out.FsyncCount) / 1e6
-		out.FsyncMaxMS = float64(st.fsyncMaxNs.Load()) / 1e6
-	}
-	out.FsyncBuckets = make([]uint64, fsyncBuckets)
-	for i := range out.FsyncBuckets {
-		out.FsyncBuckets[i] = st.fsyncBucket[i].Load()
-	}
+	d := st.flusher.digest()
+	out.FsyncCount = d.count
+	out.FsyncAvgMS = d.svcAvgMS
+	out.FsyncMaxMS = d.svcMaxMS
+	out.FsyncBuckets = d.svcBucket
+	out.QueueUnits = d.queueUnits
+	out.Inflight = d.inflight
+	out.FsyncWaitAvgMS, out.FsyncWaitMaxMS = d.waitAvgMS, d.waitMaxMS
+	out.FsyncWaitP50MS, out.FsyncWaitP99MS = d.waitP50MS, d.waitP99MS
+	out.FsyncSvcP50MS, out.FsyncSvcP99MS = d.svcP50MS, d.svcP99MS
+	out.FsyncBytesAvg, out.FsyncBytesMax = d.bytesAvg, d.bytesMax
 	return out
-}
-
-// recordFsync books one slot fsync: what it cost and which bucket it fell in.
-func (st *Store) recordFsync(d time.Duration) {
-	ns := uint64(d)
-	st.fsyncCount.Add(1)
-	st.fsyncNs.Add(ns)
-	for {
-		old := st.fsyncMaxNs.Load()
-		if ns <= old || st.fsyncMaxNs.CompareAndSwap(old, ns) {
-			break
-		}
-	}
-	ms := float64(ns) / 1e6
-	i := 0
-	for i < fsyncBuckets-1 && ms >= fsyncBucketBoundsMs[i] {
-		i++
-	}
-	st.fsyncBucket[i].Add(1)
 }
 
 // WriteCount returns the number of records made durable in one slot since
@@ -688,80 +666,14 @@ func (st *Store) Flush() error {
 	return nil
 }
 
-func (st *Store) flushLoop() {
-	defer close(st.done)
-	// The sweep is armed only while some dirty slot has an interval-policy
-	// deadline ahead of it, and a slot that crossed its record-count threshold
-	// (or just joined the dirty set) kicks the loop. With no dirty slots the
-	// loop parks holding no timer at all: an idle store costs zero wakeups —
-	// a standing 1s ticker delivered one per second per node forever.
-	var sweep *time.Timer
-	var sweepC <-chan time.Time
-	rearm := func(now time.Time) {
-		var next time.Time
-		st.dirtyMu.Lock()
-		ids := make([]int32, 0, len(st.dirty))
-		for id := range st.dirty {
-			ids = append(ids, id)
-		}
-		st.dirtyMu.Unlock()
-		for _, id := range ids {
-			s := st.slots[id].Load()
-			if s == nil {
-				st.clearDirty(id)
-				continue
-			}
-			if _, pending := s.FlushDue(now); !pending && !s.HasPending() {
-				// double-check closes the window where a concurrent append
-				// marked the slot dirty during FlushDue; that append lands in
-				// the dirty set and kicks the loop, so nothing slips.
-				st.clearDirty(id)
-			}
-			if d := s.DueAt(now); !d.IsZero() && (next.IsZero() || d.Before(next)) {
-				next = d
-			}
-		}
-		if next.IsZero() {
-			if sweep != nil {
-				sweep.Stop()
-				sweep = nil
-				sweepC = nil
-			}
-			return
-		}
-		if sweep == nil {
-			sweep = time.NewTimer(time.Until(next))
-			sweepC = sweep.C
-		} else {
-			if !sweep.Stop() {
-				select {
-				case <-sweep.C:
-				default:
-				}
-			}
-			sweep.Reset(time.Until(next))
-		}
-	}
-	rearm(time.Now())
-	for {
-		select {
-		case <-st.stop:
-			return
-		case <-st.flushKick:
-			rearm(time.Now())
-		case <-sweepC:
-			sweep = nil
-			sweepC = nil
-			rearm(time.Now())
-		}
-	}
-}
-
-// Close stops the flush loop and flushes everything.
+// Close makes every loaded slot durable and stops the flusher. The final fsyncs
+// run on the flusher goroutine like every other one, so they drain before the
+// loop exits. Close is idempotent: a second call re-drains inline (the loop is
+// already retired) rather than queueing work for a barrier nothing would reach.
 func (st *Store) Close() error {
-	close(st.stop)
-	<-st.done
-	return st.Flush()
+	err := st.Flush()     // through the flusher, or inline once it is retired
+	st.flusher.shutdown() // idempotent: drain the queue, then retire the loop
+	return err
 }
 
 // SlotDigest answers the same summary for a slot id, opening nothing: an

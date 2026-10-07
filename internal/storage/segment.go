@@ -104,6 +104,9 @@ type Segment struct {
 
 	unflushed     int64
 	lastFlushTime time.Time
+	// syncedSize is the file size covered by the last completed fsync:
+	// sizeBytes > syncedSize is exactly "this segment owes an fsync".
+	syncedSize int64
 
 	scatterBuf   []byte   // scratch for EncodeScatter headers
 	scatterParts [][]byte // reusable segment list handed to pwritev
@@ -166,6 +169,7 @@ func CreateSegment(dir string, slotID int32, baseSeq uint64) (*Segment, error) {
 		File:          f,
 		dataStart:     WALHeaderLen,
 		sizeBytes:     WALHeaderLen,
+		syncedSize:    WALHeaderLen,
 		writable:      true,
 		lastFlushTime: time.Now(),
 	}
@@ -384,6 +388,7 @@ func (s *Segment) Flush() error {
 		s.idx.flushSparse()
 	}
 	s.unflushed = 0
+	s.syncedSize = s.sizeBytes
 	s.lastFlushTime = time.Now()
 	return nil
 }

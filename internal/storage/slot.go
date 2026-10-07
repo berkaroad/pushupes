@@ -402,9 +402,10 @@ func (s *Slot) tail() (*Segment, error) {
 	seg := s.segments[len(s.segments)-1]
 	if seg.SizeBytes() >= s.segmentBytes {
 		seg.Seal()
-		if err := seg.Flush(); err != nil {
-			return nil, err
-		}
+		// The sealed segment's data goes to the store's flusher: its fsync runs
+		// on that goroutine with no slot lock held, so a slow device no longer
+		// blocks the roll (or this slot's appends) behind it.
+		s.enqueueSealedLocked(seg)
 		// The sealed segment's index is complete: make it durable and stop.
 		if err := seg.indexFlushAndClose(); err != nil {
 			return nil, err
@@ -1136,20 +1137,39 @@ func (s *Slot) SealedSegments() []*Segment {
 	return out
 }
 
-// Flush fsyncs all segments.
-func (s *Slot) Flush() error {
+// flushInline runs this slot's fsync on the calling goroutine: the path for a
+// bare Slot (no store around it) and for a store whose flusher has already been
+// retired, where queueing work would mean waiting for a loop that is gone.
+func (s *Slot) flushInline() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.flushSegments(); err != nil {
+	if err := s.flushInlineLocked(); err != nil {
 		return err
 	}
 	s.markFlushedLocked()
 	return nil
 }
 
+// Flush makes this slot's outstanding records durable now. It runs on the
+// store's flusher goroutine (one fsync at a time, no slot lock held) and this
+// call waits for it to settle.
+func (s *Slot) Flush() error {
+	if f := s.flusher(); f != nil {
+		return f.flushSlotNow(s)
+	}
+	return s.flushInline()
+}
+
+// flusher is the store's single fsync owner, or nil for a bare Slot.
+func (s *Slot) flusher() *flusher {
+	if s.store == nil {
+		return nil
+	}
+	return s.store.flusher
+}
+
 // markFlushedLocked records that the slot holds nothing unflushed: the pending
-// counter resets and the store drops the slot's dirty mark, so the flush-stats
-// view cannot show a slot as waiting after its records are durable.
+// counter resets and the store drops the slot's dirty mark.
 // Caller holds s.mu for writing.
 func (s *Slot) markFlushedLocked() {
 	s.pendingFlush = 0
@@ -1159,48 +1179,141 @@ func (s *Slot) markFlushedLocked() {
 	}
 }
 
-// flushSegments fsyncs every segment of this slot and books the cost. The
-// caller holds s.mu for writing, so this fsync blocks the slot's appends: that
-// is how a slow disk reaches writers, and why the cost is recorded.
-func (s *Slot) flushSegments() error {
-	t0 := time.Now()
+// syncAllLocked fsyncs every segment of this slot inline. It is the path for a
+// bare Slot and for the flusher's own drain; the flusher's normal path takes a
+// snapshot under this lock and runs the syscalls with no lock held (see
+// prepareFlushLocked / settleFlush).
+// Caller holds s.mu for writing.
+func (s *Slot) flushInlineLocked() error {
 	for _, seg := range s.segments {
 		if err := seg.Flush(); err != nil {
 			return err
 		}
 	}
-	if s.store != nil {
-		s.store.recordFsync(time.Since(t0))
-	}
 	return nil
 }
 
-// FlushDue fsyncs if the flush policy is satisfied. It reports (flushed,
-// stillPending): a slot that holds unflushed records but has not reached its
-// policy yet stays pending so the store keeps revisiting it.
-func (s *Slot) FlushDue(now time.Time) (bool, bool) {
+// prepareFlushLocked decides this slot's flush policy and, when it fires (or
+// when force is set), snapshots its outstanding segments as fsync units for the
+// store's flusher. The syscalls happen later, on the flusher goroutine, with no
+// slot lock held.
+//
+// It returns the units, the next policy deadline (zero when the policy has no
+// interval clause), and whether anything was handed over. It deliberately does
+// not reset the counters it snapshots: settleFlush subtracts them once the
+// syscall is done, so records appended while the fsync is in flight stay
+// counted and are covered by the next round.
+//
+// Caller holds s.mu for writing.
+func (s *Slot) prepareFlushLocked(now time.Time, force bool) ([]*flushUnit, time.Time, bool) {
+	if s.flusher() == nil {
+		return nil, time.Time{}, false
+	}
+	var due time.Time
+	if s.pendingFlush > 0 && s.flush.Interval > 0 {
+		due = s.lastFlush.Add(s.flush.Interval)
+	}
+	fired := force
+	if !fired && s.pendingFlush > 0 {
+		if s.flush.IntervalMessages > 0 && s.pendingFlush >= s.flush.IntervalMessages {
+			fired = true
+		}
+		if !fired && !due.IsZero() && !due.After(now) {
+			fired = true
+		}
+	}
+	if !fired {
+		return nil, due, false
+	}
+	var units []*flushUnit
+	for _, seg := range s.segments {
+		if seg.File == nil || seg.sizeBytes <= seg.syncedSize {
+			continue // nothing outstanding in this segment
+		}
+		units = append(units, &flushUnit{
+			slot: s.ID,
+			seg:  seg,
+			file: seg.File, // handle snapshot: the file stays open while queued (detach waits first)
+			size: seg.sizeBytes,
+			recs: seg.unflushed,
+			enq:  now,
+		})
+	}
+	// Push the index buffers out while the lock is already held: those are
+	// buffered writes (no fsync) and the index may lag the WAL, so they ride
+	// the prepare rather than the syscall.
+	for _, seg := range s.segments {
+		if seg.idx != nil {
+			seg.idx.flushBlock()
+			seg.idx.flushSparse()
+		}
+	}
+	return units, due, true
+}
+
+// enqueueSealedLocked hands one just-sealed segment to the store's flusher. A
+// segment already covered by an earlier fsync owes nothing and queues nothing.
+// Caller holds s.mu for writing.
+func (s *Slot) enqueueSealedLocked(seg *Segment) {
+	if f := s.flusher(); f != nil {
+		f.enqueueSealed(s, seg)
+	}
+}
+
+// settleFlush books one finished unit: the counters it snapshotted are
+// subtracted here, under the lock, so a concurrent append during the syscall
+// keeps its own record counted. Caller (the flusher) holds no other lock.
+func (s *Slot) settleFlush(u *flushUnit, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.pendingFlush == 0 {
-		return false, false
+	if err != nil {
+		return // leave the counters standing: the policy will retry
 	}
-	if s.flush.IntervalMessages > 0 && s.pendingFlush >= s.flush.IntervalMessages {
-		_ = s.flushAll()
-		return true, false
+	seg := u.seg
+	if u.size > seg.syncedSize {
+		seg.syncedSize = u.size
 	}
-	if s.flush.Interval > 0 && now.Sub(s.lastFlush) >= s.flush.Interval {
-		_ = s.flushAll()
-		return true, false
+	seg.unflushed -= u.recs
+	if seg.unflushed < 0 {
+		seg.unflushed = 0
 	}
-	return false, true
+	seg.lastFlushTime = time.Now()
+	s.pendingFlush -= u.recs
+	if s.pendingFlush <= 0 {
+		s.markFlushedLocked()
+		return
+	}
+	s.lastFlush = time.Now()
 }
 
-func (s *Slot) flushAll() error {
-	if err := s.flushSegments(); err != nil {
-		return err
+// FlushDue applies the flush policy through the store's flusher. It reports
+// (flushed, stillPending): a slot that holds unflushed records but has not
+// reached its policy yet stays pending so the store keeps revisiting it.
+func (s *Slot) FlushDue(now time.Time) (bool, bool) {
+	s.mu.Lock()
+	pending := s.pendingFlush > 0
+	intervalDue := pending && s.flush.Interval > 0 && !s.lastFlush.Add(s.flush.Interval).After(now)
+	countDue := pending && s.flush.IntervalMessages > 0 && s.pendingFlush >= s.flush.IntervalMessages
+	s.mu.Unlock()
+	if !pending {
+		return false, false
+	}
+	if !intervalDue && !countDue {
+		return false, true
+	}
+	if f := s.flusher(); f != nil {
+		if err := f.flushSlotNow(s); err != nil {
+			return true, true
+		}
+		return true, s.HasPending()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.flushInlineLocked(); err != nil {
+		return true, true
 	}
 	s.markFlushedLocked()
-	return nil
+	return true, false
 }
 
 // TotalSize is the bytes occupied by the slot WAL.
@@ -1271,15 +1384,17 @@ func (s *Slot) SegmentFile(name string) *Segment {
 	return nil
 }
 
-// Close flushes and releases the slot.
+// Close releases the slot. It detaches the slot from the flusher first: no unit
+// of it stays queued, and no fsync of it is in flight, before the segment files
+// are closed (a queued syscall must never land on a closed handle).
 func (s *Slot) Close() error {
+	if f := s.flusher(); f != nil {
+		f.detach(s.ID)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var firstErr error
 	for _, seg := range s.segments {
-		if err := seg.Flush(); err != nil && firstErr == nil {
-			firstErr = err
-		}
 		if err := seg.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -1289,6 +1404,9 @@ func (s *Slot) Close() error {
 
 // Drop removes the slot's WAL files (source side after migration commit).
 func (s *Slot) Drop() error {
+	if f := s.flusher(); f != nil {
+		f.detach(s.ID)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, seg := range s.segments {
