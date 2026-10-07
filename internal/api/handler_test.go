@@ -106,3 +106,61 @@ func TestAdminWriteHandlersRefuseWithoutController(t *testing.T) {
 		}
 	}
 }
+
+// TestAdminStatsMergesFlushAndRepl pins the merged diagnostics endpoint: one
+// read answers both sub-systems' views with their own numbers, ?worst=N is
+// accepted, and the two endpoints it replaced are gone.
+func TestAdminStatsMergesFlushAndRepl(t *testing.T) {
+	st, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	srv := New(cluster.NewEngine(nil, st, "node-9", nil), st)
+
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/admin/stats?worst=4", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d (%s)", rr.Code, rr.Body.String())
+	}
+	body := decodeBody(t, rr)
+	if body["node"] != "node-9" {
+		t.Fatalf("node = %v, want node-9", body["node"])
+	}
+	flush, _ := body["flush"].(map[string]any)
+	if flush == nil {
+		t.Fatalf("no flush section in %v", body)
+	}
+	for _, k := range []string{"dirty", "oldest_dirty_age_s", "busy_locked", "fsync_count", "fsync_buckets_ms"} {
+		if _, ok := flush[k]; !ok {
+			t.Fatalf("flush section missing %q: %v", k, flush)
+		}
+	}
+	repl, _ := body["repl"].(map[string]any)
+	if repl == nil {
+		t.Fatalf("no repl section in %v", body)
+	}
+	for _, k := range []string{"node", "tracked_slots", "stuck_slots", "stuck_oldest_age_s", "peers", "mfetch", "fetch"} {
+		if _, ok := repl[k]; !ok {
+			t.Fatalf("repl section missing %q: %v", k, repl)
+		}
+	}
+	mfetch, _ := repl["mfetch"].(map[string]any)
+	if mfetch == nil {
+		t.Fatalf("no mfetch section: %v", repl)
+	}
+	for _, k := range []string{"rounds", "parked_rounds", "ended_by_wake", "ended_by_deadline", "parked_now"} {
+		if _, ok := mfetch[k]; !ok {
+			t.Fatalf("mfetch section missing %q: %v", k, mfetch)
+		}
+	}
+
+	// The split endpoints are gone; /admin/stats is the one view.
+	for _, p := range []string{"/admin/flushstats", "/admin/replstats"} {
+		rr := httptest.NewRecorder()
+		srv.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, p, nil))
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("%s: status = %d, want 404 (merged into /admin/stats)", p, rr.Code)
+		}
+	}
+}

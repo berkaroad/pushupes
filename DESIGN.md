@@ -159,6 +159,12 @@ Body: Record*，每条记录：
 - **刷盘策略**：flush.policy 可配（每 N 条 / 每 T 毫秒 fsync；默认组提交
   依赖页缓存）。写入确认的是**复制**（ISR 高水位覆盖该 seq），不是逐条
   本地 fsync——持久化边界与刷盘策略挂钩，见 §4。
+- **刷盘路径自视**：一条槽的 fsync 在槽写锁内执行，设备变慢时它就直接
+  落在 append 上；`GET /admin/stats` 的 `flush` 段把这件事变成可读的数字——脏槽数
+  与最老脏槽年龄（对照 `-flush-interval`：稳态就是该间隔量级）、采样时
+  正持锁的槽数（`busy_locked`，即当场在 fsync 而挡着自己的 append）、
+  以及已发出的 fsync 次数/均值/最大值直方图。这台设备上 4K+fdatasync 的
+  参照：盘空闲时 p50 ≈ 2ms、邻租户打满时 ≈ 7ms。
 
 ## 4. 高可用（复制设计）
 
@@ -232,6 +238,27 @@ Body: Record*，每条记录：
     （连接已断，`goneSess`）；(3) 已被 controller 判定离线（`mark_down`）的副本。
     这三类都是\"正在被搬运/拉取的额外副本或已不可达的副本\"，等它追平到 leader LEO
     或重新上报那一刻起才按普通 ISR 成员参与把关（`isr` 视图同样把它们排除在外）；
+    **复制面自视**（`GET /admin/stats` 的 `repl` 段，`?worst=N` 列出最久的槽）：把「客户端在等高水位」
+    这一状态直接读出来——本节点所领槽里 `hw < LEO` 的**槽数**、最大缺口、
+    最老缺口的**持续时长**（`slotRepl.hwAt` 记录 hw 上次推进时刻，于是它就是
+    「这些 append 已经等了多久」），`?worst=N` 直接点名等得最久的 N 个槽；
+    另有每副本的上报新鲜度与 LEO 落后、以及 leader 侧 fetch 轮的收尾方式
+    （`ended_by_wake` = 被新记录唤醒收尾，`ended_by_deadline` = 长轮询等待预算
+    到期才收尾）。发病时节点看起来是空闲的（无读在飞、无 handler 在等、CPU 接近 0），
+    所以这几项是唯一能把「健康」与「被等待预算牵着走」分开的量。
+    **一轮的写形状**：一轮的 items 是不同槽，**按槽并行写**（worker 数 =
+    2×`GOMAXPROCS(0)`，`GOMAXPROCS(0)` 是本进程可用核数——容器里反映配额而非宿主核数，
+    与 store 开槽 worker 同一口径；每槽内仍逐条按 seq 写，每条记录一次 durable 写），
+    items 少于 `GOMAXPROCS(0)` 时走串行；一轮落地后把这一轮的槽位**一次性上报**
+    （ReplicaProgress，带轮末标记）。
+    依据：设备对并发写者的服务能力远高于单写者（4K pwrite+fdatasync 实测：1 写者 222 写/s、
+    2 写者 388、4 写者 818、8 写者 1430），而串行写一轮时整轮的耗时就是各记录写耗时的**和**，
+    于是「设备变慢」被整轮放大成「水位推进慢 ⇒ 确认慢」。同一套对照组实测（副本落后 +
+    自造磁盘占用，冷启动，conns=1/batch=100、conns=8/batch=20/100 三格）：串行 237/379/318
+    msg/s ⇒ 并行 5737/15049/5840，隐含每记录成本 6.33/3.96/4.72ms ⇒ 0.26/0.10/0.26ms。
+    对照实验同时排除了「把上报拆成轮内多波」这条路：单独改上报（串行 apply + 轮内多波）
+    与基线等价（233/248/231），叠在并行之上也无增益——一批的确认等的是这批里最后一条
+    记录所在槽的 apply，而那条上报只能在它 apply 之后发出，提前上报无法缩短它。
     等待高水位
     超过 10s 返回 `fail/1005`，此时记录已在 leader WAL 落定——客户端应带同一
     command_id 重试，命中 `exists` 即确认。
@@ -455,6 +482,7 @@ GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（�
                                                #   status 读缓存值；storage_bytes_complete=false 表示
                                                #   有 slot leader 没应答，此时该值是下界
 GET  /admin/writes                             # 每槽 durable 计数 + 槽内总字节/事件流数量 + 本节点待清理副本（前端轮询）
+GET  /admin/stats[?worst=N]                    # 两个「等在哪里」自视合一：flush = 脏槽数/最老脏槽年龄/正持锁 fsync 的槽数与待刷条数/fsync 次数与耗时直方图；repl = `hw < LEO` 的槽数与最老等待时长（?worst=N 列出最久的槽）/每副本上报新鲜度与 LEO 落后/fetch 轮次与「按数据唤醒 vs 按等待预算到期」计数
 GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本，仅内存索引，不读 WAL）
 POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移（控制器专属，必须发到 Raft leader 的 admin 地址）
 POST /admin/slots/{slot}/remove-replica {node} # 回收副本集里的一个成员（控制器专属，同上）

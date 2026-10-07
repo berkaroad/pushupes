@@ -42,6 +42,7 @@ func New(eng *cluster.Engine, store *storage.Store) *Server {
 	// admin
 	s.mux.HandleFunc("GET /admin/cluster/status", s.handleClusterStatus)
 	s.mux.HandleFunc("GET /admin/writes", s.handleWrites)
+	s.mux.HandleFunc("GET /admin/stats", s.handleStats)
 	s.mux.HandleFunc("GET /admin/slots/{slot}/describe", s.handleSlotDescribe)
 	s.mux.HandleFunc("GET /admin/slots/{slot}/streams", s.handleSlotStreams)
 	s.mux.HandleFunc("POST /admin/slots/{slot}/migrate", s.handleMigrate)
@@ -264,6 +265,33 @@ func (s *Server) handleWrites(w http.ResponseWriter, r *http.Request) {
 		// console asks every node and marks the replica whose copy is on its
 		// way out. Same shape as bytes/streams.
 		"dropping": s.Engine.PendingDrops(),
+	})
+}
+
+// handleStats answers both sub-systems' own views in one read: the storage
+// flush path (is the dirty set backing up, and what did the fsyncs it issued
+// cost) and the replication data plane (how many slots this node leads have a
+// high watermark behind their own log — their appends cannot be acknowledged —
+// how long the oldest has waited, and how the fetch rounds it served ended).
+// They live together because they answer the same question: a node whose writers
+// are blocked on a flush or on an acknowledgement looks idle from the outside —
+// no read in flight, no handler waiting, CPU near zero — so these are the
+// numbers that say where a wait is coming from.
+//
+// ?worst=N also lists the N most-starved slots (by how long their watermark has
+// been behind their log), so a caller can go straight to the slots clients are
+// blocked on instead of guessing which they are.
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	worst := 0
+	if v := r.URL.Query().Get("worst"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1024 {
+			worst = n
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"node":  s.Engine.Self(),
+		"flush": s.Store.FlushStats(),
+		"repl":  s.Engine.ReplStatsTop(worst),
 	})
 }
 
