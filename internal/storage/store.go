@@ -30,6 +30,18 @@ type Store struct {
 	// acquisitions per tick instead of O(slot count).
 	dirtyMu sync.Mutex
 	dirty   map[int32]bool
+	// dirtySince is when each dirty slot joined the set. The age of the
+	// oldest entry is how long a record has been sitting unflushed — the
+	// number that says whether the flush loop is keeping up.
+	dirtySince map[int32]time.Time
+	// flushStats book what the periodic fsyncs cost. A flush holds the slot's
+	// write lock across its fsync (see Slot.flushSegments), so a slow disk
+	// lands directly on appends; without these counters that showed up only
+	// as client-side latency on an otherwise idle-looking node.
+	fsyncCount  atomic.Uint64
+	fsyncNs     atomic.Uint64
+	fsyncMaxNs  atomic.Uint64
+	fsyncBucket [fsyncBuckets]atomic.Uint64
 	// flushKick wakes flushLoop when the dirty set gained a slot (its policy
 	// deadline must now be armed) or a slot crossed its record-count threshold
 	// (that append, not the clock, closed the policy). With an empty dirty set
@@ -80,6 +92,7 @@ func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushP
 		slots:        make([]atomic.Pointer[Slot], slotCount),
 		writes:       make([]atomic.Uint64, slotCount),
 		dirty:        map[int32]bool{},
+		dirtySince:   map[int32]time.Time{},
 		flushKick:    make(chan struct{}, 1),
 		stop:         make(chan struct{}),
 		done:         make(chan struct{}),
@@ -330,6 +343,9 @@ func (st *Store) markDirty(slotID int32) {
 	st.dirtyMu.Lock()
 	_, seen := st.dirty[slotID]
 	st.dirty[slotID] = true
+	if !seen {
+		st.dirtySince[slotID] = time.Now()
+	}
 	st.dirtyMu.Unlock()
 	if !seen {
 		st.kickFlush()
@@ -348,7 +364,99 @@ func (st *Store) kickFlush() {
 func (st *Store) clearDirty(slotID int32) {
 	st.dirtyMu.Lock()
 	delete(st.dirty, slotID)
+	delete(st.dirtySince, slotID)
 	st.dirtyMu.Unlock()
+}
+
+// noteFlushed clears a slot's dirty mark: it holds nothing unflushed any more.
+// The flush path calls this while holding the slot's lock, so the mark cannot
+// go stale between a flush and its bookkeeping — a stale entry would make the
+// flush-stats gauges report a flush that is behind when it is not.
+func (st *Store) noteFlushed(slotID int32) { st.clearDirty(slotID) }
+
+// fsyncBuckets / fsyncBucketBoundsMs bucket one slot's fsync cost, in ms:
+// <1, <4, <16, <64, <256, <1024, >=1024.
+const fsyncBuckets = 7
+
+var fsyncBucketBoundsMs = [fsyncBuckets - 1]float64{1, 4, 16, 64, 256, 1024}
+
+// FlushStats is the flush path's own view: how many slots are waiting for an
+// fsync, how long the oldest has waited, and what the fsyncs that ran cost.
+type FlushStats struct {
+	Dirty           int      `json:"dirty"`
+	OldestDirtyAgeS float64  `json:"oldest_dirty_age_s"`
+	Sampled         int      `json:"sampled"`
+	BusyLocked      int      `json:"busy_locked"`
+	PendingFlushSum int64    `json:"pending_flush_sum"`
+	FsyncCount      uint64   `json:"fsync_count"`
+	FsyncAvgMS      float64  `json:"fsync_avg_ms"`
+	FsyncMaxMS      float64  `json:"fsync_max_ms"`
+	FsyncBuckets    []uint64 `json:"fsync_buckets_ms"`
+}
+
+// FlushStats snapshots the flush path. It never waits on a slot: a slot whose
+// write lock is held (one that is fsyncing right now, and therefore blocking
+// its own appends) is counted as busy instead — that count is the point.
+func (st *Store) FlushStats() FlushStats {
+	var out FlushStats
+	st.dirtyMu.Lock()
+	out.Dirty = len(st.dirty)
+	var oldest time.Time
+	for _, ts := range st.dirtySince {
+		if oldest.IsZero() || ts.Before(oldest) {
+			oldest = ts
+		}
+	}
+	ids := make([]int32, 0, len(st.dirty))
+	for id := range st.dirty {
+		ids = append(ids, id)
+	}
+	st.dirtyMu.Unlock()
+	if !oldest.IsZero() {
+		out.OldestDirtyAgeS = time.Since(oldest).Seconds()
+	}
+	for _, id := range ids {
+		s := st.slots[id].Load()
+		if s == nil {
+			continue
+		}
+		if !s.mu.TryLock() {
+			out.BusyLocked++
+			continue
+		}
+		out.PendingFlushSum += s.pendingFlush
+		out.Sampled++
+		s.mu.Unlock()
+	}
+	out.FsyncCount = st.fsyncCount.Load()
+	if out.FsyncCount > 0 {
+		out.FsyncAvgMS = float64(st.fsyncNs.Load()) / float64(out.FsyncCount) / 1e6
+		out.FsyncMaxMS = float64(st.fsyncMaxNs.Load()) / 1e6
+	}
+	out.FsyncBuckets = make([]uint64, fsyncBuckets)
+	for i := range out.FsyncBuckets {
+		out.FsyncBuckets[i] = st.fsyncBucket[i].Load()
+	}
+	return out
+}
+
+// recordFsync books one slot fsync: what it cost and which bucket it fell in.
+func (st *Store) recordFsync(d time.Duration) {
+	ns := uint64(d)
+	st.fsyncCount.Add(1)
+	st.fsyncNs.Add(ns)
+	for {
+		old := st.fsyncMaxNs.Load()
+		if ns <= old || st.fsyncMaxNs.CompareAndSwap(old, ns) {
+			break
+		}
+	}
+	ms := float64(ns) / 1e6
+	i := 0
+	for i < fsyncBuckets-1 && ms >= fsyncBucketBoundsMs[i] {
+		i++
+	}
+	st.fsyncBucket[i].Add(1)
 }
 
 // WriteCount returns the number of records made durable in one slot since

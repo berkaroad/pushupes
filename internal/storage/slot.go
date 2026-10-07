@@ -1140,13 +1140,38 @@ func (s *Slot) SealedSegments() []*Segment {
 func (s *Slot) Flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.flushSegments(); err != nil {
+		return err
+	}
+	s.markFlushedLocked()
+	return nil
+}
+
+// markFlushedLocked records that the slot holds nothing unflushed: the pending
+// counter resets and the store drops the slot's dirty mark, so the flush-stats
+// view cannot show a slot as waiting after its records are durable.
+// Caller holds s.mu for writing.
+func (s *Slot) markFlushedLocked() {
+	s.pendingFlush = 0
+	s.lastFlush = time.Now()
+	if s.store != nil {
+		s.store.noteFlushed(s.ID)
+	}
+}
+
+// flushSegments fsyncs every segment of this slot and books the cost. The
+// caller holds s.mu for writing, so this fsync blocks the slot's appends: that
+// is how a slow disk reaches writers, and why the cost is recorded.
+func (s *Slot) flushSegments() error {
+	t0 := time.Now()
 	for _, seg := range s.segments {
 		if err := seg.Flush(); err != nil {
 			return err
 		}
 	}
-	s.pendingFlush = 0
-	s.lastFlush = time.Now()
+	if s.store != nil {
+		s.store.recordFsync(time.Since(t0))
+	}
 	return nil
 }
 
@@ -1171,13 +1196,10 @@ func (s *Slot) FlushDue(now time.Time) (bool, bool) {
 }
 
 func (s *Slot) flushAll() error {
-	for _, seg := range s.segments {
-		if err := seg.Flush(); err != nil {
-			return err
-		}
+	if err := s.flushSegments(); err != nil {
+		return err
 	}
-	s.pendingFlush = 0
-	s.lastFlush = time.Now()
+	s.markFlushedLocked()
 	return nil
 }
 
