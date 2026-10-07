@@ -957,13 +957,15 @@ func (e *Engine) SubmitBatch(ctx context.Context, slot int32, recs []*data.Event
 	case !ok:
 		// single-node / unassigned: serve locally
 		return e.batchLocal(ctx, slot, recs, "")
-	case pState == SlotMigratingOut && pMigratingTo != "" && pLeader == e.self:
-		// step 4 of migration: source keeps serving and mirrors accepted
-		// records to the target (see submitAppendLocked for why the push is
-		// best effort)
-		return e.batchLocal(ctx, slot, recs, pMigratingTo)
 	case pState == SlotMigratingOut:
-		return nil, &RedirectError{Kind: data.ErrIDMigrating, Slot: slot, Node: pLeader, Addr: e.clientAddr(pLeader)}
+		if pMigratingTo != "" && pLeader == e.self {
+			// step 4 of migration: source keeps serving and mirrors accepted
+			// records to the target (see submitAppendLocked for why the push is
+			// best effort)
+			return e.batchLocal(ctx, slot, recs, pMigratingTo)
+		} else {
+			return nil, &RedirectError{Kind: data.ErrIDMigrating, Slot: slot, Node: pLeader, Addr: e.clientAddr(pLeader)}
+		}
 	case pLeader == e.self:
 		return e.batchLocal(ctx, slot, recs, "")
 	default:
