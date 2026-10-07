@@ -2,8 +2,7 @@ package cluster
 
 import (
 	"fmt"
-
-	"github.com/sirupsen/logrus"
+	"log/slog"
 
 	"pushupes/internal/raft"
 )
@@ -20,7 +19,7 @@ type ApplyResult struct {
 // pull-based fetch protocol (see replication.go).
 type FSM struct {
 	applier Applier
-	logger  *logrus.Entry
+	logger  *slog.Logger
 }
 
 func (f *FSM) Apply(e raft.Entry) any {

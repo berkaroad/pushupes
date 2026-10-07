@@ -12,13 +12,12 @@ package cluster
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
 	"sync"
 	"time"
-
-	"github.com/sirupsen/logrus"
 
 	"pushupes/internal/raft"
 )
@@ -149,13 +148,13 @@ type Node struct {
 	fsm      *FSM
 	mux      *peerMux
 	stopOnce sync.Once
-	logger   *logrus.Entry
+	logger   *slog.Logger
 }
 
 // NewNode starts (or recovers) a Raft node. The second return value is the
 // gRPC listener demuxed off the peer port (HTTP/2 preface 'P') — the caller
 // hands it to Engine.ServePeer.
-func NewNode(cfg Config, applier Applier, logger *logrus.Entry) (*Node, net.Listener, error) {
+func NewNode(cfg Config, applier Applier, logger *slog.Logger) (*Node, net.Listener, error) {
 	cfg.withDefaults()
 	if cfg.NodeID == "" || cfg.PeerAddr == "" || cfg.DataDir == "" {
 		return nil, nil, errors.New("cluster: node id, raft addr and data dir are required")
@@ -204,11 +203,10 @@ func NewNode(cfg Config, applier Applier, logger *logrus.Entry) (*Node, net.List
 	// One line per start: the timings are a ratio, so an operator tuning them
 	// needs to see what the node actually took (and the node log is where the
 	// cluster's own start script looks).
-	logger.WithFields(logrus.Fields{
-		"heartbeat": cfg.HeartbeatTimeout,
-		"election":  cfg.ElectionTimeout,
-		"ratio":     float64(cfg.ElectionTimeout) / float64(cfg.HeartbeatTimeout),
-	}).Info("raft consensus timings")
+	logger.Info("raft consensus timings",
+		"heartbeat", cfg.HeartbeatTimeout,
+		"election", cfg.ElectionTimeout,
+		"ratio", float64(cfg.ElectionTimeout)/float64(cfg.HeartbeatTimeout))
 
 	return &Node{cfg: cfg, raft: rn, fsm: fsm, mux: mux, logger: logger}, mux.GRPCListener(), nil
 }
@@ -224,12 +222,12 @@ func raftVoters(cfg Config) []raft.Voter {
 }
 
 // raftLogAdapter routes the consensus layer's log lines into the service logger.
-type raftLogAdapter struct{ l *logrus.Entry }
+type raftLogAdapter struct{ l *slog.Logger }
 
-func (a raftLogAdapter) Debugf(f string, args ...any) { a.l.Debugf(f, args...) }
-func (a raftLogAdapter) Infof(f string, args ...any)  { a.l.Infof(f, args...) }
-func (a raftLogAdapter) Warnf(f string, args ...any)  { a.l.Warnf(f, args...) }
-func (a raftLogAdapter) Errorf(f string, args ...any) { a.l.Errorf(f, args...) }
+func (a raftLogAdapter) Debugf(f string, args ...any) { a.l.Debug(fmt.Sprintf(f, args...)) }
+func (a raftLogAdapter) Infof(f string, args ...any)  { a.l.Info(fmt.Sprintf(f, args...)) }
+func (a raftLogAdapter) Warnf(f string, args ...any)  { a.l.Warn(fmt.Sprintf(f, args...)) }
+func (a raftLogAdapter) Errorf(f string, args ...any) { a.l.Error(fmt.Sprintf(f, args...)) }
 
 // Apply submits a command through Raft and returns the applied result.
 func (n *Node) Apply(cmd []byte) ([]byte, error) {

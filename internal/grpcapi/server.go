@@ -10,11 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"runtime"
 	"sync"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -33,7 +33,7 @@ type Server struct {
 
 	engine *cluster.Engine
 	store  *storage.Store
-	logger *logrus.Entry
+	logger *slog.Logger
 
 	// leaders pools EventService clients for cross-node read proxies
 	// (this node holds neither the slot nor a replica of it).
@@ -42,14 +42,12 @@ type Server struct {
 }
 
 // NewServer wires the gRPC facade onto the engine + store.
-func NewServer(eng *cluster.Engine, store *storage.Store, logger *logrus.Entry) *Server {
+func NewServer(eng *cluster.Engine, store *storage.Store, logger *slog.Logger) *Server {
 	// A nil logger must not panic a handler half-way through: the read path
 	// logs (and continues) on a proxy failure, and a panic there replaces a
 	// "proxy dial failed" warning with a crash that hides the real reason.
 	if logger == nil {
-		l := logrus.New()
-		l.SetOutput(io.Discard)
-		logger = logrus.NewEntry(l)
+		logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
 	}
 	return &Server{engine: eng, store: store, logger: logger,
 		leaders: map[string]pushupesv1.EventServiceClient{}}
@@ -483,19 +481,17 @@ func (s *Server) ReadTails(ctx context.Context, req *pushupesv1.ReadTailsRequest
 		b := fwd[addr]
 		client, err := s.leaderClient(addr)
 		if err != nil {
-			s.logger.WithError(err).WithField("addr", addr).
-				Warn("read tails: proxy dial failed; reporting 0 for its aggregates")
+			s.logger.Warn("read tails: proxy dial failed; reporting 0 for its aggregates", "addr", addr, "error", err)
 			continue
 		}
 		sub, err := client.ReadTails(ctx, &pushupesv1.ReadTailsRequest{AggregateIds: b.ids})
 		if err != nil {
-			s.logger.WithError(err).WithField("addr", addr).
-				Warn("read tails: proxy call failed; reporting 0 for its aggregates")
+			s.logger.Warn("read tails: proxy call failed; reporting 0 for its aggregates", "addr", addr, "error", err)
 			continue
 		}
 		if len(sub.Versions) != len(b.ids) {
-			s.logger.WithFields(map[string]any{"addr": addr, "want": len(b.ids), "got": len(sub.Versions)}).
-				Warn("read tails: proxy returned a mismatched length; reporting 0 for its aggregates")
+			s.logger.Warn("read tails: proxy returned a mismatched length; reporting 0 for its aggregates",
+				"addr", addr, "want", len(b.ids), "got", len(sub.Versions))
 			continue
 		}
 		for n, i := range b.idx {

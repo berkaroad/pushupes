@@ -1,11 +1,10 @@
 package cluster
 
 import (
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/sirupsen/logrus"
 
 	"pushupes/internal/raft"
 )
@@ -34,7 +33,7 @@ func TestClusterConfigCarriesRaftTimings(t *testing.T) {
 // node takes at startup: a pair that would vote the leader out on one late
 // heartbeat must stop the node instead of being accepted silently.
 func TestClusterRejectsATightElectionTimeout(t *testing.T) {
-	logger := logrus.NewEntry(logrus.New())
+	logger := slog.Default()
 	build := func(heartbeat, election time.Duration) (*Node, error) {
 		n, listener, err := NewNode(Config{
 			NodeID:           "node-1",

@@ -7,6 +7,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net"
 	_ "net/http/pprof"
 	"os"
@@ -23,7 +24,6 @@ import (
 	"pushupes/internal/raft"
 	"pushupes/internal/storage"
 
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 
 	"pushupes/internal/grpcapi"
@@ -91,16 +91,16 @@ func main() {
 	payloadcodec.InstallBufferPool()
 	payloadcodec.InstallCodec()
 
-	base := logrus.New()
-	base.SetLevel(logrus.InfoLevel)
-	logger := logrus.NewEntry(base).WithField("node", *nodeID)
+	base := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := base.With("node", *nodeID)
 
 	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *dropAfter, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
-		logger.WithError(err).Fatal("pushupes exited with error")
+		logger.Error("pushupes exited with error", "error", err)
+		os.Exit(1)
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount int, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD, dropAfter time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *logrus.Entry) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount int, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD, dropAfter time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
 	// Canonical form for every stored address: scheme required. A bare
 	// host:port gets the default "http://" prefix; an explicit protocol
 	// is honoured as passed. TCP-level uses (listen/dial) strip it again.
@@ -125,8 +125,8 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 	if err != nil {
 		return err
 	}
-	logger.WithField("drop_after", dropRetention.String()).
-		Info("post-migration cleanup: the former source drops its local copy after this retention")
+	logger.Info("post-migration cleanup: the former source drops its local copy after this retention",
+		"drop_after", dropRetention.String())
 	store, err := storage.OpenStore(dataDir, int32(slotCount), segmentBytes, storage.FlushPolicy{
 		IntervalMessages: flushN,
 		Interval:         flushD,
@@ -164,10 +164,10 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 	targets := joinTargets(nodeID, peers, joinAddr)
 	if seeding {
 		if strings.TrimSpace(joinAddr) == "" {
-			logger.WithFields(map[string]any{"seeds": targets, "first_id": canonicalFirstPeer(peers)}).
-				Warnf("%s does not lead -peers: starting as a joiner (offering itself through the configured members) instead of writing an initial configuration. To author a brand-new cluster from this node, pass -bootstrap", nodeID)
+			logger.Warn(fmt.Sprintf("%s does not lead -peers: starting as a joiner (offering itself through the configured members) instead of writing an initial configuration. To author a brand-new cluster from this node, pass -bootstrap", nodeID),
+				"seeds", targets, "first_id", canonicalFirstPeer(peers))
 		} else {
-			logger.WithField("targets", targets).Info("starting as a joiner: offering itself through the configured members")
+			logger.Info("starting as a joiner: offering itself through the configured members", "targets", targets)
 		}
 	}
 
@@ -189,9 +189,8 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 	}
 	eng.SetRebalanceConfig(rebalanceInterval, rebalanceBatch)
 	if rebalanceInterval > 0 && rebalanceBatch > 0 {
-		logger.WithFields(map[string]any{
-			"interval": rebalanceInterval.String(), "batch": rebalanceBatch,
-		}).Info("leader rebalance: the controller hands deviated slots back to the ring layout")
+		logger.Info("leader rebalance: the controller hands deviated slots back to the ring layout",
+			"interval", rebalanceInterval.String(), "batch", rebalanceBatch)
 	} else {
 		logger.Info("leader rebalance disabled (-rebalance-interval or -rebalance-batch is 0)")
 	}
@@ -257,11 +256,10 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 	}
 	go func() { errCh <- grpcSrv.Serve(grpcLis) }()
 
-	logger.WithFields(map[string]any{
-		// The replica count is not a field here: it is derived from the member
-		// count by the controller and logged when it changes.
-		"admin": adminAddr, "client": clientAddr, "peer": peerAddr, "slots": slotCount,
-	}).Info("pushupes node started")
+	// The replica count is not a field here: it is derived from the member
+	// count by the controller and logged when it changes.
+	logger.Info("pushupes node started",
+		"admin", adminAddr, "client", clientAddr, "peer", peerAddr, "slots", slotCount)
 
 	select {
 	case <-ctx.Done():

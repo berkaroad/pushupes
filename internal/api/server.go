@@ -3,20 +3,19 @@ package api
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 // HTTPServer owns the listener lifecycle for the API handler tree.
 type HTTPServer struct {
 	httpServer *http.Server
-	logger     *logrus.Entry
+	logger     *slog.Logger
 }
 
 // NewServer builds an HTTPServer on the given address.
-func NewServer(addr string, handler http.Handler, logger *logrus.Entry) *HTTPServer {
+func NewServer(addr string, handler http.Handler, logger *slog.Logger) *HTTPServer {
 	return &HTTPServer{
 		httpServer: &http.Server{
 			Addr:              addr,
@@ -29,7 +28,7 @@ func NewServer(addr string, handler http.Handler, logger *logrus.Entry) *HTTPSer
 
 // ListenAndServe blocks serving until Shutdown is called elsewhere.
 func (s *HTTPServer) ListenAndServe() error {
-	s.logger.WithField("addr", s.httpServer.Addr).Info("pushupes admin server listening")
+	s.logger.Info("pushupes admin server listening", "addr", s.httpServer.Addr)
 	err := s.httpServer.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil

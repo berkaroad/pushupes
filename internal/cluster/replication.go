@@ -5,7 +5,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -18,8 +20,6 @@ import (
 	"pushupes/internal/data"
 	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
 	"pushupes/internal/storage"
-
-	"github.com/sirupsen/logrus"
 )
 
 // Engine is the application-level cluster state: it owns the slot table
@@ -32,7 +32,7 @@ type Engine struct {
 	store   *storage.Store
 	table   *Table
 	tableMu sync.RWMutex
-	logger  *logrus.Entry
+	logger  *slog.Logger
 	peers   *peerClient // cached PeerService connections, keyed by peer addr
 	self    string
 
@@ -399,7 +399,7 @@ const (
 
 // NewEngine wires the cluster to the local storage. The Raft node may be
 // attached later with SetNode (they reference each other).
-func NewEngine(node *Node, store *storage.Store, self string, logger *logrus.Entry) *Engine {
+func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logger) *Engine {
 	e := &Engine{
 		node:  node,
 		store: store,
@@ -446,9 +446,8 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *logrus.Ent
 	e.fetchScratchPool.New = func() any { return &fetchScratch{} }
 	e.fences = make([]slotFence, store.SlotCount)
 	if e.logger == nil {
-		l := logrus.New()
-		l.SetLevel(logrus.WarnLevel)
-		e.logger = l.WithField("component", "cluster")
+		l := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		e.logger = l.With("component", "cluster")
 	}
 	return e
 }
@@ -1030,8 +1029,8 @@ func (e *Engine) forwardBestEffort(ctx context.Context, slot int32, toNode strin
 		return // target not registered (yet); fetch catches up when it is
 	}
 	if err := e.forwardTo(ctx, addr, slot, seq, rec); err != nil {
-		e.logger.WithError(err).WithFields(map[string]any{"slot": slot, "target": toNode}).
-			Debug("migration forward skipped; target catches up via fetch")
+		e.logger.Debug("migration forward skipped; target catches up via fetch",
+			"slot", slot, "target", toNode, "error", err)
 	}
 }
 
@@ -1136,13 +1135,12 @@ func (e *Engine) logHWStall(slot int32, seq, hw uint64) {
 		}
 	}
 	e.replMu.Unlock()
-	e.logger.WithFields(map[string]any{
-		"slot": slot, "seq": seq, "hw": hw,
-		"leader_leo": e.store.LastSeqOf(slot),
-		"replicas":   e.tableReplicasOf(slot),
-		"positions":  reps,
-		"target":     e.migrationTargetOf(slot),
-	}).Warn("watermark wait deadline hit: high watermark did not cover the append")
+	e.logger.Warn("watermark wait deadline hit: high watermark did not cover the append",
+		"slot", slot, "seq", seq, "hw", hw,
+		"leader_leo", e.store.LastSeqOf(slot),
+		"replicas", e.tableReplicasOf(slot),
+		"positions", reps,
+		"target", e.migrationTargetOf(slot))
 }
 
 func (e *Engine) replicaCount(slot int32) int {
@@ -1235,8 +1233,8 @@ func (e *Engine) noteFollowerSessionLost(follower string, slots []int32) {
 		return
 	}
 	if e.logger != nil {
-		e.logger.WithFields(map[string]any{"follower": follower, "slots": len(slots)}).
-			Info("follower fetch session lost: its positions stop gating the watermark until it reports again")
+		e.logger.Info("follower fetch session lost: its positions stop gating the watermark until it reports again",
+			"follower", follower, "slots", len(slots))
 	}
 	for _, s := range slots {
 		e.advanceHW(s)
@@ -1321,7 +1319,7 @@ func (e *Engine) reportLeaderUnreachable(suspect string) {
 			return
 		}
 		if _, err := c.ReportUnreachable(ctx, &pushupesv1.ReportUnreachableRequest{Reporter: reporter, Suspect: suspect}); err != nil && e.logger != nil {
-			e.logger.WithField("suspect", suspect).Debug("unreachable report: controller did not take it (it will probe)")
+			e.logger.Debug("unreachable report: controller did not take it (it will probe)", "suspect", suspect)
 		}
 	}()
 }
@@ -1899,8 +1897,8 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 	}
 	t0 := time.Now()
 	defer func() {
-		e.logger.WithFields(logrus.Fields{"self": e.self, "follower": req.Follower, "items": n,
-			"ms": time.Since(t0).Milliseconds()}).Debug("mfetch round")
+		e.logger.Debug("mfetch round", "self", e.self, "follower", req.Follower, "items", n,
+			"ms", time.Since(t0).Milliseconds())
 	}()
 	waitMS := req.WaitMS
 
@@ -2259,7 +2257,7 @@ func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
 		}
 		_, err := e.fetchRound(ctx, sess.leader, slots, sweep)
 		if err != nil {
-			e.logger.WithField("leader", sess.leader).WithError(err).Warn("fetch round failed")
+			e.logger.Warn("fetch round failed", "leader", sess.leader, "error", err)
 			// Evidence, not a verdict: a transport-level failure repeated twice
 			// tells the controller this leader looks dead so it can skip its own
 			// probe threshold (see reportLeaderUnreachable). A slow server, a
@@ -2384,8 +2382,8 @@ func (e *Engine) noteDivergence(slot int32, seqs []uint64) {
 	e.diverged[slot] = fmt.Sprintf("seqs %v", seqs)
 	e.divMu.Unlock()
 	if !had {
-		e.logger.WithFields(map[string]any{"slot": slot, "seqs": seqs}).Warn(
-			"replica fetch: local log diverged from the leader at a seq; quarantining this slot and keeping the rest of the session (other slots unaffected)")
+		e.logger.Warn("replica fetch: local log diverged from the leader at a seq; quarantining this slot and keeping the rest of the session (other slots unaffected)",
+			"slot", slot, "seqs", seqs)
 	}
 }
 
@@ -2687,7 +2685,7 @@ func (e *Engine) submit(c *Command) error {
 
 func (e *Engine) loggerf(format string, args ...any) {
 	if e.logger != nil {
-		e.logger.Warnf(format, args...)
+		e.logger.Warn(fmt.Sprintf(format, args...))
 	}
 }
 

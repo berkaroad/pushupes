@@ -87,11 +87,11 @@ func (e *Engine) StartMigration(ctx context.Context, slot int32, toNode string) 
 		if err := e.submit(&Command{Op: OpSlotAddReplica, Slots: []int32{slot}, NodeID: toNode}); err != nil {
 			return fmt.Errorf("add target replica: %w", err)
 		}
-		e.logger.WithFields(map[string]any{"slot": slot, "target": toNode, "op": OpSlotAddReplica}).
-			Info("migration step 1/3: target joined the replica set")
+		e.logger.Info("migration step 1/3: target joined the replica set",
+			"slot", slot, "target", toNode, "op", OpSlotAddReplica)
 	} else {
-		e.logger.WithFields(map[string]any{"slot": slot, "target": toNode}).
-			Info("migration step 1/3: target already a replica (no admission needed)")
+		e.logger.Info("migration step 1/3: target already a replica (no admission needed)",
+			"slot", slot, "target", toNode)
 	}
 
 	// step 1
@@ -126,8 +126,8 @@ func (e *Engine) StartMigration(ctx context.Context, slot int32, toNode string) 
 		srcProbe = "" // read our own copy locally (the source IS us)
 	}
 	if equivalent, err := e.slotCopyEquivalent(ctx, slot, srcProbe, e.peerAddr(toNode)); err == nil && equivalent {
-		e.logger.WithFields(map[string]any{"slot": slot, "target": toNode, "op": "skip_snapshot"}).
-			Info("migration step 2/3: target already holds an equivalent copy; skipping the segment snapshot")
+		e.logger.Info("migration step 2/3: target already holds an equivalent copy; skipping the segment snapshot",
+			"slot", slot, "target", toNode, "op", "skip_snapshot")
 	} else if err := e.snapshotTo(ctx, srcAddr, slot, toNode); err != nil {
 		e.rollbackMigration(slot)
 		return fmt.Errorf("snapshot: %w", err)
@@ -167,8 +167,8 @@ func (e *Engine) StartMigration(ctx context.Context, slot int32, toNode string) 
 	if p, ok := e.TableSnapshot().Slots[slot]; ok {
 		epoch = p.Epoch
 	}
-	e.logger.WithFields(map[string]any{"slot": slot, "leader": toNode, "epoch": epoch, "op": OpLeaderMove}).
-		Info("migration step 2/3: leader moved to the target")
+	e.logger.Info("migration step 2/3: leader moved to the target",
+		"slot", slot, "leader", toNode, "epoch", epoch, "op", OpLeaderMove)
 
 	// step 6: reclaim the surplus copy the admission step created. Admitting
 	// an out-of-set target grew the replica set to factor+1; now that the
@@ -184,7 +184,7 @@ func (e *Engine) StartMigration(ctx context.Context, slot int32, toNode string) 
 	// slot) — see syncMigrationState/localdrop.go. Scheduling it from the
 	// controller would (a) ignore who actually holds the copy and (b) risk
 	// starting the retention for a migration that has not committed yet.
-	e.logger.WithFields(map[string]any{"slot": slot, "from": from, "to": toNode}).Info("Slot migration committed")
+	e.logger.Info("Slot migration committed", "slot", slot, "from", from, "to", toNode)
 	return nil
 }
 
@@ -226,27 +226,25 @@ func (e *Engine) reclaimSurplusReplica(slot int32, from, toNode string) {
 	node, over := surplusForReclaim(p, tbl.Replicas, from, toNode)
 	if !over {
 		if p.State == SlotStable {
-			e.logger.WithFields(map[string]any{"slot": slot, "factor": tbl.Replicas}).
-				Info("migration step 3/3: no surplus replica (set already at the factor)")
+			e.logger.Info("migration step 3/3: no surplus replica (set already at the factor)",
+				"slot", slot, "factor", tbl.Replicas)
 		}
 		return // not stable (a migration owns it), or already at the factor
 	}
 	if node == "" {
 		// Over the factor, yet no member is eligible (every one is the
 		// leader or the target): leave it to the operator rather than guess.
-		e.logger.WithFields(map[string]any{"slot": slot, "from": from, "to": toNode}).
-			Warn("migration step 3/3: set is over the factor but no replica is eligible for reclaim")
+		e.logger.Warn("migration step 3/3: set is over the factor but no replica is eligible for reclaim",
+			"slot", slot, "from", from, "to", toNode)
 		return
 	}
 	if err := e.RemoveReplica(context.Background(), slot, node); err != nil {
-		e.logger.WithError(err).WithFields(map[string]any{
-			"slot": slot, "node": node, "from": from, "to": toNode, "op": OpSlotRemoveReplica,
-		}).Warn("migration step 3/3: surplus replica reclaim failed; leaving it in the set (migration stays committed)")
+		e.logger.Warn("migration step 3/3: surplus replica reclaim failed; leaving it in the set (migration stays committed)",
+			"slot", slot, "node", node, "from", from, "to", toNode, "op", OpSlotRemoveReplica, "error", err)
 		return
 	}
-	e.logger.WithFields(map[string]any{
-		"slot": slot, "node": node, "from": from, "factor": tbl.Replicas, "op": OpSlotRemoveReplica,
-	}).Info("migration step 3/3: source replica reclaimed (set back at the factor)")
+	e.logger.Info("migration step 3/3: source replica reclaimed (set back at the factor)",
+		"slot", slot, "node", node, "from", from, "factor", tbl.Replicas, "op", OpSlotRemoveReplica)
 }
 
 // surplusForReclaim decides whether a slot's replica set has a member to drop
@@ -574,10 +572,10 @@ func (e *Engine) reconcileOrphanMigrations() {
 	if len(slots) == 0 {
 		return
 	}
-	e.logger.WithField("slots", slots).Warn("abandoned slot migrations (their controller is gone): returning the slots to stable")
+	e.logger.Warn("abandoned slot migrations (their controller is gone): returning the slots to stable", "slots", slots)
 	if err := e.submit(&Command{Op: OpSlotState, Slots: slots, State: SlotStable}); err != nil {
-		e.logger.WithError(err).WithField("slots", slots).
-			Warn("abandoned slot migrations: could not return the slots to stable; retried next round")
+		e.logger.Warn("abandoned slot migrations: could not return the slots to stable; retried next round",
+			"slots", slots, "error", err)
 	}
 }
 
@@ -759,8 +757,8 @@ func (e *Engine) HandleDropSlot(slot int32, from string) error {
 	if err := e.store.DropSlot(slot); err != nil {
 		return err
 	}
-	e.logger.WithFields(map[string]any{"slot": slot, "from": from}).
-		Warn("migration target copy discarded: its streams were inconsistent with its LEO; rebuilding from the source")
+	e.logger.Warn("migration target copy discarded: its streams were inconsistent with its LEO; rebuilding from the source",
+		"slot", slot, "from", from)
 	return nil
 }
 
@@ -788,11 +786,10 @@ func (e *Engine) ensureTargetConsistent(ctx context.Context, slot int32, targetA
 	if st.Aggregates == srcAgg && st.Versions == srcVer && st.Resolvable == srcRes {
 		return nil
 	}
-	e.logger.WithFields(map[string]any{
-		"slot": slot, "target": toNode, "target_leo": st.LEO,
-		"target_digest": fmt.Sprintf("agg=%d versions=%d resolvable=%d", st.Aggregates, st.Versions, st.Resolvable),
-		"source_digest": fmt.Sprintf("agg=%d versions=%d resolvable=%d", srcAgg, srcVer, srcRes),
-	}).Warn("migration target's streams do not match this source; discarding its copy and rebuilding")
+	e.logger.Warn("migration target's streams do not match this source; discarding its copy and rebuilding",
+		"slot", slot, "target", toNode, "target_leo", st.LEO,
+		"target_digest", fmt.Sprintf("agg=%d versions=%d resolvable=%d", st.Aggregates, st.Versions, st.Resolvable),
+		"source_digest", fmt.Sprintf("agg=%d versions=%d resolvable=%d", srcAgg, srcVer, srcRes))
 
 	if err := e.peerDropSlot(ctx, targetAddr, slot, toNode); err != nil {
 		return fmt.Errorf("fence: drop inconsistent target copy: %w", err)

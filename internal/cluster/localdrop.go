@@ -166,9 +166,9 @@ func (e *Engine) dropAfterRetention(slot int32, gen uint64, delay time.Duration)
 		return
 	}
 	if err := e.store.DropSlot(slot); err != nil {
-		e.logger.WithError(err).WithField("slot", slot).Warn("post-migration drop failed")
+		e.logger.Warn("post-migration drop failed", "slot", slot, "error", err)
 	} else {
-		e.logger.WithField("slot", slot).Info("Post-migration source copy dropped")
+		e.logger.Info("Post-migration source copy dropped", "slot", slot)
 	}
 	e.forgetPendingDrop(slot, gen)
 }

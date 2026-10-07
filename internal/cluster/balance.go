@@ -182,18 +182,16 @@ func (e *Engine) rebalanceRound(ctx context.Context, limit int) int {
 			continue // still catching up: the cheap hand-back waits for it
 		}
 		if !equivalent {
-			e.logger.WithFields(map[string]any{
-				"slot": m.Slot, "from": m.From, "to": m.To, "op": "rebalance_repair",
-			}).Warn("rebalance: target copy has the source's LEO but a different directory; rebuilding it before handing leadership back")
+			e.logger.Warn("rebalance: target copy has the source's LEO but a different directory; rebuilding it before handing leadership back",
+				"slot", m.Slot, "from", m.From, "to", m.To, "op", "rebalance_repair")
 		}
 		e.recordRebalanceAttempt(m.Slot, m.From, m.To, time.Now())
 		if err := e.StartMigration(ctx, m.Slot, m.To); err != nil {
 			e.loggerf("rebalance: moving slot %d back to %s failed: %v (retried with backoff)", m.Slot, m.To, err)
 			continue
 		}
-		e.logger.WithFields(map[string]any{
-			"slot": m.Slot, "from": m.From, "to": m.To, "op": "rebalance",
-		}).Info("leader rebalanced back to the ring layout")
+		e.logger.Info("leader rebalanced back to the ring layout",
+			"slot", m.Slot, "from", m.From, "to", m.To, "op", "rebalance")
 		done++
 	}
 	return done
@@ -393,9 +391,8 @@ func (e *Engine) reclaimRound(ctx context.Context, limit int) int {
 			// when it hands this slot's leadership over), and probing it again
 			// every round buys nothing: back off.
 			e.recordSeatAttempt(s, drop, time.Now())
-			e.logger.WithFields(map[string]any{
-				"slot": s, "seat": drop, "op": "seat_reclaim",
-			}).Warn("surplus seat kept: a copy that stays has the leader's LEO but a different directory")
+			e.logger.Warn("surplus seat kept: a copy that stays has the leader's LEO but a different directory",
+				"slot", s, "seat", drop, "op", "seat_reclaim")
 			continue
 		}
 		if err := e.RemoveReplica(ctx, s, drop); err != nil {
@@ -403,9 +400,8 @@ func (e *Engine) reclaimRound(ctx context.Context, limit int) int {
 			e.loggerf("surplus seat reclaim: dropping %s from slot %d failed: %v (retried with backoff)", drop, s, err)
 			continue
 		}
-		e.logger.WithFields(map[string]any{
-			"slot": s, "seat": drop, "factor": tbl.Replicas, "op": OpSlotRemoveReplica,
-		}).Info("surplus replica reclaimed: the set is back at the factor")
+		e.logger.Info("surplus replica reclaimed: the set is back at the factor",
+			"slot", s, "seat", drop, "factor", tbl.Replicas, "op", OpSlotRemoveReplica)
 		done++
 	}
 	return done

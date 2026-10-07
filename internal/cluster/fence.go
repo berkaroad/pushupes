@@ -211,8 +211,8 @@ func (e *Engine) releaseSlotFence(slot int32) {
 	}
 	f.mu.Unlock()
 	if held > 0 {
-		e.logger.WithFields(map[string]any{"slot": slot, "ms": held.Milliseconds(), "op": "fence_release"}).
-			Info("migration write fence released: blocked appends resumed")
+		e.logger.Info("migration write fence released: blocked appends resumed",
+			"slot", slot, "ms", held.Milliseconds(), "op", "fence_release")
 	}
 	e.fenceSetDel(slot)
 }
@@ -269,14 +269,14 @@ func (e *Engine) holdFenceUntilTargetLeader(slot int32, target string, epoch int
 		if stale {
 			return // a newer fence (or none) owns the slot now
 		}
-		fields := map[string]any{
-			"slot": slot, "target": target, "epoch": epoch,
-			"waited_ms": time.Since(start).Milliseconds(), "target_ready": ready, "op": "fence_gate",
+		args := []any{
+			"slot", slot, "target", target, "epoch", epoch,
+			"waited_ms", time.Since(start).Milliseconds(), "target_ready", ready, "op", "fence_gate",
 		}
 		if ready {
-			e.logger.WithFields(fields).Info("migration write fence: target applied the leader move; releasing the fence")
+			e.logger.Info("migration write fence: target applied the leader move; releasing the fence", args...)
 		} else {
-			e.logger.WithFields(fields).Warn("migration write fence: target did not confirm the leader move before the gate deadline; releasing so writes cannot be wedged")
+			e.logger.Warn("migration write fence: target did not confirm the leader move before the gate deadline; releasing so writes cannot be wedged", args...)
 		}
 		e.releaseSlotFence(slot)
 	}()
@@ -294,8 +294,7 @@ func (e *Engine) armFenceWatchdog(slot int32, f *slotFence) {
 		stale := f.closed && !time.Now().Before(f.deadline)
 		f.mu.Unlock()
 		if stale {
-			e.logger.WithField("slot", slot).
-				Warn("migration write fence held past its bound; releasing so a lost controller cannot wedge the slot's writes")
+			e.logger.Warn("migration write fence held past its bound; releasing so a lost controller cannot wedge the slot's writes", "slot", slot)
 			e.releaseSlotFence(slot)
 		}
 	}()
@@ -354,8 +353,8 @@ func (e *Engine) HandleFenceSlot(ctx context.Context, slot int32) (uint64, error
 		return 0, err
 	}
 	ok = true
-	e.logger.WithFields(map[string]any{"slot": slot, "leo": leo, "ms": time.Since(start).Milliseconds(), "op": "fence"}).
-		Info("migration write fence held: new appends blocked, target confirmed the frozen LEO")
+	e.logger.Info("migration write fence held: new appends blocked, target confirmed the frozen LEO",
+		"slot", slot, "leo", leo, "ms", time.Since(start).Milliseconds(), "op", "fence")
 	return leo, nil
 }
 
