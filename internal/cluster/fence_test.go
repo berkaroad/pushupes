@@ -301,7 +301,7 @@ func TestApplyFetchItemsQuarantinesOneSlotKeepsSession(t *testing.T) {
 		{Slot: 0, FromSeq: 1, NextSeq: 4, Payload: pay0},
 		{Slot: 1, FromSeq: 1, NextSeq: 4, Payload: pay1},
 	}
-	productive, err := follower.applyFetchItems(items)
+	productive, err := follower.applyFetchItems(items, nil)
 	if err != nil {
 		t.Fatalf("one slot's fork must not fail the round: %v", err)
 	}

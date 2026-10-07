@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -39,6 +40,7 @@ type Engine struct {
 	// replication bookkeeping per slot, only meaningful on slot leaders
 	replMu sync.Mutex
 	repl   map[int32]*slotRepl
+	diag   replDiag // data-plane tallies reported by ReplStats
 
 	// rotation cursor for the mfetch payload budget
 	fetchRot atomic.Uint64
@@ -188,6 +190,9 @@ type slotRepl struct {
 	leo    []uint64
 	lastOK []time.Time
 	hw     uint64
+	// hwAt is when hw last advanced. The age of a stuck slot's hwAt is how long
+	// its appends have been waiting for an acknowledgement (see ReplStats).
+	hwAt time.Time
 
 	// seats is the slot's replica set as of the last table walk while this node
 	// led it, and building lists the seats that APPEARED in that set since —
@@ -397,6 +402,22 @@ const (
 	maxPayloadBytes = 32 << 20
 )
 
+// Applying one fetch round: the round's items are different slots, so they are
+// applied concurrently (a small pool) while one slot's records stay in seq order
+// inside its item — the store writes one durable frame per record, and the
+// device serves concurrent writers far better than a single serial one. The
+// round's positions are reported once, after it lands (see the call site in
+// fetchRound).
+//
+// The pool scales with the CPU budget this process actually has. GOMAXPROCS(0)
+// is the runtime's own view of it — the same measure the store's open workers
+// use — so inside a container it reflects the enforced quota rather than the
+// host's core count, and a node does not fan out a worker per host core.
+var (
+	applyWorkers     = 2 * runtime.GOMAXPROCS(0) // slots applied concurrently within one round
+	applyParallelMin = runtime.GOMAXPROCS(0)     // below this, a pool costs more than it saves
+)
+
 // NewEngine wires the cluster to the local storage. The Raft node may be
 // attached later with SetNode (they reference each other).
 func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logger) *Engine {
@@ -449,6 +470,12 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logge
 		l := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 		e.logger = l.With("component", "cluster")
 	}
+	// The round-apply shape, resolved once (see the constants): how many slots a
+	// fetch round writes concurrently, when the pool kicks in, and when progress
+	// is posted mid-round. One line per node so an operator can see what the
+	// process actually chose on its machine.
+	e.logger.Info("fetch round apply pool",
+		"apply_workers", applyWorkers, "apply_parallel_min", applyParallelMin)
 	return e
 }
 
@@ -681,7 +708,7 @@ func (e *Engine) syncMigrationState() {
 			// Just took the slot over: start from a clean slate of positions (the
 			// previous term's are stale) while recording the seats we inherit and
 			// the ones still being built (see slotRepl.takeover).
-			sr = &slotRepl{}
+			sr = newSlotRepl()
 			e.repl[s] = sr
 			sr.takeover(ledSeats[s], e.youngSeats(s, ledSeats[s], time.Now()))
 			continue
@@ -1562,8 +1589,211 @@ func (e *Engine) advanceHW(slot int32) {
 	}
 	if minLEO > sr.hw {
 		sr.hw = minLEO
+		sr.hwAt = time.Now()
 	}
 }
+
+// ---- Replication diagnostics -------------------------------------------------
+//
+// The data plane's own view of itself, in the same spirit as the storage flush
+// view: a cluster whose client appends are parked in waitForHW looks idle from
+// the outside (nothing reading, no handler waiting, CPU near zero), so the
+// numbers that say whether the pipeline is healthy are the ones only the
+// pipeline can report — how many slots have a high watermark behind their own
+// log and for how long, how the leader's parked fetch rounds ended, and what
+// the follower side actually posted.
+
+// replDiag counts fetch activity at both ends. Increments happen once per
+// fetch round (tens to thousands per second), never per record.
+type replDiag struct {
+	mfetchRounds  atomic.Uint64 // leader: MFetch rounds entered
+	mfetchServed  atomic.Uint64 // ... that returned payloads in phase 1
+	mfetchParked  atomic.Uint64 // ... that parked waiting for data
+	mfetchStarved atomic.Uint64 // ... that answered early: the fetch budget was spent
+	mfetchByWake  atomic.Uint64 // ... whose park ended on a data wake
+	mfetchByDeadl atomic.Uint64 // ... whose park ended on the wait deadline
+	mfetchByCtx   atomic.Uint64 // ... whose park ended because the caller went away
+	parkedNow     atomic.Int64  // parked rounds right now
+	fetchRounds   atomic.Uint64 // follower: fetch rounds issued
+	fetchData     atomic.Uint64 // ... that landed payloads
+	fetchBytes    atomic.Uint64 // payload bytes landed
+	reportsSent   atomic.Uint64 // progress reports posted
+	reportsSlots  atomic.Uint64 // slots covered by those reports
+	lastRoundNS   atomic.Int64  // follower: when the last round returned (0 = never)
+	lastReportNS  atomic.Int64  // follower: when the last report was posted (0 = never)
+}
+
+// ReplPeerView is the leader's view of one follower, summed over the slots this
+// node leads: how stale its reports are and how far its log trails the leader's.
+type ReplPeerView struct {
+	Follower     string  `json:"follower"`
+	Slots        int     `json:"slots"`
+	InISRSlots   int     `json:"in_isr_slots"`
+	OldestOKAgeS float64 `json:"oldest_ok_age_s"`
+	WorstLEOLag  uint64  `json:"worst_leo_lag"`
+}
+
+// ReplMfetchView is the leader's fetch-round tally. EndedByDeadline against
+// EndedByWake is the number that separates a burst-driven pipeline (rounds end
+// because new records arrived) from one paced by the long-poll wait budget.
+type ReplMfetchView struct {
+	Rounds          uint64 `json:"rounds"`
+	ServedRounds    uint64 `json:"served_rounds"`
+	ParkedRounds    uint64 `json:"parked_rounds"`
+	StarvedRounds   uint64 `json:"starved_rounds"`
+	EndedByWake     uint64 `json:"ended_by_wake"`
+	EndedByDeadline uint64 `json:"ended_by_deadline"`
+	EndedByCtx      uint64 `json:"ended_by_ctx"`
+	ParkedNow       int64  `json:"parked_now"`
+}
+
+// ReplFetchView is this node's own tally as a follower.
+type ReplFetchView struct {
+	Rounds         uint64  `json:"rounds"`
+	DataRounds     uint64  `json:"data_rounds"`
+	Bytes          uint64  `json:"bytes"`
+	Reports        uint64  `json:"reports"`
+	ReportSlots    uint64  `json:"report_slots"`
+	LastRoundAgeS  float64 `json:"last_round_age_s"`
+	LastReportAgeS float64 `json:"last_report_age_s"`
+}
+
+// ReplStuckSlot is one slot this node leads whose log runs ahead of its own
+// high watermark: the appends in (HW, LEO] are waiting for a replica report
+// before they can be acknowledged.
+type ReplStuckSlot struct {
+	Slot int32   `json:"slot"`
+	LEO  uint64  `json:"leo"`
+	HW   uint64  `json:"hw"`
+	Gap  uint64  `json:"gap"`
+	AgeS float64 `json:"age_s"`
+}
+
+// ReplView is the whole replication self-view.
+type ReplView struct {
+	Node            string          `json:"node"`
+	TrackedSlots    int             `json:"tracked_slots"`
+	StuckSlots      int             `json:"stuck_slots"`
+	StuckMaxGap     uint64          `json:"stuck_max_gap"`
+	StuckOldestAgeS float64         `json:"stuck_oldest_age_s"`
+	Worst           []ReplStuckSlot `json:"worst"`
+	Peers           []ReplPeerView  `json:"peers"`
+	Mfetch          ReplMfetchView  `json:"mfetch"`
+	Fetch           ReplFetchView   `json:"fetch"`
+}
+
+// ReplStats snapshots the replication data plane.
+func (e *Engine) ReplStats() ReplView { return e.ReplStatsTop(0) }
+
+// ReplStatsTop is ReplStats with the worstN most-starved slots listed (by how
+// long their watermark has been behind their log), so a caller can go straight
+// to the slots clients are blocked on instead of guessing which they are.
+// Safe to call while the node serves: replMu is held only for the map walk.
+func (e *Engine) ReplStatsTop(worstN int) ReplView {
+	e.replMu.Lock()
+	tracked := len(e.repl)
+	stuck, maxGap, oldest, worst, peers := aggregateRepl(e.repl, e.store.LastSeqOf, time.Now(), worstN)
+	e.replMu.Unlock()
+
+	d := &e.diag
+	now := time.Now()
+	return ReplView{
+		Node: e.self, TrackedSlots: tracked,
+		StuckSlots: stuck, StuckMaxGap: maxGap, StuckOldestAgeS: oldest,
+		Worst: worst, Peers: peers,
+		Mfetch: ReplMfetchView{
+			Rounds: d.mfetchRounds.Load(), ServedRounds: d.mfetchServed.Load(),
+			ParkedRounds: d.mfetchParked.Load(), StarvedRounds: d.mfetchStarved.Load(),
+			EndedByWake: d.mfetchByWake.Load(), EndedByDeadline: d.mfetchByDeadl.Load(),
+			EndedByCtx: d.mfetchByCtx.Load(), ParkedNow: d.parkedNow.Load(),
+		},
+		Fetch: ReplFetchView{
+			Rounds: d.fetchRounds.Load(), DataRounds: d.fetchData.Load(),
+			Bytes: d.fetchBytes.Load(), Reports: d.reportsSent.Load(),
+			ReportSlots:    d.reportsSlots.Load(),
+			LastRoundAgeS:  ageSeconds(d.lastRoundNS.Load(), now),
+			LastReportAgeS: ageSeconds(d.lastReportNS.Load(), now),
+		},
+	}
+}
+
+// ageSeconds turns a stored unix-nano stamp into an age, with -1 for "never".
+func ageSeconds(ns int64, now time.Time) float64 {
+	if ns == 0 {
+		return -1
+	}
+	return now.Sub(time.Unix(0, ns)).Seconds()
+}
+
+// aggregateRepl sums the per-slot replication state this node keeps for the
+// slots it leads. A slot counts as stuck when its high watermark trails its own
+// log: appends sitting at seqs above it cannot be acknowledged until a replica
+// reports them, so the count, the largest gap and the age of the oldest are the
+// leader-side measure of "how long have clients been waiting". Pure, so it can
+// be tested against hand-built state.
+func aggregateRepl(repl map[int32]*slotRepl, leoOf func(int32) uint64, now time.Time, worstN int) (stuck int, maxGap uint64, oldestS float64, worst []ReplStuckSlot, peers []ReplPeerView) {
+	byPeer := map[string]*ReplPeerView{}
+	for slot, sr := range repl {
+		if sr == nil {
+			continue
+		}
+		leo := leoOf(slot)
+		if leo > sr.hw {
+			stuck++
+			if g := leo - sr.hw; g > maxGap {
+				maxGap = g
+			}
+			age := 0.0
+			if !sr.hwAt.IsZero() {
+				age = now.Sub(sr.hwAt).Seconds()
+				if age > oldestS {
+					oldestS = age
+				}
+			}
+			if worstN > 0 {
+				worst = append(worst, ReplStuckSlot{Slot: slot, LEO: leo, HW: sr.hw, Gap: leo - sr.hw, AgeS: age})
+			}
+		}
+		for i, node := range sr.node {
+			if node == "" {
+				continue
+			}
+			pv := byPeer[node]
+			if pv == nil {
+				pv = &ReplPeerView{Follower: node}
+				byPeer[node] = pv
+			}
+			pv.Slots++
+			okAge := now.Sub(sr.lastOK[i])
+			if okAge <= isrStaleAfter {
+				pv.InISRSlots++
+			}
+			if a := okAge.Seconds(); a > pv.OldestOKAgeS {
+				pv.OldestOKAgeS = a
+			}
+			if l := sr.leo[i]; leo > l {
+				if lag := leo - l; lag > pv.WorstLEOLag {
+					pv.WorstLEOLag = lag
+				}
+			}
+		}
+	}
+	for _, pv := range byPeer {
+		peers = append(peers, *pv)
+	}
+	sort.Slice(peers, func(i, j int) bool { return peers[i].Follower < peers[j].Follower })
+	if worstN > 0 && len(worst) > 1 {
+		sort.Slice(worst, func(i, j int) bool { return worst[i].AgeS > worst[j].AgeS })
+		if len(worst) > worstN {
+			worst = worst[:worstN]
+		}
+	}
+	return stuck, maxGap, oldestS, worst, peers
+}
+
+// newSlotRepl returns an empty per-slot replication record for a slot this node
+// leads.
+func newSlotRepl() *slotRepl { return &slotRepl{hwAt: time.Now()} }
 
 // migrationTargetOf returns the node a slot is currently migrating to, or ""
 // when it is not migrating_out.
@@ -1656,7 +1886,7 @@ func (e *Engine) noteReplicaProgress(slot int32, follower string, leo uint64, no
 	e.replMu.Lock()
 	sr := e.repl[slot]
 	if sr == nil {
-		sr = &slotRepl{}
+		sr = newSlotRepl()
 		e.repl[slot] = sr
 	}
 	i := sr.find(follower)
@@ -1718,7 +1948,7 @@ func (b *progressBatch) apply(e *Engine) {
 		leo := b.leos[i]
 		sr := e.repl[slot]
 		if sr == nil {
-			sr = &slotRepl{}
+			sr = newSlotRepl()
 			e.repl[slot] = sr
 		}
 		j := sr.find(b.follower)
@@ -1827,26 +2057,17 @@ func (e *Engine) HandleMFetch(req MFetchRequest) (*MFetchResponse, error) {
 // a second per followed leader — and both are dead as soon as the round's RPC
 // returns, so one goroutine (the session loop) reuses them.
 type fetchScratch struct {
-	froms   []uint64
-	changed []int32
-	leos    []uint64
+	froms []uint64 // the round's reported positions, one per followed slot
 }
 
 func (f *fetchScratch) reset() *fetchScratch {
-	f.froms, f.changed, f.leos = f.froms[:0], f.changed[:0], f.leos[:0]
+	f.froms = f.froms[:0]
 	return f
 }
 
 func sizedU64(b []uint64, n int) []uint64 {
 	if cap(b) < n {
 		return make([]uint64, n)
-	}
-	return b[:n]
-}
-
-func sizedI32(b []int32, n int) []int32 {
-	if cap(b) < n {
-		return make([]int32, n)
 	}
 	return b[:n]
 }
@@ -1947,6 +2168,7 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 	e.store.ScanFetchState(req.Slots, req.FromSeqs, scan.moved, scan.wakes)
 
 	out := &MFetchResponse{Follower: req.Follower, Items: make([]FetchItem, 0, 64)}
+	e.diag.mfetchRounds.Add(1)
 	budget := int64(maxPayloadBytes)
 	starved := false
 	served := false
@@ -2031,7 +2253,16 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 	e.scanPool.Put(scan.reset())
 	e.orderPool.Put(order[:cap(order)])
 
+	if served {
+		e.diag.mfetchServed.Add(1)
+	}
+	if starved {
+		e.diag.mfetchStarved.Add(1)
+	}
 	if len(parked) > 0 && waitMS > 0 && !starved && !served {
+		e.diag.mfetchParked.Add(1)
+		e.diag.parkedNow.Add(1)
+		defer e.diag.parkedNow.Add(-1)
 		wait := time.Duration(waitMS) * time.Millisecond
 		if wait > fetchMaxWait {
 			wait = fetchMaxWait
@@ -2046,8 +2277,10 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 			// was a top CPU contributor on the fetch hot path.
 			select {
 			case <-deadline:
+				e.diag.mfetchByDeadl.Add(1)
 				break waitLoop // budget spent: answer with whatever we have
 			case <-ctx.Done():
+				e.diag.mfetchByCtx.Add(1)
 				e.parkedPool.Put(parked[:0])
 				e.progressPool.Put(prog.reset())
 				return nil, ctx.Err() // client went away
@@ -2090,6 +2323,7 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 					out.Items = append(out.Items, FetchItem{Slot: pe.slot, FromSeq: pe.from, NextSeq: next, Payload: payload})
 				}
 				if anyData {
+					e.diag.mfetchByWake.Add(1)
 					break waitLoop // answer with the whole burst
 				}
 			}
@@ -2300,6 +2534,7 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 	if addr == "" {
 		return false, data.ErrNotLeader
 	}
+	e.diag.fetchRounds.Add(1)
 	scr := e.fetchScratchPool.Get().(*fetchScratch)
 	defer e.fetchScratchPool.Put(scr.reset())
 	froms := sizedU64(scr.froms, len(slots))
@@ -2317,32 +2552,37 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 	// returns that buffer to the pool, so it must happen after the round has
 	// written everything it took.
 	defer release()
-	productive, err := e.applyFetchItems(fr.Items)
+	e.diag.lastRoundNS.Store(time.Now().UnixNano())
+	if len(fr.Items) > 0 {
+		e.diag.fetchData.Add(1)
+		for i := range fr.Items {
+			e.diag.fetchBytes.Add(uint64(len(fr.Items[i].Payload)))
+		}
+	}
+	var productive bool
+	if len(fr.Items) > 0 {
+		// The round's landing positions, collected from whichever worker applied
+		// each slot and reported once, after the round (a productive round on a
+		// busy leader touches tens of slots, not the full 1.4k set). Reporting
+		// is what advances the leader's watermark, so the collection must stay
+		// safe under the apply pool. A quarantined slot is skipped by applyItem.
+		var repMu sync.Mutex
+		var changed []int32
+		var leos []uint64
+		productive, err = e.applyFetchItems(fr.Items, func(slot int32, from uint64) {
+			repMu.Lock()
+			changed = append(changed, slot)
+			leos = append(leos, from)
+			repMu.Unlock()
+		})
+		if err == nil && len(changed) > 0 {
+			e.reportProgress(addr, changed, leos, true)
+		}
+	} else {
+		productive, err = e.applyFetchItems(fr.Items, nil)
+	}
 	if err != nil {
 		return productive, err
-	}
-	if len(fr.Items) > 0 {
-		// Positions moved: report only the slots that actually advanced
-		// (a productive round on a busy leader touches tens of slots, not
-		// the full 1.4k set), so the leader advances HW immediately
-		// instead of waiting for the next round's piggyback.
-		changed := sizedI32(scr.changed, len(fr.Items))[:0]
-		leos := sizedU64(scr.leos, len(fr.Items))[:0]
-		for _, it := range fr.Items {
-			if e.isDiverged(it.Slot) {
-				// A quarantined slot's content is not the leader's: do not
-				// report it, so it cannot stand in for an in-sync replica.
-				continue
-			}
-			changed = append(changed, it.Slot)
-			leos = append(leos, e.store.LastSeqOf(it.Slot)+1)
-		}
-		// The report is a synchronous unary call, so the slices can go back to
-		// the scratch right after it: the message is already on the wire.
-		if len(changed) > 0 {
-			e.reportProgress(addr, changed, leos, false)
-		}
-		scr.changed, scr.leos = changed[:0], leos[:0]
 	}
 	return productive, nil
 }
@@ -2355,19 +2595,72 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 // the whole multiplexed session (which used to back the session off and leave
 // every other slot of that leader without a fetch round — the 10s watermark
 // freeze). A genuine failure (a malformed frame) still aborts the round.
-func (e *Engine) applyFetchItems(items []FetchItem) (bool, error) {
-	productive := false
-	for _, it := range items {
-		dvg, err := applyFetchPayload(e.store, it.Slot, it.NextSeq, it.Payload)
-		if err != nil {
-			return productive, err
-		}
-		if len(dvg) > 0 {
-			e.noteDivergence(it.Slot, dvg)
-		}
-		productive = true
+func (e *Engine) applyFetchItems(items []FetchItem, report func(slot int32, from uint64)) (bool, error) {
+	if len(items) == 0 {
+		return false, nil
 	}
-	return productive, nil
+	if len(items) < applyParallelMin {
+		for i := range items {
+			if err := e.applyItem(&items[i], report); err != nil {
+				return false, err
+			}
+		}
+		return true, nil
+	}
+	workers := applyWorkers
+	if workers > len(items) {
+		workers = len(items)
+	}
+	// A cursor hands each worker the next item, so a slow slot does not pin the
+	// others; a genuine failure stops the round early (the slots already applied
+	// are not lost — the next round's positions come from the store itself).
+	var cursor, failed atomic.Int64
+	var errMu sync.Mutex
+	var firstErr error
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(cursor.Add(1)) - 1
+				if i >= len(items) || failed.Load() != 0 {
+					return
+				}
+				if err := e.applyItem(&items[i], report); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+					failed.Store(1)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return false, firstErr
+	}
+	return true, nil
+}
+
+// applyItem lands one slot's share of a round: its records in seq order, then
+// its new position to report. A quarantined slot is deliberately not reported,
+// so a replica holding different bytes cannot stand in for an in-sync one.
+func (e *Engine) applyItem(it *FetchItem, report func(slot int32, from uint64)) error {
+	dvg, err := applyFetchPayload(e.store, it.Slot, it.NextSeq, it.Payload)
+	if len(dvg) > 0 {
+		e.noteDivergence(it.Slot, dvg)
+	}
+	if err != nil {
+		return err
+	}
+	if report != nil && !e.isDiverged(it.Slot) {
+		report(it.Slot, e.store.LastSeqOf(it.Slot)+1)
+	}
+	return nil
 }
 
 // noteDivergence latches a slot whose local log forked from its leader's at one
@@ -2445,6 +2738,9 @@ func countRecords(payload []byte) int {
 func (e *Engine) reportProgress(addr string, slots []int32, froms []uint64, stamp bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	e.diag.reportsSent.Add(1)
+	e.diag.reportsSlots.Add(uint64(len(slots)))
+	e.diag.lastReportNS.Store(time.Now().UnixNano())
 	_ = e.peerProgress(ctx, addr, e.self, slots, froms, stamp)
 }
 
