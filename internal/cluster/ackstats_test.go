@@ -186,6 +186,60 @@ func TestAckStatsCountsRedirects(t *testing.T) {
 	}
 }
 
+// TestWaitForHWWakesOnAdvance pins that a parked watermark wait is woken by the
+// replica progress that advances it. The safety tick is pushed to 30s, so a
+// return at all proves the event path: under a poll (or a tick) this would
+// still be parked.
+func TestWaitForHWWakesOnAdvance(t *testing.T) {
+	e, _ := newTestEngine(t, "node-1")
+	leadSlot0(t, e)
+	e.hwWait = 30 * time.Second
+
+	saved := hwWaitTick
+	hwWaitTick = 30 * time.Second
+	defer func() { hwWaitTick = saved }()
+
+	// one in-sync replica, watermark one record behind
+	e.replMu.Lock()
+	e.repl[0] = &slotRepl{node: []string{"node-2"}, leo: []uint64{1}, lastOK: []time.Time{time.Now()}, hw: 1}
+	e.replMu.Unlock()
+
+	agg := aggsOnSlot(t, e, 0, 1)[0]
+	// First record lands at seq 1, which the frozen watermark already covers:
+	// the record that has to park is the next one.
+	if _, err := e.SubmitAppend(context.Background(), makeRecord(agg, 1, "hw-wake-0")); err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+	rec := makeRecord(agg, 2, "hw-wake-1")
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.SubmitAppend(context.Background(), rec)
+		done <- err
+	}()
+
+	// let it park, then advance the replica and kick exactly as a report does
+	time.Sleep(30 * time.Millisecond)
+	if w := e.AckStats().WaitersNow; w == 0 {
+		t.Fatal("no call parked in waitForHW: the test is not exercising the wait")
+	}
+	e.replMu.Lock()
+	e.repl[0].leo[0] = e.store.LastSeqOf(0)
+	e.replMu.Unlock()
+	e.advanceHW(0)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("append after the watermark advanced: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the wait did not wake on the advance (it waited for the tick)")
+	}
+	if w := e.AckStats().WaitersNow; w != 0 {
+		t.Fatalf("waiters_now = %d after the wait returned, want 0", w)
+	}
+}
+
 // TestAckStatsFastPathStaysClean: with the watermark already past the record
 // there is no stall, no waiters, and the wait step stays small — the view must
 // not manufacture a problem out of a healthy append.

@@ -43,6 +43,10 @@ type Engine struct {
 	diag   replDiag // data-plane tallies reported by ReplStats
 	ack    ackDiag  // per-step ack-chain timings reported by AckStats
 
+	// hwGates wakes the calls parked in waitForHW when a slot's watermark
+	// moves (see hwwake.go). Indexed by slot id, read-only after construction.
+	hwGates []hwGate
+
 	// rotation cursor for the mfetch payload budget
 	fetchRot atomic.Uint64
 
@@ -461,7 +465,8 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logge
 		rebalanceInterval: DefaultRebalanceInterval,
 		rebalanceBatch:    DefaultRebalanceBatch,
 		// per-slot ack-chain tallies, indexed by slot id (read-only after this)
-		ack: ackDiag{slots: make([]slotAck, store.SlotCount)},
+		ack:     ackDiag{slots: make([]slotAck, store.SlotCount)},
+		hwGates: make([]hwGate, store.SlotCount),
 	}
 	e.orderPool.New = func() any { return make([]int, 0, 64) }
 	e.parkedPool.New = func() any { return make([]parkedEntry, 0, 64) }
@@ -1143,6 +1148,13 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 	e.ack.waitersNow.Add(1)
 	defer e.ack.waitersNow.Add(-1)
 	deadline := time.Now().Add(timeout)
+	// Event-driven: a replica report that moves the watermark kicks the slot's
+	// gate, so the acknowledged append wakes on the movement itself instead of
+	// on a poll interval. The tick is the safety net for transitions that
+	// produce no report (a replica going stale, a peer marked down); see
+	// hwWaitTick.
+	tick := time.NewTicker(hwWaitTick)
+	defer tick.Stop()
 	for {
 		e.replMu.Lock()
 		sr := e.repl[slot]
@@ -1166,6 +1178,14 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 				break
 			}
 		}
+		// Take the wake channel before releasing replMu: an advance that
+		// stores the watermark and kicks between this read and the park then
+		// either closed this generation (we wake) or happened before it (the
+		// watermark we just read already covers the record).
+		var wake <-chan struct{}
+		if g := e.hwGateOf(slot); g != nil {
+			wake = g.wait()
+		}
 		e.replMu.Unlock()
 		if !inSync {
 			// No in-sync replica to wait for: the durability promise is to
@@ -1184,7 +1204,12 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 			e.logHWStall(slot, seq, hw)
 			return hw, fmt.Errorf("timeout waiting for high watermark (hw %d < seq %d)", hw, seq)
 		}
-		time.Sleep(2 * time.Millisecond)
+		select {
+		case <-wake: // a replica report moved the watermark
+		case <-tick.C: // safety net: re-check stale/down transitions
+		case <-ctx.Done():
+			return hw, ctx.Err()
+		}
 	}
 }
 
@@ -1638,6 +1663,27 @@ func (e *Engine) advanceHW(slot int32) {
 	if minLEO > sr.hw {
 		sr.hw = minLEO
 		sr.hwAt = time.Now()
+		// Wake the calls parked in waitForHW: their acknowledgement is exactly
+		// this movement, so they must not wait for a poll interval (the kick
+		// is free when nobody is parked).
+		e.kickHW(slot)
+	}
+}
+
+// hwGateOf returns the slot's wake gate, or nil for a slot outside this store
+// (a test store with a smaller slot count: no gate, so such a wait is driven
+// by the safety tick alone).
+func (e *Engine) hwGateOf(slot int32) *hwGate {
+	if slot < 0 || int(slot) >= len(e.hwGates) {
+		return nil
+	}
+	return &e.hwGates[slot]
+}
+
+// kickHW wakes the waiters parked on a slot's high watermark.
+func (e *Engine) kickHW(slot int32) {
+	if g := e.hwGateOf(slot); g != nil {
+		g.kick()
 	}
 }
 
