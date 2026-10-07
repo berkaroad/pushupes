@@ -489,7 +489,7 @@ GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（�
                                                #   status 读缓存值；storage_bytes_complete=false 表示
                                                #   有 slot leader 没应答，此时该值是下界
 GET  /admin/writes                             # 每槽 durable 计数 + 槽内总字节/事件流数量 + 本节点待清理副本（前端轮询）
-GET  /admin/stats[?worst=N]                    # 两个「等在哪里」自视合一：flush = 脏槽数/最老脏槽年龄/刷盘队列长度与在飞数/fsync 排队等待与 syscall 服务时间分位/单次覆盖字节；repl = `hw < LEO` 的槽数与最老等待时长（?worst=N 列出最久的槽）/每副本上报新鲜度与 LEO 落后/fetch 轮次与「按数据唤醒 vs 按等待预算到期」计数
+GET  /admin/stats[?worst=N]                    # 三个「等在哪里」自视合一：flush = 脏槽数/最老脏槽年龄/刷盘队列长度与在飞数/fsync 排队等待与 syscall 服务时间分位/单次覆盖字节；repl = `hw < LEO` 的槽数与最老等待时长（?worst=N 列出最久的槽）/每副本上报新鲜度与 LEO 落后/fetch 轮次与「按数据唤醒 vs 按等待预算到期」计数；ack = 每条写入的确认链路四段耗时（栅栏+路由 / 本地 WAL 落地 / 等 ISR 高水位 / 整调用）与结果、失败原因分布、正在等待的调用数、水位落后条数（?worst=N 列出等得最久的槽）
 GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本，仅内存索引，不读 WAL）
 POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移（控制器专属，必须发到 Raft leader 的 admin 地址）
 POST /admin/slots/{slot}/remove-replica {node} # 回收副本集里的一个成员（控制器专属，同上）
@@ -912,6 +912,34 @@ before 侧（1494 写/s）。3 节点的 ack 延迟由复制那一跳（副本�
 （leader 等 ISR 高水位覆盖该 seq）都未改动；Raft WAL 的 fsync 未并入本次改造；
 段索引文件（`segidx`/`segcidx`/`segaidx`）在封段与关闭时各一次 fsync 的频率
 ≈ 段滚动，仍未并入。
+
+## 7.4 ack 链路自视（排查「写入慢在哪一步」）
+
+写入被确认的条件是「槽的高水位覆盖该条」（§4），所以一次调用的时延就是四段之和：
+取迁移写栅栏并判路由 → 本地 WAL 落地 → 等 ISR 高水位 → 其余（组装响应、调用方调度）。
+`GET /admin/stats` 的 `ack` 段把每段单独计时（每调用 4 次 `time.Now()` + 若干原子计数，
+固定桶直方图，快照无锁无分配），`?worst=N` 按「等高水位」的 p99 列出最差的槽。
+
+3 节点、`--duration 20s --size 1024 --conns 4 --aggs 10000 --batch 100` 的实测样本：
+
+```
+appends=102882 batches=99855 success=102161 fail=0 (timeout=0 version=0 other=0) redirects=331
+fence_route p50 0.05ms  p99 0.05ms  max   5.99ms
+wal_land    p50 0.05ms  p99    5ms  max  31.88ms
+hw_wait     p50    5ms  p99   50ms  max 120.14ms
+total       p50    5ms  p99   50ms  max 122.67ms
+waiters_now=0  hw_stalls=0  水位落后(条) p50=0 p99=1 max=3
+```
+
+读法：`total` ≈ `hw_wait`、而 `fence_route`/`wal_land` 在亚毫秒 ⇒ 这条链路的时延几乎
+全在「等副本位置推进高水位」上，本地落盘不是瓶颈；`水位落后` 只有个位数说明高水位
+贴着日志走，副本没有积压；`waiters_now` 与 `hw_stalls` 为 0 说明此刻没有调用被拖住、
+也没有撞过 10s 截止。反过来，如果 p99 高而 `hw_wait` 低，嫌疑就在客户端/重定向；
+如果 `hw_stalls` 上升，看 `repl` 段的每副本上报新鲜度与 LEO 落后。
+
+`fail` 进一步按原因拆分（`fail_hw_timeout` / `fail_version_conflict` / `fail_other`），
+因为「有写入失败」只有分清「复制没跟上」还是「客户端请求本身不合规」才可行动：实测
+那 186 例失败全部是 `version_conflict`（业务规则 1001），`fail_hw_timeout` 为 0。
 
 ## 11. 控制面共识层（自研 Raft 设计）
 

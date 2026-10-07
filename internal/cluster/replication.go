@@ -41,6 +41,7 @@ type Engine struct {
 	replMu sync.Mutex
 	repl   map[int32]*slotRepl
 	diag   replDiag // data-plane tallies reported by ReplStats
+	ack    ackDiag  // per-step ack-chain timings reported by AckStats
 
 	// rotation cursor for the mfetch payload budget
 	fetchRot atomic.Uint64
@@ -459,6 +460,8 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logge
 		// and -rebalance-batch (an interval or batch of 0 turns it off).
 		rebalanceInterval: DefaultRebalanceInterval,
 		rebalanceBatch:    DefaultRebalanceBatch,
+		// per-slot ack-chain tallies, indexed by slot id (read-only after this)
+		ack: ackDiag{slots: make([]slotAck, store.SlotCount)},
 	}
 	e.orderPool.New = func() any { return make([]int, 0, 64) }
 	e.parkedPool.New = func() any { return make([]parkedEntry, 0, 64) }
@@ -769,10 +772,20 @@ func (e *Engine) syncMigrationState() {
 // the fence is released and is then re-evaluated against the table — it is
 // never failed by the fence, and it is redirected to the new leader once the
 // move is applied.
-func (e *Engine) SubmitAppend(ctx context.Context, rec *data.EventRecord) (*data.AppendResponse, error) {
+func (e *Engine) SubmitAppend(ctx context.Context, rec *data.EventRecord) (resp *data.AppendResponse, err error) {
+	start := time.Now()
 	slot := e.SlotOf(rec.AggregateID)
 	leave := e.enterWriteFence(slot)
 	defer leave()
+	fenced := time.Now()
+	e.noteCall(start, fenced, 1, false)
+	defer func() {
+		redir := redirected(err)
+		e.noteCallEnd(start, redir)
+		if !redir {
+			e.noteOutcome(resp)
+		}
+	}()
 	return e.submitAppendLocked(ctx, rec, slot)
 }
 
@@ -869,16 +882,24 @@ func (e *Engine) clientAddr(nodeID string) string {
 // an append acknowledged without that wait could vanish if the leader died
 // before its replicas pulled the record.
 func (e *Engine) localAppend(slot int32, rec *data.EventRecord) (*data.AppendResponse, error) {
+	if s := e.slotAckOf(slot); s != nil {
+		s.appends.Add(1)
+	}
+	tLand := time.Now()
 	resp, err := e.landLocalAppend(slot, rec)
+	e.noteLand(slot, time.Since(tLand))
 	if err != nil || resp.Status != data.StatusSuccess {
 		return resp, err
 	}
 	// success: wait for the watermark so the acknowledged record survives a
 	// leader crash (see the function comment).
-	if _, err := e.waitForHW(context.Background(), slot, resp.Seq, e.hwWait); err != nil {
+	tWait := time.Now()
+	hw, werr := e.waitForHW(context.Background(), slot, resp.Seq, e.hwWait)
+	e.noteWait(slot, time.Since(tWait), e.hwLagRecords(slot, hw), werr != nil)
+	if werr != nil {
 		resp.Status = data.StatusFail
 		resp.ErrID = data.ErrIDNotLeader
-		resp.Err = err.Error()
+		resp.Err = werr.Error()
 		return resp, nil
 	}
 	return resp, nil
@@ -935,12 +956,26 @@ func (e *Engine) landLocalAppend(slot int32, rec *data.EventRecord) (*data.Appen
 // A routing outcome that is not local (MOVED/ASK/NOT_LEADER for the slot)
 // fails the WHOLE group the same way: it is slot-level state, every record
 // shares the answer. Migration forwarding stays per record (best effort).
-func (e *Engine) SubmitBatch(ctx context.Context, slot int32, recs []*data.EventRecord) ([]*data.AppendResponse, error) {
+func (e *Engine) SubmitBatch(ctx context.Context, slot int32, recs []*data.EventRecord) (out []*data.AppendResponse, err error) {
 	if len(recs) == 0 {
 		return nil, nil
 	}
+	start := time.Now()
 	leave := e.enterWriteFence(slot)
 	defer leave()
+	fenced := time.Now()
+	e.noteCall(start, fenced, len(recs), true)
+	defer func() {
+		redir := redirected(err)
+		e.noteCallEnd(start, redir)
+		if !redir {
+			// batchLocal has already demoted the records above the watermark
+			// deadline, so these are the settled statuses.
+			for _, r := range out {
+				e.noteOutcome(r)
+			}
+		}
+	}()
 
 	// One routing snapshot for the group (same copy-under-lock rule as
 	// submitAppendLocked: the placement is mutated in place by the apply loop).
@@ -982,7 +1017,11 @@ func (e *Engine) SubmitBatch(ctx context.Context, slot int32, recs []*data.Event
 // wait for the watermark once against the group's max seq.
 func (e *Engine) batchLocal(ctx context.Context, slot int32, recs []*data.EventRecord, fwdTarget string) ([]*data.AppendResponse, error) {
 	out := make([]*data.AppendResponse, len(recs))
+	if s := e.slotAckOf(slot); s != nil {
+		s.appends.Add(uint64(len(recs)))
+	}
 	var maxSeq uint64
+	tLand := time.Now()
 	for i, rec := range recs {
 		resp, err := e.landLocalAppend(slot, rec)
 		if err != nil {
@@ -1001,10 +1040,14 @@ func (e *Engine) batchLocal(ctx context.Context, slot int32, recs []*data.EventR
 			}
 		}
 	}
+	e.noteLand(slot, time.Since(tLand))
 	if maxSeq == 0 {
 		return out, nil // nothing new landed: fail/exists only, no wait
 	}
-	if hw, err := e.waitForHW(context.Background(), slot, maxSeq, e.hwWait); err != nil {
+	tWait := time.Now()
+	hw, werr := e.waitForHW(context.Background(), slot, maxSeq, e.hwWait)
+	e.noteWait(slot, time.Since(tWait), e.hwLagRecords(slot, hw), werr != nil)
+	if werr != nil {
 		// The group's wait ran out. Judge every record against the watermark
 		// waitForHW observed at the deadline: the prefix it covers keeps its
 		// success (its durability promise IS met), only the records above it
@@ -1015,7 +1058,7 @@ func (e *Engine) batchLocal(ctx context.Context, slot int32, recs []*data.EventR
 			if resp.Status == data.StatusSuccess && resp.Seq > hw {
 				resp.Status = data.StatusFail
 				resp.ErrID = data.ErrIDNotLeader
-				resp.Err = err.Error()
+				resp.Err = werr.Error()
 			}
 		}
 	}
@@ -1097,6 +1140,8 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 	if e.replicaCount(slot) <= 1 {
 		return 0, nil // nothing to wait for
 	}
+	e.ack.waitersNow.Add(1)
+	defer e.ack.waitersNow.Add(-1)
 	deadline := time.Now().Add(timeout)
 	for {
 		e.replMu.Lock()
@@ -1135,6 +1180,7 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 			return hw, nil
 		}
 		if time.Now().After(deadline) {
+			e.ack.stalls.Add(1)
 			e.logHWStall(slot, seq, hw)
 			return hw, fmt.Errorf("timeout waiting for high watermark (hw %d < seq %d)", hw, seq)
 		}

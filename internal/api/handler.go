@@ -292,6 +292,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"node":  s.Engine.Self(),
 		"flush": s.Store.FlushStats(),
 		"repl":  s.Engine.ReplStatsTop(worst),
+		"ack":   s.Engine.AckStatsTop(worst),
 	})
 }
 
