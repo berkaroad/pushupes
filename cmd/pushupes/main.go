@@ -67,7 +67,9 @@ func main() {
 		// BatchAppend asks for one batch to fit inside the cap, so the
 		// operator raises it together with typical batch size (a 4MiB cap
 		// carries roughly 4000 records of 1KiB bodies).
-		grpcMaxMsg    = byteSize(envIntOr("PUSHUPES_GRPC_MAX_MSG_SIZE", defaultGrpcMaxMsgBytes))
+		grpcMaxMsg = byteSize(envIntOr("PUSHUPES_GRPC_MAX_MSG_SIZE", defaultGrpcMaxMsgBytes))
+		batchPar   = flag.Int("batch-slot-parallelism", envIntOr("PUSHUPES_BATCH_SLOT_PARALLELISM", grpcapi.DefaultBatchSlotParallelism),
+			"max slots one BatchAppend executes concurrently (different slots take independent fences and WALs; a wide batch spanning the ring lands at most this many concurrent WAL writers — env PUSHUPES_BATCH_SLOT_PARALLELISM)")
 		bootstrap     = flag.Bool("bootstrap", false, "write this cluster's initial configuration from this node. By default the node whose id leads -peers does that and every other configured node starts as a seed that offers itself through the running cluster (env PUSHUPES_BOOTSTRAP not read: this is a startup decision, not a tunable)")
 		raftHeartbeat = flag.Duration("raft-heartbeat-timeout", envDurationOr("PUSHUPES_RAFT_HEARTBEAT_TIMEOUT", raft.DefaultHeartbeatTimeout),
 			"consensus heartbeat interval (env PUSHUPES_RAFT_HEARTBEAT_TIMEOUT). A leader whose heartbeats do not arrive in time is voted out, so on a host that can delay the consensus event loop raise this together with -raft-election-timeout")
@@ -94,13 +96,13 @@ func main() {
 	base := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	logger := base.With("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *dropAfter, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, int64(segmentB), int64(grpcMaxMsg), *batchPar, *flushN, *flushD, *dropAfter, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
 		logger.Error("pushupes exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount int, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD, dropAfter time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount int, segmentBytes, grpcMaxMsgBytes int64, batchParallelism int, flushN int64, flushD, dropAfter time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
 	// Canonical form for every stored address: scheme required. A bare
 	// host:port gets the default "http://" prefix; an explicit protocol
 	// is honoured as passed. TCP-level uses (listen/dial) strip it again.
@@ -113,6 +115,12 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 
 	if err := storage.ValidateSegmentBytes(segmentBytes); err != nil {
 		return err
+	}
+	// The batch slot cap sizes a semaphore; a zero/negative value would make
+	// every BatchAppend block forever (fail fast at startup; the default is
+	// grpcapi.DefaultBatchSlotParallelism).
+	if batchParallelism <= 0 {
+		return fmt.Errorf("-batch-slot-parallelism %d must be positive", batchParallelism)
 	}
 	// The client-plane message cap must be positive; a zero/negative value
 	// would break every gRPC call on the data plane (fail fast at startup).
@@ -249,7 +257,7 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 		grpc.MaxSendMsgSize(int(grpcMaxMsgBytes)),
 	}
 	grpcSrv := grpc.NewServer(grpcOpts...)
-	grpcapi.NewServer(eng, store, logger).Register(grpcSrv)
+	grpcapi.NewServer(eng, store, logger, batchParallelism).Register(grpcSrv)
 	grpcLis, err := net.Listen("tcp", cluster.HostPort(clientAddr))
 	if err != nil {
 		return fmt.Errorf("client listen %s: %w", clientAddr, err)

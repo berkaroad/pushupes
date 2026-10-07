@@ -191,6 +191,7 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 | `-rebalance-interval` | `PUSHUPES_REBALANCE_INTERVAL` | 2s | controller 每隔多久检查一次 leader 布局并执行回切（节点宕机恢复后把槽 leader 迁回环上预期节点）；0=关闭，负数启动即报错 |
 | `-rebalance-batch` | `PUSHUPES_REBALANCE_BATCH` | 28 | 每轮回切最多串行执行几个 leader 交接；轮内串行保证任一时刻只有一个槽在交接栅栏上，一轮跑不完下个间隔自动顺延；0=关闭，负数启动即报错 |
 | `-grpc-max-msg-size` | `PUSHUPES_GRPC_MAX_MSG_SIZE` | 4MiB | client 面 gRPC 消息上限（recv/send 同值）；`BatchAppend` 单批要装进它，可写 `16MiB` 等带单位形式；≤0 启动即报错 |
+| `-batch-slot-parallelism` | `PUSHUPES_BATCH_SLOT_PARALLELISM` | 100 | `BatchAppend` 一批最多同时执行几个槽（异槽并行、同槽串行；铺满 1680 槽的宽批也不会瞬间压上等量并发 WAL 写者）；≤0 启动即报错 |
 
 ### 客户端接入
 
@@ -202,7 +203,7 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 - `EventService/BatchAppend`：批量写入。一批携带多条 `AppendRequest`（批内
   `aggregate_id` 必须各不相同，重复的那组整组 `fail/1002` 且不执行），逐条
   独立走同一套写入规则，按请求同序返回逐条结果（回显 `aggregate_id`）。
-  服务端同槽串行、异槽并行（并发上限 2×CPU 核数）。单批必须装进 client 面
+  服务端同槽串行、异槽并行（并发上限 `-batch-slot-parallelism`，默认 100）。单批必须装进 client 面
   gRPC 消息上限（`-grpc-max-msg-size`，默认 4MiB）。
 - `EventService/ReadStream`：按聚合读取事件流（≤HW 语义）。
 - `EventService/ReadByCommand`：按 `command_id` 查询已写入的记录。

@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"runtime"
 	"sync"
 	"time"
 
@@ -35,22 +34,36 @@ type Server struct {
 	store  *storage.Store
 	logger *slog.Logger
 
+	// batchParallelism caps how many slots one BatchAppend executes
+	// concurrently (see BatchAppend).
+	batchParallelism int
+
 	// leaders pools EventService clients for cross-node read proxies
 	// (this node holds neither the slot nor a replica of it).
 	mu      sync.Mutex
 	leaders map[string]pushupesv1.EventServiceClient
 }
 
-// NewServer wires the gRPC facade onto the engine + store.
-func NewServer(eng *cluster.Engine, store *storage.Store, logger *slog.Logger) *Server {
+// DefaultBatchSlotParallelism is the concurrent-slot cap one BatchAppend
+// fans out to; -batch-slot-parallelism raises or lowers it per node.
+const DefaultBatchSlotParallelism = 100
+
+// NewServer wires the gRPC facade onto the engine + store. A
+// batchParallelism of zero or less means "the default cap" (callers that do
+// not tune the knob pass 0).
+func NewServer(eng *cluster.Engine, store *storage.Store, logger *slog.Logger, batchParallelism int) *Server {
 	// A nil logger must not panic a handler half-way through: the read path
 	// logs (and continues) on a proxy failure, and a panic there replaces a
 	// "proxy dial failed" warning with a crash that hides the real reason.
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
 	}
+	if batchParallelism <= 0 {
+		batchParallelism = DefaultBatchSlotParallelism
+	}
 	return &Server{engine: eng, store: store, logger: logger,
-		leaders: map[string]pushupesv1.EventServiceClient{}}
+		batchParallelism: batchParallelism,
+		leaders:          map[string]pushupesv1.EventServiceClient{}}
 }
 
 // Register adds the service to a grpc.Server.
@@ -184,20 +197,6 @@ func (s *Server) batchSlot(ctx context.Context, slot int32, reqs []*pushupesv1.A
 
 // ---- BatchAppend -------------------------------------------------------------
 
-// batchSlotParallelism caps how many slots one batch executes concurrently:
-// 2x CPU cores. Different slots take independent write fences and hit
-// independent WALs; within one slot records execute serially in request
-// order. The cap is about a batch spanning MANY slots (1680 of them) not
-// swamping the node with concurrent WAL writers while a normal batch keeps
-// full slot-level parallelism.
-func batchSlotParallelism() int {
-	n := 2 * runtime.GOMAXPROCS(0)
-	if n < 1 {
-		n = 1
-	}
-	return n
-}
-
 // BatchAppend appends many records in one call. Each record gets its own
 // result (success/exists/fail) in the SAME ORDER as the request. The batch
 // must carry distinct aggregate_ids: every record sharing an aggregate_id
@@ -211,7 +210,8 @@ func batchSlotParallelism() int {
 // routing slot, one worker per slot runs them in request order through the
 // ordinary SubmitAppend path (write fence, routing, idempotency, version
 // check, HW wait — the same rules a single Append applies), and distinct
-// slots run concurrently under a shared cap. The slot WAL lock already
+// slots run concurrently under the server's shared cap
+// (-batch-slot-parallelism, default DefaultBatchSlotParallelism). The slot WAL lock already
 // serialises appends to one slot; keeping the HW waits serial per slot as
 // well is what stops two batch records from racing to observe a watermark
 // for the other's seq.
@@ -265,7 +265,7 @@ func (s *Server) BatchAppend(ctx context.Context, req *pushupesv1.BatchAppendReq
 	// Fan out per slot; the semaphore caps concurrent slots across the
 	// batch. Each slot group executes as ONE SubmitBatch: serial land in
 	// request order + one merged watermark wait for the group.
-	sem := make(chan struct{}, batchSlotParallelism())
+	sem := make(chan struct{}, s.batchParallelism)
 	var wg sync.WaitGroup
 	for _, g := range groups {
 		wg.Add(1)
