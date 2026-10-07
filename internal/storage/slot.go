@@ -78,7 +78,16 @@ type Slot struct {
 	segmentBytes int64
 	flush        FlushPolicy
 	pendingFlush int64
-	lastFlush    time.Time
+	// unflushedSinceNS is when this slot went from having nothing unflushed
+	// to holding records that still need an fsync (0 = nothing waiting). It is
+	// the durability-exposure clock FlushStats reports. The slot lock writes
+	// it and the stats read it without the lock, so a busy slot still shows an
+	// age instead of dropping out of the gauge; it moves forward whenever a
+	// flush leaves records behind (those arrived during the syscall), so it
+	// cannot grow without bound under sustained writes the way the flush
+	// policy's dirty mark does.
+	unflushedSinceNS atomic.Int64
+	lastFlush        time.Time
 
 	mu sync.RWMutex
 	// cond signals seqCounter advances (single-slot long-poll wait).
@@ -1173,6 +1182,7 @@ func (s *Slot) flusher() *flusher {
 // Caller holds s.mu for writing.
 func (s *Slot) markFlushedLocked() {
 	s.pendingFlush = 0
+	s.unflushedSinceNS.Store(0)
 	s.lastFlush = time.Now()
 	if s.store != nil {
 		s.store.noteFlushed(s.ID)
@@ -1231,12 +1241,13 @@ func (s *Slot) prepareFlushLocked(now time.Time, force bool) ([]*flushUnit, time
 			continue // nothing outstanding in this segment
 		}
 		units = append(units, &flushUnit{
-			slot: s.ID,
-			seg:  seg,
-			file: seg.File, // handle snapshot: the file stays open while queued (detach waits first)
-			size: seg.sizeBytes,
-			recs: seg.unflushed,
-			enq:  now,
+			slot:     s.ID,
+			seg:      seg,
+			file:     seg.File, // handle snapshot: the file stays open while queued (detach waits first)
+			size:     seg.sizeBytes,
+			newBytes: seg.sizeBytes - seg.syncedSize,
+			recs:     seg.unflushed,
+			enq:      now,
 		})
 	}
 	// Push the index buffers out while the lock is already held: those are
@@ -1283,6 +1294,10 @@ func (s *Slot) settleFlush(u *flushUnit, err error) {
 		s.markFlushedLocked()
 		return
 	}
+	// Records arrived while this fsync was in flight: they are the ones still
+	// waiting, so the exposure clock restarts now (an upper bound: they may be
+	// newer than this, never older).
+	s.unflushedSinceNS.Store(time.Now().UnixNano())
 	s.lastFlush = time.Now()
 }
 
@@ -1348,6 +1363,9 @@ func (s *Slot) HasPending() bool {
 // policy, and the store arms no timer for such a slot (see DueAt), so this
 // kick is the slot's only path to its fsync.
 func (s *Slot) noteAppendPending() {
+	if s.pendingFlush == 0 {
+		s.unflushedSinceNS.Store(time.Now().UnixNano())
+	}
 	s.pendingFlush++
 	if s.flush.IntervalMessages > 0 && s.pendingFlush == s.flush.IntervalMessages && s.store != nil {
 		s.store.kickFlush()

@@ -28,10 +28,6 @@ type Store struct {
 	// acquisitions per tick instead of O(slot count).
 	dirtyMu sync.Mutex
 	dirty   map[int32]bool
-	// dirtySince is when each dirty slot joined the set. The age of the
-	// oldest entry is how long a record has been sitting unflushed — the
-	// number that says whether the flush loop is keeping up.
-	dirtySince map[int32]time.Time
 	// flusher owns every segment fsync: one goroutine, one fsync in flight at
 	// a time, with no slot write lock held across the syscall (see flusher.go).
 	flusher *flusher
@@ -80,7 +76,6 @@ func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushP
 		slots:        make([]atomic.Pointer[Slot], slotCount),
 		writes:       make([]atomic.Uint64, slotCount),
 		dirty:        map[int32]bool{},
-		dirtySince:   map[int32]time.Time{},
 		wakeBus:      make(chan struct{}),
 	}
 	st.flusher = newFlusher(st)
@@ -329,9 +324,6 @@ func (st *Store) markDirty(slotID int32) {
 	st.dirtyMu.Lock()
 	_, seen := st.dirty[slotID]
 	st.dirty[slotID] = true
-	if !seen {
-		st.dirtySince[slotID] = time.Now()
-	}
 	st.dirtyMu.Unlock()
 	if !seen {
 		st.kickFlush()
@@ -345,7 +337,6 @@ func (st *Store) kickFlush() { st.flusher.kick() }
 func (st *Store) clearDirty(slotID int32) {
 	st.dirtyMu.Lock()
 	delete(st.dirty, slotID)
-	delete(st.dirtySince, slotID)
 	st.dirtyMu.Unlock()
 }
 
@@ -355,24 +346,30 @@ func (st *Store) clearDirty(slotID int32) {
 // flush-stats gauges report a flush that is behind when it is not.
 func (st *Store) noteFlushed(slotID int32) { st.clearDirty(slotID) }
 
-// fsyncBuckets / fsyncBucketBoundsMs bucket one slot's fsync cost, in ms:
-// <1, <4, <16, <64, <256, <1024, >=1024.
-const fsyncBuckets = 7
+// fsyncBucketBoundsMs are the upper bounds (in ms) of the fsync histograms the
+// p50/p99 estimates come from; the remaining bucket collects everything above
+// the last bound. The low end is fine on purpose: a fence/route or a small
+// segment's fsync is sub-millisecond, and coarse bounds report it as 1ms.
+var fsyncBucketBoundsMs = [...]float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000}
 
-var fsyncBucketBoundsMs = [fsyncBuckets - 1]float64{1, 4, 16, 64, 256, 1024}
+const fsyncBuckets = len(fsyncBucketBoundsMs) + 1
 
 // FlushStats is the flush path's own view: how many slots are waiting for an
 // fsync, how long the oldest has waited, and what the fsyncs that ran cost.
 type FlushStats struct {
-	Dirty           int      `json:"dirty"`
-	OldestDirtyAgeS float64  `json:"oldest_dirty_age_s"`
-	Sampled         int      `json:"sampled"`
-	BusyLocked      int      `json:"busy_locked"`
-	PendingFlushSum int64    `json:"pending_flush_sum"`
-	FsyncCount      uint64   `json:"fsync_count"`
-	FsyncAvgMS      float64  `json:"fsync_avg_ms"`
-	FsyncMaxMS      float64  `json:"fsync_max_ms"`
-	FsyncBuckets    []uint64 `json:"fsync_buckets_ms"`
+	Dirty int `json:"dirty"`
+	// OldestUnflushedAgeS is how long the oldest record still waiting for an
+	// fsync has waited: a slot's clock starts at the append that finds it
+	// clean and restarts whenever a flush leaves records behind (those arrived
+	// during the syscall). It is the durability-exposure gauge, and the
+	// dispatch order keeps it inside the flush policy's bound. It is NOT the
+	// age of the flush policy's dirty mark — a continuously written slot never
+	// leaves that set, so that number grows without bound by construction.
+	OldestUnflushedAgeS float64 `json:"oldest_unflushed_age_s"`
+	Sampled             int     `json:"sampled"`
+	BusyLocked          int     `json:"busy_locked"`
+	PendingFlushSum     int64   `json:"pending_flush_sum"`
+	FsyncCount          uint64  `json:"fsync_count"`
 
 	// The flusher's own view (flusher.go). Previous accounts could not tell a
 	// slow device from a long queue: fsync_wait_ms is the time a unit spent in
@@ -386,8 +383,13 @@ type FlushStats struct {
 	FsyncWaitP99MS float64 `json:"fsync_wait_p99_ms"`
 	FsyncSvcP50MS  float64 `json:"fsync_svc_p50_ms"`
 	FsyncSvcP99MS  float64 `json:"fsync_svc_p99_ms"`
-	FsyncBytesAvg  float64 `json:"fsync_bytes_avg"`
-	FsyncBytesMax  uint64  `json:"fsync_bytes_max"`
+	// FsyncNewBytes is what each fsync was the first to make durable;
+	// FsyncFileSize is the segment file it covered (that is what a long
+	// service time scales with, not the bytes written since the last one).
+	FsyncNewBytesAvg float64 `json:"fsync_new_bytes_avg"`
+	FsyncNewBytesMax uint64  `json:"fsync_new_bytes_max"`
+	FsyncFileSizeAvg float64 `json:"fsync_file_size_avg"`
+	FsyncFileSizeMax uint64  `json:"fsync_file_size_max"`
 }
 
 // FlushStats snapshots the flush path. It never waits on a slot: a slot whose
@@ -396,24 +398,27 @@ func (st *Store) FlushStats() FlushStats {
 	var out FlushStats
 	st.dirtyMu.Lock()
 	out.Dirty = len(st.dirty)
-	var oldest time.Time
-	for _, ts := range st.dirtySince {
-		if oldest.IsZero() || ts.Before(oldest) {
-			oldest = ts
-		}
-	}
 	ids := make([]int32, 0, len(st.dirty))
 	for id := range st.dirty {
 		ids = append(ids, id)
 	}
 	st.dirtyMu.Unlock()
-	if !oldest.IsZero() {
-		out.OldestDirtyAgeS = time.Since(oldest).Seconds()
-	}
+
+	// The age comes from the slots themselves: each one stamps when it went
+	// from clean to holding unflushed records, so this is how long the oldest
+	// record still waiting for an fsync has waited. A slot whose lock is held
+	// right now is counted busy instead of sampled (never wait here).
+	var oldestMS int64
 	for _, id := range ids {
 		s := st.slots[id].Load()
 		if s == nil {
 			continue
+		}
+		// The exposure clock is an atomic the slot writes under its own lock,
+		// so it is read here even when the slot is busy (a busy slot must not
+		// vanish from the gauge).
+		if ns := s.unflushedSinceNS.Load(); ns > 0 && (oldestMS == 0 || ns < oldestMS) {
+			oldestMS = ns
 		}
 		if !s.mu.TryLock() {
 			out.BusyLocked++
@@ -423,17 +428,19 @@ func (st *Store) FlushStats() FlushStats {
 		out.Sampled++
 		s.mu.Unlock()
 	}
+	if oldestMS > 0 {
+		out.OldestUnflushedAgeS = time.Since(time.Unix(0, oldestMS)).Seconds()
+	}
+
 	d := st.flusher.digest()
 	out.FsyncCount = d.count
-	out.FsyncAvgMS = d.svcAvgMS
-	out.FsyncMaxMS = d.svcMaxMS
-	out.FsyncBuckets = d.svcBucket
 	out.QueueUnits = d.queueUnits
 	out.Inflight = d.inflight
 	out.FsyncWaitAvgMS, out.FsyncWaitMaxMS = d.waitAvgMS, d.waitMaxMS
 	out.FsyncWaitP50MS, out.FsyncWaitP99MS = d.waitP50MS, d.waitP99MS
 	out.FsyncSvcP50MS, out.FsyncSvcP99MS = d.svcP50MS, d.svcP99MS
-	out.FsyncBytesAvg, out.FsyncBytesMax = d.bytesAvg, d.bytesMax
+	out.FsyncNewBytesAvg, out.FsyncNewBytesMax = d.newBytesAvg, d.newBytesMax
+	out.FsyncFileSizeAvg, out.FsyncFileSizeMax = d.fileSizeAvg, d.fileSizeMax
 	return out
 }
 

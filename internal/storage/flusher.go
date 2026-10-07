@@ -17,7 +17,7 @@ import (
 //	   applies keep making progress while the device is slow.
 //	I2 at most one fsync is in flight (inflight never exceeds 1).
 //	I3 a slot's data is fsynced within the flush policy's bound: the queue is
-//	   drained oldest-dirty-first, so oldest_dirty_age_s stays bounded.
+//	   drained oldest-unflushed-first, so oldest_unflushed_age_s stays bounded.
 //
 // A unit of work is ONE segment of one slot (not a whole slot): a slow fsync
 // therefore delays a single 256MiB segment, not every segment of that slot, and
@@ -27,12 +27,13 @@ import (
 // was snapshotted under the slot's write lock in prepareFlushLocked, so the
 // flusher never touches slot state outside the lock's windows.
 type flushUnit struct {
-	slot int32
-	seg  *Segment
-	file *os.File // handle snapshot; syncing it needs no lock and it stays open while queued
-	size int64    // file size this fsync covers, settled into seg.syncedSize
-	recs int64    // records this fsync covers, settled into seg.unflushed/pendingFlush
-	enq  time.Time
+	slot     int32
+	seg      *Segment
+	file     *os.File // handle snapshot; syncing it needs no lock and it stays open while queued
+	size     int64    // file size this fsync covers, settled into seg.syncedSize
+	newBytes int64    // of size, the bytes not covered by an earlier fsync (durable from here)
+	recs     int64    // records this fsync covers, settled into seg.unflushed/pendingFlush
+	enq      time.Time
 }
 
 // flusher owns every fsync in the store.
@@ -61,15 +62,17 @@ type flusher struct {
 
 	inflight atomic.Int64 // invariant I2: 0 or 1
 
-	count      atomic.Uint64 // fsyncs performed
-	svcNS      atomic.Uint64 // syscall service time
-	svcMaxNS   atomic.Uint64
-	waitNS     atomic.Uint64 // queue wait before the syscall
-	waitMaxNS  atomic.Uint64
-	bytesSum   atomic.Uint64 // bytes covered by each fsync
-	bytesMax   atomic.Uint64
-	svcBucket  [fsyncBuckets]atomic.Uint64
-	waitBucket [fsyncBuckets]atomic.Uint64
+	count       atomic.Uint64 // fsyncs performed
+	svcNS       atomic.Uint64 // syscall service time
+	svcMaxNS    atomic.Uint64
+	waitNS      atomic.Uint64 // queue wait before the syscall
+	waitMaxNS   atomic.Uint64
+	fileSizeSum atomic.Uint64 // segment file size each fsync covered
+	fileSizeMax atomic.Uint64
+	newBytesSum atomic.Uint64 // of that, bytes this fsync was the first to cover
+	newBytesMax atomic.Uint64
+	svcBucket   [fsyncBuckets]atomic.Uint64
+	waitBucket  [fsyncBuckets]atomic.Uint64
 }
 
 func newFlusher(st *Store) *flusher {
@@ -292,8 +295,12 @@ func (f *flusher) syncUnit(u *flushUnit) error {
 	f.waitNS.Add(uint64(wait))
 	addMax(&f.svcMaxNS, uint64(svc))
 	addMax(&f.waitMaxNS, uint64(wait))
-	f.bytesSum.Add(uint64(u.size))
-	addMax(&f.bytesMax, uint64(u.size))
+	f.fileSizeSum.Add(uint64(u.size))
+	addMax(&f.fileSizeMax, uint64(u.size))
+	if u.newBytes > 0 {
+		f.newBytesSum.Add(uint64(u.newBytes))
+		addMax(&f.newBytesMax, uint64(u.newBytes))
+	}
 	bucketAdd(&f.svcBucket, svc)
 	bucketAdd(&f.waitBucket, wait)
 
@@ -350,18 +357,20 @@ type flushDigest struct {
 	queueUnits int
 	inflight   int64
 	count      uint64
-	svcAvgMS   float64
-	svcMaxMS   float64
 	waitAvgMS  float64
 	waitMaxMS  float64
-	bytesAvg   float64
-	bytesMax   uint64
-	svcP50MS   float64
-	svcP99MS   float64
-	waitP50MS  float64
-	waitP99MS  float64
-	svcBucket  []uint64
-	waitBucket []uint64
+	// fileSize is the segment file each fsync covered (it explains a long
+	// service time); newBytes is what that fsync was the first to cover.
+	fileSizeAvg float64
+	fileSizeMax uint64
+	newBytesAvg float64
+	newBytesMax uint64
+	svcP50MS    float64
+	svcP99MS    float64
+	waitP50MS   float64
+	waitP99MS   float64
+	svcBucket   []uint64
+	waitBucket  []uint64
 }
 
 func (f *flusher) digest() flushDigest {
@@ -369,17 +378,17 @@ func (f *flusher) digest() flushDigest {
 	q := len(f.units)
 	f.mu.Unlock()
 	d := flushDigest{
-		queueUnits: q,
-		inflight:   f.inflight.Load(),
-		count:      f.count.Load(),
-		bytesMax:   f.bytesMax.Load(),
+		queueUnits:  q,
+		inflight:    f.inflight.Load(),
+		count:       f.count.Load(),
+		fileSizeMax: f.fileSizeMax.Load(),
+		newBytesMax: f.newBytesMax.Load(),
 	}
 	if d.count > 0 {
-		d.svcAvgMS = float64(f.svcNS.Load()) / float64(d.count) / 1e6
-		d.svcMaxMS = float64(f.svcMaxNS.Load()) / 1e6
 		d.waitAvgMS = float64(f.waitNS.Load()) / float64(d.count) / 1e6
 		d.waitMaxMS = float64(f.waitMaxNS.Load()) / 1e6
-		d.bytesAvg = float64(f.bytesSum.Load()) / float64(d.count)
+		d.fileSizeAvg = float64(f.fileSizeSum.Load()) / float64(d.count)
+		d.newBytesAvg = float64(f.newBytesSum.Load()) / float64(d.count)
 	}
 	d.svcBucket = make([]uint64, fsyncBuckets)
 	d.waitBucket = make([]uint64, fsyncBuckets)

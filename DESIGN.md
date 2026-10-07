@@ -166,12 +166,15 @@ Body: Record*，每条记录：
   算未刷），同时最多一个 fsync 在飞。策略触发（`IntervalMessages`/`Interval`）、
   封段滚动（封段即入队）与显式 `Flush()`/`Close`（入队 + 等完成）三个入口
   都收敛到这条队列。
-- **刷盘路径自视**：`GET /admin/stats` 的 `flush` 段给出脏槽数与最老脏槽年龄
-  （对照 `-flush-interval`：稳态就是该间隔量级）、队列长度 `queue_units`、
-  在飞数 `inflight`、排队等待 `fsync_wait_ms{p50,p99,avg,max}` 与 syscall
-  服务时间 `fsync_svc_ms{p50,p99}`、单次覆盖字节 `fsync_bytes_avg/max`——
-  把「等在哪」与「设备多慢」分成两条统计量。这台设备上 4K+fdatasync 的
-  参照：盘空闲时 p50 ≈ 2ms、邻租户打满时 ≈ 7ms。
+- **刷盘路径自视**：`GET /admin/stats` 的 `flush` 段给出无锁可读的
+  `pending_flush_sum`（未刷记录总数）、`oldest_unflushed_age_s`（最老一条
+  等待 fsync 的记录等了多久：槽从「干净」转入「有未刷」时起表，每次
+  flush 若仍留下记录就重新起表——持续写入的槽不会让它无限增长）、队列长度
+  `queue_units`、在飞数 `inflight`、排队等待 `fsync_wait_ms{p50,p99,avg,max}`
+  与 syscall 服务时间 `fsync_svc_ms{p50,p99}`、以及每次 fsync 新覆盖的字节
+  `fsync_new_bytes_avg/max` 与它覆盖的段文件大小
+  `fsync_file_size_avg/max`（后者才是服务时间量级的解释）。这台设备上
+  4K+fdatasync 的参照：盘空闲时 p50 ≈ 2ms、邻租户打满时 ≈ 7ms。
 
 ## 4. 高可用（复制设计）
 
@@ -489,7 +492,7 @@ GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（�
                                                #   status 读缓存值；storage_bytes_complete=false 表示
                                                #   有 slot leader 没应答，此时该值是下界
 GET  /admin/writes                             # 每槽 durable 计数 + 槽内总字节/事件流数量 + 本节点待清理副本（前端轮询）
-GET  /admin/stats[?worst=N]                    # 三个「等在哪里」自视合一：flush = 脏槽数/最老脏槽年龄/刷盘队列长度与在飞数/fsync 排队等待与 syscall 服务时间分位/单次覆盖字节；repl = `hw < LEO` 的槽数与最老等待时长（?worst=N 列出最久的槽）/每副本上报新鲜度与 LEO 落后/fetch 轮次与「按数据唤醒 vs 按等待预算到期」计数；ack = 每条写入的确认链路四段耗时（栅栏+路由 / 本地 WAL 落地 / 等 ISR 高水位 / 整调用）与结果、失败原因分布、正在等待的调用数、水位落后条数（?worst=N 列出等得最久的槽）
+GET  /admin/stats[?worst=N]                    # 三个「等在哪里」自视合一：flush = 待刷记录数/最老未刷记录年龄/刷盘队列长度与在飞数/fsync 排队等待与 syscall 服务时间分位/每次新覆盖字节与覆盖的段文件大小；repl = `hw < LEO` 的槽数与最老等待时长（?worst=N 列出最久的槽）/每副本上报新鲜度与 LEO 落后/fetch 轮次与「按数据唤醒 vs 按等待预算到期」计数；ack = 每条写入的确认链路四段耗时（栅栏+路由 / 本地 WAL 落地 / 等 ISR 高水位 / 整调用）与结果、失败原因分布、正在等待的调用数、水位落后条数（?worst=N 列出等得最久的槽）
 GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本，仅内存索引，不读 WAL）
 POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移（控制器专属，必须发到 Raft leader 的 admin 地址）
 POST /admin/slots/{slot}/remove-replica {node} # 回收副本集里的一个成员（控制器专属，同上）

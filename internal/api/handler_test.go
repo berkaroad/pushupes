@@ -131,7 +131,8 @@ func TestAdminStatsMergesFlushAndRepl(t *testing.T) {
 	if flush == nil {
 		t.Fatalf("no flush section in %v", body)
 	}
-	for _, k := range []string{"dirty", "oldest_dirty_age_s", "busy_locked", "fsync_count", "fsync_buckets_ms"} {
+	for _, k := range []string{"dirty", "oldest_unflushed_age_s", "busy_locked", "fsync_count",
+		"fsync_new_bytes_avg", "fsync_file_size_max", "queue_units", "inflight", "fsync_svc_p99_ms"} {
 		if _, ok := flush[k]; !ok {
 			t.Fatalf("flush section missing %q: %v", k, flush)
 		}
