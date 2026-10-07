@@ -42,6 +42,10 @@ type Engine struct {
 	repl   map[int32]*slotRepl
 	diag   replDiag // data-plane tallies reported by ReplStats
 	ack    ackDiag  // per-step ack-chain timings reported by AckStats
+	// fetchSettle is how long a fetch round sleeps after a data wake before
+	// scanning, so one round answers every slot the burst touched instead of
+	// the first one to land (see SetFetchSettle).
+	fetchSettle time.Duration
 
 	// hwGates wakes the calls parked in waitForHW when a slot's watermark
 	// moves (see hwwake.go). Indexed by slot id, read-only after construction.
@@ -391,15 +395,23 @@ type fetchSession struct {
 // whole idle cycle (wait+maxBackoff) must stay inside the ISR staleness
 // window for replicas to remain in-sync.
 const (
-	fetchBaseInterval    = 100 * time.Millisecond
-	fetchMaxBackoff      = 2 * time.Second
-	fetchWait            = 2 * time.Second      // follower-requested long-poll budget
-	fetchSlack           = 1 * time.Second      // client-side timeout margin
-	fetchMaxWait         = 5 * time.Second      // leader-side cap on a requested wait
-	fetchBurstSettle     = 2 * time.Millisecond // coalescing window after one waiter wakes
-	fetchSweepInterval   = 2 * time.Second      // stamp all positions at least this often
-	isrStaleAfter        = 10 * time.Second     // must exceed fetchWait+fetchMaxBackoff
-	defaultHWWaitTimeout = 10 * time.Second     // the write-ack watermark deadline
+	fetchBaseInterval = 100 * time.Millisecond
+	fetchMaxBackoff   = 2 * time.Second
+	fetchWait         = 2 * time.Second // follower-requested long-poll budget
+	fetchSlack        = 1 * time.Second // client-side timeout margin
+	fetchMaxWait      = 5 * time.Second // leader-side cap on a requested wait
+	// DefaultFetchSettle is the fetch round's coalescing window (see
+	// SetFetchSettle): how long a woken round waits for the rest of the same
+	// write burst before it scans and answers. Measured on the 3-node bench
+	// (1KiB, conns 4, batch 100, mirrored 2ms/200us/0 sweep): answering at
+	// once is WORSE than coalescing (fewer slots per round leaves the tail of a
+	// burst to a later round: hw_wait 6.42ms at 0 vs 4.60ms at 200us against
+	// 5.70ms at 2ms), so the window earns its keep -- but 2ms is overpaid, at
+	// 37 slots per round against 29 for the same acknowledgement latency.
+	DefaultFetchSettle   = 200 * time.Microsecond
+	fetchSweepInterval   = 2 * time.Second  // stamp all positions at least this often
+	isrStaleAfter        = 10 * time.Second // must exceed fetchWait+fetchMaxBackoff
+	defaultHWWaitTimeout = 10 * time.Second // the write-ack watermark deadline
 
 	// maxPayloadBytes caps one long-poll response: during a backlog the
 	// session streams item by item across rounds instead of building a
@@ -465,8 +477,9 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logge
 		rebalanceInterval: DefaultRebalanceInterval,
 		rebalanceBatch:    DefaultRebalanceBatch,
 		// per-slot ack-chain tallies, indexed by slot id (read-only after this)
-		ack:     ackDiag{slots: make([]slotAck, store.SlotCount)},
-		hwGates: make([]hwGate, store.SlotCount),
+		ack:         ackDiag{slots: make([]slotAck, store.SlotCount)},
+		hwGates:     make([]hwGate, store.SlotCount),
+		fetchSettle: DefaultFetchSettle,
 	}
 	e.orderPool.New = func() any { return make([]int, 0, 64) }
 	e.parkedPool.New = func() any { return make([]parkedEntry, 0, 64) }
@@ -1958,6 +1971,20 @@ func (e *Engine) Self() string { return e.self }
 // SetNode attaches the Raft node (breaking the engine<->node cycle).
 func (e *Engine) SetNode(node *Node) { e.node = node }
 
+// SetFetchSettle sets the fetch round's coalescing window: after a parked round
+// is woken by data, the leader waits this long before scanning, so a burst that
+// scatters across slots is answered by ONE round instead of one round per slot.
+// It trades acknowledgement latency (every acknowledged append pays it, since
+// the round that carries the record pays it) against rounds and reports: 0
+// answers as soon as the first slot has data.
+func (e *Engine) SetFetchSettle(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	e.fetchSettle = d
+	e.logger.Info("fetch round coalescing window", "settle", d.String())
+}
+
 // RaftStats exposes consensus counters for the admin API.
 func (e *Engine) RaftStats() map[string]any {
 	return e.node.Stats()
@@ -2396,7 +2423,9 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 				// appends of the same burst land before we scan — without
 				// it the scan races the burst and captures only the first
 				// slot. 2ms against a multi-second cadence is negligible.
-				time.Sleep(fetchBurstSettle)
+				if e.fetchSettle > 0 {
+					time.Sleep(e.fetchSettle)
+				}
 				anyData := false
 				for k := range parked {
 					pe := &parked[k]

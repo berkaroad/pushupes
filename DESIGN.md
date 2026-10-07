@@ -663,6 +663,10 @@ segment_bytes   = 268435456    # 默认 256MiB；须为 64MiB 的整数倍，最
 replica_count   = 2
 election_mode   = leader       # preferred leader 自动回切
 flush.policy    = 每 1000 条或 5s（可关闭为纯页缓存）
+fetch-settle    = 200µs（fetch 轮被数据唤醒后的合并窗口：一轮覆盖整批写入涉及的多个槽；
+                  每次 ack 都会付它一次，换的是轮次与上报次数。实测 3 节点 1KiB/conns 4/batch 100
+                  的镜像三档（2ms/200µs/0）：hw_wait 均值 5.70/4.60/6.42ms、每轮槽数 37.2/29.4/27.2
+                  ⇒ 不合并（0）最差、2ms 又过长，取 200µs）
 drop_after      = 30s          # 迁移后前源节点本地副本的保留期，到期自动 DropSlot
                               # -drop-after / PUSHUPES_DROP_AFTER：正数=该时长，0=默认 30s，
                               # 负数启动即报错；没有关闭选项（留着会把节点写满）

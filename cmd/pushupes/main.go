@@ -54,9 +54,15 @@ func main() {
 		// tolerance (ReplicaCountForMembers), so it is not a flag either: a
 		// cluster that grows at runtime raises its own copy count with no
 		// restart and nothing to configure. See DESIGN §4.
-		segmentB  = byteSize(storage.DefaultSegmentBytes)
-		flushN    = flag.Int64("flush-messages", 1000, "fsync every N records (0 disables)")
-		flushD    = flag.Duration("flush-interval", 5*time.Second, "fsync every interval (0 disables)")
+		segmentB = byteSize(storage.DefaultSegmentBytes)
+		flushN   = flag.Int64("flush-messages", 1000, "fsync every N records (0 disables)")
+		flushD   = flag.Duration("flush-interval", 5*time.Second, "fsync every interval (0 disables)")
+		// How long a woken fetch round waits for the rest of the write burst
+		// before answering. Every acknowledged append pays it once (the round
+		// carrying its record pays it), and it buys rounds: 0 answers as soon
+		// as the first slot has data, at the cost of more rounds and reports.
+		fetchSettleD = flag.Duration("fetch-settle", envDurationOr("PUSHUPES_FETCH_SETTLE", cluster.DefaultFetchSettle),
+			"fetch round coalescing window after a data wake (0 answers at once)")
 		dropAfter = flag.Duration("drop-after", envDurationOr("PUSHUPES_DROP_AFTER", cluster.DefaultDropRetention),
 			"post-migration retention: how long the FORMER SOURCE keeps its local copy of a migrated slot before dropping it (positive = that window, 0 = the default 30s; negative is rejected; the cleanup cannot be disabled — env PUSHUPES_DROP_AFTER)")
 		rebalanceInterval = flag.Duration("rebalance-interval", envDurationOr("PUSHUPES_REBALANCE_INTERVAL", cluster.DefaultRebalanceInterval),
@@ -96,13 +102,13 @@ func main() {
 	base := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	logger := base.With("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, int64(segmentB), int64(grpcMaxMsg), *batchPar, *flushN, *flushD, *dropAfter, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, int64(segmentB), int64(grpcMaxMsg), *batchPar, *flushN, *flushD, *dropAfter, *fetchSettleD, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
 		logger.Error("pushupes exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount int, segmentBytes, grpcMaxMsgBytes int64, batchParallelism int, flushN int64, flushD, dropAfter time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount int, segmentBytes, grpcMaxMsgBytes int64, batchParallelism int, flushN int64, flushD, dropAfter, fetchSettle time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
 	// Canonical form for every stored address: scheme required. A bare
 	// host:port gets the default "http://" prefix; an explicit protocol
 	// is honoured as passed. TCP-level uses (listen/dial) strip it again.
@@ -196,6 +202,10 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 		return fmt.Errorf("-rebalance-batch %d must not be negative (positive = hand-overs per round, 0 = the rebalancer is off)", rebalanceBatch)
 	}
 	eng.SetRebalanceConfig(rebalanceInterval, rebalanceBatch)
+	if fetchSettle < 0 {
+		return fmt.Errorf("-fetch-settle %s must not be negative", fetchSettle)
+	}
+	eng.SetFetchSettle(fetchSettle)
 	if rebalanceInterval > 0 && rebalanceBatch > 0 {
 		logger.Info("leader rebalance: the controller hands deviated slots back to the ring layout",
 			"interval", rebalanceInterval.String(), "batch", rebalanceBatch)
