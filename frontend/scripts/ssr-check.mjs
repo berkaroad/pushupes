@@ -97,8 +97,26 @@ assert('policy edit holds a draft state', pageSrc.includes('policyDraft'))
 assert('the Raft-state card is gone', !pageSrc.includes('Raft 状态'))
 assert('storage card reads storage_bytes', pageSrc.includes('storage_bytes'))
 assert('storage card flags a lower bound', pageSrc.includes('storage_bytes_complete'))
-const { humanBytes } = await vite.ssrLoadModule('/src/format.ts')
+// The stat row's slot card merges the old 迁移中槽位 into 槽位（迁移中 / 总数）
+// ("1 / 1680"), and the cluster-wide durable write rate rides on its own row
+// as TWO cards — 写入速度（数量） ("100 msg/s") and 写入速度（大小）
+// ("100 KiB/s") — never crammed into one value. The rate is summed at each
+// slot's leader from the same light /admin/writes poll the slots page uses.
+// These pin the wiring: the merged title, the removed separate card, the two
+// card titles, and the counter-sum helper that keeps the leader-only
+// accounting (replicas and both migration ends would double count).
+assert('slot card merges migrating into the total', pageSrc.includes('槽位（迁移中 / 总数）'))
+assert('the separate migrating-slot card is gone', !pageSrc.includes('"迁移中槽位"'))
+assert('the old slot-total title is gone', !pageSrc.includes('"槽位总数"'))
+assert('write-speed is two cards, not one',
+  pageSrc.includes('写入速度（数量）') && pageSrc.includes('写入速度（大小）')
+  && !pageSrc.includes('写入速度（数量 / 大小）'))
+assert('write-speed sums at slot leaders', pageSrc.includes('leaderWriteTotals'))
+assert('write-speed polls the light counters endpoint', pageSrc.includes('fetchNodeWrites'))
+assert('write-speed reads the byte counters', pageSrc.includes('write_bytes'))
+const { humanBytes, humanBytesPerSec } = await vite.ssrLoadModule('/src/format.ts')
 assert('byte formatter renders sizes', humanBytes(0) === '0 B' && humanBytes(1536) === '1.5 KiB' && humanBytes(70496329) === '67.2 MiB')
+assert('byte formatter renders rates', humanBytesPerSec(0) === '0 B/s' && humanBytesPerSec(1536) === '1.5 KiB/s')
 const liveAdmin = (process.env.PUSHUPES_ADMIN ?? '').trim()
 if (liveAdmin) {
   try {

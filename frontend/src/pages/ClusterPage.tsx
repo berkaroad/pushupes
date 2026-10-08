@@ -1,10 +1,40 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, App, Button, Card, Col, Form, Input, Modal, Row, Select, Space, Statistic, Switch, Typography } from 'antd'
 import { EditOutlined, PlusOutlined } from '@ant-design/icons'
-import type { ClusterStatus } from '../types'
-import { humanBytes } from '../format'
-import { addClusterNode, ensureLeader, removeClusterNode, setReplicaPolicy, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
+import type { ClusterStatus, NodeWrites } from '../types'
+import { humanBytes, humanBytesPerSec } from '../format'
+import { addClusterNode, ensureLeader, fetchNodeWrites, removeClusterNode, setReplicaPolicy, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
 import { PeerCard, isOnlinePeer } from '../PeerCard'
+
+// The write-speed cards sample every node's durable counters on the same
+// cadence the slots page polls them at (2s): the rate is the diff between two
+// samples of the leaders-only totals.
+const WRITES_POLL_MS = 2000
+
+// leaderWriteTotals sums one counter field (durable writes, or their bytes)
+// over every slot AT ITS LEADER (per-slot arrays are indexed by slot id):
+// replicas apply replicated records into their own counters and a migrating
+// slot advances counters on both ends until it lands, so counting a slot only
+// at its placement's current leader counts each record exactly once — the
+// same one-leader rule the backend's storage gauge follows. It answers null
+// when any ledged slot's leader did not report the number (unreachable node,
+// or an older node without the field): a partial sum would diff against the
+// last full one into a fake dip, so the caller keeps its previous rate.
+function leaderWriteTotals(
+  st: ClusterStatus, perNode: Record<string, NodeWrites>, field: 'writes' | 'write_bytes',
+): number | null {
+  const idToAddr: Record<string, string> = {}
+  for (const p of Object.values(st.peers)) idToAddr[p.id] = p.admin_addr
+  let total = 0
+  for (const [slotStr, p] of Object.entries(st.slots)) {
+    if (!p.leader) continue
+    const s = Number(slotStr)
+    const arr = perNode[idToAddr[p.leader]]?.[field]
+    if (!arr || s >= arr.length) return null
+    total += arr[s]
+  }
+  return total
+}
 
 export default function ClusterPage() {
   const [status, setStatus] = useState<ClusterStatus | null>(null)
@@ -49,6 +79,56 @@ export default function ClusterPage() {
     const t = setInterval(refresh, 5000)
     return () => clearInterval(t)
   }, [refresh, auto])
+
+  // The write-speed cards: the cluster's durable write rate, msg/s and bytes/s.
+  // It rides the same light /admin/writes poll the slots page uses — every
+  // peer answers its per-slot counters, and leaderWriteTotals folds the table
+  // into ONE number per field by summing each slot at its leader. Two
+  // consecutive samples diff into the rate; the first sample (and any sample
+  // whose leaders were not all reporting) keeps the last known rate.
+  const [writeRate, setWriteRate] = useState<{ msg: number; bytes: number } | null>(null)
+  const lastSample = useRef<{ at: number; writes: number; bytes: number } | null>(null)
+
+  useEffect(() => {
+    let stop = false
+    const tick = async () => {
+      try {
+        const st = statusRef.current
+        if (!st) return
+        const addrs = Object.values(st.peers).map((p) => p.admin_addr)
+        const results = await Promise.allSettled(addrs.map((a) => fetchNodeWrites(a)))
+        if (stop) return
+        const perNode: Record<string, NodeWrites> = {}
+        results.forEach((r, i) => {
+          if (r.status === 'fulfilled' && r.value.writes) perNode[addrs[i]] = r.value
+        })
+        // A sample counts for the rate only when BOTH totals are complete
+        // (every ledged slot answered its writes AND its bytes at its
+        // leader). Skipping an incomplete sample rather than storing it
+        // keeps the diff windows honest: a partial sum held as "last" would
+        // turn the next full sum into a fake jump, and the reverse a dip.
+        const writes = leaderWriteTotals(st, perNode, 'writes')
+        const bytes = leaderWriteTotals(st, perNode, 'write_bytes')
+        if (writes === null || bytes === null) return
+        const prev = lastSample.current
+        const now = Date.now()
+        lastSample.current = { at: now, writes, bytes }
+        if (!prev || now <= prev.at) return
+        const dt = (now - prev.at) / 1000
+        // Counters only move forward; a leader change can retarget which
+        // node answers for a slot mid-poll, so clamp negatives to 0.
+        setWriteRate({
+          msg: Math.max(0, (writes - prev.writes) / dt),
+          bytes: Math.max(0, (bytes - prev.bytes) / dt),
+        })
+      } catch {
+        /* poll failure: keep the last rate */
+      }
+    }
+    tick()
+    const t = setInterval(tick, WRITES_POLL_MS)
+    return () => { stop = true; clearInterval(t) }
+  }, [])
 
   const doAdd = async () => {
     const { id, peer_addr } = await aForm.validateFields()
@@ -208,6 +288,9 @@ export default function ClusterPage() {
   // that does not serve the field yet (or has not sampled) renders '-'.
   const storageBytes = status.storage_bytes
   const storageLowerBound = storageBytes !== undefined && status.storage_bytes_complete === false
+  // The write-speed cards show '-' until the poller has two complete samples.
+  const writeSpeedMsg = writeRate ? `${Math.round(writeRate.msg)} msg/s` : '-'
+  const writeSpeedBytes = writeRate ? humanBytesPerSec(writeRate.bytes) : '-'
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -216,17 +299,22 @@ export default function ClusterPage() {
         <Switch checked={auto} onChange={setAuto} size="small" />
       </Space>
       {err ? <Alert type="warning" closable message={err} onClose={() => setErr(null)} /> : null}
-      {/* Four cards, one row of the 24-column grid. (A fifth would not divide
-          it evenly, so it would drop onto a line of its own.) */}
+      {/* The summary row: three cards fill the 24-column grid (span 8 each).
+          The two write-speed cards take a row of their own (span 12 each):
+          count and size are read side by side, never crammed into one value. */}
       <Row gutter={16}>
-        <Col span={6}><Card><Statistic title="节点（在线 / 总数）" value={`${online} / ${peers.length}`}
+        <Col span={8}><Card><Statistic title="节点（在线 / 总数）" value={`${online} / ${peers.length}`}
           valueStyle={online < peers.length ? { color: '#cf1322' } : undefined} /></Card></Col>
-        <Col span={6}><Card><Statistic title="槽位总数" value={status.slot_count} /></Card></Col>
-        <Col span={6}><Card><Statistic title="迁移中槽位" value={migrating} valueStyle={{ color: migrating ? '#faad14' : undefined }} /></Card></Col>
-        <Col span={6}><Card><Statistic title="存储大小"
+        <Col span={8}><Card><Statistic title="槽位（迁移中 / 总数）" value={`${migrating} / ${status.slot_count}`}
+          valueStyle={migrating ? { color: '#faad14' } : undefined} /></Card></Col>
+        <Col span={8}><Card><Statistic title="存储大小"
           value={storageBytes === undefined ? '-' : humanBytes(storageBytes)}
           valueStyle={storageLowerBound ? { color: '#faad14' } : undefined}
           suffix={storageLowerBound ? '（下界）' : undefined} /></Card></Col>
+      </Row>
+      <Row gutter={16}>
+        <Col span={12}><Card><Statistic title="写入速度（数量）" value={writeSpeedMsg} /></Card></Col>
+        <Col span={12}><Card><Statistic title="写入速度（大小）" value={writeSpeedBytes} /></Card></Col>
       </Row>
       {/* The replica policy, its own card above the node block. The tier and
           the factor it derives are cluster state (replicated through the slot

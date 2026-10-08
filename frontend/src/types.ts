@@ -106,6 +106,10 @@ export interface NodeWrites {
   node?: string
   slot_count?: number
   writes: number[]
+  // Durable record bytes per slot (frame bytes on disk), index-aligned with
+  // `writes`: diffing two snapshots turns one window into a message rate and
+  // a byte rate. The cluster page's write-speed cards require both.
+  write_bytes?: number[]
   bytes?: number[]
   streams?: number[]
   // Per-slot post-migration cleanup queue of THAT node: 0, or the unix second
