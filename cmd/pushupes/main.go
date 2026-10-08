@@ -50,10 +50,14 @@ func main() {
 		// migration granularity), so it is not a runtime knob — it is fixed at
 		// data.DefaultSlotCount. See DESIGN §7.2.
 		slotCount = data.DefaultSlotCount
-		// The per-slot replica count is derived from the cluster's own fault
-		// tolerance (ReplicaCountForMembers), so it is not a flag either: a
-		// cluster that grows at runtime raises its own copy count with no
-		// restart and nothing to configure. See DESIGN §4.
+		// The replica policy tier (low / medium / high) behind the per-slot
+		// replica factor. This flag only SEEDS a brand-new cluster: the policy
+		// lives in the replicated slot table, so on an existing cluster the
+		// table's value wins and the admin endpoint
+		// (POST /admin/cluster/replica-policy) is the entry point for every
+		// change. See DESIGN §4.
+		replicaPolicy = flag.String("replica-policy", envOr("PUSHUPES_REPLICA_POLICY", string(cluster.DefaultReplicaPolicy)),
+			"replica policy tier for a NEW cluster: low (1 copy per slot), medium (2), high (fault tolerance + 1); applied on the table's first plan only — an existing cluster keeps the policy the admin endpoint last set (env PUSHUPES_REPLICA_POLICY)")
 		segmentB = byteSize(storage.DefaultSegmentBytes)
 		flushN   = flag.Int64("flush-messages", 1000, "fsync every N records (0 disables)")
 		flushD   = flag.Duration("flush-interval", 5*time.Second, "fsync every interval (0 disables)")
@@ -102,13 +106,13 @@ func main() {
 	base := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	logger := base.With("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, int64(segmentB), int64(grpcMaxMsg), *batchPar, *flushN, *flushD, *dropAfter, *fetchSettleD, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, *replicaPolicy, int64(segmentB), int64(grpcMaxMsg), *batchPar, *flushN, *flushD, *dropAfter, *fetchSettleD, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
 		logger.Error("pushupes exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount int, segmentBytes, grpcMaxMsgBytes int64, batchParallelism int, flushN int64, flushD, dropAfter, fetchSettle time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount int, replicaPolicy string, segmentBytes, grpcMaxMsgBytes int64, batchParallelism int, flushN int64, flushD, dropAfter, fetchSettle time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
 	// Canonical form for every stored address: scheme required. A bare
 	// host:port gets the default "http://" prefix; an explicit protocol
 	// is honoured as passed. TCP-level uses (listen/dial) strip it again.
@@ -190,9 +194,20 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 	// hand it to NewNode and wire the node back in.
 	eng := cluster.NewEngine(nil, store, nodeID, logger)
 	eng.SetDropRetention(dropRetention)
-	// The per-slot replica count is not configured here: the controller derives
-	// it from the member count every round (cluster.ReplicaCountForMembers), so
-	// a cluster that grows at runtime raises its own copy count.
+	// -replica-policy is a seed, not a live knob: an invalid value is a
+	// startup error (same fail-fast rule as -drop-after), and a valid one is
+	// applied by the controller ONLY on a brand-new cluster's first plan. An
+	// existing cluster keeps the policy stored in the replicated table — the
+	// admin endpoint is the entry point for every change after that.
+	bootPolicy, err := cluster.NormalizeReplicaPolicy(replicaPolicy)
+	if err != nil {
+		return fmt.Errorf("-replica-policy: %w", err)
+	}
+	eng.SetBootPolicy(bootPolicy)
+	// The per-slot replica factor follows from that policy tier and the member
+	// count, re-derived by the controller every round — so a cluster that
+	// grows at runtime raises its own copy count under the high tier, while
+	// low/medium hold theirs.
 	// Leader rebalance: 0 on either knob is the operator's off switch; a
 	// negative value is a startup error (same fail-fast rule as -drop-after).
 	if rebalanceInterval < 0 {

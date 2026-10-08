@@ -230,7 +230,7 @@ wait_ready() {
         local planned; planned="$(json_count "$body" epoch)"
         if [[ "${state,,}" == "leader" && "$planned" -gt 0 ]]; then
           local rf; rf="$(json_field "$body" replica_factor)"
-          info "集群就绪：slot 规划 $planned 槽（每槽 ${rf:-?} 副本，按容错节点数推导）"
+          info "集群就绪：slot 规划 $planned 槽（每槽 ${rf:-?} 副本，按副本策略 × 成员数推导）"
           return 0
         fi
       done
