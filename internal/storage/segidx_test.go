@@ -35,7 +35,7 @@ func TestSegIndexRoundTripAndDamage(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 300; i++ {
-		w.add(0xAAAA0000_0000_0000+uint64(i), base+uint64(i), fmt.Sprintf("agg-%d", i%2), uint32(i%3+1))
+		w.add(0xAAAA0000_0000_0000+uint64(i), base+uint64(i), fmt.Sprintf("agg-%d", i%2), uint32(i%3+1), 1700000000+int64(i))
 		if i%64 == 0 {
 			w.addSparse(base+uint64(i), int64(i)*40)
 		}
@@ -117,7 +117,7 @@ func TestSegIndexRoundTripAndDamage(t *testing.T) {
 		t.Fatalf("reopen offset %d, want the validated prefix's extent %d", w2.idxOff, want)
 	}
 	for i := 256; i < 300; i++ {
-		w2.add(0xAAAA0000_0000_0000+uint64(i), base+uint64(i), fmt.Sprintf("agg-%d", i%2), uint32(i%3+1))
+		w2.add(0xAAAA0000_0000_0000+uint64(i), base+uint64(i), fmt.Sprintf("agg-%d", i%2), uint32(i%3+1), 1700000000+int64(i))
 	}
 	if err := w2.close(); err != nil {
 		t.Fatal(err)
@@ -155,7 +155,7 @@ func TestSegIndexResumeAfterPartialBlocks(t *testing.T) {
 	const slotID, base = int32(9), uint64(1)
 	add := func(w *segIndexWriter, from, to int) {
 		for i := from; i < to; i++ {
-			w.add(0xBBBB0000_0000_0000+uint64(i), base+uint64(i), "agg", uint32(i+1))
+			w.add(0xBBBB0000_0000_0000+uint64(i), base+uint64(i), "agg", uint32(i+1), 1700000000+int64(i))
 		}
 	}
 
@@ -222,7 +222,7 @@ func TestSegIndexRefusesASeqGap(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 300; i++ {
-		w.add(0xCCCC0000_0000_0000+uint64(i), base+uint64(i), "agg", uint32(i+1))
+		w.add(0xCCCC0000_0000_0000+uint64(i), base+uint64(i), "agg", uint32(i+1), 1700000000+int64(i))
 	}
 	if err := w.close(); err != nil { // block 0 full (256), block 1 partial (44)
 		t.Fatal(err)

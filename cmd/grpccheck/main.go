@@ -130,6 +130,68 @@ func main() {
 		fatal("by-command: %+v", bc)
 	}
 	fmt.Printf("by-command found v1 (seq=%d) ok\n", bc.Record.Seq)
+
+	// 6) point-in-time version anchor (ReadVersionByTime, on every node so
+	// the proxy path is covered too): v1/v2 carry explicit stamps, so the
+	// anchor for "before v2's time" is exactly 1, and past-the-clock is the
+	// full tail 2. The time stream hashes to its own slot, so its appends
+	// follow MOVED to that slot's leader like step 1 does.
+	const t1, t2 = int64(1600000001), int64(1600000002)
+	tagg := agg + "-t"
+	tTarget := target
+	for pass := 0; pass < 3; pass++ {
+		okBoth := true
+		r, err := cli(tTarget).Append(ctx, &pushupesv1.AppendRequest{
+			AggregateId: tagg, Version: 1, UnixTime: t1, CommandId: "t-1",
+			Events: []*pushupesv1.Event{{Type: "T", Body: []byte("{}")}},
+		})
+		check(err)
+		if r.Status == pushupesv1.AppendResponse_STATUS_FAIL && r.ErrId == 1003 {
+			tTarget, okBoth = r.Node, false
+		} else if r.Status != pushupesv1.AppendResponse_STATUS_SUCCESS && r.Status != pushupesv1.AppendResponse_STATUS_EXISTS {
+			fatal("append time v1: %+v", r)
+		}
+		if okBoth {
+			r2, err := cli(tTarget).Append(ctx, &pushupesv1.AppendRequest{
+				AggregateId: tagg, Version: 2, UnixTime: t2, CommandId: "t-2",
+				Events: []*pushupesv1.Event{{Type: "T", Body: []byte("{}")}},
+			})
+			check(err)
+			if r2.Status == pushupesv1.AppendResponse_STATUS_FAIL && r2.ErrId == 1003 {
+				tTarget, okBoth = r2.Node, false
+			} else if r2.Status != pushupesv1.AppendResponse_STATUS_SUCCESS && r2.Status != pushupesv1.AppendResponse_STATUS_EXISTS {
+				fatal("append time v2: %+v", r2)
+			}
+		}
+		if okBoth {
+			break
+		}
+	}
+	time.Sleep(2 * time.Second) // let the replica see the time stream
+	for _, a := range addrs {
+		vb, err := cli(a).ReadVersionByTime(ctx, &pushupesv1.ReadVersionByTimeRequest{
+			AggregateId: tagg, UnixTime: t1, // at-or-before v1's stamp -> exactly 1
+		})
+		check(err)
+		if vb.Version != 1 {
+			fatal("version-by-time@%s at=%d: want 1 got %d", a, t1, vb.Version)
+		}
+		vb2, err := cli(a).ReadVersionByTime(ctx, &pushupesv1.ReadVersionByTimeRequest{
+			AggregateId: tagg, UnixTime: t2,
+		})
+		check(err)
+		if vb2.Version != 2 {
+			fatal("version-by-time@%s at=%d: want 2 got %d", a, t2, vb2.Version)
+		}
+		vb0, err := cli(a).ReadVersionByTime(ctx, &pushupesv1.ReadVersionByTimeRequest{
+			AggregateId: tagg, UnixTime: t1 - 1, // before the first stamp -> 0
+		})
+		check(err)
+		if vb0.Version != 0 {
+			fatal("version-by-time@%s at=%d: want 0 got %d", a, t1-1, vb0.Version)
+		}
+		fmt.Printf("version-by-time@%s: at=%d -> 1, at=%d -> 2, before=%d -> 0 ok\n", a, t1, t2, t1-1)
+	}
 	fmt.Println("GRPC SMOKE PASS")
 }
 

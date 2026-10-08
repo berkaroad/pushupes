@@ -537,6 +537,20 @@ func (st *Store) TailVersionOf(aggregateID string, uptoSeq uint64) (uint32, erro
 	return slot.TailVersion(aggregateID, uptoSeq)
 }
 
+// VersionAtOrBeforeTime returns the highest version of one aggregate whose
+// record is stamped at or before beforeOrAtUnix (0 = no visible record at or
+// before the time), bounded by uptoSeq exactly like TailVersionOf (0 = the
+// slot's durable LEO). This is the point-in-time anchor behind the gRPC
+// ReadVersionByTime: a client resolves the version, then replays with
+// ReadAggregate.
+func (st *Store) VersionAtOrBeforeTime(aggregateID string, beforeOrAtUnix int64, uptoSeq uint64) (uint32, error) {
+	slot, err := st.Slot(st.SlotOf(aggregateID))
+	if err != nil {
+		return 0, err
+	}
+	return slot.VersionAtOrBeforeTime(aggregateID, beforeOrAtUnix, uptoSeq)
+}
+
 // LastSeq returns the durable LEO for one slot (0 when the slot is unknown).
 func (st *Store) LastSeqOf(slotID int32) uint64 {
 	s, err := st.Slot(slotID)

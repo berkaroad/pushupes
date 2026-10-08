@@ -541,6 +541,45 @@ func (s *Server) ReadByCommand(ctx context.Context, req *pushupesv1.ReadByComman
 	return &pushupesv1.ReadByCommandResponse{Found: true, Record: recordToProto(rec, seq)}, nil
 }
 
+// ---- ReadVersionByTime ----------------------------------------------------------
+
+// ReadVersionByTime reports the point-in-time version anchor of one aggregate:
+// the highest version whose record is stamped at or before the requested
+// unix_time, or 0 when nothing visible predates it. The client then replays
+// history from that version with ReadStream.
+//
+// Routing and visibility are ReadStream's: a node holding neither the slot
+// nor a replica proxies to the slot leader's client plane, and a local answer
+// is bounded by the node's own durable LEO (never a watermark — the same
+// silent-short-read reasoning as ReadStream).
+func (s *Server) ReadVersionByTime(ctx context.Context, req *pushupesv1.ReadVersionByTimeRequest) (*pushupesv1.ReadVersionByTimeResponse, error) {
+	if req.AggregateId == "" {
+		return nil, status.Error(codes.InvalidArgument, "aggregate_id required")
+	}
+	slot := s.store.SlotOf(req.AggregateId)
+	if addr := s.engine.ReadProxyAddr(slot); addr != "" {
+		client, err := s.leaderClient(addr)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "read proxy dial: %v", err)
+		}
+		return client.ReadVersionByTime(ctx, &pushupesv1.ReadVersionByTimeRequest{
+			AggregateId: req.AggregateId, UnixTime: req.UnixTime,
+		})
+	}
+	hw := uint64(0)
+	if !s.engine.Leads(slot) {
+		hw = s.engine.HW(slot) // 0 unless this node leads the slot
+		if hw == 0 {
+			hw = s.store.LastSeqOf(slot) // bound by the durable local LEO
+		}
+	}
+	v, err := s.store.VersionAtOrBeforeTime(req.AggregateId, req.UnixTime, hw)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "version by time: %v", err)
+	}
+	return &pushupesv1.ReadVersionByTimeResponse{Version: v}, nil
+}
+
 // ---- record conversion -----------------------------------------------------
 
 // recordToProto maps a stored record straight to its proto form: bodies are

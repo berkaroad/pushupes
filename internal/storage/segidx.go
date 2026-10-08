@@ -24,8 +24,8 @@ package storage
 // the WAL tail beyond it is replayed. A missing, truncated, corrupt or
 // regressed index therefore costs startup work, never correctness.
 //
-//	<baseSeq>.idx  header(32) + blocks: crc32c(4) + n * entry(20)
-//	               entry = command hash(8) seqOff(4) dictID(4) version(4)
+//	<baseSeq>.idx  header(32) + blocks: crc32c(4) + n * entry(28)
+//	               entry = command hash(8) seqOff(4) dictID(4) version(4) unix_time(8)
 //	<baseSeq>.agx  header(32) + entries: crc32c(4) dictID(4) idLen(2) id
 //	<baseSeq>.spx  header(32) + blocks: crc32c(4) + n * entry(16)
 //	               entry = seq(8) file offset(8), the sparse seek index
@@ -55,9 +55,26 @@ const (
 )
 
 const (
-	segIdxEntryBytes = 20 // hash(8) seqOff(4) dictID(4) version(4)
+	// segIdxVersion is the record index's format version. 2 appended the
+	// record's unix_time to the entry, so a point-in-time answer (which version
+	// was written as of when) comes off the index instead of reading the WAL
+	// frame back.
+	segIdxVersion = 2
+	// segIdxEntryBytes is one entry: hash(8) seqOff(4) dictID(4) version(4)
+	// unix_time(8).
+	segIdxEntryBytes = 28
 	segSpxEntryBytes = 16 // seq(8) pos(8)
 )
+
+// segIdxFileVersion is the header format version of one of the three index
+// files. Only the record index changed layout; the aggregate dictionary
+// (.agx) and the sparse seek index (.spx) keep the version they always had.
+func segIdxFileVersion(magic string) byte {
+	if magic == segIdxMagic {
+		return segIdxVersion
+	}
+	return 1
+}
 
 var segIdxCRC = crc32.MakeTable(crc32.Castagnoli)
 
@@ -80,6 +97,7 @@ type segIndexEntry struct {
 	seq     uint64
 	aggID   string
 	version uint32
+	unix    int64 // the record's unix_time, for point-in-time answers
 }
 
 // segIndexLoad is what a valid index file yielded. The per-record metadata is
@@ -115,6 +133,7 @@ func (l *segIndexLoad) Entry(i int) (segIndexEntry, bool) {
 		seq:     l.base + uint64(binary.BigEndian.Uint32(raw[8:12])),
 		aggID:   id,
 		version: binary.BigEndian.Uint32(raw[16:20]),
+		unix:    int64(binary.BigEndian.Uint64(raw[20:28])),
 	}, true
 }
 
@@ -144,7 +163,7 @@ func segSpxPath(dir string, baseSeq uint64) string {
 func segIdxHeaderBuf(magic string, slotID int32, baseSeq uint64) []byte {
 	h := make([]byte, segIdxHeaderBytes)
 	copy(h, magic)
-	h[4] = 1 // format version
+	h[4] = segIdxFileVersion(magic) // format version
 	binary.BigEndian.PutUint32(h[8:12], uint32(slotID))
 	binary.BigEndian.PutUint64(h[12:20], baseSeq)
 	return h
@@ -152,7 +171,7 @@ func segIdxHeaderBuf(magic string, slotID int32, baseSeq uint64) []byte {
 
 // checkSegIdxHeader validates magic, version, slot and base seq.
 func checkSegIdxHeader(h []byte, magic string, slotID int32, baseSeq uint64) bool {
-	return checkSegIdxHeaderVer(h, 1, magic, slotID, baseSeq)
+	return checkSegIdxHeaderVer(h, segIdxFileVersion(magic), magic, slotID, baseSeq)
 }
 
 // checkSegIdxHeaderVer is checkSegIdxHeader with an explicit format version: the
@@ -201,6 +220,12 @@ func openSegIndexWriter(dir string, slotID int32, baseSeq uint64) (*segIndexWrit
 	if err != nil {
 		return nil, err
 	}
+	// An index file written by an older layout (or one whose header simply does
+	// not validate) is a CACHE, not data: resetting it lets this writer rewrite
+	// the segment's index from the frames the caller is about to re-index.
+	// Without this, a stale file would make every append fail the header check
+	// forever and the segment would stay unindexed across restarts.
+	resetStaleIndexFiles(dir, slotID, baseSeq)
 	if load != nil {
 		// Continue exactly where the validated prefix's BLOCKS end. This offset
 		// is not derivable from the entry count: block sizes follow the flush
@@ -257,6 +282,37 @@ func openSegIndexWriter(dir string, slotID int32, baseSeq uint64) (*segIndexWrit
 		}
 	}
 	return w, nil
+}
+
+// resetStaleIndexFiles truncates any of a segment's index files whose header
+// does not validate — an index written by an older format version, or one that
+// is simply damaged. The files are caches over the WAL: the caller re-indexes
+// the segment's frames right after, and a file that is not reset would fail
+// every future append's header check instead.
+func resetStaleIndexFiles(dir string, slotID int32, baseSeq uint64) {
+	for _, p := range []struct {
+		path  string
+		magic string
+	}{
+		{segIdxPath(dir, baseSeq), segIdxMagic},
+		{segAgxPath(dir, baseSeq), segAgxMagic},
+		{segSpxPath(dir, baseSeq), segSpxMagic},
+	} {
+		f, err := os.OpenFile(p.path, os.O_RDWR, 0o644)
+		if err != nil {
+			continue // absent (or unopenable): nothing to reset
+		}
+		st, err := f.Stat()
+		if err != nil || st.Size() == 0 {
+			f.Close()
+			continue
+		}
+		h := make([]byte, segIdxHeaderBytes)
+		if _, err := f.ReadAt(h, 0); err != nil || !checkSegIdxHeader(h, p.magic, slotID, baseSeq) {
+			_ = f.Truncate(0)
+		}
+		f.Close()
+	}
 }
 
 // openAppendFile opens an index file for reading and writing, creating it with
@@ -347,7 +403,7 @@ func boolInt(b bool) int {
 
 // add records one record's index entry, assigning its aggregate a dictionary
 // id first so no entry ever references an id that is not on disk.
-func (w *segIndexWriter) add(hash uint64, seq uint64, aggregateID string, version uint32) {
+func (w *segIndexWriter) add(hash uint64, seq uint64, aggregateID string, version uint32, unix int64) {
 	if w.err != nil {
 		return
 	}
@@ -382,6 +438,7 @@ func (w *segIndexWriter) add(hash uint64, seq uint64, aggregateID string, versio
 	binary.BigEndian.PutUint32(buf[8:12], uint32(seq-w.baseSeq))
 	binary.BigEndian.PutUint32(buf[12:16], dictID)
 	binary.BigEndian.PutUint32(buf[16:20], version)
+	binary.BigEndian.PutUint64(buf[20:28], uint64(unix))
 	w.block = append(w.block, buf[:]...)
 	if len(w.block) >= segIdxBlockMax*segIdxEntryBytes {
 		w.flushBlock()

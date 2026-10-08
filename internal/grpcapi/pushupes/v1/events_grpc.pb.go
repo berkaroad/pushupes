@@ -19,11 +19,12 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	EventService_Append_FullMethodName        = "/pushupes.v1.EventService/Append"
-	EventService_BatchAppend_FullMethodName   = "/pushupes.v1.EventService/BatchAppend"
-	EventService_ReadStream_FullMethodName    = "/pushupes.v1.EventService/ReadStream"
-	EventService_ReadTails_FullMethodName     = "/pushupes.v1.EventService/ReadTails"
-	EventService_ReadByCommand_FullMethodName = "/pushupes.v1.EventService/ReadByCommand"
+	EventService_Append_FullMethodName            = "/pushupes.v1.EventService/Append"
+	EventService_BatchAppend_FullMethodName       = "/pushupes.v1.EventService/BatchAppend"
+	EventService_ReadStream_FullMethodName        = "/pushupes.v1.EventService/ReadStream"
+	EventService_ReadTails_FullMethodName         = "/pushupes.v1.EventService/ReadTails"
+	EventService_ReadByCommand_FullMethodName     = "/pushupes.v1.EventService/ReadByCommand"
+	EventService_ReadVersionByTime_FullMethodName = "/pushupes.v1.EventService/ReadVersionByTime"
 )
 
 // EventServiceClient is the client API for EventService service.
@@ -50,6 +51,11 @@ type EventServiceClient interface {
 	ReadTails(ctx context.Context, in *ReadTailsRequest, opts ...grpc.CallOption) (*ReadTailsResponse, error)
 	// ReadByCommand looks one record up by command_id (idempotency probe).
 	ReadByCommand(ctx context.Context, in *ReadByCommandRequest, opts ...grpc.CallOption) (*ReadByCommandResponse, error)
+	// ReadVersionByTime reports the highest version whose record has
+	// unix_time less than or equal to the requested time — the anchor a
+	// client uses to replay history as of a point in time (it then reads
+	// from that version with ReadStream).
+	ReadVersionByTime(ctx context.Context, in *ReadVersionByTimeRequest, opts ...grpc.CallOption) (*ReadVersionByTimeResponse, error)
 }
 
 type eventServiceClient struct {
@@ -110,6 +116,16 @@ func (c *eventServiceClient) ReadByCommand(ctx context.Context, in *ReadByComman
 	return out, nil
 }
 
+func (c *eventServiceClient) ReadVersionByTime(ctx context.Context, in *ReadVersionByTimeRequest, opts ...grpc.CallOption) (*ReadVersionByTimeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReadVersionByTimeResponse)
+	err := c.cc.Invoke(ctx, EventService_ReadVersionByTime_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // EventServiceServer is the server API for EventService service.
 // All implementations must embed UnimplementedEventServiceServer
 // for forward compatibility.
@@ -134,6 +150,11 @@ type EventServiceServer interface {
 	ReadTails(context.Context, *ReadTailsRequest) (*ReadTailsResponse, error)
 	// ReadByCommand looks one record up by command_id (idempotency probe).
 	ReadByCommand(context.Context, *ReadByCommandRequest) (*ReadByCommandResponse, error)
+	// ReadVersionByTime reports the highest version whose record has
+	// unix_time less than or equal to the requested time — the anchor a
+	// client uses to replay history as of a point in time (it then reads
+	// from that version with ReadStream).
+	ReadVersionByTime(context.Context, *ReadVersionByTimeRequest) (*ReadVersionByTimeResponse, error)
 	mustEmbedUnimplementedEventServiceServer()
 }
 
@@ -158,6 +179,9 @@ func (UnimplementedEventServiceServer) ReadTails(context.Context, *ReadTailsRequ
 }
 func (UnimplementedEventServiceServer) ReadByCommand(context.Context, *ReadByCommandRequest) (*ReadByCommandResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReadByCommand not implemented")
+}
+func (UnimplementedEventServiceServer) ReadVersionByTime(context.Context, *ReadVersionByTimeRequest) (*ReadVersionByTimeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReadVersionByTime not implemented")
 }
 func (UnimplementedEventServiceServer) mustEmbedUnimplementedEventServiceServer() {}
 func (UnimplementedEventServiceServer) testEmbeddedByValue()                      {}
@@ -270,6 +294,24 @@ func _EventService_ReadByCommand_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _EventService_ReadVersionByTime_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReadVersionByTimeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EventServiceServer).ReadVersionByTime(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EventService_ReadVersionByTime_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EventServiceServer).ReadVersionByTime(ctx, req.(*ReadVersionByTimeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // EventService_ServiceDesc is the grpc.ServiceDesc for EventService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -296,6 +338,10 @@ var EventService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReadByCommand",
 			Handler:    _EventService_ReadByCommand_Handler,
+		},
+		{
+			MethodName: "ReadVersionByTime",
+			Handler:    _EventService_ReadVersionByTime_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

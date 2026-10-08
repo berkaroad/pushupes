@@ -221,6 +221,7 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 					s.indexMetaLocked(e.seq, data.RecordMeta{
 						AggregateID: e.aggID,
 						Version:     e.version,
+						UnixTime:    e.unix,
 						CommandHash: e.hash,
 					})
 				}
@@ -357,6 +358,7 @@ func (s *Slot) indexRecordLocked(seq uint64, rec *data.EventRecord) {
 	s.indexMetaLocked(seq, data.RecordMeta{
 		AggregateID: rec.AggregateID,
 		Version:     rec.Version,
+		UnixTime:    rec.UnixTime,
 		CommandHash: data.HashCommandID(rec.CommandID),
 	})
 }
@@ -414,7 +416,8 @@ func (s *Slot) indexMetaLocked(seq uint64, m data.RecordMeta) {
 	}
 	if m.Version == uint32(e.sealedN+e.n)+1 {
 		e.version = m.Version
-		e.appendSeq(seq)
+		e.lastUnix = m.UnixTime
+		e.appendSeq(seq, m.UnixTime)
 	}
 	s.aggs[m.AggregateID] = e
 }
@@ -497,6 +500,7 @@ func (s *Slot) Append(rec *data.EventRecord) (*AppendOutcome, error) {
 	seg.IndexRecord(seq, data.RecordMeta{
 		AggregateID: rec.AggregateID,
 		Version:     rec.Version,
+		UnixTime:    rec.UnixTime,
 		CommandHash: data.HashCommandID(rec.CommandID),
 	})
 	s.noteAppendPending()
@@ -541,6 +545,7 @@ func (s *Slot) appendAtSeq(seq uint64, rec *data.EventRecord) (bool, error) {
 	seg.IndexRecord(seq, data.RecordMeta{
 		AggregateID: rec.AggregateID,
 		Version:     rec.Version,
+		UnixTime:    rec.UnixTime,
 		CommandHash: data.HashCommandID(rec.CommandID),
 	})
 	s.noteAppendPending()
@@ -659,7 +664,7 @@ func (s *Slot) writeSegAggSeqsLocked(seg *Segment) (map[uint64]bool, error) {
 		if first < seg.BaseSeq {
 			continue
 		}
-		pairs := make([]uint32, 0, k*2)
+		pairs := make([]segAggPair, 0, k)
 		ok := true
 		for i := 0; i < k; i++ {
 			ord := e.seqAt(i) - seg.BaseSeq
@@ -667,7 +672,7 @@ func (s *Slot) writeSegAggSeqsLocked(seg *Segment) (map[uint64]bool, error) {
 				ok = false
 				break
 			}
-			pairs = append(pairs, uint32(ord), offs[ord])
+			pairs = append(pairs, segAggPair{ord: uint32(ord), off: offs[ord], unix: e.stampAt(i)})
 		}
 		if !ok {
 			continue
@@ -743,7 +748,7 @@ func (s *Slot) sealedVersionSeqLocked(aggregateID string, v uint32) (uint64, *da
 			if v < e.firstVer || v >= e.firstVer+e.count {
 				return false
 			}
-			ord, off, ok := ix.Pair(e, int(v-e.firstVer))
+			ord, off, _, ok := ix.Pair(e, int(v-e.firstVer))
 			if !ok {
 				return false
 			}
@@ -762,6 +767,53 @@ func (s *Slot) sealedVersionSeqLocked(aggregateID string, v uint32) (uint64, *da
 }
 
 var errAggSeqNotFound = errors.New("aggregate version not found in the sealed indexes")
+
+// sealedStampLocked resolves a sealed version's (seq, unix_time) out of the
+// sealed segments' aggregate indexes, WITHOUT reading the record: the pair's
+// unix_time is what a point-in-time walk needs. The caller confirms a
+// candidate it is about to return with sealedVersionSeqLocked, which reads the
+// record and checks the real aggregate id — the hash a list is keyed by can
+// collide, and an answer must never come from the wrong aggregate's entry.
+// Caller holds s.mu.
+func (s *Slot) sealedStampLocked(aggregateID string, v uint32) (uint64, int64, bool, error) {
+	hash := aggHash(aggregateID)
+	for i := len(s.segments) - 1; i >= 0; i-- {
+		seg := s.segments[i]
+		if seg.RecordCnt == 0 {
+			continue
+		}
+		ix := seg.aggIx
+		if ix == nil {
+			opened, err := openSegAggIndex(s.Dir, s.ID, seg.BaseSeq)
+			if err != nil {
+				return 0, 0, false, err
+			}
+			if opened == nil {
+				continue // no index for this segment: nothing to search
+			}
+			ix, seg.aggIx = opened, opened
+		}
+		var (
+			seq   uint64
+			stamp int64
+		)
+		found := ix.Lookup(hash, func(e segAggEntry) bool {
+			if v < e.firstVer || v >= e.firstVer+e.count {
+				return false
+			}
+			ord, _, unix, ok := ix.Pair(e, int(v-e.firstVer))
+			if !ok {
+				return false
+			}
+			seq, stamp = seg.BaseSeq+uint64(ord), unix
+			return true
+		})
+		if found {
+			return seq, stamp, true, nil
+		}
+	}
+	return 0, 0, false, nil
+}
 
 // readBySeqLocked fetches one record by seq; caller holds s.mu (read or write).
 func (s *Slot) readBySeqLocked(seq uint64) (*data.EventRecord, error) {
@@ -1088,6 +1140,75 @@ func (s *Slot) TailVersion(aggregateID string, uptoSeq uint64) (uint32, error) {
 		if seq <= uptoSeq {
 			return v, nil
 		}
+	}
+	return 0, nil
+}
+
+// VersionAtOrBeforeTime returns the highest version of an aggregate whose
+// record has UnixTime at most beforeOrAtUnix — the point-in-time anchor a
+// client uses to replay history as of a moment (it then reads from that
+// version with AggregateVersion). 0 means no visible record is at or before
+// the time (or the aggregate is unknown). uptoSeq bounds visibility exactly
+// like TailVersion (0 = the slot's durable LEO).
+//
+// The walk reads no WAL frame: a live version's unix_time is in the in-memory
+// directory (stampAt) and a sealed version's is in the sealed segment's
+// aggregate index (sealedStampLocked). Records are appended in version order
+// but unix_time is caller-supplied and not required to be monotonic, so the
+// walk cannot binary search on time — the answer is the last version counting
+// down from the tail whose own stamp satisfies the bound, which is what
+// stopping at the first hit yields. The one record read left is the
+// confirmation of a sealed candidate about to be returned, the same
+// hash-collision rule every index here follows. The desync gate matches
+// AggregateVersion/TailVersion: a directory that cannot resolve its claimed
+// versions must not answer a time query either.
+func (s *Slot) VersionAtOrBeforeTime(aggregateID string, beforeOrAtUnix int64, uptoSeq uint64) (uint32, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e := s.aggs[aggregateID]
+	total := uint32(e.sealedN) + uint32(e.n)
+	if e.version != total {
+		return 0, fmt.Errorf("slot %d: aggregate %s desync: latest version %d but only %d versions resolvable",
+			s.ID, aggregateID, e.version, total)
+	}
+	if total == 0 {
+		return 0, nil
+	}
+	liveFirst := uint32(e.sealedN) + 1
+	for v := total; v >= 1; v-- {
+		if v >= liveFirst {
+			i := int(v - liveFirst)
+			if seq := e.seqAt(i); uptoSeq > 0 && seq > uptoSeq {
+				continue // not visible at this bound
+			}
+			if e.stampAt(i) <= beforeOrAtUnix {
+				return v, nil
+			}
+			continue
+		}
+		seq, stamp, ok, err := s.sealedStampLocked(aggregateID, v)
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			// The directory claims this version is resolvable, but no sealed
+			// index holds it. Answer nothing rather than skipping it silently.
+			return 0, fmt.Errorf("slot %d: aggregate %s version %d unresolved in the sealed indexes",
+				s.ID, aggregateID, v)
+		}
+		if uptoSeq > 0 && seq > uptoSeq {
+			continue // not visible at this bound
+		}
+		if stamp > beforeOrAtUnix {
+			continue
+		}
+		// Confirm the candidate against the record it points at: a list is
+		// keyed by the aggregate hash, and a colliding entry must not answer.
+		_, rec, cerr := s.sealedVersionSeqLocked(aggregateID, v)
+		if cerr != nil || rec == nil || rec.Version != v || rec.UnixTime > beforeOrAtUnix {
+			continue
+		}
+		return v, nil
 	}
 	return 0, nil
 }

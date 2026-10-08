@@ -462,7 +462,8 @@ Body: Record*，每条记录：
 - **client 面（gRPC，客户端事件写入/查询唯一入口，默认 `-client
   http://127.0.0.1:8591`，`PUSHUPES_CLIENT`）**：proto3 契约
   `proto/pushupes/v1/events.proto`（`pushupes.v1.EventService`：`Append` +
-  `BatchAppend` + `ReadStream` + `ReadTails` + `ReadByCommand`）。body 为原始
+  `BatchAppend` + `ReadStream` + `ReadTails` + `ReadByCommand` +
+  `ReadVersionByTime`）。body 为原始
   bytes，无 JSON/base64 层。client 面 gRPC 消息上限由 `-grpc-max-msg-size`
   配置（默认 4MiB，recv/send 同值）：`BatchAppend` 一整批要装进这个上限，
   批次大小随它一起调。
@@ -494,6 +495,7 @@ gRPC  EventService/Append         写入：幂等(command_id)/版本(+1)/等 ISR
 gRPC  EventService/ReadStream     范围查询（≤HW 语义）
 gRPC  EventService/ReadByCommand  command_id 幂等探针
 gRPC  EventService/ReadTails      批量取多个聚合的最新版本（resume 扫描用；按槽分组一次 RPC，非持有者按目标节点成组转发）
+gRPC  EventService/ReadVersionByTime  按聚合 id + unix_time 查询「时间戳早于或等于给定时间」的最大 version（客户端按时间点追溯历史：先定锚点版本，再 ReadStream 回放；恰好写在给定时刻的记录计入锚点；0=该时间点及之前无可见记录；从索引作答、不读 WAL 帧；按本节点 durable LEO 约束，非持有者代理转发）
 
 # ---- peer 面（PeerService gRPC，与 Raft 同端口，proto/pushupes/v1/peer.proto）----
 gRPC  PeerService/MFetch          副本拉取（长轮询，多槽复用，payload=裸 WAL 字节）
@@ -635,8 +637,8 @@ follower 收到这类命令一律**拒绝**（HTTP 425 + `err_id=1005`，响应�
   同一份 31GiB 数据：堆 inuse 3.7~4.3GiB → **1.42GiB**，`OpenStore` 38.7~80.9s →
   **20.0~26.0s**，节点启动到可服务 29.3s → **18.6s**，稳态 RSS 3.88 → **2.08GiB**。
 - **段索引文件（Phase 2，已落地）**：每段三个**追加式**派生文件（与 WAL 同目录同名前缀，
-  `internal/storage/segidx.go`）：`<baseSeq>.idx`（header 32B + 块 `crc32c(4) + n×20B`，
-  entry = command hash(8) seqOff(4) dictID(4) version(4)）、`<baseSeq>.agx`（段内聚合字典，
+  `internal/storage/segidx.go`）：`<baseSeq>.idx`（header 32B + 块 `crc32c(4) + n×28B`，
+  entry = command hash(8) seqOff(4) dictID(4) version(4) unix_time(8)）、`<baseSeq>.agx`（段内聚合字典，
   新增聚合即 sync）、`<baseSeq>.spx`（稀疏 seq→pos，16B/条）。
   **不变式**：索引是派生数据——只加载 CRC 验证通过的最长前缀，其余从 WAL 重放；
   缺失、损坏、滞后一律退化为全量帧头扫描（即索引出现之前的行为），因此正确性
@@ -644,8 +646,8 @@ follower 收到这类命令一律**拒绝**（HTTP 425 + `err_id=1005`，响应�
   定出段长与条数，entry 数用 WAL 实际条数封顶（截断过的段不会凭空多出记录）。
   **策略**：`OpenStore` 启动时把「缺失/损坏/滞后」的段补齐索引（`OpenSlotRepairing`）；
   运行期（`ReloadSlot`、懒加载 `Slot()`、迁移推来的段）只加载、绝不补建，缺索引的段
-  留给下次启动——即「启动补建、运行期维持现状」。**代价**：索引约 20B/条 ≈ 数据的
-  **2.2%**（31GiB → 724MB）。实测同一 31GiB 数据集（补建前清空索引）：冷启动 27.6s
+  留给下次启动——即「启动补建、运行期维持现状」。**代价**：索引约 28B/条 ≈ 数据的
+  **3.1%**（31GiB → 1.0GB；下述实测数值是在 20B 条目时测得，28B 只加宽条目、不改机制）。实测同一 31GiB 数据集（补建前清空索引）：冷启动 27.6s
   （遍历 + 补建，堆 1353MiB/sys 1978MiB）→ 热启动 **9.7s**（堆 1353MiB 不变）；
   两次启动逐槽 `last_seq == Σversion` 均精确。热启动剩余开销主要是把 3250 万条
   索引载入内存结构（Phase 3 的目标）。
@@ -736,7 +738,7 @@ pushupes/
 │   │                          #   peer_mux.go（peer 端口首字节分流 Raft/gRPC），
 │   │                          #   migration.go（六步热迁移），register.go（地址自报 announcer+RPC）
 ├── internal/api/              # handler.go（仅管理：status/writes/plan/migrate/describe/pprof），server.go
-├── internal/grpcapi/          # gRPC 客户端数据面：server.go（Append/ReadStream/ReadTails/ReadByCommand）
+├── internal/grpcapi/          # gRPC 客户端数据面：server.go（Append/ReadStream/ReadTails/ReadByCommand/ReadVersionByTime）
 └── proto/pushupes/v1/         # events.proto 客户端契约 + peer.proto 节点间契约（buf 生成至 internal/grpcapi）
 ```
 
@@ -774,8 +776,8 @@ pushupes/
 跳过磁盘；未加载或标记 unsafe 时保守地答「可能存在」——索引缺失只会变慢，
 绝不会出错。
 
-3.3 的 `.aidx` 目前是 **v4**：目录项 `id hash(8)/firstVer(4)/count(4)/firstOrd(4)/listOff(4)`，
-列表每条记录 **8B =（段内序数, 段内字节偏移）**。序数必须逐条存：同一段里某聚合
+3.3 的 `.aidx` 目前是 **v5**：目录项 `id hash(8)/firstVer(4)/count(4)/firstOrd(4)/listOff(4)`，
+列表每条记录 **16B =（段内序数, 段内字节偏移, unix_time）**。序数必须逐条存：同一段里某聚合
 的记录与其他聚合交错出现，序数并不连续，用 `BaseSeq+firstOrd+i` 推算会指向
 其他聚合的记录。有了偏移，「按版本读已封段」变成**一次 `readRecordAt` 直达**，
 不再依赖稀疏提示走帧（当时的提示间隔为 1 MiB，约一千帧）。31GiB / 13.1 万个版本的聚合全量读
@@ -797,6 +799,13 @@ pushupes/
 
 读路径：版本 `> sealedN` 走内存（热路径，与之前同速）；其余走「从新到旧逐段
 `.aidx` 二分定位 + 读那段列表 + 按 seq 读记录」，每段 1~2 次 pread。
+
+列表里的 unix_time 是**时间锚点查询**（`ReadVersionByTime` →
+`VersionAtOrBeforeTime`）的数据来源：活版本的时间戳来自内存目录（每条记录
+8B，与 seq 同几何），封段版本来自 `.aidx` 列表，因此「某时刻的版本锚点」这一
+查询**不读任何 WAL 帧**——只有最终命中的封段版本读一次记录，用于核对真实
+`AggregateID/Version`（列表按聚合 hash 组织，碰撞项不能作答）。同一条 unix_time
+也供 `/admin/slots/{slot}/streams` 的「最近UTC时间」列使用，列表因此维持零 WAL 读。
 
 3.4b：间隔从 1 MiB 再收到 64 KiB。稀疏间隔是「一次定位最多走多少帧」与「这份
 表占多少内存」的同一个旋钮，只改走帧量、不改答案：1 TiB/节点 的内存代价

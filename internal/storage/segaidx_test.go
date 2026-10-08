@@ -32,8 +32,12 @@ func TestSegAggIndexRoundTrip(t *testing.T) {
 	aggA := "agg-a"
 	aggB := "agg-b"
 	lists := []segAggList{
-		{hash: data.HashCommandID(aggA), firstVer: 7, firstOrd: 3, pairs: []uint32{3, 4096, 5, 8192, 9, 12288}},
-		{hash: data.HashCommandID(aggB), firstVer: 1, firstOrd: 0, pairs: []uint32{0, 1024, 2, 2048}},
+		{hash: data.HashCommandID(aggA), firstVer: 7, firstOrd: 3, pairs: []segAggPair{
+			{ord: 3, off: 4096, unix: 1700000003}, {ord: 5, off: 8192, unix: 1700000005}, {ord: 9, off: 12288, unix: 1700000009},
+		}},
+		{hash: data.HashCommandID(aggB), firstVer: 1, firstOrd: 0, pairs: []segAggPair{
+			{ord: 0, off: 1024, unix: 1700000001}, {ord: 2, off: 2048, unix: 1700000002},
+		}},
 	}
 	if err := writeSegAggIndex(seg, lists); err != nil {
 		t.Fatal(err)
@@ -52,19 +56,21 @@ func TestSegAggIndexRoundTrip(t *testing.T) {
 	// offs[i], and seq baseSeq+firstOrd+i.
 	var firstVer, firstOrd uint32
 	gotOrd, gotOff := uint32(0), uint32(0)
+	gotUnix := int64(0)
 	found := ix.Lookup(data.HashCommandID(aggA), func(e segAggEntry) bool {
 		firstVer, firstOrd = e.firstVer, e.firstOrd
-		ord, off, ok := ix.Pair(e, 1) // the second record of the entry
+		ord, off, unix, ok := ix.Pair(e, 1) // the second record of the entry
 		if !ok {
 			return false
 		}
-		gotOrd, gotOff = ord, off
+		gotOrd, gotOff, gotUnix = ord, off, unix
 		return true
 	})
-	if !found || firstVer != 7 || firstOrd != 3 || gotOrd != 5 || gotOff != 8192 {
-		t.Fatalf("lookup: found=%v firstVer=%d firstOrd=%d ord=%d off=%d", found, firstVer, firstOrd, gotOrd, gotOff)
+	if !found || firstVer != 7 || firstOrd != 3 || gotOrd != 5 || gotOff != 8192 || gotUnix != 1700000005 {
+		t.Fatalf("lookup: found=%v firstVer=%d firstOrd=%d ord=%d off=%d unix=%d",
+			found, firstVer, firstOrd, gotOrd, gotOff, gotUnix)
 	}
-	if _, _, ok := ix.Pair(segAggEntry{count: 2}, 2); ok {
+	if _, _, _, ok := ix.Pair(segAggEntry{count: 2}, 2); ok {
 		t.Fatal("out of range pair reported")
 	}
 	// A missing aggregate must come back empty, not wrong.

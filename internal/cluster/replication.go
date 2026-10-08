@@ -2980,7 +2980,8 @@ func (e *Engine) LeaderReplica(slot int32) (leader, clientAddr string, local, fo
 // forwarding would silently mis-report aggregates through single-endpoint
 // front-ends (e.g. the console proxy).
 //
-// This runs on EVERY read RPC (ReadStream, ReadTails, ReadByCommand), so the
+// This runs on EVERY read RPC (ReadStream, ReadTails, ReadByCommand,
+// ReadVersionByTime), so the
 // placement lookup behind it is the single-lock LeaderReplica rather than a
 // whole-table snapshot (see its doc for the measured cost).
 //

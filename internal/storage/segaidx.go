@@ -24,8 +24,9 @@ package storage
 // memory. Only the writable segment keeps its seqs in memory, because reading
 // the newest versions of an aggregate is the hot path.
 //
-//	<baseSeq>.aidx  header(32) + entries(aggCount * 24B) + lists(totalSeq * 4B) + crc32c(4)
+//	<baseSeq>.aidx  header(32) + entries(aggCount * 24B) + lists(totalSeq * 16B) + crc32c(4)
 //	                entry = id hash(8) firstVer(4) count(4) firstOrd(4) listOff(4)
+//	                list record = segment ordinal(4) byte offset(4) unix_time(8)
 //
 // A list holds each record's byte offset inside the segment, so serving a
 // version is one pread on the segment — not a walk from the nearest sparse hint
@@ -50,7 +51,7 @@ import (
 )
 
 const (
-	segAidxVersion    = 4 // 1 = shared arena, 2 = in-segment seqs, 3 = offsets with count/firstOrd swapped
+	segAidxVersion    = 5 // 4 = list pairs without unix_time, 3 = offsets with count/firstOrd swapped
 	segAidxMagic      = "ESAI"
 	segAidxHeaderByte = 32
 	segAidxEntryBytes = 24
@@ -64,11 +65,23 @@ var errSegAggNoOffsets = errors.New("sealed segment has no command index to take
 
 // segAggList is one aggregate's contribution to a sealed segment.
 type segAggList struct {
-	hash     uint64   // hash of the aggregate id
-	firstVer uint32   // version of the entry's first record
-	firstOrd uint32   // segment-local ordinal of that record (seq - baseSeq)
-	pairs    []uint32 // per record: (segment ordinal, byte offset), in version order
+	hash     uint64       // hash of the aggregate id
+	firstVer uint32       // version of the entry's first record
+	firstOrd uint32       // segment-local ordinal of that record (seq - baseSeq)
+	pairs    []segAggPair // per record, in version order
 }
+
+// segAggPair is one record's slot in an aggregate's sealed list: where it sits
+// in the segment, and when it was written. The unix_time travels with the pair
+// so a point-in-time question ("which version as of time T") is answered from
+// the index, with no WAL frame read.
+type segAggPair struct {
+	ord  uint32 // segment-local ordinal (seq - baseSeq)
+	off  uint32 // byte offset of the record's length prefix
+	unix int64  // the record's unix_time
+}
+
+const segAidxListBytes = 16 // one pair on disk: ord(4) off(4) unix_time(8)
 
 // segAggEntry is one directory entry as stored.
 type segAggEntry struct {
@@ -89,7 +102,7 @@ func segAidxPath(dir string, baseSeq uint64) string {
 func writeSegAggIndex(seg *Segment, lists []segAggList) error {
 	total := 0
 	for _, l := range lists {
-		total += len(l.pairs) / 2
+		total += len(l.pairs)
 	}
 	if len(lists) == 0 || total == 0 {
 		return nil
@@ -98,18 +111,20 @@ func writeSegAggIndex(seg *Segment, lists []segAggList) error {
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].hash < sorted[j].hash })
 
 	entries := make([]byte, len(sorted)*segAidxEntryBytes)
-	seqs := make([]byte, total*8) // two uint32 per record: ordinal and offset
+	seqs := make([]byte, total*segAidxListBytes) // ord, off, unix_time per record
 	off := 0
 	for i, l := range sorted {
 		p := i * segAidxEntryBytes
 		binary.BigEndian.PutUint64(entries[p:p+8], l.hash)
 		binary.BigEndian.PutUint32(entries[p+8:p+12], l.firstVer)
-		binary.BigEndian.PutUint32(entries[p+12:p+16], uint32(len(l.pairs)/2))
+		binary.BigEndian.PutUint32(entries[p+12:p+16], uint32(len(l.pairs)))
 		binary.BigEndian.PutUint32(entries[p+16:p+20], l.firstOrd)
-		binary.BigEndian.PutUint32(entries[p+20:p+24], uint32(off/2))
-		for _, v := range l.pairs {
-			binary.BigEndian.PutUint32(seqs[off:off+4], v)
-			off += 4
+		binary.BigEndian.PutUint32(entries[p+20:p+24], uint32(off/segAidxListBytes))
+		for _, rec := range l.pairs {
+			binary.BigEndian.PutUint32(seqs[off:off+4], rec.ord)
+			binary.BigEndian.PutUint32(seqs[off+4:off+8], rec.off)
+			binary.BigEndian.PutUint64(seqs[off+8:off+16], uint64(rec.unix))
+			off += segAidxListBytes
 		}
 	}
 	crc := crc32.New(segIdxCRC)
@@ -190,7 +205,7 @@ func openSegAggIndex(dir string, slotID int32, baseSeq uint64) (*segAggIndex, er
 		f.Close()
 		return nil, err
 	}
-	want := int64(segAidxHeaderByte) + int64(aggN)*segAidxEntryBytes + int64(seqN)*8 + 4
+	want := int64(segAidxHeaderByte) + int64(aggN)*segAidxEntryBytes + int64(seqN)*segAidxListBytes + 4
 	if st.Size() != want {
 		f.Close()
 		return nil, nil
@@ -211,13 +226,13 @@ func (ix *segAggIndex) Valid() bool {
 	}
 	crc := crc32.New(segIdxCRC)
 	crc.Write(ix.entries)
-	seqs := make([]byte, ix.seqN*8)
+	seqs := make([]byte, ix.seqN*segAidxListBytes)
 	if err := readAtFull(ix.f, seqs, int64(segAidxHeaderByte+ix.aggN*segAidxEntryBytes)); err != nil {
 		return false
 	}
 	crc.Write(seqs)
 	var tail [4]byte
-	if err := readAtFull(ix.f, tail[:], int64(segAidxHeaderByte+ix.aggN*segAidxEntryBytes+ix.seqN*8)); err != nil {
+	if err := readAtFull(ix.f, tail[:], int64(segAidxHeaderByte+ix.aggN*segAidxEntryBytes+ix.seqN*segAidxListBytes)); err != nil {
 		return false
 	}
 	return crc.Sum32() == binary.BigEndian.Uint32(tail[:])
@@ -278,18 +293,20 @@ func (ix *segAggIndex) Covered() map[uint64]bool {
 	return m
 }
 
-// Pair reads the entry's i-th record as (segment ordinal, byte offset). The
-// ordinal is what the index cannot derive: an aggregate's records inside a
-// segment are interleaved with other aggregates', so their ordinals are not
-// consecutive and the seq is baseSeq+ordinal, not baseSeq+firstOrd+i.
-func (ix *segAggIndex) Pair(e segAggEntry, i int) (uint32, uint32, bool) {
+// Pair reads the entry's i-th record as (segment ordinal, byte offset,
+// unix_time). The ordinal is what the index cannot derive: an aggregate's
+// records inside a segment are interleaved with other aggregates', so their
+// ordinals are not consecutive and the seq is baseSeq+ordinal, not
+// baseSeq+firstOrd+i.
+func (ix *segAggIndex) Pair(e segAggEntry, i int) (uint32, uint32, int64, bool) {
 	if ix == nil || i < 0 || i >= int(e.count) {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
-	var buf [8]byte
-	off := int64(segAidxHeaderByte) + int64(ix.aggN)*segAidxEntryBytes + int64(e.listOff)*2 + int64(i)*8
+	var buf [segAidxListBytes]byte
+	off := int64(segAidxHeaderByte) + int64(ix.aggN)*segAidxEntryBytes + (int64(e.listOff)+int64(i))*segAidxListBytes
 	if err := readAtFull(ix.f, buf[:], off); err != nil {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
-	return binary.BigEndian.Uint32(buf[0:4]), binary.BigEndian.Uint32(buf[4:8]), true
+	return binary.BigEndian.Uint32(buf[0:4]), binary.BigEndian.Uint32(buf[4:8]),
+		int64(binary.BigEndian.Uint64(buf[8:16])), true
 }

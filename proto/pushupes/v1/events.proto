@@ -24,6 +24,11 @@ service EventService {
   rpc ReadTails(ReadTailsRequest) returns (ReadTailsResponse);
   // ReadByCommand looks one record up by command_id (idempotency probe).
   rpc ReadByCommand(ReadByCommandRequest) returns (ReadByCommandResponse);
+  // ReadVersionByTime reports the highest version whose record has
+  // unix_time less than or equal to the requested time — the anchor a
+  // client uses to replay history as of a point in time (it then reads
+  // from that version with ReadStream).
+  rpc ReadVersionByTime(ReadVersionByTimeRequest) returns (ReadVersionByTimeResponse);
 }
 
 message Event {
@@ -127,4 +132,17 @@ message ReadByCommandRequest {
 message ReadByCommandResponse {
   bool found = 1;
   Record record = 2;
+}
+
+// ReadVersionByTimeRequest asks for the point-in-time version anchor of one
+// aggregate: the highest version whose record carries unix_time less than or
+// equal to unix_time (a record stamped exactly at the queried time is the
+// answer). A stream with no record visible at or before that time answers 0.
+message ReadVersionByTimeRequest {
+  string aggregate_id = 1;
+  int64 unix_time = 2;
+}
+
+message ReadVersionByTimeResponse {
+  uint32 version = 1; // 0 = no record visible at or before the time
 }

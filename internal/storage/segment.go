@@ -922,7 +922,7 @@ func (s *Segment) IndexRecord(seq uint64, m data.RecordMeta) {
 	if s.idx == nil {
 		return
 	}
-	s.idx.add(m.CommandHash, seq, m.AggregateID, m.Version)
+	s.idx.add(m.CommandHash, seq, m.AggregateID, m.Version, m.UnixTime)
 }
 
 // openIndexWriter starts (or resumes) this segment's index. Failure leaves the
