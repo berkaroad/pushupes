@@ -84,6 +84,10 @@ export interface SlotDescribe {
 export interface SlotStream {
   aggregate_id: string
   version: number
+  // unix_time of the aggregate's latest record (UTC seconds), 0 when the node
+  // has no timestamp for it. Read out of the slot's in-memory directory along
+  // with the version — the listing still reads no WAL file.
+  unix_time: number
 }
 
 // Slot event-stream page: answered out of the node's in-memory slot index

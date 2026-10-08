@@ -522,7 +522,7 @@ GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（�
                                                #   有 slot leader 没应答，此时该值是下界
 GET  /admin/writes                             # 每槽 durable 计数 + 每槽落盘字节 write_bytes（与计数同下标，两快照作差得 msg/s 与字节/s）+ 槽内总字节/事件流数量 + 本节点待清理副本（前端轮询）
 GET  /admin/stats[?worst=N]                    # 三个「等在哪里」自视合一：flush = 待刷记录数/最老未刷记录年龄/刷盘队列长度与在飞数/fsync 排队等待与 syscall 服务时间分位/每次新覆盖字节与覆盖的段文件大小；repl = `hw < LEO` 的槽数与最老等待时长（?worst=N 列出最久的槽）/每副本上报新鲜度与 LEO 落后/fetch 轮次与「按数据唤醒 vs 按等待预算到期」计数；ack = 每条写入的确认链路四段耗时（栅栏+路由 / 本地 WAL 落地 / 等 ISR 高水位 / 整调用）与结果、失败原因分布、正在等待的调用数、水位落后条数（?worst=N 列出等得最久的槽）
-GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本，仅内存索引，不读 WAL）
+GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本+最新记录 unix_time，仅内存索引，不读 WAL）
 POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移（控制器专属，必须发到 Raft leader 的 admin 地址）
 POST /admin/slots/{slot}/remove-replica {node} # 回收副本集里的一个成员（控制器专属，同上）
 POST /admin/cluster/plan                       # 触发重新规划（控制器专属，同上）
@@ -582,7 +582,8 @@ Raft 配置（谁投票）与复制的成员目录（槽表里的成员列表）
 出现脏读。
 
 槽位事件流列表（`/admin/slots/{slot}/streams`）回答的是**槽内索引**：每条事件流的
-聚合 id + 最新版本号。索引在开槽时只解析记录的**帧头**（`data.DecodeRecordMeta`：
+聚合 id + 最新版本号 + 该最新记录的 `unix_time`（控制台「最近UTC时间」列；
+它随版本一起维护在内存目录里，所以取列表**不读任何 WAL 文件**）。索引在开槽时只解析记录的**帧头**（`data.DecodeRecordMeta`：
 聚合 id/版本/长度，event body 既不拷贝也不解码；与 follower 帧落盘共用同一套
 遍历逻辑），因此取列表**不读任何 WAL 文件**。本节点未打开过的槽返回
 `loaded:false` 而不是现开——开槽意味着遍历该槽的全部分段，正是该接口要避免的

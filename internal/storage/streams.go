@@ -21,10 +21,12 @@ import (
 )
 
 // StreamVersion is one event stream of a slot: its aggregate id and the
-// version of its latest committed record.
+// version of its latest committed record, plus the unix_time of that record
+// (0 = unknown) so the console can show when the stream was last written.
 type StreamVersion struct {
 	AggregateID string `json:"aggregate_id"`
 	Version     uint32 `json:"version"`
+	UnixTime    int64  `json:"unix_time"`
 }
 
 // StreamList is one page of a slot's event streams.
@@ -125,7 +127,7 @@ func (s *Slot) streamPage(after string, limit int, out *StreamList) {
 			continue
 		}
 		if len(h) < limit {
-			h = append(h, StreamVersion{AggregateID: id, Version: e.version})
+			h = append(h, StreamVersion{AggregateID: id, Version: e.version, UnixTime: e.lastUnix})
 			if len(h) == limit {
 				heap.Init(&h)
 			}

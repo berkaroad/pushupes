@@ -4,7 +4,7 @@ import type { ColumnsType } from 'antd/es/table'
 import type { ClusterStatus, NodeWrites, Placement, SlotDescribe, SlotStream, SlotStreams } from '../types'
 import { ensureLeader, fetchNodeWrites, fetchSlotDescribe, fetchSlotStreams, migrateSlot } from '../api'
 import { RATE_POINTS, RateChart, type RatePoint } from '../RateChart'
-import { humanBytes } from '../format'
+import { humanBytes, utcStamp } from '../format'
 import { ReplicaTags, dropHint } from '../ReplicaTags'
 
 const RATE_POLL_MS = 2000
@@ -390,6 +390,12 @@ export default function SlotsPage() {
       render: (v: string) => <Typography.Text copyable>{v}</Typography.Text>,
     },
     { title: '最新版本号', dataIndex: 'version', width: 110, align: 'right' },
+    {
+      // When the stream was last written, in UTC — the point-in-time anchor a
+      // client feeds to ReadVersionByTime to replay history as of a moment.
+      title: '最近UTC时间', dataIndex: 'unix_time', width: 180,
+      render: (v: number) => <span title={v ? `${v} (unix 秒)` : '未知'}>{utcStamp(v)}</span>,
+    },
   ]
 
   return (

@@ -335,3 +335,59 @@ func TestSlotIfLoadedNeverOpens(t *testing.T) {
 		t.Fatal("out-of-range slot accepted")
 	}
 }
+
+// The listing carries each aggregate's latest record time — the console's
+// 最近UTC时间 column, and the anchor a client hands back to a point-in-time
+// query. It comes out of the in-memory directory (the listing reads no WAL
+// file), and it must survive a restart, where the stamp is restored from the
+// record index rather than re-read from the frames.
+func TestStreamPageReportsLastUnix(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStore(dir, 16, 1<<10, FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	slot := int32(5)
+	agg := aggInSlotForTest(t, st, slot)
+	other := nextAggInSlot(t, st, slot, agg)
+	for v := uint32(1); v <= 5; v++ {
+		if _, err := st.Append(recAt(agg, v, int64(1700000000+v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.Append(recAt(other, 1, 1700000999)); err != nil {
+		t.Fatal(err)
+	}
+
+	check := func(st *Store) {
+		t.Helper()
+		page, err := st.StreamPage(slot, "", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]int64{}
+		for _, s := range page.Streams {
+			got[s.AggregateID] = s.UnixTime
+		}
+		if got[agg] != 1700000005 {
+			t.Fatalf("latest stream time=%d, want 1700000005 (the last version's stamp)", got[agg])
+		}
+		if got[other] != 1700000999 {
+			t.Fatalf("other stream time=%d, want 1700000999", got[other])
+		}
+	}
+	check(st)
+
+	// Reopen with a small segment size: versions seal during the first run, so
+	// the surviving stamps are the ones the reloaded index carries.
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st2, err := OpenStore(dir, 16, 1<<10, FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	check(st2)
+}

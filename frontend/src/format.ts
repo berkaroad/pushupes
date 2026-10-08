@@ -6,6 +6,16 @@ export function humanBytesPerSec(n: number): string {
   return `${humanBytes(n)}/s`
 }
 
+// utcStamp renders a unix second count as UTC "YYYY-MM-DD HH:mm:ss". The
+// event-stream listing shows when a stream was last written, and UTC is the
+// one reading every operator (and every node's log) agrees on; toISOString is
+// the locale-independent form, so the rendered string is identical under SSR
+// and in a browser. 0/absent renders '-'.
+export function utcStamp(unixSeconds?: number): string {
+  if (!unixSeconds || !Number.isFinite(unixSeconds) || unixSeconds <= 0) return '-'
+  return new Date(unixSeconds * 1000).toISOString().slice(0, 19).replace('T', ' ')
+}
+
 // humanBytes renders a byte count for display (callers put the exact value in
 // a title/tooltip). Shared by the cluster page's storage total and the slots
 // page's per-slot bytes so both read the same way.

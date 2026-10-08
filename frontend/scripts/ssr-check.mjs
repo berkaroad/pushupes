@@ -114,9 +114,17 @@ assert('write-speed is two cards, not one',
 assert('write-speed sums at slot leaders', pageSrc.includes('leaderWriteTotals'))
 assert('write-speed polls the light counters endpoint', pageSrc.includes('fetchNodeWrites'))
 assert('write-speed reads the byte counters', pageSrc.includes('write_bytes'))
-const { humanBytes, humanBytesPerSec } = await vite.ssrLoadModule('/src/format.ts')
+const { humanBytes, humanBytesPerSec, utcStamp } = await vite.ssrLoadModule('/src/format.ts')
 assert('byte formatter renders sizes', humanBytes(0) === '0 B' && humanBytes(1536) === '1.5 KiB' && humanBytes(70496329) === '67.2 MiB')
 assert('byte formatter renders rates', humanBytesPerSec(0) === '0 B/s' && humanBytesPerSec(1536) === '1.5 KiB/s')
+// The stream listing's time column must read the same in every timezone: it
+// renders UTC, and a missing stamp is a dash, never a 1970 date.
+assert('UTC stamp renders unix seconds as UTC',
+  utcStamp(1700000000) === '2023-11-14 22:13:20' && utcStamp(0) === '-' && utcStamp(undefined) === '-')
+const { default: SlotsPage } = await vite.ssrLoadModule('/src/pages/SlotsPage.tsx')
+const slotsSrc = String(SlotsPage)
+assert('the slot drawer lists each stream\'s latest UTC time',
+  slotsSrc.includes('最近UTC时间') && slotsSrc.includes('unix_time') && slotsSrc.includes('utcStamp'))
 const liveAdmin = (process.env.PUSHUPES_ADMIN ?? '').trim()
 if (liveAdmin) {
   try {
