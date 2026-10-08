@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // installProbe swaps the flusher's syscall for an observer and returns a

@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"testing"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // The command filter answers "definitely not stored", and the idempotency check

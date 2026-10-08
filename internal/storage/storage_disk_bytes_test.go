@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // TestSlotDiskBytesCoversLoadedAndColdCopies pins the per-slot source of the

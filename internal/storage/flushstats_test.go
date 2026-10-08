@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // recFor builds one appendable record: an append needs at least one event, or

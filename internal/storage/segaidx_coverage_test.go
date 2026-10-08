@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // A migration target receives ONLY the .wal files of the sealed segments

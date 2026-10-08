@@ -25,12 +25,12 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
-	"pushupes/internal/cluster"
-	"pushupes/internal/data"
-	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
-	"pushupes/internal/lease"
-	"pushupes/internal/payloadcodec"
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/cluster"
+	"github.com/berkaroad/pushupes/internal/data"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
+	"github.com/berkaroad/pushupes/internal/lease"
+	"github.com/berkaroad/pushupes/internal/payloadcodec"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // newTestClient spins up the gRPC server over an in-memory listener and

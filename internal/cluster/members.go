@@ -33,8 +33,8 @@ import (
 	"fmt"
 	"time"
 
-	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
-	"pushupes/internal/raft"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
+	"github.com/berkaroad/pushupes/internal/raft"
 )
 
 // AddMemberTimeout bounds one runtime membership change.

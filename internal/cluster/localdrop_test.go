@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // TestDropRetentionDefaultAndResolution pins the knob's contract: the default

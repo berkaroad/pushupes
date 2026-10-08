@@ -26,8 +26,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"pushupes/internal/data"
-	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
+	"github.com/berkaroad/pushupes/internal/data"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 )
 
 func req(agg string, ver uint32, cmd string) *pushupesv1.AppendRequest {

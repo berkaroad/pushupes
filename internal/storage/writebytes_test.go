@@ -17,7 +17,7 @@ package storage
 import (
 	"testing"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // TestWriteByteCountsTracksDurableWrites pins the byte side of the write-rate

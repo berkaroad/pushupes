@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // TestWriteFenceBlocksAppendsAndDoesNotFailThem pins the core fence contract:

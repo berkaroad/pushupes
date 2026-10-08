@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // leadSlot0 plans the table and pins slot 0 on node-1, then installs a

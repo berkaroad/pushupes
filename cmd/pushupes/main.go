@@ -32,16 +32,16 @@ import (
 	"syscall"
 	"time"
 
-	"pushupes/internal/api"
-	"pushupes/internal/cluster"
-	"pushupes/internal/data"
-	"pushupes/internal/raft"
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/api"
+	"github.com/berkaroad/pushupes/internal/cluster"
+	"github.com/berkaroad/pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/raft"
+	"github.com/berkaroad/pushupes/internal/storage"
 
 	"google.golang.org/grpc"
 
-	"pushupes/internal/grpcapi"
-	"pushupes/internal/payloadcodec"
+	"github.com/berkaroad/pushupes/internal/grpcapi"
+	"github.com/berkaroad/pushupes/internal/payloadcodec"
 )
 
 // defaultGrpcMaxMsgBytes is the client-plane gRPC message cap: gRPC's own

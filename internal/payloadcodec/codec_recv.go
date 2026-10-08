@@ -20,8 +20,8 @@ import (
 	"google.golang.org/grpc/mem"
 	"google.golang.org/protobuf/encoding/protowire"
 
-	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
-	"pushupes/internal/lease"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
+	"github.com/berkaroad/pushupes/internal/lease"
 )
 
 // errUnexpectedWireType aborts a fast parse so the caller can fall back to the

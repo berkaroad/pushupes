@@ -25,7 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // ErrSeqDivergence marks a replay of a seq that the local log already holds

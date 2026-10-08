@@ -24,9 +24,9 @@ import (
 	"strconv"
 	"time"
 
-	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
-	"pushupes/internal/lease"
-	"pushupes/internal/storage"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
+	"github.com/berkaroad/pushupes/internal/lease"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // ---- Migration stream bounds ---------------------------------------------------

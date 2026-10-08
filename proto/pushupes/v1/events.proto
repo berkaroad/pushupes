@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package pushupes.v1;
 
-option go_package = "pushupes/internal/grpcapi/pushupes/v1;pushupesv1";
+option go_package = "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1;pushupesv1";
 
 // EventService is the client-facing data plane: event writes and event
 // queries, served on its own port, independent of the HTTP admin/replication

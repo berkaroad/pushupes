@@ -18,7 +18,7 @@ import (
 	"context"
 	"testing"
 
-	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 )
 
 // ReadVersionByTime is the point-in-time anchor for client history replay:

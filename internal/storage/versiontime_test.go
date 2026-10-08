@@ -21,7 +21,7 @@ import (
 	"strings"
 	"testing"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // recAt builds one record with an explicit unix_time stamp.

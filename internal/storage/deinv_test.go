@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"testing"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // The per-aggregate directory entry carries two numbers that every read path

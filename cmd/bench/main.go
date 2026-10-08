@@ -46,8 +46,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"pushupes/internal/data"
-	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
+	"github.com/berkaroad/pushupes/internal/data"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 )
 
 // clients caches one gRPC connection per address (HTTP/2 keep-alive).

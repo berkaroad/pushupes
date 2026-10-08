@@ -18,7 +18,7 @@ import (
 	"google.golang.org/grpc/mem"
 	"google.golang.org/protobuf/encoding/protowire"
 
-	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 )
 
 // carryMinBytes is the size from which a bytes field is emitted as its own

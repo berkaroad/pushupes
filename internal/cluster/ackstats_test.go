@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // aggsOnSlot returns n aggregate ids that hash to the given slot.

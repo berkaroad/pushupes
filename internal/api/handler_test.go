@@ -22,9 +22,9 @@ import (
 	"strings"
 	"testing"
 
-	"pushupes/internal/cluster"
-	"pushupes/internal/data"
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/cluster"
+	"github.com/berkaroad/pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // decodeBody decodes an error response body.

@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/raft"
+	"github.com/berkaroad/pushupes/internal/raft"
 )
 
 // TestClusterConfigCarriesRaftTimings pins the cluster side of the two knobs:

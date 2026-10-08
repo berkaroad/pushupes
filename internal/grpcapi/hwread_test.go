@@ -24,10 +24,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
-	"pushupes/internal/cluster"
-	"pushupes/internal/data"
-	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/cluster"
+	"github.com/berkaroad/pushupes/internal/data"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // A leader must be able to read its own durable log. Capping a LEADER's read at

@@ -18,8 +18,8 @@ import (
 	"strconv"
 	"testing"
 
-	"pushupes/internal/data"
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // COUNTER-EXAMPLE, deliberately skipped — do not "fix" this test into passing.

@@ -35,7 +35,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // ackBucketUpperMS bounds the millisecond histogram buckets (upper bound,

@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"testing"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // Follower-style frame landing: the leader's encoded bytes reach the WAL

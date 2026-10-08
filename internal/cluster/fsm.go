@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"pushupes/internal/raft"
+	"github.com/berkaroad/pushupes/internal/raft"
 )
 
 // ApplyResult is the FSM reply to a consensus apply: plain bytes plus an error

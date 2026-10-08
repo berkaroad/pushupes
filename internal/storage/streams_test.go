@@ -19,7 +19,7 @@ import (
 	"os"
 	"testing"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // appendVersion writes version n of an aggregate (the write path requires

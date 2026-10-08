@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/data"
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // pushFrames ships the source's frozen tail to a migration target, and it

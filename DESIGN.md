@@ -727,7 +727,7 @@ peer_addr       = http://127.0.0.1:8391   # -peer / PUSHUPES_PEER（Raft + 注�
 ```
 pushupes/
 ├── DESIGN.md
-├── go.mod                     # module pushupes
+├── go.mod                     # module github.com/berkaroad/pushupes
 ├── cmd/pushupes/              # 入口：装配 storage + cluster + api（admin）+ grpcapi（client）
 ├── internal/data/             # 领域类型、WAL 编解码、槽路由哈希、错误码
 ├── internal/storage/          # WalSegment / Slot(WAL) / Store：

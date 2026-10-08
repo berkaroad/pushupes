@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // The wait after attempt n doubles from the round interval up to the cap: a

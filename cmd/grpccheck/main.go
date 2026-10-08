@@ -26,7 +26,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 )
 
 var clientAddrs = flag.String("addrs", "127.0.0.1:9991,127.0.0.1:9992,127.0.0.1:9993", "comma list of node client-plane (gRPC) addrs")

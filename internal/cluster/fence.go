@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // ---- Migration write fence ---------------------------------------------------

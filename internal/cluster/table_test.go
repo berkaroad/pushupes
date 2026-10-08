@@ -18,7 +18,7 @@ import (
 	"reflect"
 	"testing"
 
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 func newTestEngine(t *testing.T, self string) (*Engine, *storage.Store) {

@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // appendOne routes one record (via the package's makeRecord/aggInSlot test

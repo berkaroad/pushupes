@@ -33,7 +33,7 @@ import (
 	"sync"
 	"time"
 
-	"pushupes/internal/raft"
+	"github.com/berkaroad/pushupes/internal/raft"
 )
 
 const (

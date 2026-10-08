@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"testing"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // ScanFetchState is the leader's per-round answer for every reported position:

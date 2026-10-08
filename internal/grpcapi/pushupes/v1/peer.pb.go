@@ -1696,7 +1696,7 @@ const file_pushupes_v1_peer_proto_rawDesc = "" +
 	"\bDropSlot\x12\x1c.pushupes.v1.DropSlotRequest\x1a\x1d.pushupes.v1.DropSlotResponse\x12b\n" +
 	"\x11ReportUnreachable\x12%.pushupes.v1.ReportUnreachableRequest\x1a&.pushupes.v1.ReportUnreachableResponse\x12G\n" +
 	"\bSlotLeos\x12\x1c.pushupes.v1.SlotLeosRequest\x1a\x1d.pushupes.v1.SlotLeosResponse\x12J\n" +
-	"\tSlotSizes\x12\x1d.pushupes.v1.SlotSizesRequest\x1a\x1e.pushupes.v1.SlotSizesResponseB2Z0pushupes/internal/grpcapi/pushupes/v1;pushupesv1b\x06proto3"
+	"\tSlotSizes\x12\x1d.pushupes.v1.SlotSizesRequest\x1a\x1e.pushupes.v1.SlotSizesResponseBGZEgithub.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1;pushupesv1b\x06proto3"
 
 var (
 	file_pushupes_v1_peer_proto_rawDescOnce sync.Once

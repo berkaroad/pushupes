@@ -32,9 +32,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"pushupes/internal/data"
-	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/data"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // Engine is the application-level cluster state: it owns the slot table

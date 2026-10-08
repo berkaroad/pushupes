@@ -19,7 +19,7 @@ import (
 	"os"
 	"testing"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 func mkRec(agg string, ver uint32, cmd string) *data.EventRecord {

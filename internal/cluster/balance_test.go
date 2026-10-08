@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/data"
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // ---- PlanLeaderRebalance: the ring anchor, as a pure function --------------

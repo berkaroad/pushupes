@@ -18,7 +18,7 @@ import (
 	"strings"
 	"testing"
 
-	"pushupes/internal/cluster"
+	"github.com/berkaroad/pushupes/internal/cluster"
 )
 
 func TestParsePeers(t *testing.T) {

@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // Every version of every aggregate must come back as that aggregate's own

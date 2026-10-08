@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/raft"
+	"github.com/berkaroad/pushupes/internal/raft"
 )
 
 // TestRestartRestoresSnapshotWithNonMemberPlacement is the end-to-end

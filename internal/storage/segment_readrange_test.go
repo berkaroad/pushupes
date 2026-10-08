@@ -22,7 +22,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // The byte-range walk that replica fetch and migration use must cover exactly

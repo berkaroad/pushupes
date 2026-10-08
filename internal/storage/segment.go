@@ -31,7 +31,7 @@ import (
 	"sync"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // Segment file format:

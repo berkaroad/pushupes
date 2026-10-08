@@ -24,7 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // Store owns all local slot WALs and the aggregate->slot routing.

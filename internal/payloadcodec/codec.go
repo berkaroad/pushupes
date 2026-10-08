@@ -21,7 +21,7 @@ import (
 	"google.golang.org/grpc/mem"
 	"google.golang.org/protobuf/proto"
 
-	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 )
 
 // payloadCodec is a gRPC CodecV2 that keeps the large bytes fields of this

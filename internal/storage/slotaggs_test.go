@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"testing"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // Each aggregate keeps its own chunked seq list: the mapping from a version to

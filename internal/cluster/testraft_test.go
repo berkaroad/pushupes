@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/raft"
+	"github.com/berkaroad/pushupes/internal/raft"
 )
 
 // newTestRaftNode stands up an in-process single-voter consensus node so tests

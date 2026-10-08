@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/data"
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // DESIGN.md §1.1 rule 3: a record that occupies a seq and is written to the WAL

@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // A command written into a sealed segment must be findable with the in-memory

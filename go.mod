@@ -1,4 +1,4 @@
-module pushupes
+module github.com/berkaroad/pushupes
 
 go 1.26
 

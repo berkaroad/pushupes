@@ -44,7 +44,7 @@ import (
 	"path/filepath"
 	"sort"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 const (

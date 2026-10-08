@@ -33,7 +33,7 @@ import (
 	"sync"
 	"time"
 
-	"pushupes/internal/raft"
+	"github.com/berkaroad/pushupes/internal/raft"
 )
 
 // ErrNotLeader is returned when a command is submitted on a follower.

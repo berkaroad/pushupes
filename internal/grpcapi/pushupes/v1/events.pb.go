@@ -1032,7 +1032,7 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"ReadStream\x12\x1e.pushupes.v1.ReadStreamRequest\x1a\x1f.pushupes.v1.ReadStreamResponse\x12J\n" +
 	"\tReadTails\x12\x1d.pushupes.v1.ReadTailsRequest\x1a\x1e.pushupes.v1.ReadTailsResponse\x12V\n" +
 	"\rReadByCommand\x12!.pushupes.v1.ReadByCommandRequest\x1a\".pushupes.v1.ReadByCommandResponse\x12b\n" +
-	"\x11ReadVersionByTime\x12%.pushupes.v1.ReadVersionByTimeRequest\x1a&.pushupes.v1.ReadVersionByTimeResponseB2Z0pushupes/internal/grpcapi/pushupes/v1;pushupesv1b\x06proto3"
+	"\x11ReadVersionByTime\x12%.pushupes.v1.ReadVersionByTimeRequest\x1a&.pushupes.v1.ReadVersionByTimeResponseBGZEgithub.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1;pushupesv1b\x06proto3"
 
 var (
 	file_pushupes_v1_events_proto_rawDescOnce sync.Once

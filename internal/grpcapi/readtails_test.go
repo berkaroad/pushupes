@@ -19,10 +19,10 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/cluster"
-	"pushupes/internal/data"
-	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/cluster"
+	"github.com/berkaroad/pushupes/internal/data"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // ReadTails replaced a per-aggregate probe chain (exponential + binary

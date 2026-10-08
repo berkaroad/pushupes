@@ -18,7 +18,7 @@ import (
 	"os"
 	"testing"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // The on-disk aggregate index must map (aggregate, version) to the seq of the

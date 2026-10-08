@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"testing"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // What encode writes must decode back — and it must answer for the commands

@@ -25,16 +25,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/berkaroad/pushupes/internal/data"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
+	"github.com/berkaroad/pushupes/internal/lease"
+	"github.com/berkaroad/pushupes/internal/payloadcodec"
+	"github.com/berkaroad/pushupes/internal/storage"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"net"
-	"pushupes/internal/data"
-	pushupesv1 "pushupes/internal/grpcapi/pushupes/v1"
-	"pushupes/internal/lease"
-	"pushupes/internal/payloadcodec"
-	"pushupes/internal/storage"
 	"sync"
 )
 

@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // Recovery from an index must be indistinguishable from recovery by walking the

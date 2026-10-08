@@ -20,7 +20,7 @@ import (
 	"os"
 	"testing"
 
-	"pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/data"
 )
 
 // The header-only recovery walk must report exactly the records the full decode

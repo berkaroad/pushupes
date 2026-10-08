@@ -17,7 +17,7 @@ package cluster
 import (
 	"testing"
 
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // ReadProxyAddr decides, on every read RPC, whether this node serves a slot

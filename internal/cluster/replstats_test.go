@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"pushupes/internal/storage"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 // TestReplStatsTracksStuckWatermarkAndParkedRounds pins the replication
