@@ -338,13 +338,24 @@ Body: Record*，每条记录：
   目标追平（LEO 落后）不计入退避，只是让路。0=关闭再平衡；负数启动即报错。每一轮
   先做 leader 交接、再做**席位回收**（`reclaimRound`，见下面「副本集重排」）：两件事
   共用同一个 cadence、batch 与让路门禁。
-- **默认拓扑**：`slot_count=1680`（固定）。副本数**不可配置**，由 Raft 集群的容错
-  节点数推导：`ReplicaCountForMembers(N) = floor((N-1)/2) + 1`，即「共识组能扛住几次
-  故障，数据就多留一份」——1 节点 0+1=1、3 节点 1+1=2、5 节点 2+1=3、7 节点 3+1=4
-  （偶数成员同式：2→1、4→2、6→3）。控制器每轮按当前成员数重算并写进槽表
-  （`OpConfig`），成员数一变就把因子对齐；副本集按环 `slot % N` 起、向前取该数量个
-  节点。
-- **副本集重排由因子跳变触发**（operator 拍板）：因子只在成员数跨到基数时跳变，
+- **默认拓扑**：`slot_count=1680`（固定）。每槽副本数由**副本策略**（replica
+  policy）分档决定，策略值存放在 Raft 复制的槽表里、全集群一份：
+  `low` = 1 份、`medium` = 2 份（默认）、`high` = 容错节点数 + 1，即
+  `ReplicaCountForMembers(N) = floor((N-1)/2) + 1`——「共识组能扛住几次
+  故障，数据就多留一份」（1 节点 0+1=1、3 节点 1+1=2、5 节点 2+1=3、7 节点 3+1=4；
+  偶数成员同式：2→1、4→2、6→3）。任何一档的因子都按成员数钳制（因子不会超过
+  集群节点数：1 成员集群上的 medium 落为 1 份）。控制器每轮按「表里的策略 ×
+  当前成员数」重算并写进槽表（`OpConfig`），策略一变或成员数一变就把因子对齐；
+  副本集按环 `slot % N` 起、向前取该数量个节点。
+  策略的修改入口是 admin 接口 `POST /admin/cluster/replica-policy`（控制器专属
+  的 Raft 命令 `OpSetPolicy`，命令只带档位、副本数在应用时按成员数推导，保持
+  所有节点状态机确定性），控制台集群页的「副本策略」卡片配了编辑态（修改 →
+  草稿 → 保存确认 → 提交）；启动参数 `-replica-policy`（env
+  `PUSHUPES_REPLICA_POLICY`，默认 medium）只为新集群种下初始值——控制器仅在
+  槽表首次规划（表还是空的）时提交一次种子，此后表里的值就是权威，重启节点
+  不会重刷策略，改档位只能走接口。
+- **副本集重排由因子跳变触发**（operator 拍板）：因子在策略变更时（任何一档）
+  或 high 档下成员数跨到基数时跳变，
   控制器据此把槽表按环重铺。判据是「任一 stable 槽的副本集大小 ≠ 因子」——
   也就是「因子变了、布局还没跟上」（退出成员留下的多余席位，或新成员缺的席位）：
   - **补席位是重排里唯一搬动副本集的动作**：每个 stable 槽按环 `slot % N` 起算，
@@ -369,11 +380,12 @@ Body: Record*，每条记录：
   - 3、5、7…（基数）成员时重排，全员摊开：1680 槽在 3/5/7 节点上分别是
     560/336/240 个槽主，副本席位 1120/1008/960（补席位即时完成，席位回收按
     每轮 `-rebalance-batch` 个槽收敛）；
-  - 新增偶数成员（第 4 个、第 6 个）**不重排**：因子没变、副本集大小仍等于因子，
+  - 新增偶数成员（第 4 个、第 6 个）在 high 档下**不重排**：因子没变、副本集大小仍等于因子，
     该成员暂时不承载任何槽位，直到下一个基数成员加入（实测：node-4 在 4 节点时
-    0 槽，到 5 节点时变 336）。
-  这是有意的取舍（不因成员数偶数变化而搬数据），不是遗漏。因子只能从
-  `GET /admin/cluster/status` 的 `replica_factor` 读回。重排与回收都不动 leader：
+    0 槽，到 5 节点时变 336）。low / medium 档的因子不随成员数变化（只有 1 成员时
+    被钳制为 1 份），加成员同样不触发重排。
+  这是有意的取舍（high 档不因成员数偶数变化而搬数据），不是遗漏。策略与生效因子
+  从 `GET /admin/cluster/status` 的 `replica_policy` / `replica_factor` 读回。重排与回收都不动 leader：
   leader 交回环上只由再平衡循环完成。
 
 ## 5. 槽位热迁移（文件级搬运）
@@ -497,6 +509,7 @@ GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最
 POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移（控制器专属，必须发到 Raft leader 的 admin 地址）
 POST /admin/slots/{slot}/remove-replica {node} # 回收副本集里的一个成员（控制器专属，同上）
 POST /admin/cluster/plan                       # 触发重新规划（控制器专属，同上）
+POST /admin/cluster/replica-policy {policy}    # 切换副本策略档位 low/medium/high（控制器专属，同上；回当前策略与生效因子）
 GET  /admin/cluster/nodes                      # 列出当前 raft 成员（本节点视角：id/peer/admin/client/down）
 POST /admin/cluster/nodes {id,peer_addr}       # 运行时加成员（控制器专属，同上；admin/client 地址由新节点自报）
 DELETE /admin/cluster/nodes/{id}               # 运行时摘成员（控制器专属，同上；仅离线节点，在线回 400）
@@ -660,6 +673,9 @@ follower 收到这类命令一律**拒绝**（HTTP 425 + `err_id=1005`，响应�
 slot_count      = 1680         # 固定不可配置（105 的倍数，见 §7.2）
 segment_bytes   = 268435456    # 默认 256MiB；须为 64MiB 的整数倍，最小 64MiB、最大 2GiB
                               # -segment-bytes 可写字节数或带单位（256MiB / 1GiB / 268435456）
+replica_policy  = medium       # 副本策略：low=每槽 1 份 / medium=2 份 / high=容错节点数+1
+                              # -replica-policy / PUSHUPES_REPLICA_POLICY 只为新集群种初始值；
+                              # 策略存在复制的槽表里，之后的修改走 POST /admin/cluster/replica-policy
 replica_count   = 2
 election_mode   = leader       # preferred leader 自动回切
 flush.policy    = 每 1000 条或 5s（可关闭为纯页缓存）

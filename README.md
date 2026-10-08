@@ -133,8 +133,10 @@ scripts/cluster.sh clean     # stop 并删除运行目录（含数据，慎用�
 每个节点占用三个端口，按节点序号依次递增（node-i = BASE + i − 1）；数据、日志、
 pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可用环境变量覆盖：
 `REPLICAS`（节点数）、`HOST`、`ADMIN_BASE`、`PEER_BASE`、`CLIENT_BASE`、
-`SEGMENT_BYTES`、`RUN_DIR`、`READY_TIMEOUT`、`BUILD`。每槽副本数不是配置项：
-按 Raft 集群的容错节点数推导（N 个成员 → floor((N-1)/2)+1 份），扩容时自动追加。
+`SEGMENT_BYTES`、`RUN_DIR`、`READY_TIMEOUT`、`BUILD`。每槽副本数由副本策略分档
+（`PUSHUPES_REPLICA_POLICY`=low/medium/high，默认 medium：1/2/容错节点数+1 份）：
+该值只为新集群种初始值，策略存放在 Raft 复制的槽表里，之后改档位走
+`POST /admin/cluster/replica-policy`（控制台集群页的「副本策略」卡片即可操作）。
 扩节点两种做法等价：`REPLICAS=<新总数> cluster.sh start`（集群已存在时，缺的节点
 自动报名加入）或逐个 `cluster.sh join N`。
 
@@ -183,7 +185,7 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 | `-data` | `PUSHUPES_DATA` | `./data` | 数据目录 |
 | `-peers` | `PUSHUPES_PEERS` | 空 | 集群种子 `id=host:peerport,...` |
 | `-bootstrap` | — | false | 由本节点写下集群的初始配置。默认由 `-peers` 里 id 最小的节点写；其余配置了 `-peers` 的节点以种子身份启动、向这些成员报名加入，自己不写配置 |
-| 每槽副本数 | — | 推导 | **不是配置项**：按 Raft 容错节点数推导 `floor((N-1)/2)+1`（1/3/5/7 节点 → 1/2/3/4 份）。控制器每轮按成员数对齐槽表因子，扩容自动追加副本；只读 `GET /admin/cluster/status` 的 `replica_factor` |
+| `-replica-policy` | `PUSHUPES_REPLICA_POLICY` | medium | 副本策略档位：`low`=每槽 1 份、`medium`=2 份、`high`=容错节点数+1（`floor((N-1)/2)+1`）。**只用于新集群的初始值**：策略存放在 Raft 复制的槽表里，之后只能经 `POST /admin/cluster/replica-policy` 修改，重启不会重刷；任何一档的因子按成员数钳制（1 成员时都是 1 份）。`GET /admin/cluster/status` 的 `replica_policy` / `replica_factor` 读回当前值；非法值启动即报错 |
 | `-flush-messages` | — | 1000 | 每 N 条 fsync（0 关闭） |
 | `-flush-interval` | — | 5s | 每周期 fsync（0 关闭） |
 | `-segment-bytes` | — | 256MiB | WAL 段滚动大小：64MiB 整数倍，≤2GiB；可写字节数或带单位（`256MiB`/`1GiB`） |
@@ -215,8 +217,8 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 admin 面 HTTP（仅管理）：`GET /admin/cluster/status`、`GET /admin/writes`、
 `GET /admin/slots/{slot}/describe`、`GET /admin/slots/{slot}/streams`、
 `POST /admin/slots/{slot}/migrate`、`POST /admin/slots/{slot}/remove-replica`、
-`POST /admin/cluster/plan`、`GET /healthz`、`/debug/pprof/`。
-**控制器专属写命令（migrate/remove-replica/plan）必须直接发到 Raft leader 的
+`POST /admin/cluster/plan`、`POST /admin/cluster/replica-policy`、`GET /healthz`、`/debug/pprof/`。
+**控制器专属写命令（migrate/remove-replica/plan/replica-policy）必须直接发到 Raft leader 的
 admin 地址**，follower 一律拒绝（425 + 1005），不做转发。
 
 仓库自带工具：
