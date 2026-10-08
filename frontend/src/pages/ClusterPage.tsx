@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Alert, App, Button, Card, Col, Form, Input, Modal, Row, Space, Statistic, Switch, Typography } from 'antd'
-import { PlusOutlined } from '@ant-design/icons'
+import { Alert, App, Button, Card, Col, Form, Input, Modal, Row, Select, Space, Statistic, Switch, Typography } from 'antd'
+import { EditOutlined, PlusOutlined } from '@ant-design/icons'
 import type { ClusterStatus } from '../types'
 import { humanBytes } from '../format'
-import { addClusterNode, ensureLeader, removeClusterNode } from '../api'
+import { addClusterNode, ensureLeader, removeClusterNode, setReplicaPolicy, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
 import { PeerCard, isOnlinePeer } from '../PeerCard'
 
 export default function ClusterPage() {
@@ -66,6 +66,87 @@ export default function ClusterPage() {
     } finally {
       setAddBusy(false)
     }
+  }
+
+  // The replica policy. The tier lives in the replicated slot table (the
+  // startup flag only seeds a brand-new cluster), so this card is the
+  // cluster's change entry point. It reads as a plain display until 修改 is
+  // clicked: the edit state holds a DRAFT tier (nothing is sent while
+  // selecting), 保存 names the layout move in a confirm dialog and only then
+  // submits the one controller-only Raft command, 取消 drops the draft and
+  // returns to the pre-edit display. replicaFactorFor mirrors the backend's
+  // derivation (clamped to the member count) so the confirm dialog can name
+  // what the replica sets will move to.
+  const [policyEditing, setPolicyEditing] = useState(false)
+  const [policyDraft, setPolicyDraft] = useState<ReplicaPolicy>('medium')
+  const [policySaving, setPolicySaving] = useState(false)
+
+  const replicaFactorFor = (policy: ReplicaPolicy, members: number) => {
+    const n = Math.max(members, 1)
+    const want = policy === 'low' ? 1 : policy === 'high' ? Math.floor((n - 1) / 2) + 1 : 2
+    return Math.min(want, n)
+  }
+
+  const startPolicyEdit = () => {
+    // The draft starts from what the page shows: entering the edit state is
+    // never a change by itself.
+    setPolicyDraft(((statusRef.current?.replica_policy ?? 'medium') as ReplicaPolicy))
+    setPolicyEditing(true)
+  }
+
+  const cancelPolicyEdit = () => {
+    setPolicyEditing(false)
+    setPolicySaving(false)
+  }
+
+  const savePolicy = () => {
+    const st = statusRef.current
+    const cur = (st?.replica_policy ?? 'medium') as ReplicaPolicy
+    const members = st ? Object.keys(st.peers).length : 0
+    const from = st?.replica_factor ?? replicaFactorFor(cur, members)
+    const to = replicaFactorFor(policyDraft, members)
+    if (policyDraft === cur && to === from) {
+      // Nothing to confirm: the draft matches the live tier. Close the edit
+      // state instead of burning a no-op round trip.
+      cancelPolicyEdit()
+      return
+    }
+    const trend = to > from ? `副本集将补齐到每槽 ${to} 份（新席位经 fetch 追平）`
+      : to < from ? `每槽副本数 ${from} → ${to}，多出的席位由控制器在保留副本与 leader 摘要等价后逐步回收`
+      : `每槽副本数保持 ${to}`
+    modal.confirm({
+      title: `切换副本策略为 ${policyDraft}？`,
+      content: (
+        <div>
+          <Typography.Paragraph style={{ marginBottom: 8 }}>
+            {REPLICA_POLICY_LABELS[policyDraft]}。当前 {members} 个成员，{trend}。
+          </Typography.Paragraph>
+          <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
+            策略写入 Raft 复制的槽表，全集群即时生效并持久保留；扩容副本不会搬运 leader，
+            回收副本前控制器会逐槽确认留下的副本已追平。
+          </Typography.Paragraph>
+        </div>
+      ),
+      okText: '确认切换',
+      cancelText: '返回编辑',
+      onOk: async () => {
+        setPolicySaving(true)
+        try {
+          const res = await setReplicaPolicy(policyDraft, statusRef.current)
+          message.success(`副本策略已切换为 ${res.replica_policy}（副本因子 ${res.replica_factor}）`)
+          setPolicyEditing(false)
+          refresh()
+        } catch (e: any) {
+          // Keep the edit state on failure: the draft stays where the
+          // operator can fix the cause (leader moved, unreachable admin)
+          // and retry the save from here.
+          const msg = e?.response?.data?.error ?? e?.message ?? String(e)
+          message.error(`切换副本策略失败：${msg}`)
+        } finally {
+          setPolicySaving(false)
+        }
+      },
+    })
   }
 
   const askRemove = (id: string) => {
@@ -147,6 +228,52 @@ export default function ClusterPage() {
           valueStyle={storageLowerBound ? { color: '#faad14' } : undefined}
           suffix={storageLowerBound ? '（下界）' : undefined} /></Card></Col>
       </Row>
+      {/* The replica policy, its own card above the node block. The tier and
+          the factor it derives are cluster state (replicated through the slot
+          table), and changing it moves every slot's replica set — too large
+          a decision to live inside a dropdown that fires on click. So it
+          displays read-only until 修改 is pressed; the edit state holds a
+          draft the operator can still walk away from with 取消, and only
+          保存 → confirm submits the change. */}
+      <Card title="副本策略" extra={!policyEditing && (
+        <Button size="small" icon={<EditOutlined />} onClick={startPolicyEdit}>修改</Button>
+      )}>
+        {policyEditing ? (
+          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+            <Space>
+              <Typography.Text type="secondary">策略</Typography.Text>
+              <Select
+                style={{ width: 240 }}
+                value={policyDraft}
+                onChange={(v) => setPolicyDraft(v as ReplicaPolicy)}
+                options={(Object.keys(REPLICA_POLICY_LABELS) as ReplicaPolicy[]).map((p) => ({
+                  value: p,
+                  label: REPLICA_POLICY_LABELS[p],
+                }))}
+              />
+            </Space>
+            <Typography.Text type="secondary">
+              副本因子按「策略 × 当前成员数（{peers.length}）」推导：low 每槽 1 份、medium 每槽 2 份、
+              high 为容错节点数 + 1；保存前不会改动集群。
+            </Typography.Text>
+            <Space>
+              <Button type="primary" loading={policySaving} onClick={savePolicy}>保存</Button>
+              <Button disabled={policySaving} onClick={cancelPolicyEdit}>取消</Button>
+            </Space>
+          </Space>
+        ) : (
+          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+            <Space size={24}>
+              <Statistic title="策略" value={status.replica_policy ?? '-'} />
+              <Statistic title="副本因子" value={status.replica_factor ?? '-'} suffix="份 / 槽" />
+            </Space>
+            <Typography.Text type="secondary">
+              策略写入 Raft 复制的槽表，全集群生效并持久保留；启动参数 -replica-policy 只用于新集群的初始值，
+              之后的修改都从这里提交。因子由策略与成员数推导（当前 {peers.length} 个成员），控制器每轮把副本集收敛到该因子。
+            </Typography.Text>
+          </Space>
+        )}
+      </Card>
       <Card title="节点" extra={
         <Button type="primary" size="small" icon={<PlusOutlined />} onClick={() => setAdding(true)}>
           添加节点

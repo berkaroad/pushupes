@@ -76,6 +76,21 @@ try {
 const { default: ClusterPage } = await vite.ssrLoadModule('/src/pages/ClusterPage.tsx')
 const pageSrc = String(ClusterPage)
 assert('cluster page shows the storage card', pageSrc.includes('存储大小'))
+// The replica policy tier moved into the replicated table with an admin
+// change endpoint; the cluster page owns its control. These pin the wiring:
+// the card carries the selector, the read-back shows the live factor AND the
+// tier (not just the factor the old derived-only line showed), and a change
+// goes through the controller-resolving setReplicaPolicy call.
+assert('cluster page shows the replica policy selector', pageSrc.includes('副本策略'))
+assert('cluster page reads replica_policy back', pageSrc.includes('replica_policy'))
+assert('cluster page reads replica_factor back', pageSrc.includes('replica_factor'))
+assert('policy change routes through setReplicaPolicy', pageSrc.includes('setReplicaPolicy'))
+// The policy card is display-first: 修改 enters the edit state, the Select
+// holds a DRAFT (nothing fires on selection), 保存 confirms, 取消 returns to
+// the pre-edit display — all three controls must exist as separate steps.
+assert('policy card has the edit entry button', pageSrc.includes('startPolicyEdit'))
+assert('policy card has save and cancel', pageSrc.includes('savePolicy') && pageSrc.includes('cancelPolicyEdit'))
+assert('policy edit holds a draft state', pageSrc.includes('policyDraft'))
 // The Raft-state card was removed from the stat row: the leader/commit line
 // under the node cards already carries what an operator needs, and the state
 // was the only thing that card said. Pinned so it cannot come back by accident.

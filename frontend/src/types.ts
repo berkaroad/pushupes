@@ -33,6 +33,13 @@ export interface ClusterStatus {
   slots: Record<string, Placement>
   slot_count: number
   replicas?: number
+  // replica_factor is the per-slot copy count in force; replica_policy is the
+  // tier behind it (low/medium/high). The factor is derived from the policy
+  // and the member count by the controller; the policy is set through
+  // POST /admin/cluster/replica-policy (the startup flag only seeds a new
+  // cluster), so this is the live cluster-wide value every node reads back.
+  replica_factor?: number
+  replica_policy?: string
   writes?: number[]
   // Cluster storage: the sum of every slot's LEADER copy (bytes on disk). It is
   // a background sample the backend refreshes every couple of seconds, so it

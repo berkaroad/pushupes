@@ -359,3 +359,34 @@ export async function removeSlotReplica(
     status,
   )
 }
+
+// ReplicaPolicy is the cluster-wide tier behind the per-slot replica factor:
+// low = 1 copy, medium = 2, high = the cluster's fault tolerance + 1.
+export type ReplicaPolicy = 'low' | 'medium' | 'high'
+
+export const REPLICA_POLICY_LABELS: Record<ReplicaPolicy, string> = {
+  low: 'low（每槽 1 副本）',
+  medium: 'medium（每槽 2 副本）',
+  high: 'high（容错节点数 + 1）',
+}
+
+// setReplicaPolicy changes the cluster-wide replica policy tier, addressed to
+// the controller like every Raft-mutating command. The tier is stored in the
+// replicated slot table — the change lands on every node and survives
+// restarts — and the controller converges the replica sets on the factor the
+// new tier implies in its next round. The startup -replica-policy flag only
+// seeds a brand-new cluster; this is the entry point for every change after
+// that. Returns the tier and the factor now in force.
+export async function setReplicaPolicy(
+  policy: ReplicaPolicy, status: ClusterStatus | null = null,
+): Promise<{ replica_policy: string; replica_factor: number }> {
+  const { data } = await withController(
+    (addr) => axios.post(
+      `${normalizeAdminBase(addr)}/admin/cluster/replica-policy`,
+      { policy },
+      { timeout: 30000 },
+    ),
+    status,
+  )
+  return data
+}
