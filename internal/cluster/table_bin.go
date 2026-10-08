@@ -6,7 +6,7 @@ package cluster
 // slot, map keys as strings). Snapshots ride the control plane, so the
 // encoding is a string dictionary plus fixed-layout varint entries:
 //
-//	"PTAB" ver(1) slotCount(u32) replicas(u32)
+//	"PTAB" ver(1) slotCount(u32) replicas(u32) policy(len-prefixed string)
 //	peers: n(u16) { id, peer_addr, admin_addr, client_addr } as len-prefixed strings
 //	nodes: n(u16) { name } (dictionary; slot entries reference indexes)
 //	entries: n(u32) { slot(u32) leaderIdx(u8) state(u8) epoch(uvarint)
@@ -26,8 +26,14 @@ import (
 
 const (
 	tableMagic = "PTAB"
-	tableVer   = byte(3)
-	noNode     = byte(255)
+	// v4 adds the replica policy tier after the replica count in the header.
+	tableVer = byte(4)
+	// tableVerPolicy is the v3 form: it predates the policy tier, and its
+	// factor was the fault-tolerance derivation — the high tier says exactly
+	// that, so a v3 snapshot restores as high and the controller re-derives
+	// the same factor the table already carries.
+	tableVerPolicy = byte(3)
+	noNode         = byte(255)
 )
 
 var stateCodes = map[SlotState]byte{
@@ -116,6 +122,11 @@ func (t *Table) EncodeTableBinary() []byte {
 	body.WriteByte(tableVer)
 	putU32(&body, uint32(t.SlotCount))
 	putU32(&body, uint32(t.Replicas))
+	policy := string(t.Policy)
+	if policy == "" {
+		policy = string(DefaultReplicaPolicy)
+	}
+	putStr(&body, policy)
 
 	var tmp [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(tmp[:], uint64(len(peerIDs)))
@@ -188,9 +199,10 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return nil, fmt.Errorf("table: short header: %w", err)
 	}
-	if string(hdr[0:4]) != tableMagic || hdr[4] != tableVer {
+	if string(hdr[0:4]) != tableMagic || (hdr[4] != tableVer && hdr[4] != tableVerPolicy) {
 		return nil, fmt.Errorf("table: bad snapshot magic/version")
 	}
+	policyInHeader := hdr[4] == tableVer // v4 carries the tier in the header
 	var tmp4 [4]byte
 	readU32 := func() (uint32, error) {
 		if _, err := io.ReadFull(r, tmp4[:]); err != nil {
@@ -206,11 +218,26 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 	if err != nil {
 		return nil, err
 	}
+	// v3 snapshots carry no tier: their factor was the fault-tolerance
+	// derivation itself, so the restored table says high and the controller
+	// re-derives the factor the snapshot already holds.
+	policy := ReplicaPolicyHigh
+	if policyInHeader {
+		policyStr, err := readStr(r)
+		if err != nil {
+			return nil, err
+		}
+		policy, err = NormalizeReplicaPolicy(policyStr)
+		if err != nil {
+			return nil, fmt.Errorf("table: snapshot: %w", err)
+		}
+	}
+	t := NewTableWithPolicy(int32(slotCount), policy)
+	t.Replicas = int(replicas)
 	peerN, err := binary.ReadUvarint(r)
 	if err != nil {
 		return nil, err
 	}
-	t := NewTable(int32(slotCount), int(replicas))
 	for i := uint64(0); i < peerN; i++ {
 		id, err := readStr(r)
 		if err != nil {

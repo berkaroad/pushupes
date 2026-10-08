@@ -202,9 +202,10 @@ func TestMemberRemovalReDerivesReplicaSets(t *testing.T) {
 	}
 }
 
-// TestReplicaCountFollowsFaultTolerance pins the derivation: one more copy than
-// the failures the Raft group survives. It is not a knob, so these numbers are
-// the specification:
+// TestReplicaCountFollowsFaultTolerance pins the high tier's derivation: one
+// more copy than the failures the Raft group survives. These numbers are the
+// specification for ReplicaPolicyHigh (the other tiers fix the factor at 1/2,
+// clamped to the member count — see TestReplicaCountForPolicy):
 //
 //	1 voter  -> 0+1 = 1
 //	3 voters -> 1+1 = 2

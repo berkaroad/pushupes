@@ -34,17 +34,41 @@ type Placement struct {
 // Table is the replicated slot assignment table plus the peer directory.
 // It is the entire Raft-replicated state of pushupes.
 type Table struct {
-	SlotCount int32                `json:"slot_count"`
-	Replicas  int                  `json:"replicas"`
-	Peers     map[string]Peer      `json:"peers"`
-	Slots     map[int32]*Placement `json:"slots"`
+	SlotCount int32 `json:"slot_count"`
+	Replicas  int   `json:"replicas"`
+	// Policy is the cluster-wide replica strategy tier behind Replicas; the
+	// controller re-derives Replicas from it (clamped to the member count)
+	// every round, so the factor tracks both the policy and the membership.
+	Policy ReplicaPolicy        `json:"policy"`
+	Peers  map[string]Peer      `json:"peers"`
+	Slots  map[int32]*Placement `json:"slots"`
 }
 
-// NewTable makes an empty table.
+// NewTable makes an empty table with an explicit replica factor. The policy
+// defaults to medium; a table that tracks a tier is built with
+// NewTableWithPolicy, which derives the factor from the policy.
 func NewTable(slotCount int32, replicaFactor int) *Table {
 	return &Table{
 		SlotCount: slotCount,
 		Replicas:  replicaFactor,
+		Policy:    DefaultReplicaPolicy,
+		Peers:     map[string]Peer{},
+		Slots:     map[int32]*Placement{},
+	}
+}
+
+// NewTableWithPolicy makes an empty table seeded with a replica policy tier;
+// the replica factor starts at the policy's value for a single-member cluster
+// and the controller re-derives it from the member count every round. This is
+// the entry point the startup flag seeds a brand-new cluster through.
+func NewTableWithPolicy(slotCount int32, policy ReplicaPolicy) *Table {
+	if policy == "" {
+		policy = DefaultReplicaPolicy
+	}
+	return &Table{
+		SlotCount: slotCount,
+		Replicas:  ReplicaCountForPolicy(policy, 1),
+		Policy:    policy,
 		Peers:     map[string]Peer{},
 		Slots:     map[int32]*Placement{},
 	}
@@ -63,7 +87,8 @@ func tableReplicaShortfall(t *Table) bool {
 
 // Clone returns a deep copy (used to stage Raft command effects).
 func (t *Table) Clone() *Table {
-	out := NewTable(t.SlotCount, t.Replicas)
+	out := NewTableWithPolicy(t.SlotCount, t.Policy)
+	out.Replicas = t.Replicas
 	for k, v := range t.Peers {
 		out.Peers[k] = v
 	}
@@ -343,12 +368,17 @@ const (
 	// replicas. The replica set is left intact: when the node answers probes
 	// again MarkUp clears the flag, its fetch loop catches the copy up, and
 	// the rebalancer hands its ring slots back.
-	OpMarkDown       = "mark_down"
-	OpMarkUp         = "mark_up"
-	OpPlanSlots      = "plan_slots"       // (re)spread all slots over current members
-	OpLeaderMove     = "leader_move"      // explicit leader change for some slots (migration commit)
-	OpSlotState      = "slot_state"       // migration state transition for one slot
-	OpConfig         = "config"           // replica factor / slot count at bootstrap
+	OpMarkDown   = "mark_down"
+	OpMarkUp     = "mark_up"
+	OpPlanSlots  = "plan_slots"  // (re)spread all slots over current members
+	OpLeaderMove = "leader_move" // explicit leader change for some slots (migration commit)
+	OpSlotState  = "slot_state"  // migration state transition for one slot
+	OpConfig     = "config"      // replica factor / slot count at bootstrap
+	// OpSetPolicy changes the cluster-wide replica policy tier (low / medium /
+	// high). The command carries only the policy: the factor it implies is
+	// derived at apply time from the member count, so the command stays a
+	// deterministic function of the replicated state like every other op.
+	OpSetPolicy      = "set_policy"
 	OpReplanSlots    = "replan_slots"     // only plan slots that are still unassigned
 	OpRegister       = "register"         // patch a peer's self-announced admin/client addrs
 	OpSlotAddReplica = "slot_add_replica" // add one member to a slot's replica set
@@ -378,6 +408,8 @@ type Command struct {
 	// For OpConfig:
 	SlotCount int32 `json:"slot_count,omitempty"`
 	Replicas  int   `json:"replicas,omitempty"`
+	// For OpSetPolicy: the tier name (low/medium/high).
+	Policy string `json:"policy,omitempty"`
 }
 
 // Encode marshals a command for Raft.
@@ -406,6 +438,16 @@ func (t *Table) Apply(c *Command) error {
 		if c.Replicas > 0 {
 			t.Replicas = c.Replicas
 		}
+	case OpSetPolicy:
+		policy, err := NormalizeReplicaPolicy(c.Policy)
+		if err != nil {
+			return fmt.Errorf("set_policy: %w", err)
+		}
+		t.Policy = policy
+		// The factor follows the tier immediately, clamped to the members the
+		// directory holds; the layout itself converges on the next replan (the
+		// same factor-change path a membership change drives, see DESIGN §4).
+		t.Replicas = ReplicaCountForPolicy(policy, len(t.Peers))
 	case OpJoinNode:
 		if c.Peer == nil || c.Peer.ID == "" {
 			return fmt.Errorf("join_node: missing peer")
@@ -503,12 +545,15 @@ func (t *Table) Apply(c *Command) error {
 		// slot that is still unassigned, and add the ring's seats to every
 		// stable slot while a factor change is pending (applyReplanSlots).
 		// The re-layout therefore happens exactly when that factor moves,
-		// which — with the count derived from the Raft fault tolerance
-		// (ReplicaCountForMembers) — is at the ODD member counts (3 -> 2
-		// copies, 5 -> 3, 7 -> 4...). Adding an even-numbered member (a 4th,
-		// a 6th) leaves the derived count where it was, so the table is
-		// deliberately left alone: the new member carries no slot until the
-		// next odd count is reached. That is the operator's rule, not an
+		// which — the factor being derived from the replicated policy tier
+		// and the member count — is a policy change (OpSetPolicy, any tier)
+		// or, under the high tier, the ODD member counts (3 -> 2
+		// copies, 5 -> 3, 7 -> 4...). Under the high tier an even-numbered
+		// member (a 4th, a 6th) leaves the derived count where it was, so the
+		// table is deliberately left alone: the new member carries no slot
+		// until the next odd count is reached (the low/medium tiers hold the
+		// factor steady against membership, clamped to the members that
+		// exist). That is the operator's rule, not an
 		// oversight — see DESIGN §4. Leaders of assigned, stable slots are
 		// never moved — re-seating is safe because every added replica pulls
 		// via fetch before the rebalancer may hand leadership to it, and a

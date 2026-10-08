@@ -138,6 +138,13 @@ type Engine struct {
 	rebalanceInterval time.Duration
 	rebalanceBatch    int
 
+	// bootPolicy is the -replica-policy seed: it applies to the FIRST plan
+	// of a brand-new cluster (an unreplicated table), once per process.
+	// After that the policy lives in the replicated table and the only way to
+	// change it is the admin endpoint (SetReplicaPolicy) — a restart of an
+	// existing node never re-seeds it.
+	bootPolicy ReplicaPolicy
+
 	// retry backoff for hand-overs that do not stick (balance.go): one record
 	// per slot, keyed on the move's endpoints. Without it a target that cannot
 	// converge is repaired (a full slot rebuild) once per round, forever.
@@ -442,10 +449,12 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logge
 		node:  node,
 		store: store,
 		self:  self,
-		// The table starts on the replica count of a single-voter cluster; the
-		// controller re-derives it from the member count on its first round
-		// (ReplicaCountForMembers), so there is no startup knob to get wrong.
-		table:  NewTable(store.SlotCount, ReplicaCountForMembers(1)),
+		// The table starts on the medium policy — the default tier — and the
+		// replica count follows from it for a single-member cluster. A
+		// brand-new cluster re-derives the factor from the startup seed every
+		// round; an existing cluster keeps whatever policy the admin endpoint
+		// last set (it lives in the replicated table, not in the engine).
+		table:  NewTableWithPolicy(store.SlotCount, DefaultReplicaPolicy),
 		logger: logger,
 		// One HTTP/2 connection per leader carries every multiplexed
 		// long-poll fetch round plus progress/replication/leo probes —
@@ -1971,6 +1980,38 @@ func (e *Engine) Self() string { return e.self }
 // SetNode attaches the Raft node (breaking the engine<->node cycle).
 func (e *Engine) SetNode(node *Node) { e.node = node }
 
+// SetBootPolicy records the -replica-policy seed for a brand-new cluster.
+// The controller applies it exactly once — on the table's first round, while
+// the table is still unplanned — and never again: from the first plan on,
+// the policy lives in the replicated table and SetReplicaPolicy (the admin
+// endpoint's entry) is the only way to change it.
+func (e *Engine) SetBootPolicy(p ReplicaPolicy) { e.bootPolicy = p }
+
+// SetReplicaPolicy is the cluster's policy entry point: it changes the
+// replica strategy tier — low (one copy per slot), medium (two), high (the
+// cluster's fault tolerance plus one). The tier lives in the replicated slot
+// table, so the change is one Raft command: it takes effect on every node
+// and survives restarts. The factor the tier implies is derived at apply
+// time from the member count (clamped to it), and the controller's next
+// round converges the replica sets on the new factor — the same
+// factor-change path a membership change drives (DESIGN §4). Submitting the
+// tier the table already holds is a no-op. It returns the live tier and the
+// factor in force.
+func (e *Engine) SetReplicaPolicy(policy string) (ReplicaPolicy, int, error) {
+	p, err := NormalizeReplicaPolicy(policy)
+	if err != nil {
+		return "", 0, err
+	}
+	if tbl := e.TableSnapshot(); tbl.Policy == p {
+		return p, tbl.Replicas, nil
+	}
+	if err := e.submit(&Command{Op: OpSetPolicy, Policy: string(p)}); err != nil {
+		return "", 0, err
+	}
+	tbl := e.TableSnapshot()
+	return tbl.Policy, tbl.Replicas, nil
+}
+
 // SetFetchSettle sets the fetch round's coalescing window: after a parked round
 // is woken by data, the leader waits this long before scanning, so a burst that
 // scatters across slots is answered by ONE round instead of one round per slot.
@@ -2990,10 +3031,13 @@ func (e *Engine) RunController(ctx context.Context) {
 				e.submit(&Command{Op: OpLeaveNode, NodeID: id})
 			}
 		}
-		// 2) plan: first re-derive the table's replica factor from the member
-		// count (ReplicaCountForMembers — it is not configurable), because a
-		// fresh plan takes its replica count from the table and a grown
-		// cluster carries more copies of every slot. Then full-replan only
+		// 2) plan: first re-derive the table's replica factor from the
+		// replicated policy tier and the member count — ReplicaCountForPolicy
+		// reads Table.Policy (the tier the admin endpoint sets, seeded at
+		// bootstrap by the flag), so low/medium hold the factor steady against
+		// membership and only high follows the fault tolerance. A grown cluster
+		// on high carries more copies of every slot; a policy change moves the
+		// factor on any tier. Then full-replan only
 		// when nothing is assigned; otherwise converge the layout — fill gaps
 		// left by member joins and re-derive replica sets left stale by a
 		// factor change (OpReplanSlots' own function, run on a clone: a replan
@@ -3003,9 +3047,22 @@ func (e *Engine) RunController(ctx context.Context) {
 		if len(tbl.Peers) == 0 {
 			continue
 		}
-		if want := ReplicaCountForMembers(len(tbl.Peers)); tbl.Replicas != want {
-			e.loggerf("replica factor: table has %d, %d members need %d — changing it",
-				tbl.Replicas, len(tbl.Peers), want)
+		// Seed first: the -replica-policy flag only touches a brand-new
+		// cluster — an empty table has never been planned and no OpSetPolicy
+		// can have reached it, so this is the one and only moment the startup
+		// value is applied. Once the plan lands the table has slots and this
+		// branch never runs again: every later policy change comes from the
+		// admin endpoint alone, and a restart of an existing node keeps the
+		// policy the replicated table holds.
+		if len(tbl.Slots) == 0 && e.bootPolicy != "" && e.bootPolicy != tbl.Policy {
+			e.loggerf("seeding the replica policy %q from the startup flag", e.bootPolicy)
+			if err := e.submit(&Command{Op: OpSetPolicy, Policy: string(e.bootPolicy)}); err == nil {
+				tbl = e.TableSnapshot()
+			}
+		}
+		if want := ReplicaCountForPolicy(tbl.Policy, len(tbl.Peers)); tbl.Replicas != want {
+			e.loggerf("replica factor: table has %d, policy %q with %d members wants %d — changing it",
+				tbl.Replicas, tbl.Policy, len(tbl.Peers), want)
 			if err := e.submit(&Command{Op: OpConfig, Replicas: want}); err == nil {
 				// Re-read: the probe below plans with the factor this round
 				// just wrote, instead of the one it replaced.
