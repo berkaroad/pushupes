@@ -45,6 +45,13 @@ type Store struct {
 	// appends and replica/migration applies); the basis for write-rate
 	// reporting in the admin API.
 	writes []atomic.Uint64
+
+	// per-slot counters of the record bytes those durable writes landed
+	// (frame bytes on disk, matching what the segments account in
+	// commitFrame); index-aligned with `writes` — every site that adds a
+	// write adds its bytes — so the admin API diffs both into a message
+	// rate and a byte rate for the same window.
+	writeBytes []atomic.Uint64
 }
 
 // OpenStore loads every existing slot directory under dir and creates the
@@ -75,6 +82,7 @@ func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushP
 		FlushPolicy:  flush,
 		slots:        make([]atomic.Pointer[Slot], slotCount),
 		writes:       make([]atomic.Uint64, slotCount),
+		writeBytes:   make([]atomic.Uint64, slotCount),
 		dirty:        map[int32]bool{},
 		wakeBus:      make(chan struct{}),
 	}
@@ -273,6 +281,7 @@ func (st *Store) Append(rec *data.EventRecord) (*AppendOutcome, error) {
 	out, err := slot.Append(rec)
 	if err == nil && out.Status == data.StatusSuccess {
 		st.writes[slotID].Add(1)
+		st.writeBytes[slotID].Add(uint64(rec.EncodedSize()))
 		st.markDirty(slotID)
 	}
 	return out, err
@@ -291,6 +300,7 @@ func (st *Store) AppendAtSeq(slotID int32, seq uint64, rec *data.EventRecord) er
 	}
 	if newly {
 		st.writes[slotID].Add(1)
+		st.writeBytes[slotID].Add(uint64(rec.EncodedSize()))
 		st.markDirty(slotID)
 	}
 	return nil
@@ -310,6 +320,7 @@ func (st *Store) AppendFrameAtSeq(slotID int32, seq uint64, frame []byte) error 
 	}
 	if newly {
 		st.writes[slotID].Add(1)
+		st.writeBytes[slotID].Add(uint64(len(frame)))
 		st.markDirty(slotID)
 	}
 	return nil
@@ -458,6 +469,17 @@ func (st *Store) WriteCounts() []uint64 {
 	out := make([]uint64, len(st.writes))
 	for i := range st.writes {
 		out[i] = st.writes[i].Load()
+	}
+	return out
+}
+
+// WriteByteCounts snapshots the per-slot durable write byte counters,
+// index-aligned with WriteCounts: successive pairs of snapshots diff into the
+// message rate and the byte rate of the same window.
+func (st *Store) WriteByteCounts() []uint64 {
+	out := make([]uint64, len(st.writeBytes))
+	for i := range st.writeBytes {
+		out[i] = st.writeBytes[i].Load()
 	}
 	return out
 }

@@ -582,6 +582,11 @@ func (e *Engine) RestoreState(b []byte) error {
 // admin API pairs them with the table so clients can derive write rates.
 func (e *Engine) WriteCounts() []uint64 { return e.store.WriteCounts() }
 
+// WriteByteCounts snapshots this node's per-slot durable write byte counters,
+// index-aligned with WriteCounts: the admin API ships both, so clients diff
+// successive snapshots into a message rate and a byte rate for one window.
+func (e *Engine) WriteByteCounts() []uint64 { return e.store.WriteByteCounts() }
+
 // TableSnapshot returns a copy of the current table (for the admin API).
 func (e *Engine) TableSnapshot() *Table {
 	e.tableMu.RLock()

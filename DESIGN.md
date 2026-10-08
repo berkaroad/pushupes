@@ -518,7 +518,7 @@ GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（�
                                                #   每 2s 采一次样（自己 leader 的槽本地读，其余问 peer），
                                                #   status 读缓存值；storage_bytes_complete=false 表示
                                                #   有 slot leader 没应答，此时该值是下界
-GET  /admin/writes                             # 每槽 durable 计数 + 槽内总字节/事件流数量 + 本节点待清理副本（前端轮询）
+GET  /admin/writes                             # 每槽 durable 计数 + 每槽落盘字节 write_bytes（与计数同下标，两快照作差得 msg/s 与字节/s）+ 槽内总字节/事件流数量 + 本节点待清理副本（前端轮询）
 GET  /admin/stats[?worst=N]                    # 三个「等在哪里」自视合一：flush = 待刷记录数/最老未刷记录年龄/刷盘队列长度与在飞数/fsync 排队等待与 syscall 服务时间分位/每次新覆盖字节与覆盖的段文件大小；repl = `hw < LEO` 的槽数与最老等待时长（?worst=N 列出最久的槽）/每副本上报新鲜度与 LEO 落后/fetch 轮次与「按数据唤醒 vs 按等待预算到期」计数；ack = 每条写入的确认链路四段耗时（栅栏+路由 / 本地 WAL 落地 / 等 ISR 高水位 / 整调用）与结果、失败原因分布、正在等待的调用数、水位落后条数（?worst=N 列出等得最久的槽）
 GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本，仅内存索引，不读 WAL）
 POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移（控制器专属，必须发到 Raft leader 的 admin 地址）

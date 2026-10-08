@@ -258,6 +258,10 @@ func (s *Server) handleWrites(w http.ResponseWriter, r *http.Request) {
 		"node":       s.Engine.Self(),
 		"slot_count": s.Store.SlotCount,
 		"writes":     s.Engine.WriteCounts(),
+		// Durable record bytes per slot (frame bytes on disk), index-aligned
+		// with `writes`: clients diff the two arrays against their last
+		// snapshot to get a message rate and a byte rate for one window.
+		"write_bytes": s.Engine.WriteByteCounts(),
 		// Console gauges, one entry per slot id: WAL bytes on disk and event
 		// stream count. A slot this node has not loaded reads as zero instead
 		// of being opened (that would scan every segment of it) — the console
