@@ -57,7 +57,7 @@ func main() {
 		peerAddr   = flag.String("peer", envOr("PUSHUPES_PEER", "http://127.0.0.1:8391"), "Raft transport + peer gRPC listen address: all node-to-node traffic (env PUSHUPES_PEER)")
 		dataDir    = flag.String("data", envOr("PUSHUPES_DATA", "./data"), "data directory (env PUSHUPES_DATA)")
 		peers      = flag.String("peers", envOr("PUSHUPES_PEERS", ""), "comma list (env PUSHUPES_PEERS) of id=http://host:peerport (admin/client addrs are self-registered; legacy id:peerport:adminport:clientport also accepted)")
-		joinAddr   = flag.String("join", envOr("PUSHUPES_JOIN", ""), "peer address of one specific cluster member (host:peerport) to offer this node to on start. Optional: a node that does not lead its -peers list joins automatically and offers itself through the configured members in rotation — pass -join to name one instead")
+		joinAddr   = flag.String("join", envOr("PUSHUPES_JOIN", ""), "peer address of one specific cluster member (host:peerport) to offer this node to on start. Optional: a node that does not lead its -peers list joins automatically and offers itself through the configured members in rotation — pass -join to name one instead (env PUSHUPES_JOIN)")
 		adoptTo    = flag.Duration("adopt-interval", envDurationOr("PUSHUPES_ADOPT_INTERVAL", cluster.DefaultAdoptInterval),
 			"how often a node that is not a cluster member yet retries offering itself through the members it was configured with (-join when given, else -peers) (env PUSHUPES_ADOPT_INTERVAL)")
 		// The slot count is a permanent layout decision (routing, placement,
@@ -72,15 +72,15 @@ func main() {
 		// change. See DESIGN §4.
 		replicaPolicy = flag.String("replica-policy", envOr("PUSHUPES_REPLICA_POLICY", string(cluster.DefaultReplicaPolicy)),
 			"replica policy tier for a NEW cluster: low (1 copy per slot), medium (2), high (fault tolerance + 1); applied on the table's first plan only — an existing cluster keeps the policy the admin endpoint last set (env PUSHUPES_REPLICA_POLICY)")
-		segmentB = byteSize(storage.DefaultSegmentBytes)
-		flushN   = flag.Int64("flush-messages", 1000, "fsync every N records (0 disables)")
-		flushD   = flag.Duration("flush-interval", 5*time.Second, "fsync every interval (0 disables)")
+		segmentB = byteSize(envByteSizeOr("PUSHUPES_SEGMENT_BYTES", storage.DefaultSegmentBytes))
+		flushN   = flag.Int64("flush-messages", envInt64Or("PUSHUPES_FLUSH_MESSAGES", 1000), "fsync every N records (0 disables) (env PUSHUPES_FLUSH_MESSAGES)")
+		flushD   = flag.Duration("flush-interval", envDurationOr("PUSHUPES_FLUSH_INTERVAL", 5*time.Second), "fsync every interval (0 disables) (env PUSHUPES_FLUSH_INTERVAL)")
 		// How long a woken fetch round waits for the rest of the write burst
 		// before answering. Every acknowledged append pays it once (the round
 		// carrying its record pays it), and it buys rounds: 0 answers as soon
 		// as the first slot has data, at the cost of more rounds and reports.
 		fetchSettleD = flag.Duration("fetch-settle", envDurationOr("PUSHUPES_FETCH_SETTLE", cluster.DefaultFetchSettle),
-			"fetch round coalescing window after a data wake (0 answers at once)")
+			"fetch round coalescing window after a data wake (0 answers at once) (env PUSHUPES_FETCH_SETTLE)")
 		dropAfter = flag.Duration("drop-after", envDurationOr("PUSHUPES_DROP_AFTER", cluster.DefaultDropRetention),
 			"post-migration retention: how long the FORMER SOURCE keeps its local copy of a migrated slot before dropping it (positive = that window, 0 = the default 30s; negative is rejected; the cleanup cannot be disabled — env PUSHUPES_DROP_AFTER)")
 		rebalanceInterval = flag.Duration("rebalance-interval", envDurationOr("PUSHUPES_REBALANCE_INTERVAL", cluster.DefaultRebalanceInterval),
@@ -91,7 +91,7 @@ func main() {
 		// BatchAppend asks for one batch to fit inside the cap, so the
 		// operator raises it together with typical batch size (a 4MiB cap
 		// carries roughly 4000 records of 1KiB bodies).
-		grpcMaxMsg = byteSize(envIntOr("PUSHUPES_GRPC_MAX_MSG_SIZE", defaultGrpcMaxMsgBytes))
+		grpcMaxMsg = byteSize(envByteSizeOr("PUSHUPES_GRPC_MAX_MSG_SIZE", defaultGrpcMaxMsgBytes))
 		batchPar   = flag.Int("batch-slot-parallelism", envIntOr("PUSHUPES_BATCH_SLOT_PARALLELISM", grpcapi.DefaultBatchSlotParallelism),
 			"max slots one BatchAppend executes concurrently (different slots take independent fences and WALs; a wide batch spanning the ring lands at most this many concurrent WAL writers — env PUSHUPES_BATCH_SLOT_PARALLELISM)")
 		bootstrap     = flag.Bool("bootstrap", false, "write this cluster's initial configuration from this node. By default the node whose id leads -peers does that and every other configured node starts as a seed that offers itself through the running cluster (env PUSHUPES_BOOTSTRAP not read: this is a startup decision, not a tunable)")
@@ -101,12 +101,12 @@ func main() {
 			"consensus election timeout: how long a follower waits for a heartbeat before standing for election (env PUSHUPES_RAFT_ELECTION_TIMEOUT). At least 2x -raft-heartbeat-timeout; raise both when the cluster votes leaders out under load")
 		raftFlush = flag.Duration("raft-flush-interval", envDurationOr("PUSHUPES_RAFT_FLUSH_INTERVAL", cluster.DefaultRaftFlushInterval),
 			"consensus WAL group-commit window: appends arriving within it share a single fsync (env PUSHUPES_RAFT_FLUSH_INTERVAL)")
-		raftSegB = byteSize(envIntOr("PUSHUPES_RAFT_SEGMENT_BYTES", cluster.DefaultRaftSegmentBytes))
+		raftSegB = byteSize(envByteSizeOr("PUSHUPES_RAFT_SEGMENT_BYTES", cluster.DefaultRaftSegmentBytes))
 	)
 	// -segment-bytes takes a size, not just a byte count: 268435456 or 256MiB.
-	flag.Var(&segmentB, "segment-bytes", "WAL segment roll `size` (bytes, or a suffix like 256MiB/1GiB); a multiple of 64MiB, at most 2GiB")
-	flag.Var(&grpcMaxMsg, "grpc-max-msg-size", "client-plane gRPC max message `size` in bytes (suffixes like 16MiB accepted; the gRPC default 4MiB applies when unset)")
-	flag.Var(&raftSegB, "raft-segment-bytes", "consensus WAL segment roll `size` (bytes, or a suffix like 64MiB)")
+	flag.Var(&segmentB, "segment-bytes", "WAL segment roll `size` (bytes, or a suffix like 256MiB/1GiB); a multiple of 64MiB, at most 2GiB (env PUSHUPES_SEGMENT_BYTES)")
+	flag.Var(&grpcMaxMsg, "grpc-max-msg-size", "client-plane gRPC max message `size` in bytes (suffixes like 16MiB accepted; the gRPC default 4MiB applies when unset) (env PUSHUPES_GRPC_MAX_MSG_SIZE)")
+	flag.Var(&raftSegB, "raft-segment-bytes", "consensus WAL segment roll `size` (bytes, or a suffix like 64MiB) (env PUSHUPES_RAFT_SEGMENT_BYTES)")
 	flag.Parse()
 
 	// gRPC's stock buffer pool zeroes every buffer it hands out and its size
@@ -501,6 +501,38 @@ func envDurationOr(k string, def time.Duration) time.Duration {
 		os.Exit(2)
 	}
 	return d
+}
+
+// envInt64Or is envIntOr for the knobs sized in records (-flush-messages).
+func envInt64Or(k string, def int64) int64 {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid %s=%q: %v (want an integer like 1000, or 0 to disable)\n", k, v, err)
+		os.Exit(2)
+	}
+	return n
+}
+
+// envByteSizeOr reads a byte size (-segment-bytes, -grpc-max-msg-size,
+// -raft-segment-bytes) from the environment, falling back to def. It accepts
+// the same forms as the flags themselves — a plain byte count or a suffixed
+// size (256MiB, 1GiB) — so an operator can write the env var the way the flag
+// is documented; a malformed value is fatal like the other env readers.
+func envByteSizeOr(k string, def int64) int64 {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	n, err := parseByteSize(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid %s=%q: %v (want bytes or a size like 256MiB/1GiB)\n", k, v, err)
+		os.Exit(2)
+	}
+	return n
 }
 
 // byteSize is a flag.Value for -segment-bytes: it accepts a plain byte count

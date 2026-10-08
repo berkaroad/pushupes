@@ -181,3 +181,53 @@ func TestJoinTargets(t *testing.T) {
 		t.Fatalf("targets = %v, want none", got)
 	}
 }
+
+// The env readers must accept exactly what the flags accept: a knob an
+// operator can write on the command line has to be writable through the
+// environment the same way, which for a size knob means the suffixed forms
+// (256MiB), not only a raw byte count.
+func TestEnvByteSizeOr(t *testing.T) {
+	const key = "PUSHUPES_SEGMENT_BYTES"
+	if got := envByteSizeOr(key, 42); got != 42 {
+		t.Fatalf("unset: got %d, want the default 42", got)
+	}
+	for _, tc := range []struct {
+		val  string
+		want int64
+	}{
+		{"268435456", 268435456},
+		{"256MiB", 256 << 20},
+		{"1GiB", 1 << 30},
+	} {
+		t.Setenv(key, tc.val)
+		if got := envByteSizeOr(key, 0); got != tc.want {
+			t.Errorf("%s=%q: got %d, want %d", key, tc.val, got, tc.want)
+		}
+	}
+	// Same input, same bytes as the flag's own value parser.
+	var b byteSize
+	if err := b.Set("256MiB"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(key, "256MiB")
+	if got := envByteSizeOr(key, 0); got != int64(b) {
+		t.Fatalf("env %d != flag %d for the same size", got, int64(b))
+	}
+}
+
+// envInt64Or backs -flush-messages: the default when unset, the record count
+// when set, and 0 meaning "off" without being mistaken for "unset".
+func TestEnvInt64Or(t *testing.T) {
+	const key = "PUSHUPES_FLUSH_MESSAGES"
+	if got := envInt64Or(key, 1000); got != 1000 {
+		t.Fatalf("unset: got %d, want the default 1000", got)
+	}
+	t.Setenv(key, "2000")
+	if got := envInt64Or(key, 1000); got != 2000 {
+		t.Fatalf("set: got %d, want 2000", got)
+	}
+	t.Setenv(key, "0")
+	if got := envInt64Or(key, 1000); got != 0 {
+		t.Fatalf("0 must mean off, got %d", got)
+	}
+}

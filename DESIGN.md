@@ -690,17 +690,21 @@ follower 收到这类命令一律**拒绝**（HTTP 425 + `err_id=1005`，响应�
 ```
 slot_count      = 1680         # 固定不可配置（105 的倍数，见 §7.2）
 segment_bytes   = 268435456    # 默认 256MiB；须为 64MiB 的整数倍，最小 64MiB、最大 2GiB
-                              # -segment-bytes 可写字节数或带单位（256MiB / 1GiB / 268435456）
+                              # -segment-bytes / PUSHUPES_SEGMENT_BYTES 可写字节数或带单位
+                              # （256MiB / 1GiB / 268435456）
 replica_policy  = medium       # 副本策略：low=每槽 1 份 / medium=2 份 / high=容错节点数+1
                               # -replica-policy / PUSHUPES_REPLICA_POLICY 只为新集群种初始值；
                               # 策略存在复制的槽表里，之后的修改走 POST /admin/cluster/replica-policy
 replica_count   = 2
 election_mode   = leader       # preferred leader 自动回切
 flush.policy    = 每 1000 条或 5s（可关闭为纯页缓存）
+                              # -flush-messages / PUSHUPES_FLUSH_MESSAGES（每 N 条）、
+                              # -flush-interval / PUSHUPES_FLUSH_INTERVAL（每周期），0 关闭
 fetch-settle    = 200µs（fetch 轮被数据唤醒后的合并窗口：一轮覆盖整批写入涉及的多个槽；
                   每次 ack 都会付它一次，换的是轮次与上报次数。实测 3 节点 1KiB/conns 4/batch 100
                   的镜像三档（2ms/200µs/0）：hw_wait 均值 5.70/4.60/6.42ms、每轮槽数 37.2/29.4/27.2
                   ⇒ 不合并（0）最差、2ms 又过长，取 200µs）
+                              # -fetch-settle / PUSHUPES_FETCH_SETTLE
 drop_after      = 30s          # 迁移后前源节点本地副本的保留期，到期自动 DropSlot
                               # -drop-after / PUSHUPES_DROP_AFTER：正数=该时长，0=默认 30s，
                               # 负数启动即报错；没有关闭选项（留着会把节点写满）
