@@ -48,6 +48,7 @@ func New(eng *cluster.Engine, store *storage.Store) *Server {
 	s.mux.HandleFunc("POST /admin/slots/{slot}/migrate", s.handleMigrate)
 	s.mux.HandleFunc("POST /admin/slots/{slot}/remove-replica", s.handleRemoveReplica)
 	s.mux.HandleFunc("POST /admin/cluster/plan", s.handlePlan)
+	s.mux.HandleFunc("POST /admin/cluster/replica-policy", s.handleSetReplicaPolicy)
 	s.mux.HandleFunc("GET /admin/cluster/nodes", s.handleMembers)
 	s.mux.HandleFunc("POST /admin/cluster/nodes", s.handleAddMember)
 	s.mux.HandleFunc("DELETE /admin/cluster/nodes/{id}", s.handleRemoveMember)
@@ -222,10 +223,14 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 		"peers":      tbl.Peers,
 		"slots":      tbl.Slots,
 		"slot_count": tbl.SlotCount,
-		// replica_factor is the per-slot copy count the controller derives from
-		// the member count (cluster.ReplicaCountForMembers): it is not a knob,
-		// so this is the only place an operator can read it back.
+		// replica_factor is the per-slot copy count in force, derived by the
+		// controller from the cluster's replica policy tier and the member
+		// count (cluster.ReplicaCountForPolicy). replica_policy is that tier
+		// (low/medium/high) — the value stored in the replicated table, which
+		// the admin endpoint (POST /admin/cluster/replica-policy) sets and the
+		// startup flag only seeds. These are where an operator reads both back.
 		"replica_factor":        tbl.Replicas,
+		"replica_policy":        string(tbl.Policy),
 		"controller":            leaderID,
 		"controller_admin_addr": leaderAdmin,
 		// durable writes per slot since this process started; clients diff
@@ -373,6 +378,36 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleSetReplicaPolicy changes the cluster's replica policy tier
+// (low / medium / high) — the knob behind the per-slot replica factor. The
+// tier lives in the replicated slot table, so this is one controller-only
+// Raft command: it takes effect on every node and survives restarts. The
+// factor the tier implies is derived from the member count (clamped to it),
+// and the controller converges the replica sets on the next round — the same
+// factor-change path a membership change drives. The startup -replica-policy
+// flag only seeds a brand-new cluster; this endpoint is the entry point for
+// every change after that.
+//
+//	POST /admin/cluster/replica-policy  {"policy":"high"}
+func (s *Server) handleSetReplicaPolicy(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Policy string `json:"policy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Policy == "" {
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "policy required (low, medium or high)")
+		return
+	}
+	policy, factor, err := s.Engine.SetReplicaPolicy(req.Policy)
+	if err != nil {
+		if refuseNotController(w, err) {
+			return
+		}
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"replica_policy": string(policy), "replica_factor": factor})
 }
 
 // handleMembers lists the cluster's raft membership. It is local view, like

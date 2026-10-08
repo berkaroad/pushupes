@@ -89,6 +89,7 @@ func TestAdminWriteHandlersRefuseWithoutController(t *testing.T) {
 		{"migrate", "/admin/slots/0/migrate", `{"to_node":"node-2"}`},
 		{"remove-replica", "/admin/slots/0/remove-replica", `{"node":"node-2"}`},
 		{"plan", "/admin/cluster/plan", ``},
+		{"replica-policy", "/admin/cluster/replica-policy", `{"policy":"high"}`},
 	}
 	for _, tc := range cases {
 		req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
