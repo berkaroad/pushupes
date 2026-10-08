@@ -75,6 +75,7 @@ func main() {
 	size := flag.Int("size", 1024, "event body bytes (must be <= 1024 * 1024)")
 	batch := flag.Int("batch", 0, "records per BatchAppend call (>0 switches the write phase to batched appends: one record per aggregate in the chunk, grouped per slot leader; 0 = one Append RPC per record). Latency lines then report per-batch round trips")
 	reportEvery := flag.Duration("report", time.Second, "live report interval")
+	slotRate := flag.Bool("slot-rate", false, "print the per-slot durable write table (each slot's write speed) in the final report; off by default")
 	flag.Parse()
 
 	if *size > 1024*1024 {
@@ -203,10 +204,13 @@ func main() {
 	fmt.Printf("resuming: %d existing records across aggregates (probed in %s)\n",
 		resumeSum, time.Since(resumeStart).Round(time.Millisecond))
 
-	// 2) per-node write counters before the run (admin plane, HTTP)
+	// 2) per-node write counters before the run (admin plane, HTTP), needed
+	// only when the per-slot write table is enabled
 	before := map[string][]uint64{}
-	for _, n := range adminList {
-		before[n] = fetchWrites(hc, n)
+	if *slotRate {
+		for _, n := range adminList {
+			before[n] = fetchWrites(hc, n)
+		}
 	}
 
 	// 3) run
@@ -454,59 +458,62 @@ func main() {
 	fmt.Printf("phases: resume=%s (probe only, excluded from throughput=), window=%s (append phase)\n",
 		resumeElapsed.Round(time.Millisecond), elapsed.Round(time.Millisecond))
 
-	// 5) per-slot durable delta per node (admin plane, HTTP)
-	afterMap := map[string][]uint64{}
-	for _, n := range adminList {
-		afterMap[n] = fetchWrites(hc, n)
-	}
-	fmt.Println("\nper-slot durable writes (delta over run):")
-	hdr := "slot"
-	for _, n := range adminList {
-		hdr += fmt.Sprintf("  %12s", n)
-	}
-	fmt.Println(hdr)
-	grand := map[int32]uint64{}
-	for _, n := range adminList {
-		beforeN, afterN := before[n], afterMap[n]
-		for s := range afterN {
-			if s < len(beforeN) {
-				if d := afterN[s] - beforeN[s]; d > 0 {
-					grand[int32(s)] += d
+	// 5) per-slot durable delta per node (admin plane, HTTP), printed only
+	// when -slot-rate is on
+	if *slotRate {
+		afterMap := map[string][]uint64{}
+		for _, n := range adminList {
+			afterMap[n] = fetchWrites(hc, n)
+		}
+		fmt.Println("\nper-slot durable writes (delta over run):")
+		hdr := "slot"
+		for _, n := range adminList {
+			hdr += fmt.Sprintf("  %12s", n)
+		}
+		fmt.Println(hdr)
+		grand := map[int32]uint64{}
+		for _, n := range adminList {
+			beforeN, afterN := before[n], afterMap[n]
+			for s := range afterN {
+				if s < len(beforeN) {
+					if d := afterN[s] - beforeN[s]; d > 0 {
+						grand[int32(s)] += d
+					}
 				}
 			}
 		}
-	}
-	slots := make([]int, 0, len(grand))
-	for s := range grand {
-		slots = append(slots, int(s))
-	}
-	sort.Ints(slots)
-	for _, s := range slots {
-		line := fmt.Sprintf("%4d", s)
-		for _, n := range adminList {
-			var d uint64
-			if s < len(before[n]) && s < len(afterMap[n]) {
-				d = afterMap[n][s] - before[n][s]
-			}
-			line += fmt.Sprintf("  %12d", d)
+		slots := make([]int, 0, len(grand))
+		for s := range grand {
+			slots = append(slots, int(s))
 		}
-		line += fmt.Sprintf("   rate=%.0f msg/s", float64(grand[int32(s)])/elapsed.Seconds())
-		fmt.Println(line)
-	}
-	var sum uint64
-	for _, v := range grand {
-		sum += v
-	}
-	// The durable counters are sampled before the resume phase, so their
-	// delta covers probing as well as writing. Label the span explicitly and
-	// give the same delta over the write window only — that is the number
-	// comparable with the throughput line above.
-	fmt.Printf("touched slots=%d total durable=%d (%0.f msg/s over window, %.0f msg/s over window+resume)\n",
-		len(grand), sum, float64(sum)/elapsed.Seconds(),
-		float64(sum)/((elapsed + resumeElapsed).Seconds()))
-	if len(grand) < 2 {
-		fmt.Println("FAIL: writes landed on fewer than 2 slots")
-		os.Exit(1)
+		sort.Ints(slots)
+		for _, s := range slots {
+			line := fmt.Sprintf("%4d", s)
+			for _, n := range adminList {
+				var d uint64
+				if s < len(before[n]) && s < len(afterMap[n]) {
+					d = afterMap[n][s] - before[n][s]
+				}
+				line += fmt.Sprintf("  %12d", d)
+			}
+			line += fmt.Sprintf("   rate=%.0f msg/s", float64(grand[int32(s)])/elapsed.Seconds())
+			fmt.Println(line)
+		}
+		var sum uint64
+		for _, v := range grand {
+			sum += v
+		}
+		// The durable counters are sampled before the resume phase, so their
+		// delta covers probing as well as writing. Label the span explicitly and
+		// give the same delta over the write window only — that is the number
+		// comparable with the throughput line above.
+		fmt.Printf("touched slots=%d total durable=%d (%0.f msg/s over window, %.0f msg/s over window+resume)\n",
+			len(grand), sum, float64(sum)/elapsed.Seconds(),
+			float64(sum)/((elapsed + resumeElapsed).Seconds()))
+		if len(grand) < 2 {
+			fmt.Println("FAIL: writes landed on fewer than 2 slots")
+			os.Exit(1)
+		}
 	}
 	if failCnt.Load() > 0 {
 		fmt.Println("NOTE: some appends failed; check cluster health")
