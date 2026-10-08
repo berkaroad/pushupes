@@ -315,6 +315,125 @@ func TestFactorOneGrowthReSeatsTheRing(t *testing.T) {
 	}
 }
 
+// TestFactorOneShrinkRestoresLeaderlessSlots is the regression for the other
+// single-copy blind spot: removing the member that held a slot's ONLY copy
+// leaves the slot without a writer (failoverLeader has no other replica to hand
+// it to), and nothing assigns one afterwards — PlanLeaderRebalance skips an
+// empty leader by contract and the full plan only runs on an empty table. The
+// re-layout adopts the ring's expected leader, which is the seat it seats for
+// the same slot anyway.
+func TestFactorOneShrinkRestoresLeaderlessSlots(t *testing.T) {
+	tbl := NewTableWithPolicy(8, ReplicaPolicyLow)
+	populatePeers(t, tbl, []string{"node-1", "node-2", "node-3"})
+	if err := tbl.Apply(&Command{Op: OpPlanSlots}); err != nil {
+		t.Fatalf("plan slots: %v", err)
+	}
+	// node-3 leads slots 2 and 5 under the three-member ring.
+	if p := tbl.Slots[2]; p.Leader != "node-3" || p.Epoch != 1 {
+		t.Fatalf("setup: slot 2 %+v, want node-3 leading at epoch 1", p)
+	}
+
+	// node-3 leaves: it is dropped from the directory and from every replica
+	// set, and the slots it led lose their only copy with it.
+	if err := tbl.Apply(&Command{Op: OpLeaveNode, NodeID: "node-3"}); err != nil {
+		t.Fatalf("leave node-3: %v", err)
+	}
+	leaderless := 0
+	for s, p := range tbl.Slots {
+		if p.Leader == "" {
+			leaderless++
+			if s != 2 && s != 5 {
+				t.Fatalf("slot %d lost its leader, only node-3's slots may: %+v", s, p)
+			}
+		}
+	}
+	if leaderless != 2 {
+		t.Fatalf("want the two slots node-3 led left without a writer, got %d", leaderless)
+	}
+	epochAfterLeave := tbl.Slots[2].Epoch
+	// The rebalancer cannot repair them: a leader-less slot is not a deviation
+	// it fixes, so the repair has to happen in the re-layout.
+	if moves := PlanLeaderRebalance(tbl); len(moves) != 0 {
+		t.Fatalf("an empty leader is not the rebalancer's to fix, got %v", moves)
+	}
+
+	// The controller's probe must find work to do, or the replan never lands.
+	if probe := tbl.Clone(); !probe.applyReplanSlots() {
+		t.Fatal("a table with a slot left without a writer must arm the replan")
+	}
+	if err := tbl.Apply(&Command{Op: OpReplanSlots}); err != nil {
+		t.Fatalf("replan: %v", err)
+	}
+
+	nodes := tbl.PeerIDs()
+	if len(nodes) != 2 {
+		t.Fatalf("member directory after the removal: %v", nodes)
+	}
+
+	// The two slots left without a writer adopt the ring's expected leader
+	// (the ring over the two remaining members), at the epoch bump the leader
+	// change takes, with their single copy on that node.
+	if p := tbl.Slots[2]; p.Leader != "node-1" || len(p.Replicas) != 1 || p.Replicas[0] != "node-1" {
+		t.Fatalf("slot 2 must adopt the ring leader node-1 with its single copy: %+v", p)
+	}
+	if got := tbl.Slots[2].Epoch; got != epochAfterLeave+1 {
+		t.Fatalf("the adopted leader must bump the epoch: %d, want %d (leave_node already bumped to %d)",
+			got, epochAfterLeave+1, epochAfterLeave)
+	}
+	if p := tbl.Slots[5]; p.Leader != "node-2" || len(p.Replicas) != 1 || p.Replicas[0] != "node-2" {
+		t.Fatalf("slot 5 must adopt the ring leader node-2 with its single copy: %+v", p)
+	}
+
+	// The rest of the shrink is the rebalancer's half: the slots that still
+	// lead keep doing so (the re-layout never moves a leader), but their ring
+	// leader is a replica now, so the hand-over can actually happen.
+	moves := PlanLeaderRebalance(tbl)
+	if len(moves) == 0 {
+		t.Fatal("the two-member ring deviates from the three-member layout and must plan hand-overs")
+	}
+	for _, m := range moves {
+		if p := tbl.Slots[m.Slot]; !replicaListHas(p.Replicas, m.To) {
+			t.Fatalf("slot %d: hand-over target %s is not a replica — the slot would stay off the ring: %v", m.Slot, m.To, p.Replicas)
+		}
+	}
+	byTarget := map[string][]int32{}
+	for _, m := range moves {
+		byTarget[m.To] = append(byTarget[m.To], m.Slot)
+	}
+	for to, slots := range byTarget {
+		if err := tbl.Apply(&Command{Op: OpLeaderMove, Slots: slots, NewLeader: to}); err != nil {
+			t.Fatalf("leader move to %s: %v", to, err)
+		}
+	}
+	planned := PlanSlots(nodes, tbl.SlotCount, tbl.Replicas)
+	for s, p := range tbl.Slots {
+		if drop := surplusSeatForReplan(p, tbl.Replicas, planned[s].Replicas); drop != "" {
+			if err := tbl.Apply(&Command{Op: OpSlotRemoveReplica, Slots: []int32{s}, NodeID: drop}); err != nil {
+				t.Fatalf("reclaim %s from slot %d: %v", drop, s, err)
+			}
+		}
+	}
+
+	// Settled on the two-member ring: a writer on every slot, one copy each.
+	for s, p := range tbl.Slots {
+		if p.Leader == "" {
+			t.Fatalf("slot %d is still without a writer: %+v", s, p)
+		}
+		if want := nodes[int(s)%len(nodes)]; p.Leader != want {
+			t.Fatalf("slot %d: leader %s, want the ring leader %s", s, p.Leader, want)
+		}
+		if len(p.Replicas) != 1 || p.Replicas[0] != p.Leader {
+			t.Fatalf("slot %d: replicas %v, want the single copy on %s", s, p.Replicas, p.Leader)
+		}
+	}
+	if left := PlanLeaderRebalance(tbl); len(left) != 0 {
+		t.Fatalf("the ring is reached; leftovers: %v", left)
+	}
+	if probe := tbl.Clone(); probe.applyReplanSlots() {
+		t.Fatal("a settled single-copy table must not plan a further replan")
+	}
+}
+
 // TestLayoutStaleIgnoresMembersBeyondThePlan pins the guard on the zero-seat
 // judgement: with more members than the slot count can spread over, the ring
 // plan gives some of them no seat at all, and a settled table must not read

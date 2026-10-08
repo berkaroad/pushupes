@@ -396,8 +396,12 @@ Body: Record*，每条记录：
     量级是「一个节点当前数据量的 67%~75%」），这是「成员加入即参与承载」的
     一次性代价；只有因子与成员集合都不变时（稳态）布局不动。
   策略与生效因子
-  从 `GET /admin/cluster/status` 的 `replica_policy` / `replica_factor` 读回。重排与回收都不动 leader：
-  leader 交回环上只由再平衡循环完成。
+  从 `GET /admin/cluster/status` 的 `replica_policy` / `replica_factor` 读回。重排与回收都不动已有 leader：
+  leader 交回环上只由再平衡循环完成。唯一的例外是**没有 leader 的槽**——退出成员持有某槽的
+  唯一副本时，故障切换没有别的副本可托（`backupLeaderFor` 返回空），leader 留空；而再平衡按契约
+  跳过空 leader 的槽、整表重排只在槽表为空时跑，该槽会永久无主。重排对这样的槽直接补上环的
+  预期 leader（epoch 递增，与其它换主路径同一把栅栏），而同一次补席已经把这个 leader 补进了
+  它的副本集，所以补完即有写者、无需再交接。
 
 ## 5. 槽位热迁移（文件级搬运）
 

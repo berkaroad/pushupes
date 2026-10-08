@@ -275,7 +275,12 @@ func (t *Table) layoutStale() bool {
 //
 // Leaders are never moved: a slot whose current leader leaves the ring layout
 // keeps leading it until the rebalancer's fenced hand-over moves it (the
-// leader's own copy is never surplus while it leads, see copyIsSurplus).
+// leader's own copy is never surplus while it leads, see copyIsSurplus). The
+// one exception is a slot with NO leader at all — the shape the failure path
+// leaves behind when the member that left held a slot's only copy: there is no
+// leadership to disturb and no rebalancer to hand the slot over (it skips an
+// empty leader), so the slot adopts the ring's expected leader and bumps its
+// epoch, which is the leader change's fence.
 // Non-stable slots belong to a migration in flight and are never touched.
 func (t *Table) applyReplanSlots() bool {
 	nodes := t.PeerIDs()
@@ -292,7 +297,24 @@ func (t *Table) applyReplanSlots() bool {
 			changed = true
 			continue
 		}
-		if cur.State != SlotStable || !stale {
+		if cur.State != SlotStable {
+			continue
+		}
+		// A slot left without a writer: the failure path empties the leader
+		// when the member that left held the slot's only copy (a single-copy
+		// layout has no other replica to hand leadership to — backupLeaderFor
+		// returns ""), and nothing else assigns a leader to an ASSIGNED slot:
+		// PlanLeaderRebalance skips an empty leader by contract, and the full
+		// plan only ever runs on an empty table. Adopt the ring's expected
+		// leader — the seat this same call adds below — so the slot has a
+		// writer again; the epoch bump is the leader change's fence, exactly
+		// as on every other path that hands a slot to a different node.
+		if cur.Leader == "" {
+			cur.Leader = p.Leader
+			cur.Epoch++
+			changed = true
+		}
+		if !stale {
 			continue
 		}
 		grown := unionReplicas(cur.Replicas, p.Replicas)
@@ -614,7 +636,10 @@ func (t *Table) Apply(c *Command) error {
 		// the slots the ring gives it; the ordinary fetch and the rebalance
 		// converge the rest — DESIGN §4.
 		// Leaders of assigned, stable slots are
-		// never moved — re-seating is safe because every added replica pulls
+		// never moved — a slot with NO leader (the failure path leaves one
+		// behind when the departing member held a slot's only copy) adopts
+		// the ring's expected leader, which is the seat this same call adds —
+		// re-seating is safe because every added replica pulls
 		// via fetch before the rebalancer may hand leadership to it, and a
 		// dropped seat is reclaimed by its holder (localdrop). A marked-down
 		// member KEEPS its replica seats (that is how its copy is still home
