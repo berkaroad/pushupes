@@ -506,6 +506,142 @@ func TestSlotCopyStatusSeparatesBehindFromDiverged(t *testing.T) {
 	}
 }
 
+// TestFactorOneGrowthConvergesEndToEnd drives the single-copy growth on
+// loopback with two engines and real stores: a low-policy cluster that booted
+// as one member (every slot on node-1, one copy each) grows to two, and the
+// ordinary machinery — replan seats the ring leader as a follower, the
+// follower fetches the copy, the rebalancer hands the leadership over, the
+// reclaim drops the seat the slot no longer needs — spreads the slots across
+// both members with the acknowledged records intact on both sides.
+//
+// Before the layout read stale for a single-copy slot sitting off the ring,
+// none of this could start: node-2 was never seated, so the rebalancer's
+// target gate (the target must be a replica) refused every slot the ring
+// wanted moved, and the cluster stayed exactly where its first plan put it.
+func TestFactorOneGrowthConvergesEndToEnd(t *testing.T) {
+	oldStore, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oldStore.Close()
+	old := NewEngine(nil, oldStore, "node-1", nil) // the only member at bootstrap
+
+	newStore, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newStore.Close()
+	neu := NewEngine(nil, newStore, "node-2", nil) // the member that joins later
+	neu.node = newTestRaftNode(t, neu)             // the controller drives the migrations
+
+	oldAddr := newPeerHarness(t, old)
+	newAddr := newPeerHarness(t, neu)
+
+	// The bootstrap: node-1 alone, one copy per slot (the shape a 1-member
+	// cluster is clamped to whatever the policy is), the full plan run before
+	// the second member existed.
+	for _, e := range []*Engine{old, neu} {
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-1", PeerAddr: oldAddr}})
+		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-1", AdminAddr: oldAddr, ClientAddr: oldAddr}})
+		pinReplicas(t, e, 1)
+		applyCmd(t, e, &Command{Op: OpPlanSlots})
+	}
+	if p := neu.TableSnapshot().Slots[0]; p.Leader != "node-1" || len(p.Replicas) != 1 {
+		t.Fatalf("bootstrap slot 0: %+v, want the single copy on node-1", p)
+	}
+
+	// Acknowledged records on the slot the two-member ring will hand to
+	// node-2 (odd slots go to the second member).
+	moved := int32(1)
+	agg := aggInSlot(t, old, moved)
+	for v := uint32(1); v <= 3; v++ {
+		rec := makeRecord(agg, v, agg+"-"+strconv.FormatUint(uint64(v), 10))
+		if _, err := oldStore.Append(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := oldStore.LastSeqOf(moved); got != 3 {
+		t.Fatalf("setup: slot %d LEO = %d, want 3", moved, got)
+	}
+
+	// node-2 joins: join + register + the controller's replan.
+	for _, e := range []*Engine{old, neu} {
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-2", PeerAddr: newAddr}})
+		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-2", AdminAddr: newAddr, ClientAddr: newAddr}})
+		applyCmd(t, e, &Command{Op: OpReplanSlots})
+	}
+	if p := neu.TableSnapshot().Slots[moved]; p.Leader != "node-1" || !replicaListHas(p.Replicas, "node-2") {
+		t.Fatalf("after the join slot %d must carry node-2 as a replica without moving the leader: %+v", moved, p)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// First round: the empty odd slots are equivalent on both sides and hand
+	// over; the slot that carries records waits for its copy to catch up (the
+	// re-seat made node-2 a follower, and a follower pulls over the ordinary
+	// fetch protocol).
+	if done := neu.rebalanceRound(ctx, 8); done != 3 {
+		t.Fatalf("want the three empty slots to hand over and slot %d to wait, got %d moves", moved, done)
+	}
+	if p := neu.TableSnapshot().Slots[moved]; p.Leader != "node-1" {
+		t.Fatalf("slot %d moved before its copy caught up: %+v", moved, p)
+	}
+
+	// The follower's fetch lands the copy on node-2.
+	for seq := uint64(1); seq <= 3; seq++ {
+		_, next, payload, err := oldStore.ReadSlotBytes(moved, seq, seq+1, 1<<20)
+		if err != nil || next != seq+1 || len(payload) == 0 {
+			t.Fatalf("read slot %d seq %d: next=%d len=%d err=%v", moved, seq, next, len(payload), err)
+		}
+		if err := neu.HandleReplicate(moved, seq, payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Second round: the copy is equivalent now, so the hand-over goes through
+	// (fast path — nothing is re-shipped).
+	if done := neu.rebalanceRound(ctx, 8); done != 1 {
+		t.Fatalf("want slot %d to hand over once its replica caught up, got %d moves", moved, done)
+	}
+
+	tbl := neu.TableSnapshot()
+	nodes := tbl.PeerIDs()
+	if len(nodes) != 2 {
+		t.Fatalf("member directory: %v", nodes)
+	}
+	for s, p := range tbl.Slots {
+		want := nodes[int(s)%len(nodes)]
+		if p.Leader != want {
+			t.Fatalf("slot %d: leader %s, want the ring leader %s (slot still off the ring)", s, p.Leader, want)
+		}
+	}
+	if oldStore.LastSeqOf(moved) != 3 || newStore.LastSeqOf(moved) != 3 {
+		t.Fatalf("the acknowledged records must survive the hand-over on both sides: old=%d new=%d",
+			oldStore.LastSeqOf(moved), newStore.LastSeqOf(moved))
+	}
+
+	// The committed migration's own reclaim (step 6) drops the former source
+	// from the set — the re-seat had grown these slots to two seats at factor
+	// 1 — so the table is back at one copy per slot and the seat reclaim has
+	// nothing left to do.
+	tbl = neu.TableSnapshot()
+	for s, p := range tbl.Slots {
+		if len(p.Replicas) != 1 || p.Replicas[0] != p.Leader {
+			t.Fatalf("slot %d: replicas %v at factor 1, want the single copy on the ring leader %s", s, p.Replicas, p.Leader)
+		}
+	}
+	if done := neu.reclaimRound(ctx, 8); done != 0 {
+		t.Fatalf("the committed hand-overs left no surplus seat, got %d reclaims", done)
+	}
+	if left := PlanLeaderRebalance(tbl); len(left) != 0 {
+		t.Fatalf("after the convergence the ring is reached; leftovers: %v", left)
+	}
+	if probe := tbl.Clone(); probe.applyReplanSlots() {
+		t.Fatal("a settled single-copy table must not plan a further replan")
+	}
+}
+
 // ---- Surplus-seat reclaim: the drop side of a re-layout ---------------------
 
 // TestSurplusSeatForReplan pins the choice: only a seat the ring plan does not

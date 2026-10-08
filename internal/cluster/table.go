@@ -171,17 +171,74 @@ func PlanSlots(nodes []string, slotCount int32, replicaFactor int) map[int32]*Pl
 	return out
 }
 
-// layoutStale reports whether the replica sets were laid out for a member count
-// other than the current one: a stable slot whose set size is not the derived
-// replica factor is the fingerprint of a factor change that has not been
-// reconciled yet (a member left, so the factor dropped and the sets now hold
-// surplus seats; or a member joined, so the factor rose and they hold too few).
-// Even member counts reuse the odd count below them ((N-1)/2 + 1 arithmetic),
-// so an even-numbered member leaves the factor AND the sets alone by rule — the
-// layout is deliberately not re-derived for it (DESIGN §4).
+// layoutStale reports whether the replica sets no longer match the member
+// directory. Three shapes arm the re-layout:
+//
+//   - a stable slot whose set size is not the derived replica factor: the
+//     fingerprint of a factor change that has not been reconciled yet (a member
+//     left, so the factor dropped and the sets now hold surplus seats; or a
+//     member joined, so the factor rose and they hold too few);
+//   - a member the ring plan gives a seat to that holds no replica seat in ANY
+//     stable slot: the layout has left a member out entirely. That is the shape
+//     of every membership change that does NOT move the factor — the low and
+//     medium tiers hold the factor steady against membership (the single-member
+//     clamp is the only place it moves), and the high tier's even counts reuse
+//     the odd count below them — and it strands the new member exactly as a
+//     factor change does: the ring's expected leader for its slots is not a
+//     replica, and the rebalancer only ever hands leadership to an existing
+//     replica, so it can never act on them (observed: a low-policy cluster
+//     bootstrapped as one node and grown to three never moves a single slot off
+//     node-1, and a 2-member cluster grown to three never gives node-3 a single
+//     seat);
+//   - at factor 1, a stable slot whose leader is not the ring's expected
+//     leader: a single-copy set has no spare seat to hold the ring's leader as
+//     a follower, so the two shapes above can both miss a slot that is merely
+//     in the wrong place — a hand-picked migration committed off the ring
+//     leaves the set back at the factor once the surplus reclaim has taken the
+//     old seat off, with nobody left out.
+//
+// applyReplanSlots then ADDS the ring's seats every stable slot is missing;
+// that re-seat is the only thing that can put the ring's expected leader into a
+// set, and the rebalancer needs it there before it may hand the slot over.
 func (t *Table) layoutStale() bool {
 	for _, p := range t.Slots {
 		if p.State == SlotStable && len(p.Replicas) != t.Replicas {
+			return true
+		}
+	}
+	nodes := t.PeerIDs()
+	if len(nodes) == 0 {
+		return false
+	}
+	planned := PlanSlots(nodes, t.SlotCount, t.Replicas)
+	prescribed := make(map[string]bool, len(nodes))
+	for _, p := range planned {
+		for _, r := range p.Replicas {
+			prescribed[r] = true
+		}
+	}
+	seated := make(map[string]bool, len(nodes))
+	for _, p := range t.Slots {
+		if p.State != SlotStable {
+			continue
+		}
+		for _, r := range p.Replicas {
+			seated[r] = true
+		}
+	}
+	for id := range prescribed {
+		if !seated[id] {
+			return true
+		}
+	}
+	if t.Replicas != 1 {
+		return false
+	}
+	for s, p := range t.Slots {
+		if p.State != SlotStable {
+			continue
+		}
+		if want := planned[s]; want != nil && p.Leader != want.Leader {
 			return true
 		}
 	}
@@ -190,8 +247,9 @@ func (t *Table) layoutStale() bool {
 
 // applyReplanSlots re-derives the slot layout on the current member directory:
 // every unassigned slot is planned, and — while the layout is stale (a factor
-// change is pending, see layoutStale) — every stable slot ADDS the ring's seats
-// it does not hold yet. It reports whether it changed the table, which is also
+// change, a member the layout has left out, or a single-copy slot sitting off
+// the ring: see layoutStale) — every stable slot ADDS the ring's seats it does
+// not hold yet. It reports whether it changed the table, which is also
 // the controller's test for whether a replan is worth a Raft entry (the
 // controller runs it on a clone of the snapshot before submitting; the same
 // function is what OpReplanSlots applies).
@@ -543,18 +601,19 @@ func (t *Table) Apply(c *Command) error {
 	case OpReplanSlots:
 		// Converge the layout on the current member directory: fill in any
 		// slot that is still unassigned, and add the ring's seats to every
-		// stable slot while a factor change is pending (applyReplanSlots).
-		// The re-layout therefore happens exactly when that factor moves,
-		// which — the factor being derived from the replicated policy tier
-		// and the member count — is a policy change (OpSetPolicy, any tier)
-		// or, under the high tier, the ODD member counts (3 -> 2
-		// copies, 5 -> 3, 7 -> 4...). Under the high tier an even-numbered
-		// member (a 4th, a 6th) leaves the derived count where it was, so the
-		// table is deliberately left alone: the new member carries no slot
-		// until the next odd count is reached (the low/medium tiers hold the
-		// factor steady against membership, clamped to the members that
-		// exist). That is the operator's rule, not an
-		// oversight — see DESIGN §4. Leaders of assigned, stable slots are
+		// stable slot while the layout is stale (applyReplanSlots).
+		// The re-layout therefore happens when the factor moves — a policy
+		// change (OpSetPolicy, any tier) or, under the high tier, the ODD
+		// member counts (3 -> 2 copies, 5 -> 3, 7 -> 4...) — and when the
+		// layout has left a member out: an even member count under the high
+		// tier leaves the derived count where it was, and the low/medium
+		// tiers hold the factor steady against membership, so such a member
+		// holds no seat at all, the ring's expected leader for its slots is
+		// not a replica, and the rebalancer can never act on them (see
+		// layoutStale). The re-seat seats the new member as the follower of
+		// the slots the ring gives it; the ordinary fetch and the rebalance
+		// converge the rest — DESIGN §4.
+		// Leaders of assigned, stable slots are
 		// never moved — re-seating is safe because every added replica pulls
 		// via fetch before the rebalancer may hand leadership to it, and a
 		// dropped seat is reclaimed by its holder (localdrop). A marked-down
