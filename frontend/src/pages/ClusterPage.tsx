@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Alert, App, Button, Card, Col, Form, Input, Modal, Row, Select, Space, Statistic, Switch, Typography } from 'antd'
+import { Alert, App, Button, Card, Col, Form, Input, InputNumber, Modal, Row, Select, Space, Statistic, Switch, Typography } from 'antd'
 import { EditOutlined, PlusOutlined } from '@ant-design/icons'
-import type { ClusterStatus, NodeWrites } from '../types'
+import type { ClusterStatus, FlowControlDetail, NodeWrites } from '../types'
 import { humanBytes, humanBytesPerSec } from '../format'
-import { addClusterNode, ensureLeader, fetchNodeWrites, removeClusterNode, setReplicaPolicy, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
+import { addClusterNode, clearFlowControl, ensureLeader, fetchFlowControl, fetchNodeWrites, removeClusterNode, setReplicaPolicy, setFlowControl, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
 import { PeerCard, isOnlinePeer } from '../PeerCard'
 
 // The write-speed cards sample every node's durable counters on the same
@@ -59,6 +59,18 @@ export default function ClusterPage() {
   const { modal, message } = App.useApp()
   const [removingId, setRemovingId] = useState<string | null>(null)
 
+  // Flow control (node-local). The card tag reads the config view the 2s
+  // writes poll already carries per node (configured=true → 流控 tag); the
+  // modal is opened per card, prefills from that node's own
+  // GET /admin/flow-control (the poll view has no duration string), and
+  // posts DELETE-or-POST semantics straight to THAT node — no controller,
+  // no redirect, whichever node answers is the node it governs.
+  const [flowConfigured, setFlowConfigured] = useState<Record<string, boolean>>({})
+  const flowConfiguredRef = useRef<Record<string, boolean>>({})
+  const [flowTarget, setFlowTarget] = useState<{ id: string; addr: string } | null>(null)
+  const [flowBusy, setFlowBusy] = useState(false)
+  const [fForm] = Form.useForm<{ tokens_per_slot: number; period: string }>()
+
   const refresh = useCallback(async () => {
     try {
       // ensureLeader: with several configured admins the FIRST call probes the
@@ -102,6 +114,16 @@ export default function ClusterPage() {
         results.forEach((r, i) => {
           if (r.status === 'fulfilled' && r.value.writes) perNode[addrs[i]] = r.value
         })
+        // Flow-control card tags: one configured flag per node id, from the
+        // config view this same poll carries. A node that did not answer
+        // keeps its last known state (the tag says "governed", not "alive").
+        const fc: Record<string, boolean> = {}
+        for (const p of Object.values(st.peers)) {
+          const m = perNode[p.admin_addr]
+          fc[p.id] = m ? !!m.flow_control?.configured : (flowConfiguredRef.current[p.id] ?? false)
+        }
+        flowConfiguredRef.current = fc
+        setFlowConfigured(fc)
         // A sample counts for the rate only when BOTH totals are complete
         // (every ledged slot answered its writes AND its bytes at its
         // leader). Skipping an incomplete sample rather than storing it
@@ -246,6 +268,71 @@ export default function ClusterPage() {
     })
   }
 
+  // openFlowControl opens the per-node modal prefilled from the node's own
+  // GET /admin/flow-control: the poll's config view carries the numbers but
+  // not the duration STRING the POST body round-trips, so one detail read
+  // (cheap, one node, on click) seeds the form instead of guessing units.
+  const openFlowControl = async (id: string) => {
+    const addr = statusRef.current?.peers?.[id]?.admin_addr
+    if (!addr) {
+      message.warning(`节点 ${id} 没有可用的 admin 地址`)
+      return
+    }
+    setFlowTarget({ id, addr })
+    fForm.resetFields()
+    try {
+      const d: FlowControlDetail = await fetchFlowControl(addr)
+      fForm.setFieldsValue({
+        tokens_per_slot: d.unlimited ? undefined : d.tokens_per_slot,
+        period: d.unlimited ? undefined : (d.period && d.period !== '0s' ? d.period : undefined),
+      })
+    } catch {
+      // A node the console cannot read still accepts a fresh config: open
+      // the form empty and let the operator fill it.
+    }
+  }
+
+  const doFlowSave = async () => {
+    if (!flowTarget) return
+    const { tokens_per_slot, period } = await fForm.validateFields()
+    setFlowBusy(true)
+    try {
+      const n = Number(tokens_per_slot)
+      if (!n || n <= 0 || !period) {
+        // The form's own zero/empty rule is the clear path: DELETE matches
+        // "POST 0 tokens" in the backend and reads cleaner in its answer.
+        await clearFlowControl(flowTarget.addr)
+        message.success(`节点 ${flowTarget.id} 已恢复不限流`)
+      } else {
+        await setFlowControl(flowTarget.addr, n, String(period).trim())
+        message.success(`节点 ${flowTarget.id} 流控已设置：每 leader 槽 ${n} 条 / ${String(period).trim()}`)
+      }
+      setFlowTarget(null)
+    } catch (e: any) {
+      // Keep the modal open on failure (the period string is the usual
+      // culprit and is fixed in place).
+      const msg = e?.response?.data?.error ?? e?.message ?? String(e)
+      message.error(`节点 ${flowTarget.id} 流控设置失败：${msg}`)
+    } finally {
+      setFlowBusy(false)
+    }
+  }
+
+  const doFlowClear = async () => {
+    if (!flowTarget) return
+    setFlowBusy(true)
+    try {
+      await clearFlowControl(flowTarget.addr)
+      message.success(`节点 ${flowTarget.id} 已恢复不限流`)
+      setFlowTarget(null)
+    } catch (e: any) {
+      const msg = e?.response?.data?.error ?? e?.message ?? String(e)
+      message.error(`节点 ${flowTarget.id} 清除流控失败：${msg}`)
+    } finally {
+      setFlowBusy(false)
+    }
+  }
+
   const doRemove = async (id: string) => {
     // Guard the offline rule again at action time (from the freshest snapshot),
     // not only at render time: auto-refresh may have raced a node back online
@@ -377,7 +464,9 @@ export default function ClusterPage() {
                   click instead of failing inside it. */}
               <PeerCard peer={p} current={p.id === status.node} slots={leaderCount[p.id] ?? 0}
                 onRemove={isOnlinePeer(p) || p.id === status.node ? undefined : askRemove}
-                removing={removingId === p.id} />
+                removing={removingId === p.id}
+                flowControlConfigured={flowConfigured[p.id] ?? false}
+                onFlowControl={isOnlinePeer(p) ? openFlowControl : undefined} />
             </Col>
           ))}
         </Row>
@@ -398,6 +487,34 @@ export default function ClusterPage() {
           </Form.Item>
           <Form.Item name="peer_addr" label="Peer 地址" rules={[{ required: true, message: '请输入 Peer 地址' }]}>
             <Input placeholder="如 10.0.0.4:8394" />
+          </Form.Item>
+        </Form>
+      </Modal>
+      {/* The per-node flow-control modal. Node-local: saving posts to the
+          target node's own admin plane, never the controller. The body
+          spells out what the numbers mean — every slot THIS node leads gets
+          a token bucket of N per period; a write without a token fails
+          1006 FlowControl. Empty/0 on either field means unlimited and is
+          saved as a DELETE. */}
+      <Modal open={!!flowTarget} onCancel={() => setFlowTarget(null)}
+        title={`节点流控：${flowTarget?.id ?? ''}`} width={460}
+        footer={[
+          <Button key="clear" onClick={doFlowClear} loading={flowBusy}>恢复不限流</Button>,
+          <Button key="cancel" onClick={() => setFlowTarget(null)}>取消</Button>,
+          <Button key="save" type="primary" loading={flowBusy} onClick={doFlowSave}>保存</Button>,
+        ]}>
+        <Typography.Paragraph type="secondary" style={{ marginBottom: 12 }}>
+          仅作用于本节点（重启后回到不限流）：该节点作为 leader 的每个槽各得一个令牌桶，
+          桶内令牌取完后写入事件流报 <Typography.Text code>1006 FlowControl</Typography.Text>，
+          被取走的令牌在「限流周期」到期后归还。
+        </Typography.Paragraph>
+        <Form form={fForm} layout="vertical">
+          <Form.Item name="tokens_per_slot" label="每槽令牌数（tokens_per_slot）">
+            <InputNumber min={1} style={{ width: '100%' }} placeholder="如 100；留空或 0 = 不限流" />
+          </Form.Item>
+          <Form.Item name="period" label="限流周期（period）"
+            extra={'Go 时长字符串，如 "1s"、"500ms"、"1m"。每槽稳态写入上限 = 令牌数 / 周期。'}>
+            <Input placeholder="如 1s；留空 = 不限流" />
           </Form.Item>
         </Form>
       </Modal>

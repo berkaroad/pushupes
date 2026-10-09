@@ -193,3 +193,70 @@ func TestAdminStatsMergesFlushAndRepl(t *testing.T) {
 		}
 	}
 }
+
+// TestFlowControlAdminEndpoints pins the node-local flow-control surface:
+// POST sets {tokens_per_slot, period} (a duration string), GET reads it back
+// with the hit tallies, DELETE clears it, a bad period is refused, and
+// /admin/writes carries the config view plus the per-slot hit array the
+// console diffs. Nothing here is controller-only: the node that answers is
+// the node that throttles.
+func TestFlowControlAdminEndpoints(t *testing.T) {
+	st, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	srv := New(cluster.NewEngine(nil, st, "node-9", nil), st)
+
+	// Default: unlimited, zeroed counts.
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/admin/flow-control", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET status = %d (%s)", rr.Code, rr.Body.String())
+	}
+	body := decodeBody(t, rr)
+	if body["unlimited"] != true || body["tokens_per_slot"] != float64(0) {
+		t.Fatalf("fresh node should read unlimited: %v", body)
+	}
+
+	// Bad period string is a 400, not a silent unlimited.
+	rr = httptest.NewRecorder()
+	srv.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/admin/flow-control",
+		strings.NewReader(`{"tokens_per_slot":10,"period":"banana"}`)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("bad period: status = %d (%s), want 400", rr.Code, rr.Body.String())
+	}
+
+	// Set a throttle.
+	rr = httptest.NewRecorder()
+	srv.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/admin/flow-control",
+		strings.NewReader(`{"tokens_per_slot":10,"period":"1s"}`)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("POST status = %d (%s)", rr.Code, rr.Body.String())
+	}
+	body = decodeBody(t, rr)
+	if body["unlimited"] != false || body["tokens_per_slot"] != float64(10) || body["period_ms"] != float64(1000) {
+		t.Fatalf("POST echo wrong: %v", body)
+	}
+
+	// /admin/writes carries the config view; a fresh throttle has no hits.
+	rr = httptest.NewRecorder()
+	srv.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/admin/writes", nil))
+	body = decodeBody(t, rr)
+	fc, _ := body["flow_control"].(map[string]any)
+	if fc == nil || fc["configured"] != true || fc["tokens_per_slot"] != float64(10) {
+		t.Fatalf("writes.flow_control wrong: %v", body["flow_control"])
+	}
+	hits, _ := body["flow_control_hits"].([]any)
+	if len(hits) != 8 {
+		t.Fatalf("flow_control_hits must be index-aligned with the 8 slots: %v", body["flow_control_hits"])
+	}
+
+	// DELETE clears.
+	rr = httptest.NewRecorder()
+	srv.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, "/admin/flow-control", nil))
+	body = decodeBody(t, rr)
+	if body["unlimited"] != true {
+		t.Fatalf("DELETE must clear: %v", body)
+	}
+}

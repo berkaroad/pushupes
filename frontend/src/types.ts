@@ -120,4 +120,31 @@ export interface NodeWrites {
   // at which that node drops its local copy of the slot. Per-node by nature —
   // the console marks a replica from the node that reported it.
   dropping?: number[]
+  // Node-level flow control (throttle of this node's slot leaders).
+  // `flow_control` is the config in force (configured=true drives the node
+  // card's 流控 tag); `flow_control_hits` is the per-slot cumulative
+  // rejection count, index-aligned with `writes` — the slots page diffs
+  // successive snapshots to mark the slots whose throttle FIRED recently.
+  flow_control?: FlowControlView
+  flow_control_hits?: number[]
+}
+
+// FlowControlView is the config shape /admin/writes reports per node.
+export interface FlowControlView {
+  tokens_per_slot: number
+  period_ms: number
+  configured: boolean
+}
+
+// FlowControlDetail is /admin/flow-control's answer: the same config view
+// plus the duration string a POST body round-trips against and the hit
+// tallies (node total + per-slot list).
+export interface FlowControlDetail {
+  node?: string
+  tokens_per_slot: number
+  period: string
+  period_ms: number
+  unlimited: boolean
+  total_hits: number
+  slots: { slot: number; hits: number }[]
 }

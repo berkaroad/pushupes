@@ -1,4 +1,5 @@
 import { Button, Card, Descriptions, Space, Tag } from 'antd'
+import { ControlOutlined } from '@ant-design/icons'
 import type { Peer } from './types'
 
 // isOnlinePeer mirrors the cluster's own offline rule (Peer.Offline, the
@@ -10,25 +11,31 @@ export function isOnlinePeer(p: Pick<Peer, 'client_addr' | 'down'>): boolean {
   return !p.down && (p.client_addr ?? '') !== ''
 }
 
-// PeerCard renders one node of the cluster's member list: id, the "当前"
-// badge on the answering node, a red 离线 tag (plus a weakened dashed card)
-// when the peer has no announced client address, and its three plane
-// addresses ('-' where a value is missing).
+// The orange 流控 tag marks a node with flow control CONFIGURED (writes to
+// the slots it leads are governed by a token bucket) — the presence of the
+// config, not evidence of it firing: the node view answers "which nodes are
+// governed" for maintenance, and the slots page is where a slot whose
+// throttle actually FIRED gets marked. flowControlConfigured comes from the
+// per-node /admin/writes poll the page already runs.
 //
-// The footer row inside the card body carries the one membership action the
-// console offers: 移除. It appears only when onRemove is passed — which the
-// page does only for offline members other than this one — so the console's
-// own rule matches the backend's (Engine.RemoveMember refuses an online
-// member) before a click can produce a 400. The row is rendered for EVERY
-// card at a fixed height (the small-button 24px line): online cards keep the
-// empty slot as an invisible placeholder, so all cards in the grid stay the
-// same height whether or not they carry a button.
-export function PeerCard({ peer, current, slots, onRemove, removing }: {
+// The footer row inside the card body carries the two node actions the
+// console offers: 流控 (open this node's flow-control modal) and 移除.
+// 移除 appears only when onRemove is passed — which the page does only for
+// offline members other than this one — so the console's own rule matches
+// the backend's (Engine.RemoveMember refuses an online member) before a
+// click can produce a 400. 流控 is node-local and harmless to open on any
+// live node, so it appears whenever onFlowControl is passed. The row is
+// rendered for EVERY card at a fixed height (the small-button 24px line):
+// cards keep an invisible placeholder per absent button, so all cards in
+// the grid stay the same height whether or not they carry actions.
+export function PeerCard({ peer, current, slots, onRemove, removing, flowControlConfigured, onFlowControl }: {
   peer: Peer
   current: boolean
   slots: number
   onRemove?: (id: string) => void
   removing?: boolean
+  flowControlConfigured?: boolean
+  onFlowControl?: (id: string) => void
 }) {
   const online = isOnlinePeer(peer)
   // Every card — online or offline — is the same solid bordered card: the
@@ -36,14 +43,17 @@ export function PeerCard({ peer, current, slots, onRemove, removing }: {
   // read as a different (broken) frame style instead of a state.
   return (
     <Card size="small"
-      title={<Space>{peer.id}{current ? <Tag color="blue">当前</Tag> : null}{online ? null : <Tag color="red">离线</Tag>}</Space>}
+      title={<Space>{peer.id}{current ? <Tag color="blue">当前</Tag> : null}{online ? null : <Tag color="red">离线</Tag>}{flowControlConfigured ? <Tag color="orange">流控</Tag> : null}</Space>}
       extra={<Tag>{slots} slots</Tag>}>
       <Descriptions column={1} size="small">
         <Descriptions.Item label="Admin">{peer.admin_addr || '-'}</Descriptions.Item>
         <Descriptions.Item label="Client">{peer.client_addr || '-'}</Descriptions.Item>
         <Descriptions.Item label="Peer">{peer.peer_addr || '-'}</Descriptions.Item>
       </Descriptions>
-      <div style={{ marginTop: 12, height: 24, display: 'flex', justifyContent: 'flex-end' }}>
+      <div style={{ marginTop: 12, height: 24, display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+        {onFlowControl
+          ? <Button size="small" icon={<ControlOutlined />} onClick={() => onFlowControl(peer.id)}>流控</Button>
+          : <span style={{ visibility: 'hidden' }} aria-hidden><Button size="small">流控</Button></span>}
         {onRemove
           ? <Button danger size="small" loading={removing} onClick={() => onRemove(peer.id)}>移除</Button>
           : <span style={{ visibility: 'hidden' }} aria-hidden><Button danger size="small">移除</Button></span>}

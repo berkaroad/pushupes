@@ -95,6 +95,7 @@ seq 升序重放同一批记录，把计数器重建到 LEO。
 | 1003 | ERR_SLOT_NOT_LOCAL | 槽位不在本节点（MOVED，附正确节点） |
 | 1004 | ERR_MIGRATING | 槽位迁移中（ASK 语义，附目标节点） |
 | 1005 | ERR_NOT_LEADER | 本节点非该槽 leader（附 leader 地址） |
+| 1006 | ERR_FLOW_CONTROL | 本节点流控拒绝（message 固定 `FlowControl`；令牌桶取空时写入不落 WAL 直接失败，见 §6.2） |
 
 并发控制：锁粒度 = slot。同一槽串行写（保证 seq/version 原子推进），
 不同槽并行。1680 槽 = 最多 1680 条并行写路径。
@@ -520,13 +521,16 @@ GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（�
                                                #   每 2s 采一次样（自己 leader 的槽本地读，其余问 peer），
                                                #   status 读缓存值；storage_bytes_complete=false 表示
                                                #   有 slot leader 没应答，此时该值是下界
-GET  /admin/writes                             # 每槽 durable 计数 + 每槽落盘字节 write_bytes（与计数同下标，两快照作差得 msg/s 与字节/s）+ 槽内总字节/事件流数量 + 本节点待清理副本（前端轮询）
+GET  /admin/writes                             # 每槽 durable 计数 + 每槽落盘字节 write_bytes（与计数同下标，两快照作差得 msg/s 与字节/s）+ 槽内总字节/事件流数量 + 本节点待清理副本 + 本节点流控（flow_control = 生效配置视图 {tokens_per_slot, period_ms, configured}；flow_control_hits = 每槽累计流控拒绝数，与计数同下标；前端轮询）
 GET  /admin/stats[?worst=N]                    # 三个「等在哪里」自视合一：flush = 待刷记录数/最老未刷记录年龄/刷盘队列长度与在飞数/fsync 排队等待与 syscall 服务时间分位/每次新覆盖字节与覆盖的段文件大小；repl = `hw < LEO` 的槽数与最老等待时长（?worst=N 列出最久的槽）/每副本上报新鲜度与 LEO 落后/fetch 轮次与「按数据唤醒 vs 按等待预算到期」计数；ack = 每条写入的确认链路四段耗时（栅栏+路由 / 本地 WAL 落地 / 等 ISR 高水位 / 整调用）与结果、失败原因分布、正在等待的调用数、水位落后条数（?worst=N 列出等得最久的槽）
 GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本+最新记录 unix_time，仅内存索引，不读 WAL）
 POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移（控制器专属，必须发到 Raft leader 的 admin 地址）
 POST /admin/slots/{slot}/remove-replica {node} # 回收副本集里的一个成员（控制器专属，同上）
 POST /admin/cluster/plan                       # 触发重新规划（控制器专属，同上）
 POST /admin/cluster/replica-policy {policy}    # 切换副本策略档位 low/medium/high（控制器专属，同上；回当前策略与生效因子）
+POST /admin/flow-control {tokens_per_slot,period} # 设置本节点流控（**节点本地**：收到请求的节点就是被设置的节点；重启后回到不限流。period 是 Go 时长字符串（"1s"）；tokens_per_slot<=0 或 period<=0 均表示不限流；回读当前配置 + 命中统计）
+GET  /admin/flow-control                       # 本节点流控配置与累计拒绝数（节点级 total_hits + 每槽列表；同样节点本地）
+DELETE /admin/flow-control                     # 恢复本节点不限流（节点本地，同上）
 GET  /admin/cluster/nodes                      # 列出当前 raft 成员（本节点视角：id/peer/admin/client/down）
 POST /admin/cluster/nodes {id,peer_addr}       # 运行时加成员（控制器专属，同上；admin/client 地址由新节点自报）
 DELETE /admin/cluster/nodes/{id}               # 运行时摘成员（控制器专属，同上；仅离线节点，在线回 400）
@@ -623,6 +627,39 @@ follower 收到这类命令一律**拒绝**（HTTP 425 + `err_id=1005`，响应�
 未上报的节点不标记。**置灰完全由后端这两个字段驱动，前端不做任何"谁当过迁移源"
 式的推断**；后端也只对**已离开副本集**的多余副本上报，因此仍在副本集里的成员
 永远不置灰、也永远不删。
+
+### 6.2 节点级流控（令牌桶）
+
+流控是**节点级旋钮**：`POST /admin/flow-control {"tokens_per_slot":N,"period":"1s"}`
+打到哪个节点，就只对该节点生效——它约束的是**该节点作为 leader 的每个槽**（每个
+leader 槽一个独立令牌桶），副本写入走复制落地路径，不消耗令牌、不受控。配置不进
+Raft、不持久化，进程重启回到默认的不限流；这是运维应急面，与副本策略（集群级、
+持久）是两个东西。`tokens_per_slot<=0` 或 `period<=0`（含解析为空）都表示不限流，
+`DELETE` 同样恢复不限流。
+
+令牌桶按操作者的模型运转：取走一个令牌，就记下它的归还时间点（取走时刻 + period）；
+每次取令牌前先把所有已到期的时间点一次性归还（最小堆扫堆头），桶空即触发流控——
+写入报 `fail/1006`（message 固定 `FlowControl`），记录不落 WAL、不等高水位。没有
+后台补充线程：堆空意味着令牌全可取，空闲桶零成本；稳态上限 = tokens_per_slot /
+period（每槽）。改配置换代：旧桶整弃、下一笔写在新预算下重建桶；每槽累计拒绝计数
+在换代中保留（前端作差判「是否刚触发」需要单调计数）。
+
+取走的令牌何时退还：落不进 leader WAL 的记录不占预算——业务规则失败（1001 版本
+冲突 / 1002 参数非法）与 WAL 写错误都立即归还令牌；EXISTS（同 command_id 幂等
+重试）与高水位超时（fail/1005，记录实际已在 leader WAL 落定）**不**退款：exists
+同样是「一条写入请求」，按请求计数计费，退款会让客户端的重试风暴免费穿透流控；
+1005 的预算确实换到了持久化。批量写入非原子：
+逐条消耗，第 k 条取不到令牌则第 k 条及其后所有条目直接 1006（不再尝试落盘），
+之前已落地的条目照常合并等待高水位。栅栏/路由/幂等顺序不变：流控检查发生在
+localAppend/batchLocal 的落盘之前，与写栅栏、路由表读取同一条 leader 路径。
+
+控制台的呈现分两层：**集群页节点卡片**的橙色「流控」tag = 该节点配置了流控
+（configured 即亮，便于巡检谁被治理），卡片上的「流控」按钮打开该节点的设置
+modal（预填 GET 回读的配置，保存 POST / 恢复不限流 DELETE，直发该节点 admin
+面）；**槽位页「流控」列** = 该槽 leader 的拒绝计数在最近窗口内有增量（红标，
+粘滞 6s 防闪烁），配置了但从未触发的槽显示「-」。数据都不走新请求：per-node
+`GET /admin/writes` 轮询顺带 `flow_control`（配置视图）与 `flow_control_hits`
+（与 writes 同下标的每槽累计拒绝数）。
 
 ## 7. 高性能要点
 

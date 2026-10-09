@@ -54,8 +54,13 @@ type Engine struct {
 	// replication bookkeeping per slot, only meaningful on slot leaders
 	replMu sync.Mutex
 	repl   map[int32]*slotRepl
-	diag   replDiag // data-plane tallies reported by ReplStats
-	ack    ackDiag  // per-step ack-chain timings reported by AckStats
+
+	// flow is this node's flow-control throttle (see flowcontrol.go): a
+	// node-level config plus per-slot-leader token buckets. Zero value =
+	// unlimited, which is the default every node starts in.
+	flow flowControl
+	diag replDiag // data-plane tallies reported by ReplStats
+	ack  ackDiag  // per-step ack-chain timings reported by AckStats
 	// fetchSettle is how long a fetch round sleeps after a data wake before
 	// scanning, so one round answers every slot the burst touched instead of
 	// the first one to land (see SetFetchSettle).
@@ -928,6 +933,38 @@ func (e *Engine) clientAddr(nodeID string) string {
 // an append acknowledged without that wait could vanish if the leader died
 // before its replicas pulled the record.
 func (e *Engine) localAppend(slot int32, rec *data.EventRecord) (*data.AppendResponse, error) {
+	// Flow control (node-level, per slot leader): a refused append answers
+	// fail/1006 without touching the WAL. Only the leader copy pays — this
+	// function only runs when THIS node serves the slot's writes.
+	if ok, bucket := e.takeFor(slot); !ok {
+		return &data.AppendResponse{
+			Status: data.StatusFail,
+			ErrID:  data.ErrIDFlowControl,
+			Err:    "FlowControl",
+			Slot:   slot,
+		}, nil
+	} else if bucket != nil {
+		resp, err := e.localAppendThrottled(slot, rec)
+		if err != nil {
+			// The WAL write itself failed: nothing landed, refund.
+			flowRefund(bucket)
+			return resp, err
+		}
+		if resp != nil && resp.Status == data.StatusFail &&
+			(resp.ErrID == data.ErrIDVersionConflict || resp.ErrID == data.ErrIDBadRequest) {
+			// The token paid for a record that never landed on the leader's
+			// log (a business-rule fail): give it back. A watermark timeout
+			// (fail/1005) keeps its charge — the record IS durable above —
+			// and so does EXISTS, per the operator's rule for idempotent
+			// retries.
+			flowRefund(bucket)
+		}
+		return resp, err
+	}
+	return e.localAppendThrottled(slot, rec)
+}
+
+func (e *Engine) localAppendThrottled(slot int32, rec *data.EventRecord) (*data.AppendResponse, error) {
 	if s := e.slotAckOf(slot); s != nil {
 		s.appends.Add(1)
 	}
@@ -1068,12 +1105,36 @@ func (e *Engine) batchLocal(ctx context.Context, slot int32, recs []*data.EventR
 	}
 	var maxSeq uint64
 	tLand := time.Now()
+	// Flow control runs PER RECORD here, in request order: the group is not
+	// atomic (the operator's rule), so accepted records land and a refusal
+	// fails only that record and everything after it — those never touch the
+	// WAL. Records that did land keep the ordinary merged watermark wait
+	// below. A record refused at position k also stops the take loop, so a
+	// burst cannot drain the bucket on records that will not execute anyway.
+	throttled := false
 	for i, rec := range recs {
+		if throttled {
+			out[i] = &data.AppendResponse{Status: data.StatusFail, ErrID: data.ErrIDFlowControl, Err: "FlowControl", Slot: slot}
+			continue
+		}
+		ok, bucket := e.takeFor(slot)
+		if !ok {
+			throttled = true
+			out[i] = &data.AppendResponse{Status: data.StatusFail, ErrID: data.ErrIDFlowControl, Err: "FlowControl", Slot: slot}
+			continue
+		}
 		resp, err := e.landLocalAppend(slot, rec)
 		if err != nil {
+			flowRefund(bucket)
 			return nil, err
 		}
 		out[i] = resp
+		if resp.Status == data.StatusFail &&
+			(resp.ErrID == data.ErrIDVersionConflict || resp.ErrID == data.ErrIDBadRequest) {
+			// Same refund rule as the single-append path: a business-rule
+			// fail never consumed log space, so it must not consume budget.
+			flowRefund(bucket)
+		}
 		if resp.Status == data.StatusSuccess && resp.Seq > maxSeq {
 			maxSeq = resp.Seq
 		}

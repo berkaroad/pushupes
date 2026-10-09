@@ -1,6 +1,6 @@
 import axios from 'axios'
 import type {
-  ClusterStatus, NodeWrites, SlotDescribe, SlotStreams,
+  ClusterStatus, FlowControlDetail, NodeWrites, SlotDescribe, SlotStreams,
 } from './types'
 
 // ---- admin endpoint pool ----------------------------------------------------
@@ -387,6 +387,43 @@ export async function setReplicaPolicy(
       { timeout: 30000 },
     ),
     status,
+  )
+  return data
+}
+
+// ---- node-local flow control ------------------------------------------------
+//
+// Flow control is a per-NODE knob (throttles every slot this node LEADS):
+// whichever node receives the call is the node it configures. Nothing here
+// goes through withController — these are deliberately NOT replicated and
+// NOT controller-only, in contrast to the commands above.
+
+// fetchFlowControl reads one node's current config plus its cumulative
+// rejection tallies (node total + per-slot list).
+export async function fetchFlowControl(addr: string): Promise<FlowControlDetail> {
+  const { data } = await axios.get<FlowControlDetail>(`${normalizeAdminBase(addr)}/admin/flow-control`, { timeout: 5000 })
+  return data
+}
+
+// setFlowControl POSTs {tokens_per_slot, period}; period is a Go duration
+// string ("1s", "500ms"). tokens_per_slot<=0 or an empty/"0s" period sets
+// the node unlimited (the same effect as clearFlowControl).
+export async function setFlowControl(
+  addr: string, tokensPerSlot: number, period: string,
+): Promise<FlowControlDetail> {
+  const { data } = await axios.post<FlowControlDetail>(
+    `${normalizeAdminBase(addr)}/admin/flow-control`,
+    { tokens_per_slot: tokensPerSlot, period },
+    { timeout: 5000 },
+  )
+  return data
+}
+
+// clearFlowControl restores the node's default (unlimited).
+export async function clearFlowControl(addr: string): Promise<FlowControlDetail> {
+  const { data } = await axios.delete<FlowControlDetail>(
+    `${normalizeAdminBase(addr)}/admin/flow-control`,
+    { timeout: 5000 },
   )
   return data
 }

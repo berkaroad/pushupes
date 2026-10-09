@@ -9,6 +9,12 @@ import { ReplicaTags, dropHint } from '../ReplicaTags'
 
 const RATE_POLL_MS = 2000
 
+// FLOW_STICKY_MS is how long a slot keeps its 流控 mark after the last
+// observed hit growth at its leader (three 2s samples): one sample's growth
+// is a real refusal burst, but an instant fallback would make the column
+// flicker under sustained throttling and hide short ones between paints.
+const FLOW_STICKY_MS = 6000
+
 // surplusCopies lists the nodes that reported a queued cleanup for a slot but
 // are no longer part of its replica set: they are the copies the console must
 // show weakened NEXT TO the set. The backend never queues a copy a slot still
@@ -67,6 +73,20 @@ export default function SlotsPage() {
   // and gauges above: each node reports only its OWN queue, so a node that did
   // not answer simply leaves its replicas unmarked.
   const [dropAt, setDropAt] = useState<Record<number, Record<string, number>>>({})
+  // Flow control column: a slot shows 流控 while its LEADER node's
+  // flow_control_hits[s] grew within the sticky window (6s = three 2s
+  // samples — a single sample's growth is a one-sample flash that the table
+  // would flicker on). A configured-but-idle slot shows '-': the hits array
+  // only moves when the bucket actually refused a write. State lives in
+  // refs (last sample + last fire time per slot) and only the derived
+  // active set is state, so the 2s tick never re-renders on unchanged hits.
+  const [flowActive, setFlowActive] = useState<Record<number, boolean>>({})
+  const lastFlowHits = useRef<Record<string, number[]>>({})
+  const lastFlowFire = useRef<Record<number, number>>({})
+  // flowActiveRef mirrors the rendered state for the tick's cheap equality
+  // check: the poll re-derives the sticky set every 2s, and a new object
+  // each tick would re-render the table even when nothing changed.
+  const flowActiveRef = useRef<Record<number, boolean>>({})
   const statusRef = useRef<ClusterStatus | null>(null)
 
   const refresh = useCallback(async () => {
@@ -105,6 +125,42 @@ export default function SlotsPage() {
         for (const p of Object.values(st.peers)) idToAddr[p.id] = p.admin_addr
         const addrToId: Record<string, string> = {}
         for (const p of Object.values(st.peers)) if (p.admin_addr) addrToId[p.admin_addr] = p.id
+
+        // Flow control: diff each slot's hits array AT ITS LEADER (the
+        // throttle only runs on the leader copy — a replica's array is its
+        // own ledger for its own led slots). Growth since this node's last
+        // sample means the bucket refused a write in the window: stamp the
+        // fire time. Then rebuild the active set from the sticky rule: a
+        // slot stays marked for FLOW_STICKY_MS after its last fire; when no
+        // slot changed state the ref comparison keeps the same object and
+        // React skips the re-render.
+        const prevHits = lastFlowHits.current
+        const now = Date.now()
+        for (const [slotStr, p] of Object.entries(st.slots)) {
+          const s = Number(slotStr)
+          const addr = idToAddr[p.leader]
+          const hits = addr ? perNode[addr]?.flow_control_hits : undefined
+          if (!hits || s >= hits.length) continue
+          const before = prevHits[addr]?.[s]
+          prevHits[addr] = hits
+          if (before !== undefined && hits[s] > before) {
+            lastFlowFire.current[s] = now
+          }
+        }
+        const active: Record<number, boolean> = {}
+        for (const [sStr, at] of Object.entries(lastFlowFire.current)) {
+          if (now - at <= FLOW_STICKY_MS) active[Number(sStr)] = true
+        }
+        const sameSet = (a: Record<number, boolean>, b: Record<number, boolean>) => {
+          const ka = Object.keys(a)
+          const kb = Object.keys(b)
+          if (ka.length !== kb.length) return false
+          return ka.every((k) => a[Number(k)] === b[Number(k)])
+        }
+        if (!sameSet(active, flowActiveRef.current)) {
+          flowActiveRef.current = active
+          setFlowActive(active)
+        }
 
         // 总字节: the largest on-disk footprint reported for the slot (leader
         // or replica, whichever has flushed more). Absent everywhere means
@@ -343,6 +399,17 @@ export default function SlotsPage() {
       render: (v: string) => <Tag color={stateColor[v] ?? 'default'}>{v}</Tag>,
       filters: Object.keys(stateColor).map((k) => ({ text: k, value: k })),
       sorter: (a, b) => a.state.localeCompare(b.state),
+    },
+    {
+      // 流控: the slot's OWN leader refused a write (token bucket empty)
+      // within the sticky window. A node that has flow control CONFIGURED
+      // but never refused shows '-': the column marks the firing, the node
+      // cards mark the governance.
+      title: '流控', key: 'flow', width: 80,
+      sorter: (a, b) => Number(!!flowActive[a.slot]) - Number(!!flowActive[b.slot]),
+      render: (_, r) => flowActive[r.slot]
+        ? <Tag color="red">流控</Tag>
+        : <Typography.Text type="secondary">-</Typography.Text>,
     },
     {
       // The replication set carries the role: the leader's tag is the coloured

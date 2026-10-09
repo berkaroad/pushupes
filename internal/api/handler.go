@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/berkaroad/pushupes/internal/cluster"
 	"github.com/berkaroad/pushupes/internal/data"
@@ -63,6 +64,9 @@ func New(eng *cluster.Engine, store *storage.Store) *Server {
 	s.mux.HandleFunc("POST /admin/slots/{slot}/remove-replica", s.handleRemoveReplica)
 	s.mux.HandleFunc("POST /admin/cluster/plan", s.handlePlan)
 	s.mux.HandleFunc("POST /admin/cluster/replica-policy", s.handleSetReplicaPolicy)
+	s.mux.HandleFunc("POST /admin/flow-control", s.handleSetFlowControl)
+	s.mux.HandleFunc("GET /admin/flow-control", s.handleGetFlowControl)
+	s.mux.HandleFunc("DELETE /admin/flow-control", s.handleSetFlowControl)
 	s.mux.HandleFunc("GET /admin/cluster/nodes", s.handleMembers)
 	s.mux.HandleFunc("POST /admin/cluster/nodes", s.handleAddMember)
 	s.mux.HandleFunc("DELETE /admin/cluster/nodes/{id}", s.handleRemoveMember)
@@ -288,6 +292,14 @@ func (s *Server) handleWrites(w http.ResponseWriter, r *http.Request) {
 		// console asks every node and marks the replica whose copy is on its
 		// way out. Same shape as bytes/streams.
 		"dropping": s.Engine.PendingDrops(),
+		// Flow control (node-level throttle of this node's slot leaders):
+		// the config currently in force, and the per-slot cumulative
+		// rejection counts index-aligned with writes. The console diffs
+		// successive hit arrays to mark the slots whose throttle FIRED in
+		// the last window; the config (not the hits) drives the node card's
+		// 流控 tag, which says "this node is configured to throttle".
+		"flow_control_hits": s.Engine.FlowHitsPerSlot(),
+		"flow_control":      flowControlView(s.Engine.FlowConfigForAdmin()),
 	})
 }
 
@@ -428,6 +440,65 @@ func (s *Server) handleSetReplicaPolicy(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"replica_policy": string(policy), "replica_factor": factor})
 }
 
+// handleSetFlowControl sets (POST) or clears (DELETE) THIS node's
+// flow-control config: {tokens_per_slot, period}. Node-local by design —
+// whichever node receives the call is the node it throttles, no Raft
+// command, no redirect, nothing replicated. The throttle applies to every
+// slot this node LEADS (each its own token bucket); replicas are not
+// controlled. tokens_per_slot<=0 or period<=0 means unlimited (the same
+// effect as DELETE), so the console can also clear by zeroing. The period
+// is a Go duration string ("1s", "500ms"); a value that does not parse is
+// a bad request rather than a silent unlimited.
+//
+//	POST /admin/flow-control  {"tokens_per_slot":100,"period":"1s"}
+func (s *Server) handleSetFlowControl(w http.ResponseWriter, r *http.Request) {
+	cfg := cluster.FlowConfig{}
+	if r.Method == http.MethodPost {
+		var req struct {
+			TokensPerSlot int32  `json:"tokens_per_slot"`
+			Period        string `json:"period"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "body must be {\"tokens_per_slot\":N,\"period\":\"1s\"}")
+			return
+		}
+		period, err := time.ParseDuration(req.Period)
+		if err != nil && req.Period != "" {
+			writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "period must be a duration like \"1s\" (\"\" or <=0 means unlimited)")
+			return
+		}
+		cfg = cluster.FlowConfig{TokensPerSlot: req.TokensPerSlot, Period: period}
+	}
+	s.Engine.SetFlow(cfg)
+	s.writeFlowControl(w)
+}
+
+// handleGetFlowControl reports this node's current config plus the
+// cumulative rejection counts — the node total and the per-slot list — so
+// an operator can read back what is in force and where it fired.
+func (s *Server) handleGetFlowControl(w http.ResponseWriter, r *http.Request) {
+	s.writeFlowControl(w)
+}
+
+// writeFlowControl renders the flow-control answer for both admin verbs.
+func (s *Server) writeFlowControl(w http.ResponseWriter) {
+	cfg, total, slots := s.Engine.FlowStats()
+	if slots == nil {
+		slots = []cluster.FlowSlotStats{}
+	}
+	// period_ms is the machine-readable form the console prefills from; the
+	// duration string is what a POST body round-trips against.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"node":            s.Engine.Self(),
+		"tokens_per_slot": cfg.TokensPerSlot,
+		"period":          cfg.Period.String(),
+		"period_ms":       cfg.Period.Milliseconds(),
+		"unlimited":       cfg.Unlimited(),
+		"total_hits":      total,
+		"slots":           slots,
+	})
+}
+
 // handleMembers lists the cluster's raft membership. It is local view, like
 // the rest of the admin surface: a node that has just been added shows up here
 // once the configuration change has reached this node's log.
@@ -529,6 +600,17 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeErr(w http.ResponseWriter, code, errID int, msg string) {
 	writeJSON(w, code, map[string]any{"error": msg, "err_id": errID})
+}
+
+// flowControlView renders a flow config for the JSON surface: the console
+// reads `configured` (a card-level 流控 marker) without re-deriving the
+// unlimited rule from the numbers.
+func flowControlView(cfg cluster.FlowConfig) map[string]any {
+	return map[string]any{
+		"tokens_per_slot": cfg.TokensPerSlot,
+		"period_ms":       cfg.Period.Milliseconds(),
+		"configured":      !cfg.Unlimited(),
+	}
 }
 
 // refuseNotController renders a controller-only command that a FOLLOWER

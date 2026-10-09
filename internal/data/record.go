@@ -512,6 +512,7 @@ const (
 	ErrIDSlotNotLocal    = 1003 // MOVED
 	ErrIDMigrating       = 1004 // ASK
 	ErrIDNotLeader       = 1005
+	ErrIDFlowControl     = 1006 // the node's flow control refused the append
 )
 
 var (
