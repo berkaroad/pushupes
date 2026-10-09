@@ -1028,7 +1028,14 @@ waiters_now=0  hw_stalls=0  水位落后(条) p50=0 p99=1 max=3
 
 `hw_wait` 还可以再拆：`report_rtt`（副本上报自己新位置的往返，副本侧测）、
 `progress_handle`（leader 处理该上报到水位推进的耗时）、`wake_lag`（水位推进到被唤醒的调用真正
-返回之间的时间）——三者都很小 ⇒ 残余就是「数据送到副本 + 副本落盘」这一段本身，不是上报或唤醒。
+返回之间的时间）——三者都很小 ⇒ 嫌疑就在剩下的两段，现已各自有表：`fetch_serve`（leader 侧：
+唤醒到应答组装完——合并窗口、parked 槽复扫与 burst 各槽的 payload 读；实测 avg 0.8ms，其中
+0.2ms 是 fetch-settle 本身）、`replica_apply`（follower 侧：一轮 items 全部落进本地 WAL 的
+墙钟时间；实测 avg 0.26ms）。健康环境（4 核、无宿主干扰）下五段相加 ≈ hw_wait 均值
+（2.4-2.6ms ≈ 0.85 + 0.60 + 0.27 + 0.07 + 0.08 + 两段本机 wire/调度 ~0.5）——差距的每一微秒
+都有名字。两条已实测关闭的杠杆：并行化 leader 的 burst 读无收益（fetch_serve 是 CPU-bound
+memcpy，不是 syscall 等待：ABBA 并行版 fetch_serve 0.81ms vs 串行 0.82ms、吞吐 -1.9%）；
+`report_rtt` 0.6ms 是 localhost gRPC 往返的地板价，无进一步可压缩空间。
 
 `fail` 进一步按原因拆分（`fail_hw_timeout` / `fail_version_conflict` / `fail_other`），
 因为「有写入失败」只有分清「复制没跟上」还是「客户端请求本身不合规」才可行动：实测

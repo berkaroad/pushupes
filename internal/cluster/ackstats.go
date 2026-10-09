@@ -190,6 +190,20 @@ type ackDiag struct {
 	reportRTT      ackHist
 	progressHandle ackHist
 	wakeLag        ackHist
+
+	// The two segments that carry hw_wait's residual after reportRTT /
+	// progressHandle / wakeLag (together ~1ms of the ~3ms the heavy-load cell
+	// measures), timed where only each side can see it:
+	//   fetchServe   leader:   bus wake -> the round's answer assembled (the
+	//                          settle sleep, the parked-handle re-scan and the
+	//                          payload reads of the burst's slots)
+	//   replicaApply follower: fetch items arrive -> every slot of the round
+	//                          landed and its position is ready to report
+	// Neither term touches a fsync: the follower's LEO rides its page-cache
+	// write (the flusher's 1000-record pace is decoupled from the ack chain),
+	// so what these two measure is protocol cadence, not disk.
+	fetchServe   ackHist
+	replicaApply ackHist
 }
 
 // AckTiming is one step's latency distribution, in milliseconds (the lag
@@ -239,10 +253,14 @@ type AckView struct {
 
 	// The pieces hw_wait is made of (see ackDiag): a follower's report round
 	// trip, what that report costs the leader, and how long a released call
-	// took to actually return after the watermark moved.
+	// took to actually return after the watermark moved, plus the two terms
+	// that carry the residual (leader's wake->answer serve time, follower's
+	// round landing time — see ackDiag).
 	ReportRTT      AckTiming `json:"report_rtt"`
 	ProgressHandle AckTiming `json:"progress_handle"`
 	WakeLag        AckTiming `json:"wake_lag"`
+	FetchServe     AckTiming `json:"fetch_serve"`
+	ReplicaApply   AckTiming `json:"replica_apply"`
 
 	Worst []AckSlotView `json:"worst"`
 }
@@ -280,6 +298,8 @@ func (e *Engine) AckStatsTop(worstN int) AckView {
 		ReportRTT:      d.reportRTT.view(),
 		ProgressHandle: d.progressHandle.view(),
 		WakeLag:        d.wakeLag.view(),
+		FetchServe:     d.fetchServe.view(),
+		ReplicaApply:   d.replicaApply.view(),
 	}
 
 	if worstN <= 0 {

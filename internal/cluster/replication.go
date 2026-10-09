@@ -2544,6 +2544,16 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 				// appends of the same burst land before we scan — without
 				// it the scan races the burst and captures only the first
 				// slot. 2ms against a multi-second cadence is negligible.
+				//
+				// fetchServe measures this branch from wake to answer: the
+				// settle sleep + the parked-handle re-scan + the payload
+				// reads of the burst's slots. It is one of the two terms that
+				// carry hw_wait's residual (the other is the follower's
+				// replicaApply), and it touches no fsync — the follower's LEO
+				// rides its page-cache write, so this is protocol cadence,
+				// not disk. Only a wake that actually finds data is booked
+				// (a blip that parks again is not a served answer).
+				tServe := time.Now()
 				if e.fetchSettle > 0 {
 					time.Sleep(e.fetchSettle)
 				}
@@ -2576,6 +2586,7 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 				}
 				if anyData {
 					e.diag.mfetchByWake.Add(1)
+					e.ack.fetchServe.observe(time.Since(tServe))
 					break waitLoop // answer with the whole burst
 				}
 			}
@@ -2818,15 +2829,21 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 		// busy leader touches tens of slots, not the full 1.4k set). Reporting
 		// is what advances the leader's watermark, so the collection must stay
 		// safe under the apply pool. A quarantined slot is skipped by applyItem.
+		//
+		// replicaApply times the landing itself (the apply pool's wall time for
+		// this round's items): the follower's term of hw_wait's residual, from
+		// "the answer arrived" to "every slot's position is ready to report".
 		var repMu sync.Mutex
 		var changed []int32
 		var leos []uint64
+		tApply := time.Now()
 		productive, err = e.applyFetchItems(fr.Items, func(slot int32, from uint64) {
 			repMu.Lock()
 			changed = append(changed, slot)
 			leos = append(leos, from)
 			repMu.Unlock()
 		})
+		e.ack.replicaApply.observe(time.Since(tApply))
 		if err == nil && len(changed) > 0 {
 			e.reportProgress(addr, changed, leos, true)
 		}
