@@ -512,6 +512,14 @@ export default function SlotsPage() {
             <Descriptions.Item label="State">
               {placementOf(detail.data) ? <Tag color={stateColor[placementOf(detail.data)!.state]}>{placementOf(detail.data)!.state}</Tag> : '-'}
             </Descriptions.Item>
+            {/* 流控: the same mark the list column renders — the slot's
+                leader refused a write within the sticky window. One shared
+                flowActive state, so drawer and list can never disagree. */}
+            <Descriptions.Item label="流控">
+              {flowActive[detail.slot]
+                ? <Tag color="red">流控</Tag>
+                : <Typography.Text type="secondary">-</Typography.Text>}
+            </Descriptions.Item>
             <Descriptions.Item label="Epoch">{placementOf(detail.data)?.epoch ?? '-'}</Descriptions.Item>
             <Descriptions.Item label="HW">{detail.data.hw}</Descriptions.Item>
             <Descriptions.Item label="LastSeq">{detail.data.last_seq}</Descriptions.Item>
