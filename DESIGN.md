@@ -87,7 +87,8 @@ seq 升序重放同一批记录，把计数器重建到 LEO。
 3. 通过校验后：追加到 slot WAL 尾部，原子更新三个索引
    （command 索引 / 聚合版本索引 / seq 计数器），返回 `status=success`。
 
-错误 ID 表：
+错误 ID 表（定义在 `pkg/client/errs.go`——客户端按 ID 分支处理，服务端引用
+同一张表作答，`internal/data` 只做命名别名；钉测防漂移）：
 
 | 错误 ID | 名称 | 含义 |
 |---|---|---|
@@ -467,7 +468,7 @@ Body: Record*，每条记录：
   http://127.0.0.1:8591`，`PUSHUPES_CLIENT`）**：proto3 契约
   `proto/pushupes/v1/events.proto`（`pushupes.v1.EventService`：`BatchAppend`（写入唯一入口）+
   `ReadStream` + `ReadTails` + `ReadByCommand` +
-  `ReadVersionByTime`）。body 为原始
+  `ReadVersionByTime` + `PrefetchRoutes`）。body 为原始
   bytes，无 JSON/base64 层。client 面 gRPC 消息上限由 `-grpc-max-msg-size`
   配置（默认 4MiB，recv/send 同值）：`BatchAppend` 一整批要装进这个上限，
   批次大小随它一起调。
@@ -475,6 +476,17 @@ Body: Record*，每条记录：
   Peer 同时记 PeerAddr/AdminAddr/ClientAddr），客户端据此重连。本节点既无槽又无副本
   时，服务端向 leader 的 client 面代理转发（`ReadProxyAddr` 返回 leader
   client 地址）。
+
+  **`PrefetchRoutes` 是客户端的路由预取接口**：无请求参数（路由表是集群级
+  状态，不是逐查询的答案），返回 `node_client_addrs`（集群各节点 client 面
+  地址，首次出现序去重）与 `slot_node_index`（按槽号稠密排列的 leader 地址
+  下标；**数组长度就是集群槽数**）。客户端初始调用一次、此后周期性刷新，
+  写入命中 MOVED 时也即时修补本地路由行——路由表只是**提示**，写入正确性
+  由 MOVED/ASK 重定向自愈定义，不依赖表的新旧。任何节点都能回答（表经
+  Raft 复制）。客户端可见的只有**算法**：槽计算 `SlotOf` 与错误 ID 表落在
+  `pkg/client`（`slot.go`/`errs.go`），服务端代码引用同一实现（算法一致性
+  有钉测）；**槽数对客户端代码不可见**——客户端不硬编码它，从
+  `PrefetchRoutes` 应答的数组长度读取。
 - **admin 面（HTTP，默认 `-admin http://127.0.0.1:8091`，`PUSHUPES_ADMIN`）**：**仅管理**——
   status/writes/plan/migrate/槽 describe/healthz/pprof，**不承载任何节点间流量**
   （原 `/internal/*` 复制/迁移端点已全部迁到 peer 面 PeerService gRPC，admin HTTP
@@ -500,6 +512,7 @@ gRPC  EventService/ReadStream     范围查询（≤HW 语义）
 gRPC  EventService/ReadByCommand  command_id 幂等探针
 gRPC  EventService/ReadTails      批量取多个聚合的最新版本（resume 扫描用；按槽分组一次 RPC，非持有者按目标节点成组转发）
 gRPC  EventService/ReadVersionByTime  按聚合 id + unix_time 查询「时间戳早于或等于给定时间」的最大 version（客户端按时间点追溯历史：先定锚点版本，再 ReadStream 回放；恰好写在给定时刻的记录计入锚点；0=该时间点及之前无可见记录；从索引作答、不读 WAL 帧；按本节点 durable LEO 约束，非持有者代理转发）
+gRPC  EventService/PrefetchRoutes  路由表预取（无请求参数；返回全集群节点 client 地址表 + 按槽稠密的 leader 下标表，长度即槽数；客户端初始一次 + 周期刷新 + MOVED 即时修补）
 
 # ---- peer 面（PeerService gRPC，与 Raft 同端口，proto/pushupes/v1/peer.proto）----
 gRPC  PeerService/MFetch          副本拉取（长轮询，多槽复用，payload=裸 WAL 字节）
@@ -773,7 +786,12 @@ pushupes/
 ├── DESIGN.md
 ├── go.mod                     # module github.com/berkaroad/pushupes
 ├── cmd/pushupes/              # 入口：装配 storage + cluster + api（admin）+ grpcapi（client）
-├── internal/data/             # 领域类型、WAL 编解码、槽路由哈希、错误码
+├── pkg/client/                # 客户端契约：槽算法 SlotOf（slot.go）+ 错误 ID 表（errs.go）。
+│                              #   服务端代码引用同一实现（internal/data 只做命名别名）；
+│                              #   仓库内的客户端工具（bench/batchsmoke/grpccheck/seed/slotcheck）
+│                              #   只允许 import pkg/ 下的包（契约守门 scripts/check-client-imports.sh），
+│                              #   槽数不在契约内——从 PrefetchRoutes 应答长度读取
+├── internal/data/             # 领域类型、WAL 编解码、槽路由哈希（委托 pkg/client）、错误码（引用 pkg/client）
 ├── internal/storage/          # WalSegment / Slot(WAL) / Store：
 │   │                          #   追加、幂等/版本校验、恢复、字节区间读
 │   ├── segment.go  slot.go  store.go
@@ -783,7 +801,7 @@ pushupes/
 │   │                          #   peer_mux.go（peer 端口首字节分流 Raft/gRPC），
 │   │                          #   migration.go（六步热迁移），register.go（地址自报 announcer+RPC）
 ├── internal/api/              # handler.go（仅管理：status/writes/plan/migrate/describe/pprof），server.go
-├── internal/grpcapi/          # gRPC 客户端数据面：server.go（BatchAppend/ReadStream/ReadTails/ReadByCommand/ReadVersionByTime）
+├── internal/grpcapi/          # gRPC 客户端数据面：server.go（BatchAppend/ReadStream/ReadTails/ReadByCommand/ReadVersionByTime/PrefetchRoutes）
 └── proto/pushupes/v1/         # events.proto 客户端契约 + peer.proto 节点间契约（含 buf 工具链，生成至 pkg/grpcapi）
 ```
 
@@ -904,6 +922,14 @@ K=4096/2048/1024 则对 3/5/7 全部
 max/mean ≤ 1.008），所以均衡不是选 K 的理由，这个不变性才是。
 
 ### 7.2.4 槽位分布均匀性：CRC16 对结构化 id 非均匀（已改为混合哈希）
+
+**算法归属**：`SlotOf` 的实现放在 `pkg/client/slot.go`——槽算法是客户端
+契约的一部分（客户端必须自行算出聚合落哪个槽，才能按 `PrefetchRoutes`
+的路由行直接写 leader），服务端代码引用同一实现（`internal/data.SlotOf`
+只做委托，委托一致性有钉测）。**总槽数不在契约内**：客户端代码不硬编码
+它，从 `PrefetchRoutes` 应答的数组长度读取；`data.DefaultSlotCount` 只是
+服务端建库默认值。算法改动 = 客户端兼容性事故，所以 `pkg/client` 带金标
+向量测试（另一语言独立实现算出），任何漂移都会先撞上它。
 
 实测 CRC16/XMODEM 的 16 位原始直方图：随机 UUID `chi2/df = 1.001`，而
 零填充顺序号（`agg-%07d`、`tenant-42-%07d`）为 **1.606** —— 哈希本身对结构化 id
