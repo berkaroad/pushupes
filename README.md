@@ -82,6 +82,30 @@ client-streaming 分块流式搬运，≤4MiB/块，两端内存只占单块大�
 - 客户端路由：本地缓存 `slot → node`，收到 MOVED(1003)/ASK(1004) 即刷新；
   幂等规则保证转发期间的写入不产生重复。
 
+### 节点级流控（令牌桶）
+
+- 流控是**节点级旋钮**：`POST /admin/flow-control {"tokens":N,"period":"1s"}`
+  打到哪个节点就只对该节点生效，且预算也在节点层——该节点作为 leader 的所有槽
+  共享一个令牌桶，任何 leader 槽的一次事件流写入从桶里取一个令牌；控制与设置的
+  粒度一致。副本写入走复制落地路径，不消耗令牌。
+- 令牌模型是「取走即登记归还时间点」：一次取令牌记下取走时刻 + `period` 为它的
+  归还点，每次取之前把所有已到期的时间点一次性归还（最小堆扫堆头）。桶空即写入
+  报 `fail/1006`（记录不落 WAL、不等高水位），稳态写入上限 = `tokens / period`。
+  业务失败（1001 版本冲突 / 1002 参数非法）与 WAL 写错误立即退还令牌；`exists`
+  （幂等重试）与高水位超时（1005）不退——按写入请求计费，重放不会免费穿透流控。
+- 配置不进集群共识、不落盘，进程重启回到不限流；`DELETE /admin/flow-control` 或
+  `tokens<=0` / `period<=0` 都是不限流。它是运维应急面，与副本策略（集群级、
+  持久化）分属两层。机制细节（换代语义、批内逐条计费、栅栏顺序）见 DESIGN.md §6.2。
+- **客户端库把 1006 吸收为回压**：`pkg/client` 的 `BatchAppend` 从不把 1006 交给
+  调用方——被拒的记录进入回退环，持有该节点的闸门（每节点一个），每
+  `FlowBackoff`（默认 100ms）只重发被拒子集，直到一轮应答干净才放闸；闸门关闭
+  期间，发往该节点的后续写请求全部在闸门外排队，其他节点与读路径不受影响。等待
+  发生在尝试预算之外（限流是等待，不是重试），重发安全靠 `command_id` 幂等兜底。
+  观测面 `Client.FlowPauses()` 数被拒的重发轮次。
+- 控制台在集群页的节点卡片上呈现：橙色「流控」tag = 该节点配置了流控；检测到
+  该节点拒绝写入时 tag 持续闪烁 3 秒（每轮新检测都续期，末次触发 3s 后熄灭）。
+  卡片上的「流控」按钮打开设置 modal，直发该节点。
+
 ### 内存与容量设计
 
 内存开销主体由**记录条数**驱动。实测常数：命令布隆过滤器 1.25 B/条、未封段
@@ -92,7 +116,8 @@ seq 8 B/条、段稀疏索引 16 B/每 64 KiB 数据。配合「封段后把 seq
 
 ### 管理控制台（frontend/）
 
-React 18 + antd 5 + Vite，提供集群页（含运行中添加 Raft 节点）与槽位管理：槽位表（状态/副本/总字节、
+React 18 + antd 5 + Vite，提供集群页（含运行中添加 Raft 节点、节点卡片的流控
+tag 与设置入口）与槽位管理：槽位表（状态/副本/总字节、
 迁移弹窗、待清理副本置灰）、槽详情抽屉（HW/LastSeq/ISR + 写入速率折线图，
 2s 轮询）、事件流列表（只读内存索引，不触发 WAL 扫描）。支持 light/dark
 主题。
@@ -219,12 +244,15 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 
 错误 ID：`1001` 版本冲突（附 current_version）、`1002` 参数非法、
 `1003` MOVED、`1004` ASK、`1005` 本节点非 controller（admin 写命令专用，
-响应附 `controller` 与 `controller_admin_addr`）。
+响应附 `controller` 与 `controller_admin_addr`）、`1006` 本节点流控拒绝
+（见「节点级流控」；经 `pkg/client` 写入时该码被库吸收为回压，调用方看不到它）。
 
 admin 面 HTTP（仅管理）：`GET /admin/cluster/status`、`GET /admin/writes`、
 `GET /admin/slots/{slot}/describe`、`GET /admin/slots/{slot}/streams`、
 `POST /admin/slots/{slot}/migrate`、`POST /admin/slots/{slot}/remove-replica`、
-`POST /admin/cluster/plan`、`POST /admin/cluster/replica-policy`、`GET /healthz`、`/debug/pprof/`。
+`POST /admin/cluster/plan`、`POST /admin/cluster/replica-policy`、
+`POST/GET/DELETE /admin/flow-control`（节点本地：收到请求的节点就是被设置/查询/
+恢复的节点）、`GET /healthz`、`/debug/pprof/`。
 **控制器专属写命令（migrate/remove-replica/plan/replica-policy）必须直接发到 Raft leader 的
 admin 地址**，follower 一律拒绝（425 + 1005），不做转发。
 
@@ -242,6 +270,10 @@ go run ./cmd/bench -nodes http://127.0.0.1:8591,http://127.0.0.1:8592,http://127
 
 # BatchAppend 冒烟（经 pkg/client 客户端库：success/exists/1001/批内重复拒绝/回读断言）
 go run ./cmd/batchsmoke -nodes http://127.0.0.1:8591,http://127.0.0.1:8592,http://127.0.0.1:8593
+
+# 流控回压冒烟（经 pkg/client：给 -admin 节点设 N tokens/period，并发写断言
+# 调用方零 1006 零失败——节点拒绝全部被库的回压吸收）
+go run ./cmd/flowcheck -seed http://127.0.0.1:8591 -admin 127.0.0.1:8091 -tokens 2 -period 1s
 
 # 单槽灌数据（容量/恢复调试）
 go run ./cmd/seed -slot 7 -mib 512
