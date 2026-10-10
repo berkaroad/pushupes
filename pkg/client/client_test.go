@@ -17,6 +17,7 @@ package client
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -128,6 +129,244 @@ func fakeCluster(t *testing.T, n int) ([]*fakeNode, []string) {
 
 func rec(id string) *pushupesv1.AppendRequest {
 	return &pushupesv1.AppendRequest{AggregateId: id, Version: 1, CommandId: "cmd-" + id}
+}
+
+// ---- flow-control backpressure ----
+
+// throttleResp builds a per-record all-1006 batch answer: a node whose
+// token bucket is empty refuses every record of the batch it received.
+func throttleResp(req *pushupesv1.BatchAppendRequest) *pushupesv1.BatchAppendResponse {
+	out := &pushupesv1.BatchAppendResponse{}
+	for _, r := range req.Records {
+		out.Results = append(out.Results, &pushupesv1.BatchAppendResult{
+			AggregateId: r.AggregateId,
+			Response: &pushupesv1.AppendResponse{
+				Status: pushupesv1.AppendResponse_STATUS_FAIL, ErrId: ErrIDFlowControl,
+			},
+		})
+	}
+	return out
+}
+
+func TestClientFlowControlRetriesUntilClean(t *testing.T) {
+	nodes, addrs := fakeCluster(t, 1)
+	node := nodes[0]
+	node.onAppend = func(n int, req *pushupesv1.BatchAppendRequest) *pushupesv1.BatchAppendResponse {
+		if n < 2 {
+			return throttleResp(req) // refused twice, clean on the third answer
+		}
+		return nil
+	}
+	c, err := New([]string{addrs[0]}, &Config{RouteRefresh: time.Hour, FlowBackoff: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resps, err := c.BatchAppend(ctx, []*pushupesv1.AppendRequest{rec("fc-a"), rec("fc-b")})
+	if err != nil {
+		t.Fatalf("lastErr = %v", err)
+	}
+	for i, r := range resps {
+		if r == nil {
+			t.Fatalf("record %d unanswered", i)
+		}
+		if r.GetErrId() == ErrIDFlowControl {
+			t.Fatalf("record %d answered the raw 1006: the library must absorb it", i)
+		}
+		if r.GetStatus() != pushupesv1.AppendResponse_STATUS_SUCCESS {
+			t.Fatalf("record %d status = %v", i, r.GetStatus())
+		}
+	}
+	if got := len(node.calls()); got != 3 {
+		t.Fatalf("node saw %d batches, want 3 (two refused, one clean)", got)
+	}
+	if c.FlowPauses() < 2 {
+		t.Fatalf("FlowPauses = %d, want >= 2 (each refused round counts)", c.FlowPauses())
+	}
+}
+
+// TestClientFlowControlGateIsPerNode proves the pause is scoped to the
+// throttled node: while node 0 (slot 0 leader, "a-*" aggregates) is in
+// backpressure, writes routed to node 1 (slot 1 leader, "b-*" aggregates)
+// must flow through untouched — a gate is one node's ledger, and parking
+// a healthy node's writers would turn one throttle into a client-wide
+// outage.
+func TestClientFlowControlGateIsPerNode(t *testing.T) {
+	nodes, addrs := fakeCluster(t, 2)
+	// pick two aggregates whose slots land on DIFFERENT nodes, then the
+	// throttled node is A's leader, wherever the table puts it.
+	if SlotOf("a-x", 8)%2 == SlotOf("b-x", 8)%2 {
+		t.Fatalf("fixture assumption broken: a-x slot %d, b-x slot %d share a node", SlotOf("a-x", 8), SlotOf("b-x", 8))
+	}
+	a := nodes[SlotOf("a-x", 8)%2] // the throttled node (A's leader)
+	b := nodes[SlotOf("b-x", 8)%2] // the healthy node (B's leader)
+	a.onAppend = func(n int, req *pushupesv1.BatchAppendRequest) *pushupesv1.BatchAppendResponse {
+		return throttleResp(req) // A's node never recovers during the window
+	}
+	c, err := New([]string{addrs[0]}, &Config{RouteRefresh: time.Hour, FlowBackoff: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// A's call enters backpressure and parks its node's gate (the gate is
+	// created closed by the first refused answer; every later refused
+	// round keeps holding it).
+	errA := make(chan error, 1)
+	go func() {
+		_, err := c.BatchAppend(ctx, []*pushupesv1.AppendRequest{rec("a-x")})
+		errA <- err
+	}()
+	// Give A its first refused round (one RPC + one 50ms sleep): the gate
+	// is definitely closed when B starts.
+	time.Sleep(120 * time.Millisecond)
+
+	t0 := time.Now()
+	resps, err := c.BatchAppend(ctx, []*pushupesv1.AppendRequest{rec("b-x")})
+	waited := time.Since(t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resps[0] == nil || resps[0].GetStatus() != pushupesv1.AppendResponse_STATUS_SUCCESS {
+		t.Fatalf("B answered %v", resps[0])
+	}
+	// B rides one uncontended RPC: if the pause were client-wide (or the
+	// gate keyed by something other than the node), B would have waited
+	// behind A's never-ending backpressure until the ctx deadline.
+	if waited > 2*time.Second {
+		t.Fatalf("B waited %v while A's node was throttled: the pause leaked across nodes", waited)
+	}
+	if len(b.calls()) == 0 {
+		t.Fatal("the healthy node never saw B's batch")
+	}
+	// And B's batch must not have been swallowed by the throttled node's
+	// ledger: only A's aggregate went there.
+	for _, req := range a.calls() {
+		for _, r := range req.Records {
+			if strings.HasPrefix(r.GetAggregateId(), "b-") {
+				t.Fatalf("B's record %q hit the throttled node", r.GetAggregateId())
+			}
+		}
+	}
+
+	// Now clear the throttle: A's next re-send must land and its
+	// call must finish — the per-node gate did not corrupt A's own
+	// recovery path either.
+	a.mu.Lock()
+	a.onAppend = nil
+	a.mu.Unlock()
+	if err := <-errA; err != nil {
+		t.Fatalf("A returned %v after its node recovered", err)
+	}
+}
+
+func TestClientFlowControlGateParksConcurrentWriters(t *testing.T) {
+	nodes, addrs := fakeCluster(t, 1)
+	node := nodes[0]
+	node.onAppend = func(n int, req *pushupesv1.BatchAppendRequest) *pushupesv1.BatchAppendResponse {
+		if n < 3 {
+			return throttleResp(req) // A's stretch: three refused rounds, then clean
+		}
+		return nil
+	}
+	c, err := New([]string{addrs[0]}, &Config{RouteRefresh: time.Hour, FlowBackoff: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	errA := make(chan error, 1)
+	go func() {
+		_, err := c.BatchAppend(ctx, []*pushupesv1.AppendRequest{rec("gate-a")})
+		errA <- err
+	}()
+	// A is inside its backpressure window after ~5ms of RPC time: its
+	// refused answer came back and the gate closed before B starts.
+	time.Sleep(30 * time.Millisecond)
+	t0 := time.Now()
+	resps, err := c.BatchAppend(ctx, []*pushupesv1.AppendRequest{rec("gate-b")})
+	waited := time.Since(t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errA; err != nil {
+		t.Fatal(err)
+	}
+	if resps[0] == nil || resps[0].GetErrId() == ErrIDFlowControl {
+		t.Fatalf("B answered %v", resps[0])
+	}
+	// B parked for at least A's remaining refused rounds (3 sleeps of
+	// 100ms, minus the 30ms head start) — a client that did NOT pause
+	// would have been answered in ~one RPC.
+	if waited < 250*time.Millisecond {
+		t.Fatalf("B returned after %v: the gate did not park it", waited)
+	}
+	calls := node.calls()
+	if len(calls) < 4 {
+		t.Fatalf("node saw %d batches, want >= 4", len(calls))
+	}
+	for i, req := range calls[:len(calls)-1] {
+		if strings.HasPrefix(req.Records[0].GetAggregateId(), "gate-b") {
+			t.Fatalf("batch #%d (%s) landed before A's backpressure ended: concurrent writers bypassed the gate", i, req.Records[0].GetAggregateId())
+		}
+	}
+	if calls[len(calls)-1].Records[0].GetAggregateId() != "gate-b" {
+		t.Fatalf("last batch is not B's: %v", calls[len(calls)-1].Records[0].GetAggregateId())
+	}
+}
+
+func TestClientFlowControlCancelledHolderReleasesGate(t *testing.T) {
+	nodes, addrs := fakeCluster(t, 1)
+	node := nodes[0]
+	node.onAppend = func(n int, req *pushupesv1.BatchAppendRequest) *pushupesv1.BatchAppendResponse {
+		return throttleResp(req) // the throttle never clears
+	}
+	c, err := New([]string{addrs[0]}, &Config{RouteRefresh: time.Hour, FlowBackoff: 30 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// A holder whose ctx dies must release the gate: a cancelled holder
+	// that left it closed would strand every later writer on the node.
+	ctxA, cancelA := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancelA()
+	if _, err := c.BatchAppend(ctxA, []*pushupesv1.AppendRequest{rec("dead-a")}); err == nil {
+		t.Fatal("cancelled holder returned no error")
+	}
+
+	// The next call rides a fresh script (throttle the first batch, then
+	// clean) — a stuck gate would hang it past the deadline instead of
+	// answering. seen flips only inside onAppend, and the two rounds are
+	// ordered by the RPC responses on this one goroutine.
+	node.mu.Lock()
+	seen := false
+	node.onAppend = func(n int, req *pushupesv1.BatchAppendRequest) *pushupesv1.BatchAppendResponse {
+		if !seen {
+			seen = true
+			return throttleResp(req)
+		}
+		return nil
+	}
+	node.mu.Unlock()
+	cleanCtx, cancelClean := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelClean()
+	resps, err := c.BatchAppend(cleanCtx, []*pushupesv1.AppendRequest{rec("dead-b")})
+	if err != nil {
+		t.Fatalf("post-cancel call failed: %v", err)
+	}
+	if resps[0] == nil || resps[0].GetErrId() == ErrIDFlowControl {
+		t.Fatalf("post-cancel call answered %v: gate stuck closed", resps[0])
+	}
 }
 
 func TestClientSeedsRoutingAndWritesLeadersDirectly(t *testing.T) {

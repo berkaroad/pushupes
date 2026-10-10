@@ -34,21 +34,30 @@ type Config struct {
 	RouteRefresh time.Duration // slot->leader table re-fetch interval; 0 = fetch once at startup (default 30s)
 	Attempts     int           // max send rounds per BatchAppend call, retries of redirected records included (default 3)
 	CallTimeout  time.Duration // per-attempt RPC timeout inside BatchAppend (default 10s)
+	FlowBackoff  time.Duration // pause after a node answers 1006 (flow control); the refused records re-send and the node's gate stays closed until one answer comes back un-throttled (default 100ms)
 }
 
 // Client talks to a pushupes cluster's data plane: routing resolved and
 // maintained by PrefetchRoutes (seeded at New, refreshed on a timer,
 // patched per MOVED/ASK in between), one long-lived gRPC connection per
-// node address shared by every call, and per-record redirect self-heal on
-// the write path. Business rules (idempotency, version checks) pass
-// through untouched: a Client answers what the cluster answered.
+// node address shared by every call, per-record redirect self-heal on
+// the write path, and flow-control backpressure: a node that answers 1006
+// gets its refused records re-sent every FlowBackoff (default 100ms) while
+// a per-node gate stays closed, pausing every later write to that node
+// until one re-send comes back un-throttled. Business rules (idempotency,
+// version checks) pass through untouched: a Client answers what the
+// cluster answered — except the 1006 itself, which the library absorbs as
+// waiting rather than relaying.
 type Client struct {
 	cfg         Config
 	connsMu     sync.Mutex
 	conns       map[string]*grpc.ClientConn
+	gatesMu     sync.Mutex
+	gates       map[string]*gateT // per-node flow-control gate; created open on the first 1006, kept until the Client is dropped
 	routes      *routeTable
 	rr          atomic.Uint64 // round-robin cursor for entry picks
 	redirects   atomic.Uint64
+	flowPauses  atomic.Uint64
 	refreshStop chan struct{}
 	refreshOnce sync.Once
 }
@@ -82,6 +91,9 @@ func New(nodes []string, cfg *Config) (*Client, error) {
 	if c.cfg.CallTimeout <= 0 {
 		c.cfg.CallTimeout = 10 * time.Second
 	}
+	if c.cfg.FlowBackoff <= 0 {
+		c.cfg.FlowBackoff = 100 * time.Millisecond
+	}
 	c.routes = &routeTable{entries: entries, client: c}
 	if err := c.routes.fetch(); err != nil {
 		return nil, err
@@ -99,6 +111,13 @@ func (c *Client) SlotCount() int { return c.routes.slotCountNow() }
 // the local table since New — a nonzero count on a healthy cluster means
 // the refresh period is too long for the churn, not an error.
 func (c *Client) Redirects() uint64 { return c.redirects.Load() }
+
+// FlowPauses counts the 1006-answered re-send rounds the write path has
+// run since New: one per refused answer (the first batch and every
+// FlowBackoff retry). Growth means some node's token bucket is actively
+// refusing this client's writes — the library is absorbing it as waiting,
+// not surfacing it as an error.
+func (c *Client) FlowPauses() uint64 { return c.flowPauses.Load() }
 
 // Close stops the route refresh loop and releases every cached connection.
 func (c *Client) Close() error {
@@ -133,6 +152,129 @@ func (c *Client) event(addr string) pushupesv1.EventServiceClient {
 	return pushupesv1.NewEventServiceClient(cc)
 }
 
+// ---- flow-control gate --------------------------------------------------
+
+// gateT is one node's gate. While the node refuses appends (1006 — the
+// operator throttle at its node-wide token bucket), the goroutine that
+// entered backpressure HOLDS the gate: it sleeps FlowBackoff, re-sends the
+// refused records, and keeps holding until an answer comes back without a
+// single 1006, then releases. Every other write destined for that node
+// parks meanwhile — the pause is what keeps a throttled node from being
+// hammered by a whole fleet of concurrent callers. The open flag is one
+// atomic so the fast path (gate open, the overwhelming majority of calls)
+// costs a single load and no lock; mu guards the flag flip and the wake
+// channel, which release CLOSES and remakes — a close broadcasts, so
+// every parked waiter re-checks the flag at once (a 1-slot signal would
+// wake only one and strand the rest behind a stale channel).
+type gateT struct {
+	open atomic.Bool
+	wake chan struct{} // closed on release, then remade; readers take the ref under mu
+	mu   sync.Mutex
+}
+
+// gateFor returns the addr's gate, creating it OPEN on first sight (an
+// addr with no gate has never refused this client a write). Entries are
+// only created, never removed, so a pointer returned here stays valid for
+// the Client's lifetime.
+func (c *Client) gateFor(addr string) *gateT {
+	c.gatesMu.Lock()
+	defer c.gatesMu.Unlock()
+	if c.gates == nil {
+		c.gates = map[string]*gateT{}
+	}
+	g := c.gates[addr]
+	if g == nil {
+		g = &gateT{wake: make(chan struct{})}
+		g.open.Store(true)
+		c.gates[addr] = g
+	}
+	return g
+}
+
+// peekGate looks a gate up WITHOUT creating one: the send loop asks before
+// every batch, and a node that has never throttled this client stays a
+// single map miss away from the fast path.
+func (c *Client) peekGate(addr string) *gateT {
+	c.gatesMu.Lock()
+	defer c.gatesMu.Unlock()
+	return c.gates[addr]
+}
+
+func (g *gateT) isOpen() bool { return g.open.Load() }
+
+// waitOpen parks until the gate reopens or ctx dies. The channel ref is
+// read under mu: a release that lands between the open-check and the
+// select must still wake this waiter (closing the channel it holds —
+// read before the swap, so it IS the old one — delivers even a parked
+// receive instantly).
+func (g *gateT) waitOpen(ctx context.Context) error {
+	for {
+		g.mu.Lock()
+		if g.open.Load() {
+			g.mu.Unlock()
+			return nil
+		}
+		ch := g.wake
+		g.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// hold parks the caller until no other goroutine holds the gate, then
+// CLOSES it and returns true — the caller becomes the holder and owns that
+// node's backpressure loop; false means ctx died while parking. The flip
+// is under mu, so concurrent contenders for the same throttle serialize
+// into exactly one holder and never herd retries onto a still-throttled
+// node.
+func (g *gateT) hold(ctx context.Context) bool {
+	for {
+		g.mu.Lock()
+		if g.open.Load() {
+			g.open.Store(false)
+			g.mu.Unlock()
+			return true
+		}
+		ch := g.wake
+		g.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+// release reopens the gate after a clean (1006-free) answer and wakes ALL
+// parked waiters by closing (then remaking) the channel. Holder-only.
+// Woken writers that are BatchAppend callers re-check via the send-loop
+// fast path and ride the next batch open; the next throttle is entered by
+// whichever answer carries a 1006 from then on.
+func (g *gateT) release() {
+	g.mu.Lock()
+	g.open.Store(true)
+	close(g.wake)
+	g.wake = make(chan struct{})
+	g.mu.Unlock()
+}
+
+// sleepCtx sleeps d unless ctx dies first (false = ctx died: the caller
+// gives up its records and releases the gate — a cancelled holder must not
+// leave the node parked forever).
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
 // BatchAppend writes a batch of records through the data plane. Records
 // are grouped by the cached slot leader, one BatchAppend per destination,
 // and MOVED/ASK answers patch that slot's row and re-send just those
@@ -141,7 +283,11 @@ func (c *Client) event(addr string) pushupesv1.EventServiceClient {
 // order of recs; a nil entry means the record was still redirected or
 // unanswered when the attempts ran out — the error (last transport
 // failure, informational) says which. Business outcomes (success/exists/
-// fail with their error ids) are the cluster's, untouched.
+// fail with their error ids) are the cluster's, untouched — EXCEPT flow
+// control: a 1006 never reaches the caller. Refused records are re-sent
+// every Config.FlowBackoff while the node's gate is held closed, parking
+// every later write to that node, until one answer comes back
+// un-throttled (see gateT).
 func (c *Client) BatchAppend(ctx context.Context,
 	recs []*pushupesv1.AppendRequest) ([]*pushupesv1.AppendResponse, error) {
 
@@ -172,6 +318,18 @@ func (c *Client) BatchAppend(ctx context.Context,
 			batch := make([]*pushupesv1.AppendRequest, len(idx))
 			for k, i := range idx {
 				batch[k] = recs[i]
+			}
+			// Flow-control backpressure: park while another caller holds
+			// this node's gate (the node is refusing writes). Waiting
+			// happens OUTSIDE the attempt clock — time behind a gate must
+			// not burn the caller's Attempts — and only costs a map miss
+			// plus one atomic load while no throttle is active.
+			if gate := c.peekGate(addr); gate != nil && !gate.isOpen() {
+				if werr := gate.waitOpen(ctx); werr != nil {
+					lastErr = werr
+					next = append(next, idx...)
+					continue
+				}
 			}
 			cctx, cancel := context.WithTimeout(ctx, c.cfg.CallTimeout)
 			resp, err := c.event(addr).BatchAppend(cctx, &pushupesv1.BatchAppendRequest{Records: batch})
@@ -209,6 +367,7 @@ func (c *Client) BatchAppend(ctx context.Context,
 				next = append(next, idx...)
 				continue
 			}
+			var throttled []int
 			for k, r := range resp.Results {
 				i := idx[k]
 				switch r.Response.GetErrId() {
@@ -218,8 +377,74 @@ func (c *Client) BatchAppend(ctx context.Context,
 					}
 					c.redirects.Add(1)
 					next = append(next, i)
+				case ErrIDFlowControl:
+					throttled = append(throttled, i)
 				default:
 					out[i] = r.Response
+				}
+			}
+			// The node's token bucket refused part of the batch: become the
+			// gate holder (concurrent contenders for the same throttle park
+			// in hold), sleep FlowBackoff, and re-send ONLY the refused
+			// records until an answer carries no 1006, then release the
+			// gate. Re-sending is safe: append idempotency keys on
+			// command_id, so a record the node wrote before throttling
+			// answers exists on the next round, never twice. The loop runs
+			// past Config.Attempts on purpose — Attempts counts REDIRECT
+			// rounds; throttling is waiting, not retrying, and ends when
+			// the node recovers or ctx dies (a dead holder releases the
+			// gate and requeues its records like a transport failure).
+			if len(throttled) > 0 {
+				gate := c.gateFor(addr)
+				if !gate.hold(ctx) {
+					lastErr = ctx.Err()
+					next = append(next, throttled...)
+				} else {
+					c.flowPauses.Add(1)
+					th := throttled
+					for len(th) > 0 {
+						if !sleepCtx(ctx, c.cfg.FlowBackoff) {
+							lastErr = ctx.Err()
+							next = append(next, th...)
+							break
+						}
+						thBatch := make([]*pushupesv1.AppendRequest, len(th))
+						for k, i := range th {
+							thBatch[k] = recs[i]
+						}
+						cctx, cancel := context.WithTimeout(ctx, c.cfg.CallTimeout)
+						thResp, thErr := c.event(addr).BatchAppend(cctx, &pushupesv1.BatchAppendRequest{Records: thBatch})
+						cancel()
+						if thErr != nil {
+							lastErr = thErr
+						}
+						if thErr != nil || len(thResp.GetResults()) != len(thBatch) {
+							next = append(next, th...)
+							break
+						}
+						var again []int
+						for k, r := range thResp.Results {
+							i := th[k]
+							switch r.Response.GetErrId() {
+							case ErrIDSlotNotLocal, ErrIDMigrating:
+								if r.Response.GetNode() != "" {
+									c.routes.patch(c.slotOf(recs[i].AggregateId), hostPort(r.Response.GetNode()))
+								}
+								c.redirects.Add(1)
+								next = append(next, i)
+							case ErrIDFlowControl:
+								again = append(again, i)
+							default:
+								out[i] = r.Response
+							}
+						}
+						if len(again) == 0 {
+							break
+						}
+						th = again
+						c.flowPauses.Add(1)
+					}
+					gate.release()
 				}
 			}
 		}
