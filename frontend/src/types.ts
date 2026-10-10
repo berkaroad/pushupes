@@ -131,7 +131,7 @@ export interface NodeWrites {
 
 // FlowControlView is the config shape /admin/writes reports per node.
 export interface FlowControlView {
-  tokens_per_slot: number
+  tokens: number
   period_ms: number
   configured: boolean
 }
@@ -141,7 +141,7 @@ export interface FlowControlView {
 // tallies (node total + per-slot list).
 export interface FlowControlDetail {
   node?: string
-  tokens_per_slot: number
+  tokens: number
   period: string
   period_ms: number
   unlimited: boolean

@@ -67,9 +67,29 @@ export default function ClusterPage() {
   // no redirect, whichever node answers is the node it governs.
   const [flowConfigured, setFlowConfigured] = useState<Record<string, boolean>>({})
   const flowConfiguredRef = useRef<Record<string, boolean>>({})
+  // flowFiring marks nodes whose 流控 tag blinks: set when a 2s poll sees
+  // ANY growth in that node's per-slot hit arrays (the throttle fired in
+  // the window), and cleared 3s later. Sustained throttling grows the
+  // counters on every successive sample, which re-arms the timer — the
+  // tag keeps blinking while refusals keep landing and settles 3s after
+  // the last one. Timers live in a ref map so a re-arm cancels cleanly.
+  const [flowFiring, setFlowFiring] = useState<Record<string, boolean>>({})
+  const flowFiringTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
+  // per-node last snapshot of flow_control_hits, keyed by admin addr.
+  const lastFlowHits = useRef<Record<string, number[]>>({})
+  const fireFlow = (id: string) => {
+    setFlowFiring((m) => (m[id] ? m : { ...m, [id]: true }))
+    clearTimeout(flowFiringTimers.current[id])
+    flowFiringTimers.current[id] = setTimeout(() => {
+      setFlowFiring((m) => {
+        const { [id]: _drop, ...rest } = m
+        return rest
+      })
+    }, 3000)
+  }
   const [flowTarget, setFlowTarget] = useState<{ id: string; addr: string } | null>(null)
   const [flowBusy, setFlowBusy] = useState(false)
-  const [fForm] = Form.useForm<{ tokens_per_slot: number; period: string }>()
+  const [fForm] = Form.useForm<{ tokens: number; period: string }>()
 
   const refresh = useCallback(async () => {
     try {
@@ -121,6 +141,20 @@ export default function ClusterPage() {
         for (const p of Object.values(st.peers)) {
           const m = perNode[p.admin_addr]
           fc[p.id] = m ? !!m.flow_control?.configured : (flowConfiguredRef.current[p.id] ?? false)
+          // Fire detection: any growth in this node's per-slot refusal
+          // counters since ITS last sample means a token-less write was
+          // rejected at one of the slots it leads. The budget is node-wide
+          // but the counts stay per-slot, so a plain array scan sees every
+          // fire anywhere on the node. First sample only stores, never
+          // fires (the counters survive restarts? no — a restart resets
+          // them, but a page load against a throttled node must not blink
+          // on the baseline it has no history of).
+          const hits = m?.flow_control_hits
+          if (hits && hits.length) {
+            const before = lastFlowHits.current[p.admin_addr]
+            lastFlowHits.current[p.admin_addr] = hits
+            if (before && hits.some((h, i) => (before[i] ?? 0) < h)) fireFlow(p.id)
+          }
         }
         flowConfiguredRef.current = fc
         setFlowConfigured(fc)
@@ -149,7 +183,8 @@ export default function ClusterPage() {
     }
     tick()
     const t = setInterval(tick, WRITES_POLL_MS)
-    return () => { stop = true; clearInterval(t) }
+    const firingTimers = flowFiringTimers.current
+    return () => { stop = true; clearInterval(t); Object.values(firingTimers).forEach(clearTimeout) }
   }, [])
 
   const doAdd = async () => {
@@ -283,7 +318,7 @@ export default function ClusterPage() {
     try {
       const d: FlowControlDetail = await fetchFlowControl(addr)
       fForm.setFieldsValue({
-        tokens_per_slot: d.unlimited ? undefined : d.tokens_per_slot,
+        tokens: d.unlimited ? undefined : d.tokens,
         period: d.unlimited ? undefined : (d.period && d.period !== '0s' ? d.period : undefined),
       })
     } catch {
@@ -294,10 +329,10 @@ export default function ClusterPage() {
 
   const doFlowSave = async () => {
     if (!flowTarget) return
-    const { tokens_per_slot, period } = await fForm.validateFields()
+    const { tokens, period } = await fForm.validateFields()
     setFlowBusy(true)
     try {
-      const n = Number(tokens_per_slot)
+      const n = Number(tokens)
       if (!n || n <= 0 || !period) {
         // The form's own zero/empty rule is the clear path: DELETE matches
         // "POST 0 tokens" in the backend and reads cleaner in its answer.
@@ -305,7 +340,7 @@ export default function ClusterPage() {
         message.success(`节点 ${flowTarget.id} 已恢复不限流`)
       } else {
         await setFlowControl(flowTarget.addr, n, String(period).trim())
-        message.success(`节点 ${flowTarget.id} 流控已设置：每 leader 槽 ${n} 条 / ${String(period).trim()}`)
+        message.success(`节点 ${flowTarget.id} 流控已设置：节点 ${n} 条 / ${String(period).trim()}（全部 leader 槽共享）`)
       }
       setFlowTarget(null)
     } catch (e: any) {
@@ -466,6 +501,7 @@ export default function ClusterPage() {
                 onRemove={isOnlinePeer(p) || p.id === status.node ? undefined : askRemove}
                 removing={removingId === p.id}
                 flowControlConfigured={flowConfigured[p.id] ?? false}
+                flowControlFiring={!!flowFiring[p.id]}
                 onFlowControl={isOnlinePeer(p) ? openFlowControl : undefined} />
             </Col>
           ))}
@@ -492,10 +528,10 @@ export default function ClusterPage() {
       </Modal>
       {/* The per-node flow-control modal. Node-local: saving posts to the
           target node's own admin plane, never the controller. The body
-          spells out what the numbers mean — every slot THIS node leads gets
-          a token bucket of N per period; a write without a token fails
-          1006 FlowControl. Empty/0 on either field means unlimited and is
-          saved as a DELETE. */}
+          spells out what the numbers mean — ONE node-wide token bucket of
+          N per period, shared by every slot THIS node leads; a write
+          without a token fails 1006 FlowControl. Empty/0 on either field
+          means unlimited and is saved as a DELETE. */}
       <Modal open={!!flowTarget} onCancel={() => setFlowTarget(null)}
         title={`节点流控：${flowTarget?.id ?? ''}`} width={460}
         footer={[
@@ -504,16 +540,16 @@ export default function ClusterPage() {
           <Button key="save" type="primary" loading={flowBusy} onClick={doFlowSave}>保存</Button>,
         ]}>
         <Typography.Paragraph type="secondary" style={{ marginBottom: 12 }}>
-          仅作用于本节点（重启后回到不限流）：该节点作为 leader 的每个槽各得一个令牌桶，
-          桶内令牌取完后写入事件流报 <Typography.Text code>1006 FlowControl</Typography.Text>，
+          仅作用于本节点（重启后回到不限流）：该节点作为 leader 的所有槽共享一个令牌桶，
+          任一槽的写入取不到令牌即报 <Typography.Text code>1006 FlowControl</Typography.Text>，
           被取走的令牌在「限流周期」到期后归还。
         </Typography.Paragraph>
         <Form form={fForm} layout="vertical">
-          <Form.Item name="tokens_per_slot" label="每槽令牌数（tokens_per_slot）">
+          <Form.Item name="tokens" label="节点令牌数（tokens）">
             <InputNumber min={1} style={{ width: '100%' }} placeholder="如 100；留空或 0 = 不限流" />
           </Form.Item>
           <Form.Item name="period" label="限流周期（period）"
-            extra={'Go 时长字符串，如 "1s"、"500ms"、"1m"。每槽稳态写入上限 = 令牌数 / 周期。'}>
+            extra={'Go 时长字符串，如 "1s"、"500ms"、"1m"。节点稳态写入上限 = 令牌数 / 周期（跨该节点全部 leader 槽）。'}>
             <Input placeholder="如 1s；留空 = 不限流" />
           </Form.Item>
         </Form>

@@ -405,15 +405,16 @@ export async function fetchFlowControl(addr: string): Promise<FlowControlDetail>
   return data
 }
 
-// setFlowControl POSTs {tokens_per_slot, period}; period is a Go duration
-// string ("1s", "500ms"). tokens_per_slot<=0 or an empty/"0s" period sets
-// the node unlimited (the same effect as clearFlowControl).
+// setFlowControl POSTs {tokens, period}; period is a Go duration string
+// ("1s", "500ms"). The budget is ONE node-wide bucket shared by every slot
+// the node leads; tokens<=0 or an empty/"0s" period sets the node unlimited
+// (the same effect as clearFlowControl).
 export async function setFlowControl(
-  addr: string, tokensPerSlot: number, period: string,
+  addr: string, tokens: number, period: string,
 ): Promise<FlowControlDetail> {
   const { data } = await axios.post<FlowControlDetail>(
     `${normalizeAdminBase(addr)}/admin/flow-control`,
-    { tokens_per_slot: tokensPerSlot, period },
+    { tokens, period },
     { timeout: 5000 },
   )
   return data

@@ -1,0 +1,12 @@
+/* flow-blink: the 3-second blink the cluster page puts on a node card's
+   流控 tag while the node keeps refusing writes (the page re-arms the
+   timer every poll sample that sees counter growth; it settles 3s after
+   the last fire). Applied by dropping the class off the tag, so the
+   animation runs on the element's own lifecycle — no per-cycle JS. */
+@keyframes flow-blink-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.15; }
+}
+.flow-blink {
+  animation: flow-blink-pulse 0.8s ease-in-out infinite;
+}

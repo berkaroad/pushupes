@@ -12,10 +12,11 @@ export function isOnlinePeer(p: Pick<Peer, 'client_addr' | 'down'>): boolean {
 }
 
 // The orange 流控 tag marks a node with flow control CONFIGURED (writes to
-// the slots it leads are governed by a token bucket) — the presence of the
-// config, not evidence of it firing: the node view answers "which nodes are
-// governed" for maintenance, and the slots page is where a slot whose
-// throttle actually FIRED gets marked. flowControlConfigured comes from the
+// the slots it leads are governed by one node-wide token bucket) — the
+// presence of the config. flowControlFiring blinks it (see flow-blink in
+// index.css): the page detected refusals on this node within its last 2s
+// poll sample, and the blink holds for 3s after the last fire — a glance
+// answers "governed" versus "actively throttling". Both flags come from the
 // per-node /admin/writes poll the page already runs.
 //
 // The footer row inside the card body carries the two node actions the
@@ -28,13 +29,14 @@ export function isOnlinePeer(p: Pick<Peer, 'client_addr' | 'down'>): boolean {
 // rendered for EVERY card at a fixed height (the small-button 24px line):
 // cards keep an invisible placeholder per absent button, so all cards in
 // the grid stay the same height whether or not they carry actions.
-export function PeerCard({ peer, current, slots, onRemove, removing, flowControlConfigured, onFlowControl }: {
+export function PeerCard({ peer, current, slots, onRemove, removing, flowControlConfigured, flowControlFiring, onFlowControl }: {
   peer: Peer
   current: boolean
   slots: number
   onRemove?: (id: string) => void
   removing?: boolean
   flowControlConfigured?: boolean
+  flowControlFiring?: boolean
   onFlowControl?: (id: string) => void
 }) {
   const online = isOnlinePeer(peer)
@@ -43,7 +45,7 @@ export function PeerCard({ peer, current, slots, onRemove, removing, flowControl
   // read as a different (broken) frame style instead of a state.
   return (
     <Card size="small"
-      title={<Space>{peer.id}{current ? <Tag color="blue">当前</Tag> : null}{online ? null : <Tag color="red">离线</Tag>}{flowControlConfigured ? <Tag color="orange">流控</Tag> : null}</Space>}
+      title={<Space>{peer.id}{current ? <Tag color="blue">当前</Tag> : null}{online ? null : <Tag color="red">离线</Tag>}{flowControlConfigured ? <Tag color="orange" className={flowControlFiring ? 'flow-blink' : undefined}>流控</Tag> : null}</Space>}
       extra={<Tag>{slots} slots</Tag>}>
       <Descriptions column={1} size="small">
         <Descriptions.Item label="Admin">{peer.admin_addr || '-'}</Descriptions.Item>
