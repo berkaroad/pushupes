@@ -441,25 +441,25 @@ func (s *Server) handleSetReplicaPolicy(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleSetFlowControl sets (POST) or clears (DELETE) THIS node's
-// flow-control config: {tokens_per_slot, period}. Node-local by design —
-// whichever node receives the call is the node it throttles, no Raft
-// command, no redirect, nothing replicated. The throttle applies to every
-// slot this node LEADS (each its own token bucket); replicas are not
-// controlled. tokens_per_slot<=0 or period<=0 means unlimited (the same
-// effect as DELETE), so the console can also clear by zeroing. The period
-// is a Go duration string ("1s", "500ms"); a value that does not parse is
-// a bad request rather than a silent unlimited.
+// flow-control config: {tokens, period}. Node-local by design — whichever
+// node receives the call is the node it throttles, no Raft command, no
+// redirect, nothing replicated. The budget is ONE node-wide token bucket
+// shared by every slot this node leads (a leader-side write to any slot
+// takes from it); replicas are not controlled. tokens<=0 or period<=0
+// means unlimited (the same effect as DELETE), so the console can also
+// clear by zeroing. The period is a Go duration string ("1s", "500ms"); a
+// value that does not parse is a bad request rather than a silent unlimited.
 //
-//	POST /admin/flow-control  {"tokens_per_slot":100,"period":"1s"}
+//	POST /admin/flow-control  {"tokens":100,"period":"1s"}
 func (s *Server) handleSetFlowControl(w http.ResponseWriter, r *http.Request) {
 	cfg := cluster.FlowConfig{}
 	if r.Method == http.MethodPost {
 		var req struct {
-			TokensPerSlot int32  `json:"tokens_per_slot"`
-			Period        string `json:"period"`
+			Tokens int32  `json:"tokens"`
+			Period string `json:"period"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "body must be {\"tokens_per_slot\":N,\"period\":\"1s\"}")
+			writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "body must be {\"tokens\":N,\"period\":\"1s\"}")
 			return
 		}
 		period, err := time.ParseDuration(req.Period)
@@ -467,15 +467,17 @@ func (s *Server) handleSetFlowControl(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "period must be a duration like \"1s\" (\"\" or <=0 means unlimited)")
 			return
 		}
-		cfg = cluster.FlowConfig{TokensPerSlot: req.TokensPerSlot, Period: period}
+		cfg = cluster.FlowConfig{Tokens: req.Tokens, Period: period}
 	}
 	s.Engine.SetFlow(cfg)
 	s.writeFlowControl(w)
 }
 
 // handleGetFlowControl reports this node's current config plus the
-// cumulative rejection counts — the node total and the per-slot list — so
-// an operator can read back what is in force and where it fired.
+// cumulative rejection counts — the node total and the per-slot list (the
+// budget is node-wide; a refusal still belongs to the slot whose write was
+// rejected) — so an operator can read back what is in force and where it
+// fired.
 func (s *Server) handleGetFlowControl(w http.ResponseWriter, r *http.Request) {
 	s.writeFlowControl(w)
 }
@@ -489,13 +491,13 @@ func (s *Server) writeFlowControl(w http.ResponseWriter) {
 	// period_ms is the machine-readable form the console prefills from; the
 	// duration string is what a POST body round-trips against.
 	writeJSON(w, http.StatusOK, map[string]any{
-		"node":            s.Engine.Self(),
-		"tokens_per_slot": cfg.TokensPerSlot,
-		"period":          cfg.Period.String(),
-		"period_ms":       cfg.Period.Milliseconds(),
-		"unlimited":       cfg.Unlimited(),
-		"total_hits":      total,
-		"slots":           slots,
+		"node":       s.Engine.Self(),
+		"tokens":     cfg.Tokens,
+		"period":     cfg.Period.String(),
+		"period_ms":  cfg.Period.Milliseconds(),
+		"unlimited":  cfg.Unlimited(),
+		"total_hits": total,
+		"slots":      slots,
 	})
 }
 
@@ -607,9 +609,9 @@ func writeErr(w http.ResponseWriter, code, errID int, msg string) {
 // unlimited rule from the numbers.
 func flowControlView(cfg cluster.FlowConfig) map[string]any {
 	return map[string]any{
-		"tokens_per_slot": cfg.TokensPerSlot,
-		"period_ms":       cfg.Period.Milliseconds(),
-		"configured":      !cfg.Unlimited(),
+		"tokens":     cfg.Tokens,
+		"period_ms":  cfg.Period.Milliseconds(),
+		"configured": !cfg.Unlimited(),
 	}
 }
 

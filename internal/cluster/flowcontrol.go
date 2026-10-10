@@ -14,18 +14,25 @@
 
 package cluster
 
-// Node-level flow control: one operator-set token budget per slot LEADER on
-// this node. A rejected append answers fail/1006 (data.ErrIDFlowControl,
-// message "FlowControl") without touching the WAL. The configuration lives
-// only in this process — set through POST /admin/flow-control, it is not
-// replicated through Raft and a restart returns the node to unlimited.
+// Node-level flow control: ONE operator-set token budget shared by every
+// slot this node LEADS — the control and its configuration live at the same
+// granularity, the node. Any leader-side write to any of this node's slots
+// takes one token from the node's bucket. A rejected append answers
+// fail/1006 (data.ErrIDFlowControl, message "FlowControl") without touching
+// the WAL. The configuration lives only in this process — set through
+// POST /admin/flow-control, it is not replicated through Raft and a restart
+// returns the node to unlimited.
+//
+// Refusals stay COUNTED PER SLOT: the bucket is the node's, but which write
+// got refused happened at a concrete slot, and the admin per-slot hit array
+// (and the console's slot-level marker) depends on that attribution.
 //
 // The bucket model is the operator's own: taking a token stamps its return
 // deadline (take time + period); tokens come back when their deadline passes,
 // in one sweep run on the write path before the next take. No refill
 // goroutine exists — an empty deadline heap means every token is available,
-// so an idle bucket costs nothing, and the sustained ceiling is
-// tokens/period per slot.
+// so an idle bucket costs nothing, and the sustained ceiling is tokens/period
+// for the NODE.
 
 import (
 	"container/heap"
@@ -34,15 +41,16 @@ import (
 	"time"
 )
 
-// FlowConfig is one node-level flow-control setting. A non-positive token
-// budget or period means the node appends without any throttle.
+// FlowConfig is one node-level flow-control setting: Tokens per Period
+// across every slot the node leads. A non-positive token budget or period
+// means the node appends without any throttle.
 type FlowConfig struct {
-	TokensPerSlot int32         `json:"tokens_per_slot"`
-	Period        time.Duration `json:"-"`
+	Tokens int32         `json:"tokens"`
+	Period time.Duration `json:"-"`
 }
 
 // Unlimited reports whether this config throttles nothing.
-func (c FlowConfig) Unlimited() bool { return c.TokensPerSlot <= 0 || c.Period <= 0 }
+func (c FlowConfig) Unlimited() bool { return c.Tokens <= 0 || c.Period <= 0 }
 
 // flowHeap is a min-heap of token return deadlines (unix nanos), one entry
 // per token currently away. Swept at the head before each take.
@@ -60,7 +68,8 @@ func (h *flowHeap) Pop() any {
 	return x
 }
 
-// slotBucket is one slot leader's token bucket on this node. Its shape
+// slotBucket is the node's single token bucket (the type name keeps "slot"
+// only in its history: it gates slot-leader writes). Its shape
 // (capacity + period) is frozen when the bucket is created under a config
 // generation, so its mu-protected fields never re-interpret a deadline
 // stamped under different rules: a config change rotates the generation and
@@ -81,11 +90,6 @@ type slotBucket struct {
 	// the sweep consumes the mark by popping past that many head entries
 	// without crediting tokens for them.
 	refunded int
-	// hits counts this slot's throttle rejections since the process started.
-	// It lives OUTSIDE the bucket (a map the generation swap never touches):
-	// the console diffs successive snapshots, so the counter must stay
-	// monotonic across config changes — only a restart resets it.
-	hits *atomic.Uint64
 }
 
 // sweep returns every token whose deadline has passed. Refund-marked tokens
@@ -111,13 +115,13 @@ func (b *slotBucket) away() int {
 
 // take consumes one token for a write about to land, reporting whether the
 // bucket allowed it. Expired tokens are swept back first; a successful take
-// stamps the token's return deadline.
+// stamps the token's return deadline. The bucket counts nothing itself: a
+// refusal is attributed by the caller to the slot whose write was rejected.
 func (b *slotBucket) take(now int64) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.sweep(now)
 	if int32(b.away()) >= b.capacity {
-		b.hits.Add(1)
 		return false
 	}
 	heap.Push(&b.due, now+b.period)
@@ -135,18 +139,19 @@ func (b *slotBucket) refund() {
 	b.refunded++
 }
 
-// flowControl is the node's whole throttle: the current config plus the
-// per-slot buckets built under the generation that config belongs to.
+// flowControl is the node's whole throttle: the current config plus the one
+// bucket built under the generation that config belongs to.
 type flowControl struct {
 	cfg atomic.Pointer[FlowConfig]
 
-	mu      sync.Mutex
-	gen     uint64
-	buckets map[int32]*slotBucket
+	mu  sync.Mutex
+	gen uint64
+	bkt *slotBucket
 
-	// hitCounters keeps one monotonic counter per slot across generation
-	// swaps: bucketOf wires the counter into every bucket it builds, so a
-	// config change rebuilds the throttle but never erases its history.
+	// hitCounters keeps one monotonic counter per slot: the shared bucket
+	// routes a refusal's count to the slot whose write was rejected (see
+	// takeFor), so per-slot attribution survives node-wide budgeting. The
+	// map outlives generation swaps — history is only reset by a restart.
 	hitMu       sync.Mutex
 	hitCounters map[int32]*atomic.Uint64
 }
@@ -174,13 +179,13 @@ func (f *flowControl) config() FlowConfig {
 	return FlowConfig{}
 }
 
-// set installs a config and rotates the generation: the bucket map is
-// dropped, so the next write per slot builds a bucket under the new budget.
+// set installs a config and rotates the generation: the bucket is dropped,
+// so the next write builds a fresh one under the new budget.
 func (f *flowControl) set(c FlowConfig) {
 	f.cfg.Store(&c)
 	f.mu.Lock()
 	f.gen++
-	f.buckets = nil
+	f.bkt = nil
 	f.mu.Unlock()
 }
 
@@ -194,40 +199,41 @@ func (f *flowControl) generation() uint64 {
 	return f.gen
 }
 
-// bucketOf returns the slot's bucket under generation gen, creating it on
+// nodeBucket returns the node's bucket under generation gen, creating it on
 // first use. gen mismatch (the config was re-set concurrently) answers nil.
-func (f *flowControl) bucketOf(slot int32, cfg FlowConfig, gen uint64) *slotBucket {
+func (f *flowControl) nodeBucket(cfg FlowConfig, gen uint64) *slotBucket {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.gen != gen {
 		return nil
 	}
-	if f.buckets == nil {
-		f.buckets = map[int32]*slotBucket{}
+	if f.bkt == nil {
+		f.bkt = &slotBucket{capacity: cfg.Tokens, period: int64(cfg.Period)}
 	}
-	b := f.buckets[slot]
-	if b == nil {
-		b = &slotBucket{capacity: cfg.TokensPerSlot, period: int64(cfg.Period), hits: f.hitCounter(slot)}
-		f.buckets[slot] = b
-	}
-	return b
+	return f.bkt
 }
 
-// takeFor attempts one token for a slot append under the node's config,
+// takeFor attempts one token from the NODE's bucket for a write at `slot`,
 // answering (allowed, bucket). The caller refunds the bucket when a taken
 // token's record ends up not landing. A nil bucket means flow control does
 // not apply: the config is unlimited, or the generation rotated mid-call.
+// A refusal increments the refusing slot's own counter: one budget, per-
+// slot attribution.
 func (e *Engine) takeFor(slot int32) (bool, *slotBucket) {
 	gen := e.flow.generation()
 	cfg := e.flow.config()
 	if cfg.Unlimited() {
 		return true, nil
 	}
-	b := e.flow.bucketOf(slot, cfg, gen)
+	b := e.flow.nodeBucket(cfg, gen)
 	if b == nil {
 		return true, nil
 	}
-	return b.take(time.Now().UnixNano()), b
+	if b.take(time.Now().UnixNano()) {
+		return true, b
+	}
+	e.flow.hitCounter(slot).Add(1)
+	return false, b
 }
 
 // flowRefund returns a token taken for a record that did not land.

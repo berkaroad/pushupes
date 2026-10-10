@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,7 +29,7 @@ import (
 // its stamped deadline passes.
 func TestFlowBucketTakeAndReturn(t *testing.T) {
 	const capacity = 3
-	b := &slotBucket{capacity: capacity, period: int64(time.Second), hits: new(atomic.Uint64)}
+	b := &slotBucket{capacity: capacity, period: int64(time.Second)}
 	now := int64(1_000_000_000)
 	for i := 0; i < capacity; i++ {
 		if !b.take(now) {
@@ -39,9 +38,6 @@ func TestFlowBucketTakeAndReturn(t *testing.T) {
 	}
 	if b.take(now) {
 		t.Fatal("the (cap+1)-th take inside one period must be refused")
-	}
-	if got := b.hits.Load(); got != 1 {
-		t.Fatalf("hits = %d, want 1", got)
 	}
 	// One nanosecond before the deadline: still refused.
 	if b.take(now + int64(time.Second) - 1) {
@@ -60,7 +56,7 @@ func TestFlowBucketTakeAndReturn(t *testing.T) {
 // refund-marked deadlines must not be credited a second time when they
 // expire — away = un-refunded entries, so capacity accounting stays honest.
 func TestFlowBucketRefund(t *testing.T) {
-	b := &slotBucket{capacity: 1, period: int64(time.Hour), hits: new(atomic.Uint64)}
+	b := &slotBucket{capacity: 1, period: int64(time.Hour)}
 	if !b.take(0) {
 		t.Fatal("first take refused")
 	}
@@ -92,7 +88,7 @@ func TestFlowConfigUnlimited(t *testing.T) {
 	if _, b := e.takeFor(0); b != nil {
 		t.Fatal("an engine that never set a config must not build buckets")
 	}
-	e.SetFlow(FlowConfig{TokensPerSlot: 1, Period: time.Hour})
+	e.SetFlow(FlowConfig{Tokens: 1, Period: time.Hour})
 	ok, b := e.takeFor(0)
 	if !ok || b == nil {
 		t.Fatal("configured throttle must build a bucket and allow the first take")
@@ -100,11 +96,11 @@ func TestFlowConfigUnlimited(t *testing.T) {
 	if ok, _ := e.takeFor(0); ok {
 		t.Fatal("capacity 1: the second immediate take must be refused")
 	}
-	e.SetFlow(FlowConfig{TokensPerSlot: 0, Period: time.Hour})
+	e.SetFlow(FlowConfig{Tokens: 0, Period: time.Hour})
 	if _, b := e.takeFor(0); b != nil {
-		t.Fatal("tokens_per_slot<=0 must mean unlimited")
+		t.Fatal("tokens<=0 must mean unlimited")
 	}
-	e.SetFlow(FlowConfig{TokensPerSlot: 5, Period: 0})
+	e.SetFlow(FlowConfig{Tokens: 5, Period: 0})
 	if _, b := e.takeFor(0); b != nil {
 		t.Fatal("period<=0 must mean unlimited")
 	}
@@ -115,14 +111,14 @@ func TestFlowConfigUnlimited(t *testing.T) {
 // survives the swap (the console diffs cumulative counters).
 func TestFlowGenerationSwap(t *testing.T) {
 	e, _ := newTestEngine(t, "node-1")
-	e.SetFlow(FlowConfig{TokensPerSlot: 1, Period: time.Hour})
+	e.SetFlow(FlowConfig{Tokens: 1, Period: time.Hour})
 	if ok, _ := e.takeFor(3); !ok {
 		t.Fatal("first take refused")
 	}
 	if ok, _ := e.takeFor(3); ok {
 		t.Fatal("second take must be refused")
 	}
-	e.SetFlow(FlowConfig{TokensPerSlot: 1, Period: time.Hour})
+	e.SetFlow(FlowConfig{Tokens: 1, Period: time.Hour})
 	if ok, _ := e.takeFor(3); !ok {
 		t.Fatal("after a re-set the bucket must be rebuilt with a fresh token")
 	}
@@ -162,7 +158,7 @@ func TestFlowControlOnWritePath(t *testing.T) {
 	e, st := newTestEngine(t, "node-1")
 	aggs := sameSlotAggregates(t, e, 4)
 	slot := e.SlotOf(aggs[0])
-	e.SetFlow(FlowConfig{TokensPerSlot: 2, Period: time.Hour})
+	e.SetFlow(FlowConfig{Tokens: 2, Period: time.Hour})
 
 	append1 := func(agg string, ver uint32, cmd string) *data.AppendResponse {
 		t.Helper()
@@ -229,10 +225,59 @@ func TestFlowControlOnWritePath(t *testing.T) {
 	}
 }
 
-// TestFlowControlConcurrent hammers one bucket from many goroutines: the
-// takes that succeed inside one period never exceed the capacity.
+// TestFlowBucketSharedAcrossSlots pins the new granularity: ONE node budget
+// for every led slot. Draining the budget through slot A immediately
+// refuses slot B's otherwise-valid write — the defining difference from the
+// old per-slot buckets, where A's drain could not touch B. The refusal is
+// still COUNTED at B (the attribution slot, not the budget slot).
+func TestFlowBucketSharedAcrossSlots(t *testing.T) {
+	e, _ := newTestEngine(t, "node-1")
+	slotA := e.SlotOf("anchor")
+	// an aggregate on a DIFFERENT slot
+	var aggB string
+	for i := 0; ; i++ {
+		cand := fmt.Sprintf("other-slot-%d", i)
+		if e.SlotOf(cand) != slotA {
+			aggB = cand
+			break
+		}
+	}
+	slotB := e.SlotOf(aggB)
+
+	e.SetFlow(FlowConfig{Tokens: 1, Period: time.Hour})
+	resp, err := e.SubmitAppend(context.Background(), makeRecord("anchor", 1, "sa-1"))
+	if err != nil || resp.Status != data.StatusSuccess {
+		t.Fatalf("slot A first write = %+v (%v), want success (takes the only token)", resp, err)
+	}
+	// slot B writes a fresh aggregate — under per-slot buckets it would
+	// have had its own token; the node-wide budget must refuse it.
+	resp, err = e.SubmitAppend(context.Background(), makeRecord(aggB, 1, "sb-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Status != data.StatusFail || resp.ErrID != data.ErrIDFlowControl {
+		t.Fatalf("slot B write = %+v, want fail/1006 (node budget drained by slot A)", resp)
+	}
+	// attribution: the refusal counted slot B, not slot A.
+	_, total, slots := e.FlowStats()
+	if total != 1 {
+		t.Fatalf("total hits = %d, want 1", total)
+	}
+	for _, st := range slots {
+		if st.Slot == slotA && st.Hits > 0 {
+			t.Fatalf("slot A counted a refusal that happened at slot B")
+		}
+		if st.Slot == slotB {
+			return
+		}
+	}
+	t.Fatalf("per-slot history must carry slot B's refusal: %+v", slots)
+}
+
+// TestFlowControlConcurrent hammers the node bucket from many goroutines:
+// the takes that succeed inside one period never exceed the capacity.
 func TestFlowControlConcurrent(t *testing.T) {
-	b := &slotBucket{capacity: 50, period: int64(time.Hour), hits: new(atomic.Uint64)}
+	b := &slotBucket{capacity: 50, period: int64(time.Hour)}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	allowed := 0
@@ -252,8 +297,5 @@ func TestFlowControlConcurrent(t *testing.T) {
 	wg.Wait()
 	if allowed != 50 {
 		t.Fatalf("allowed takes = %d, want exactly the capacity 50", allowed)
-	}
-	if b.hits.Load() == 0 {
-		t.Fatal("refusals must have been counted")
 	}
 }

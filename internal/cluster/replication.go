@@ -951,9 +951,10 @@ func (e *Engine) SlotRouteTable() []string {
 // an append acknowledged without that wait could vanish if the leader died
 // before its replicas pulled the record.
 func (e *Engine) localAppend(slot int32, rec *data.EventRecord) (*data.AppendResponse, error) {
-	// Flow control (node-level, per slot leader): a refused append answers
-	// fail/1006 without touching the WAL. Only the leader copy pays — this
-	// function only runs when THIS node serves the slot's writes.
+	// Flow control (one node-wide token budget shared by every slot this
+	// node leads): a refused append answers fail/1006 without touching the
+	// WAL. Only the leader copy pays — this function only runs when THIS
+	// node serves the slot's writes.
 	if ok, bucket := e.takeFor(slot); !ok {
 		return &data.AppendResponse{
 			Status: data.StatusFail,
@@ -1123,12 +1124,13 @@ func (e *Engine) batchLocal(ctx context.Context, slot int32, recs []*data.EventR
 	}
 	var maxSeq uint64
 	tLand := time.Now()
-	// Flow control runs PER RECORD here, in request order: the group is not
-	// atomic (the operator's rule), so accepted records land and a refusal
-	// fails only that record and everything after it — those never touch the
-	// WAL. Records that did land keep the ordinary merged watermark wait
-	// below. A record refused at position k also stops the take loop, so a
-	// burst cannot drain the bucket on records that will not execute anyway.
+	// Flow control runs PER RECORD here, in request order, against the
+	// node's shared bucket: the group is not atomic (the operator's rule),
+	// so accepted records land and a refusal fails only that record and
+	// everything after it — those never touch the WAL. Records that did
+	// land keep the ordinary merged watermark wait below. A record refused
+	// at position k also stops the take loop, so a burst cannot drain the
+	// bucket on records that will not execute anyway.
 	throttled := false
 	for i, rec := range recs {
 		if throttled {

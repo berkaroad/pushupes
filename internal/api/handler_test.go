@@ -195,7 +195,7 @@ func TestAdminStatsMergesFlushAndRepl(t *testing.T) {
 }
 
 // TestFlowControlAdminEndpoints pins the node-local flow-control surface:
-// POST sets {tokens_per_slot, period} (a duration string), GET reads it back
+// POST sets {tokens, period} (a duration string), GET reads it back
 // with the hit tallies, DELETE clears it, a bad period is refused, and
 // /admin/writes carries the config view plus the per-slot hit array the
 // console diffs. Nothing here is controller-only: the node that answers is
@@ -215,14 +215,14 @@ func TestFlowControlAdminEndpoints(t *testing.T) {
 		t.Fatalf("GET status = %d (%s)", rr.Code, rr.Body.String())
 	}
 	body := decodeBody(t, rr)
-	if body["unlimited"] != true || body["tokens_per_slot"] != float64(0) {
+	if body["unlimited"] != true || body["tokens"] != float64(0) {
 		t.Fatalf("fresh node should read unlimited: %v", body)
 	}
 
 	// Bad period string is a 400, not a silent unlimited.
 	rr = httptest.NewRecorder()
 	srv.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/admin/flow-control",
-		strings.NewReader(`{"tokens_per_slot":10,"period":"banana"}`)))
+		strings.NewReader(`{"tokens":10,"period":"banana"}`)))
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("bad period: status = %d (%s), want 400", rr.Code, rr.Body.String())
 	}
@@ -230,12 +230,12 @@ func TestFlowControlAdminEndpoints(t *testing.T) {
 	// Set a throttle.
 	rr = httptest.NewRecorder()
 	srv.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/admin/flow-control",
-		strings.NewReader(`{"tokens_per_slot":10,"period":"1s"}`)))
+		strings.NewReader(`{"tokens":10,"period":"1s"}`)))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("POST status = %d (%s)", rr.Code, rr.Body.String())
 	}
 	body = decodeBody(t, rr)
-	if body["unlimited"] != false || body["tokens_per_slot"] != float64(10) || body["period_ms"] != float64(1000) {
+	if body["unlimited"] != false || body["tokens"] != float64(10) || body["period_ms"] != float64(1000) {
 		t.Fatalf("POST echo wrong: %v", body)
 	}
 
@@ -244,7 +244,7 @@ func TestFlowControlAdminEndpoints(t *testing.T) {
 	srv.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/admin/writes", nil))
 	body = decodeBody(t, rr)
 	fc, _ := body["flow_control"].(map[string]any)
-	if fc == nil || fc["configured"] != true || fc["tokens_per_slot"] != float64(10) {
+	if fc == nil || fc["configured"] != true || fc["tokens"] != float64(10) {
 		t.Fatalf("writes.flow_control wrong: %v", body["flow_control"])
 	}
 	hits, _ := body["flow_control_hits"].([]any)
