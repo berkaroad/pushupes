@@ -39,139 +39,8 @@ import (
 	"syscall"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
 	"github.com/berkaroad/pushupes/pkg/client"
 	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
-)
-
-// clients caches one gRPC connection per address (HTTP/2 keep-alive).
-var (
-	connMu sync.Mutex
-	conns  = map[string]*grpc.ClientConn{}
-)
-
-func eventClient(addr string) pushupesv1.EventServiceClient {
-	connMu.Lock()
-	defer connMu.Unlock()
-	c, ok := conns[addr]
-	if !ok {
-		var err error
-		c, err = grpc.NewClient(hostPort(addr), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			panic(err)
-		}
-		conns[addr] = c
-	}
-	return pushupesv1.NewEventServiceClient(c)
-}
-
-// routeTable caches the cluster's slot->leader routing as the client sees
-// it. PrefetchRoutes seeds it and re-fetches it wholesale on a timer (the
-// answering node's Raft-replicated table is the authoritative view); a
-// write's MOVED/ASK answer patches individual rows in between, which is why
-// the table is only ever a hint — append correctness is defined by the
-// redirect self-heal, not by the table being current.
-type routeTable struct {
-	mu        sync.RWMutex
-	slotCount int      // len(bySlot): the cluster's slot count, from the table itself
-	bySlot    []string // slot -> leader client addr ("host:port")
-	entries   []string // every known node addr, the round-robin fallback set
-	cursor    int      // last entry addr that answered a fetch
-}
-
-// fetch pulls the whole routing table, trying entry nodes round-robin.
-func (rt *routeTable) fetch() error {
-	for k := 0; k < len(rt.entries); k++ {
-		i := (rt.cursor + k) % len(rt.entries)
-		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resp, err := eventClient(rt.entries[i]).PrefetchRoutes(cctx, &pushupesv1.PrefetchRoutesRequest{})
-		cancel()
-		if err != nil {
-			continue
-		}
-		bySlot := make([]string, len(resp.SlotNodeIndex))
-		for slot, idx := range resp.SlotNodeIndex {
-			bySlot[slot] = hostPort(resp.NodeClientAddrs[idx])
-		}
-		rt.mu.Lock()
-		rt.slotCount = len(bySlot)
-		rt.bySlot = bySlot
-		rt.cursor = i
-		rt.mu.Unlock()
-		return nil
-	}
-	return fmt.Errorf("prefetch routes: no entry node answered")
-}
-
-// refreshEvery re-fetches the whole table until stop closes. A failed
-// refresh keeps the old rows — the table is a hint, stale beats absent.
-func (rt *routeTable) refreshEvery(d time.Duration, stop <-chan struct{}) {
-	tk := time.NewTicker(d)
-	defer tk.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-tk.C:
-			if err := rt.fetch(); err != nil {
-				fmt.Printf("warn: route refresh: %v\n", err)
-			}
-		}
-	}
-}
-
-// slotOf routes an aggregate id with the shared algorithm over the CURRENT
-// table's slot count.
-func (rt *routeTable) slotOf(agg string) int32 {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	return client.SlotOf(agg, rt.slotCount)
-}
-
-// addrFor answers the cached leader of a slot; fallback picks the
-// round-robin entry when the row is missing (a slot beyond a stale,
-// shorter table mid-reslot).
-func (rt *routeTable) addrFor(slot int32, fallback int) string {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	if slot >= 0 && int(slot) < len(rt.bySlot) && rt.bySlot[slot] != "" {
-		return rt.bySlot[slot]
-	}
-	return rt.entries[fallback%len(rt.entries)]
-}
-
-// patch points one slot's row at addr (the MOVED/ASK answer, or a rotated
-// guess after a transport failure). The next refresh overwrites it with the
-// authoritative table.
-func (rt *routeTable) patch(slot int32, addr string) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	if slot >= 0 && int(slot) < len(rt.bySlot) {
-		rt.bySlot[slot] = addr
-	}
-}
-
-// nodeCount counts distinct addrs the current table routes to.
-func (rt *routeTable) nodeCount() int {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	seen := map[string]bool{}
-	for _, a := range rt.bySlot {
-		seen[a] = true
-	}
-	return len(seen)
-}
-
-// anyGrpc is the round-robin entry-point list (all peer gRPC addrs).
-var anyGrpc []string
-
-// first batch transport errors, verbatim (capped): a no-response record needs
-// its cause on the report, not just a count.
-var (
-	errSampleMu sync.Mutex
-	errSamples  []string
 )
 
 func main() {
@@ -195,27 +64,20 @@ func main() {
 		os.Exit(2)
 	}
 	body := makeBody(*size)
-	// Routing over the data plane: one PrefetchRoutes against any entry
-	// node seeds the slot->leader table, and the dense answer is where the
-	// cluster's slot count comes from — the routing ALGORITHM is shared
-	// (pkg/client), the COUNT is cluster state, read from here rather than
-	// hard-coded. The entry list doubles as the round-robin set for
-	// transport-failure fallbacks.
-	anyGrpc = append(anyGrpc, entryList...)
-	sort.Strings(anyGrpc)
-
-	routes := &routeTable{entries: anyGrpc}
-	if err := routes.fetch(); err != nil {
+	// The reusable client (pkg/client) owns everything routing-shaped:
+	// PrefetchRoutes seeds the slot->leader table (its answer length is the
+	// cluster's slot count — the ALGORITHM is the shared contract, the COUNT
+	// is cluster state), one goroutine refreshes it on -route-refresh, MOVED/
+	// ASK answers patch rows in between, and one long-lived gRPC connection
+	// per node backs every call.
+	cl, err := client.New(entryList, &client.Config{RouteRefresh: *routeRefresh})
+	if err != nil {
 		fmt.Printf("FAIL: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("routing: %d slots over %d cluster nodes (PrefetchRoutes)\n",
-		routes.slotCount, routes.nodeCount())
-	if *routeRefresh > 0 {
-		stop := make(chan struct{})
-		defer close(stop)
-		go routes.refreshEvery(*routeRefresh, stop)
-	}
+	defer cl.Close()
+	fmt.Printf("routing: %d slots (PrefetchRoutes via %d entry addrs)\n",
+		cl.SlotCount(), len(entryList))
 
 	// 1) pick aggregate ids, verify slot spread
 	aggIDs := make([]string, 0, *aggs)
@@ -223,7 +85,7 @@ func main() {
 	for i := 0; len(aggIDs) < *aggs; i++ {
 		id := fmt.Sprintf("bench-%d", i)
 		aggIDs = append(aggIDs, id)
-		slotSeen[routes.slotOf(id)]++
+		slotSeen[client.SlotOf(id, cl.SlotCount())]++
 	}
 	if len(slotSeen) < 2 {
 		fmt.Printf("FAIL: %d aggregates landed on %d slot(s), need >= 2\n", len(aggIDs), len(slotSeen))
@@ -235,62 +97,29 @@ func main() {
 	// resume per-aggregate versions against the slot LEADER (replicas only
 	// show <=HW data; under-estimating the tail burns retries on 1001).
 	//
-	// Done as one ReadTails call per node instead of one ReadStream probe
-	// chain per aggregate: the per-aggregate form cost O(aggregates x
-	// log(tail)) RPCs and grew with the data already on disk (measured
-	// 5.5s at 58k existing records across 1000 aggregates).
+	// One ReadTails for the whole list instead of a per-aggregate ReadStream
+	// probe chain: the per-aggregate form cost O(aggregates x log(tail)) RPCs
+	// and grew with the data already on disk (measured 5.5s at 58k existing
+	// records across 1000 aggregates). The server groups the request by slot
+	// and forwards one grouped RPC per node it does not hold, so the client
+	// side stays a single call.
 	//
 	// This phase is NOT part of the write window, and it is timed separately
 	// so the reported throughput stays a write-phase number.
 	resumeStart := time.Now()
 	lastVers := make([]uint32, len(aggIDs))
 	{
-		// Group aggregates by the node we will ask: ReadTails groups by slot
-		// internally, so asking the slot leader directly keeps it to one RPC
-		// per node with no cross-node forwarding.
-		byAddr := map[string][]int{}
-		var order []string
-		for i, id := range aggIDs {
-			addr := routes.addrFor(routes.slotOf(id), 0)
-			if _, ok := byAddr[addr]; !ok {
-				order = append(order, addr)
-			}
-			byAddr[addr] = append(byAddr[addr], i)
+		cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		resp, err := cl.ReadTails(cctx, aggIDs)
+		cancel()
+		if err != nil {
+			fmt.Printf("warn: read tails: %v (tails left at 0)\n", err)
+		} else if len(resp.Versions) != len(aggIDs) {
+			fmt.Printf("warn: read tails: got %d versions for %d aggregates\n",
+				len(resp.Versions), len(aggIDs))
+		} else {
+			copy(lastVers, resp.Versions)
 		}
-		type tailsReq struct {
-			idx []int
-			ids []string
-		}
-		reqs := make([]tailsReq, len(order))
-		var wg sync.WaitGroup
-		for n, addr := range order {
-			idx := byAddr[addr]
-			ids := make([]string, len(idx))
-			for k, i := range idx {
-				ids[k] = aggIDs[i]
-			}
-			reqs[n] = tailsReq{idx: idx, ids: ids}
-			wg.Add(1)
-			go func(addr string, r tailsReq) {
-				defer wg.Done()
-				cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				resp, err := eventClient(addr).ReadTails(cctx, &pushupesv1.ReadTailsRequest{AggregateIds: r.ids})
-				if err != nil {
-					fmt.Printf("warn: read tails %s: %v (tails left at 0)\n", addr, err)
-					return
-				}
-				if len(resp.Versions) != len(r.ids) {
-					fmt.Printf("warn: read tails %s: got %d versions for %d aggregates\n",
-						addr, len(resp.Versions), len(r.ids))
-					return
-				}
-				for k, i := range r.idx {
-					lastVers[i] = resp.Versions[k]
-				}
-			}(addr, reqs[n])
-		}
-		wg.Wait()
 	}
 	var resumeSum uint64
 	for _, v := range lastVers {
@@ -310,11 +139,15 @@ func main() {
 		cancel()
 	}()
 
-	var total, okCnt, existsCnt, failCnt, redirectCnt, noRespCnt atomic.Int64
+	var total, okCnt, existsCnt, failCnt, noRespCnt atomic.Int64
 	var errIDMu sync.Mutex
 	errIDCnt := map[uint32]*atomic.Int64{} // per wire error id of batch failures
 	var latMu sync.Mutex
 	var latencies []float64 // ms
+	// first batch transport errors, verbatim (capped): a no-response record
+	// needs its cause on the report, not just a count.
+	var errSampleMu sync.Mutex
+	var errSamples []string
 
 	nw := *connsFlag
 	if nw > len(aggIDs) {
@@ -364,11 +197,11 @@ func main() {
 			}
 			if *batch > 0 {
 				// Batched mode: one BatchAppend per chunk of DISTINCT
-				// aggregates (the batch rule rejects repeats). The chunk is
-				// sent to the leader of the first aggregate's slot;
-				// redirected records are resent (as one batch) to their own
-				// leader by batchWithRetry. Throughput counts records,
-				// latency counts batch round trips (retries included).
+				// aggregates (the batch rule rejects repeats). cl.BatchAppend
+				// groups the chunk per slot leader itself; redirected records
+				// are resent (as one batch) to their own leader. Throughput
+				// counts records, latency counts batch round trips (retries
+				// included).
 				for ctx.Err() == nil {
 					for c := 0; c < len(targets); c += *batch {
 						if ctx.Err() != nil {
@@ -384,7 +217,18 @@ func main() {
 							recs[k] = bump(agg)
 						}
 						t0 := time.Now()
-						resps := batchWithRetry(w, recs, routes)
+						// the write-window ctx is deliberately NOT passed: a batch
+						// in flight when the window closes gets its answer
+						// (the client bounds each attempt by CallTimeout
+						// internally), same as before the client refactor.
+						resps, berr := cl.BatchAppend(context.Background(), recs)
+						if berr != nil {
+							errSampleMu.Lock()
+							if len(errSamples) < 8 {
+								errSamples = append(errSamples, berr.Error())
+							}
+							errSampleMu.Unlock()
+						}
 						lat := float64(time.Since(t0).Microseconds()) / 1000.0
 						total.Add(int64(len(recs)))
 						latMu.Lock()
@@ -418,9 +262,6 @@ func main() {
 									ver[chunk[k]] = resp.CurrentVersion
 								}
 							}
-							if resp.ErrId == client.ErrIDSlotNotLocal || resp.ErrId == client.ErrIDMigrating {
-								redirectCnt.Add(1)
-							}
 						}
 					}
 				}
@@ -439,7 +280,7 @@ func main() {
 						Events:    []*pushupesv1.Event{{Type: "BenchAppend", Body: body}},
 					}
 					t0 := time.Now()
-					resp := batchWithRetry(w, []*pushupesv1.AppendRequest{req}, routes)[0]
+					resp := singleAppend(cl, req)
 					// version self-heal: if the leader reports a newer tail
 					// (resume estimate lagged), adopt it and retry once.
 					if resp != nil &&
@@ -448,7 +289,7 @@ func main() {
 						ver[agg] = resp.CurrentVersion
 						req.Version = resp.CurrentVersion + 1
 						t0 = time.Now()
-						resp = batchWithRetry(w, []*pushupesv1.AppendRequest{req}, routes)[0]
+						resp = singleAppend(cl, req)
 					}
 					lat := float64(time.Since(t0).Microseconds()) / 1000.0
 					total.Add(1)
@@ -466,9 +307,6 @@ func main() {
 						existsCnt.Add(1)
 					default:
 						failCnt.Add(1) // version conflicts etc. should not happen
-					}
-					if resp.ErrId == client.ErrIDSlotNotLocal || resp.ErrId == client.ErrIDMigrating {
-						redirectCnt.Add(1)
 					}
 				}
 			}
@@ -509,7 +347,7 @@ func main() {
 	resumeElapsed := start.Sub(resumeStart)
 	fmt.Printf("\n== bench done in %s ==\n", elapsed.Round(time.Millisecond))
 	fmt.Printf("attempts=%d ok=%d exists=%d fail=%d redirects=%d\n",
-		total.Load(), okCnt.Load(), existsCnt.Load(), failCnt.Load(), redirectCnt.Load())
+		total.Load(), okCnt.Load(), existsCnt.Load(), failCnt.Load(), cl.Redirects())
 	if *batch > 0 {
 		// batch failures need their cause spelled out: unreachable-vs-answer
 		// and which wire error dominated (1001 self-heal races vs 1005 HW)
@@ -542,77 +380,14 @@ func main() {
 	}
 }
 
-// batchWithRetry posts one batch over gRPC, following MOVED/ASK at most
-// twice per record: a redirected record is resent to its redirect target on
-// the next attempt (grouped by destination, so each node still gets one RPC
-// per attempt). Returns the final response per record position (nil =
-// unreachable or still redirected).
-func batchWithRetry(w int, recs []*pushupesv1.AppendRequest,
-	routes *routeTable) []*pushupesv1.AppendResponse {
-
-	slotOf := func(agg string) int32 { return routes.slotOf(agg) }
-	routeFor := func(slot int32) string { return routes.addrFor(slot, w) }
-
-	out := make([]*pushupesv1.AppendResponse, len(recs))
-	// pending pairs original positions with their records; it shrinks to the
-	// redirected/unanswered subset after each attempt.
-	pending := make([]int, len(recs))
-	for i := range pending {
-		pending[i] = i
-	}
-	for attempt := 0; attempt < 3 && len(pending) > 0; attempt++ {
-		// One BatchAppend per destination node: group by the cached route.
-		byAddr := map[string][]int{}
-		var order []string
-		for _, i := range pending {
-			addr := routeFor(slotOf(recs[i].AggregateId))
-			if _, ok := byAddr[addr]; !ok {
-				order = append(order, addr)
-			}
-			byAddr[addr] = append(byAddr[addr], i)
-		}
-		var next []int
-		for _, addr := range order {
-			idx := byAddr[addr]
-			batch := make([]*pushupesv1.AppendRequest, len(idx))
-			for k, i := range idx {
-				batch[k] = recs[i]
-			}
-			cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			resp, err := eventClient(addr).BatchAppend(cctx, &pushupesv1.BatchAppendRequest{Records: batch})
-			cancel()
-			if err != nil {
-				errSampleMu.Lock()
-				if len(errSamples) < 8 {
-					errSamples = append(errSamples, err.Error())
-				}
-				errSampleMu.Unlock()
-			}
-			if err != nil || len(resp.Results) != len(batch) {
-				// transport failure or misaligned answer: rotate the route
-				// and requeue these records for the next attempt
-				for _, i := range idx {
-					routes.patch(slotOf(recs[i].AggregateId), anyGrpc[(w+attempt+1)%len(anyGrpc)])
-				}
-				next = append(next, idx...)
-				continue
-			}
-			for k, r := range resp.Results {
-				i := idx[k]
-				switch r.Response.ErrId {
-				case client.ErrIDSlotNotLocal, client.ErrIDMigrating:
-					if r.Response.Node != "" {
-						routes.patch(slotOf(recs[i].AggregateId), hostPort(r.Response.Node))
-					}
-					next = append(next, i)
-				default:
-					out[i] = r.Response
-				}
-			}
-		}
-		pending = next
-	}
-	return out
+// singleAppend writes one record through the client (a batch of exactly one
+// AppendRequest) and answers its position-0 response.
+func singleAppend(cl *client.Client, req *pushupesv1.AppendRequest) *pushupesv1.AppendResponse {
+	// Detached from the write window: an append in flight when the window
+	// closes gets its answer (the client bounds each attempt by CallTimeout
+	// internally), same as before the client refactor.
+	resps, _ := cl.BatchAppend(context.Background(), []*pushupesv1.AppendRequest{req})
+	return resps[0]
 }
 
 // aggIndex finds an aggregate id's position; -1 when absent.
@@ -634,32 +409,12 @@ func makeBody(size int) []byte {
 	return b
 }
 
-// hostPort strips a URL scheme for gRPC dialing (routing-table addresses
-// carry "http://" by convention; a bare host:port is passed through).
-func hostPort(addr string) string {
-	if i := strings.Index(addr, "://"); i >= 0 {
-		return addr[i+3:]
-	}
-	return addr
-}
-
 func splitAddrs(s string) []string {
 	var out []string
-	cur := ""
-	for _, c := range s {
-		if c == ',' {
-			if cur != "" {
-				out = append(out, cur)
-			}
-			cur = ""
-			continue
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
 		}
-		if c != ' ' {
-			cur += string(c)
-		}
-	}
-	if cur != "" {
-		out = append(out, cur)
 	}
 	return out
 }

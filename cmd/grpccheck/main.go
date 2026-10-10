@@ -268,6 +268,16 @@ func main() {
 		fmt.Printf("prefetch-routes: %d slots / %d addrs, table consistent across %d nodes, routed write followed 1 redirect\n",
 			slotCount, len(rt.NodeClientAddrs), len(addrs))
 	}
+	// 8) empty batch: the protocol answer, RAW (grpccheck dials stubs
+	// directly by design — the routed client short-circuits an empty batch
+	// locally, so only a raw call can prove what a NODE answers).
+	eb, err := cli(addrs[0]).BatchAppend(ctx, &pushupesv1.BatchAppendRequest{})
+	check(err)
+	if len(eb.Results) != 0 {
+		fatal("empty batch on %s: %d results, want 0", addrs[0], len(eb.Results))
+	}
+	fmt.Println("empty batch answers empty results (raw protocol) ok")
+
 	fmt.Println("GRPC SMOKE PASS")
 }
 

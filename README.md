@@ -240,8 +240,8 @@ go run ./cmd/grpccheck -addrs http://127.0.0.1:8591,http://127.0.0.1:8592,http:/
 go run ./cmd/bench -nodes http://127.0.0.1:8591 -conns 8 -size 1024 -duration 30s
 go run ./cmd/bench -nodes http://127.0.0.1:8591,http://127.0.0.1:8592,http://127.0.0.1:8593 -conns 8 -size 1024 -batch 64 -duration 30s
 
-# BatchAppend 冒烟（success/exists/1001/批内重复拒绝/重定向跟随/空批，直打 8591）
-go run ./cmd/batchsmoke
+# BatchAppend 冒烟（经 pkg/client 客户端库：success/exists/1001/批内重复拒绝/回读断言）
+go run ./cmd/batchsmoke -nodes http://127.0.0.1:8591,http://127.0.0.1:8592,http://127.0.0.1:8593
 
 # 单槽灌数据（容量/恢复调试）
 go run ./cmd/seed -slot 7 -mib 512
