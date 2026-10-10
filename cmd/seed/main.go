@@ -13,19 +13,19 @@
 // limitations under the License.
 
 // Command seed writes approximately -mib of event records into one slot so
-// migration benchmarks have a realistic sealed-segment layout. It finds an
-// aggregate whose hash lands on -slot, then appends to the
-// slot leader (resolved from an admin status snapshot).
+// migration benchmarks have a realistic sealed-segment layout. It is a pure
+// client of the data plane: PrefetchRoutes reveals the slot count and the
+// target slot's leader, the shared routing algorithm (pkg/client) picks
+// aggregates that hash into that slot, and appends follow MOVED/ASK the way
+// any client's would.
 package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,12 +33,33 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/berkaroad/pushupes/internal/data"
+	"github.com/berkaroad/pushupes/pkg/client"
 	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 )
 
+// clients keyed by node client addr, shared across the worker goroutines.
+var (
+	connMu sync.Mutex
+	pools  = map[string]pushupesv1.EventServiceClient{}
+)
+
+func clientAt(addr string) pushupesv1.EventServiceClient {
+	connMu.Lock()
+	defer connMu.Unlock()
+	if c, ok := pools[addr]; ok {
+		return c
+	}
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		panic(err)
+	}
+	c := pushupesv1.NewEventServiceClient(conn)
+	pools[addr] = c
+	return c
+}
+
 func main() {
-	admin := flag.String("admin", "127.0.0.1:8091", "one admin addr of the cluster")
+	addr := flag.String("addr", "127.0.0.1:8591", "any node's client-plane (gRPC) addr")
 	slot := flag.Int("slot", 0, "target slot id")
 	mib := flag.Int("mib", 100, "approx bytes to write, in MiB")
 	conns := flag.Int("conns", 8, "parallel aggregates")
@@ -49,31 +70,29 @@ func main() {
 		body[i] = byte('a' + i%26)
 	}
 
-	st := fetchStatus(*admin)
-	ldr, ok := st.Slots[fmt.Sprint(*slot)]
-	if !ok {
-		fmt.Fprintf(os.Stderr, "slot %d not in table (run plan first?)\n", *slot)
-		os.Exit(1)
-	}
-	addr := st.Peers[ldr.Leader].ClientAddr
-	if addr == "" {
-		fmt.Fprintln(os.Stderr, "leader has no client_addr")
-		os.Exit(1)
-	}
-	fmt.Printf("seeding slot %d via leader %s (%s)\n", *slot, ldr.Leader, addr)
-
-	conn, err := grpc.NewClient(hostPort(addr), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Routing comes from the cluster, not from client-side constants: the
+	// slot count is the length of the dense table, and slot -slot's leader
+	// is the address its row points at.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	rt, err := clientAt(hostPort(*addr)).PrefetchRoutes(ctx, &pushupesv1.PrefetchRoutesRequest{})
+	cancel()
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "prefetch routes: %v\n", err)
+		os.Exit(1)
 	}
-	defer conn.Close()
-	cli := pushupesv1.NewEventServiceClient(conn)
+	slotCount := len(rt.SlotNodeIndex)
+	if *slot < 0 || *slot >= slotCount {
+		fmt.Fprintf(os.Stderr, "slot %d outside 0..%d (cluster slot count)\n", *slot, slotCount-1)
+		os.Exit(1)
+	}
+	target := hostPort(rt.NodeClientAddrs[rt.SlotNodeIndex[*slot]])
+	fmt.Printf("seeding slot %d via %s (cluster: %d slots, %d nodes)\n", *slot, target, slotCount, len(rt.NodeClientAddrs))
 
-	// distinct aggregates that all hash into the slot
+	// distinct aggregates that all hash into the slot, by the shared algorithm
 	var aggs []string
 	for i := 0; len(aggs) < *conns; i++ {
 		a := fmt.Sprintf("seed-%d-%d", *slot, i)
-		if int(data.SlotOf(a, data.DefaultSlotCount)) == *slot {
+		if int(client.SlotOf(a, slotCount)) == *slot {
 			aggs = append(aggs, a)
 		}
 	}
@@ -82,6 +101,11 @@ func main() {
 	perAgg := int(perAgg64)
 	var seq atomic.Int64
 	var fails atomic.Int64
+	// the write target can move under a migration; a MOVED/ASK answer is the
+	// live routing signal, shared by all workers (the prefetched table stays
+	// the startup source, the redirect the in-flight correction).
+	var routeMu sync.Mutex
+	route := target
 	var wg sync.WaitGroup
 	t0 := time.Now()
 	for _, agg := range aggs {
@@ -90,19 +114,42 @@ func main() {
 			defer wg.Done()
 			for v := uint32(1); v <= uint32(perAgg); v++ {
 				n := seq.Add(1)
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				_, err := cli.BatchAppend(ctx, &pushupesv1.BatchAppendRequest{
-					Records: []*pushupesv1.AppendRequest{{
-						AggregateId: agg, Version: v, CommandId: fmt.Sprintf("s-%d", n),
-						Events: []*pushupesv1.Event{{Type: "Seed", Body: body}},
-					}},
-				})
-				cancel()
-				if err != nil {
-					fails.Add(1)
-					if fails.Load() < 5 {
-						fmt.Fprintf(os.Stderr, "append fail: %v\n", err)
+				req := &pushupesv1.BatchAppendRequest{Records: []*pushupesv1.AppendRequest{{
+					AggregateId: agg, Version: v, CommandId: fmt.Sprintf("s-%d", n),
+					Events: []*pushupesv1.Event{{Type: "Seed", Body: body}},
+				}}}
+				lastHop := ""
+				for pass := 0; pass < 3; pass++ {
+					routeMu.Lock()
+					dst := route
+					routeMu.Unlock()
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					resp, err := clientAt(dst).BatchAppend(ctx, req)
+					cancel()
+					if err != nil {
+						fails.Add(1)
+						if fails.Load() < 5 {
+							fmt.Fprintf(os.Stderr, "append fail: %v\n", err)
+						}
+						break
 					}
+					r := resp.Results[0].Response
+					if r.Status == pushupesv1.AppendResponse_STATUS_FAIL &&
+						(r.ErrId == client.ErrIDSlotNotLocal || r.ErrId == client.ErrIDMigrating) &&
+						r.Node != "" && r.Node != lastHop {
+						lastHop = r.Node
+						routeMu.Lock()
+						route = hostPort(r.Node)
+						routeMu.Unlock()
+						continue
+					}
+					if r.Status == pushupesv1.AppendResponse_STATUS_FAIL {
+						fails.Add(1)
+						if fails.Load() < 5 {
+							fmt.Fprintf(os.Stderr, "append rejected: %+v\n", r)
+						}
+					}
+					break
 				}
 			}
 		}(agg)
@@ -114,42 +161,9 @@ func main() {
 	}
 }
 
-type status struct {
-	Slots map[string]struct {
-		Leader string `json:"leader"`
-	} `json:"slots"`
-	Peers map[string]struct {
-		ClientAddr string `json:"client_addr"`
-	} `json:"peers"`
-}
-
-func fetchStatus(admin string) status {
-	hc := &http.Client{Timeout: 10 * time.Second}
-	resp, err := hc.Get("http://" + hostPort(admin) + "/admin/cluster/status")
-	if err != nil {
-		panic(err)
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	var s status
-	if err := json.Unmarshal(b, &s); err != nil {
-		panic(err)
-	}
-	return s
-}
-
 func hostPort(addr string) string {
-	if i := indexOf(addr, "://"); i >= 0 {
+	if i := strings.Index(addr, "://"); i >= 0 {
 		addr = addr[i+3:]
 	}
 	return addr
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }

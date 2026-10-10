@@ -26,7 +26,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/berkaroad/pushupes/internal/data"
+	"github.com/berkaroad/pushupes/pkg/client"
 	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 )
 
@@ -107,7 +107,7 @@ func main() {
 				case pushupesv1.AppendResponse_STATUS_EXISTS:
 					fail("fresh command answered exists: %+v", r)
 				default:
-					if r.Response.ErrId == data.ErrIDSlotNotLocal || r.Response.ErrId == data.ErrIDMigrating {
+					if r.Response.ErrId == client.ErrIDSlotNotLocal || r.Response.ErrId == client.ErrIDMigrating {
 						if r.Response.Node == "" {
 							fail("redirect without node: %+v", r.Response)
 						}
@@ -171,7 +171,7 @@ func main() {
 			var next []pending
 			for k, r := range rs {
 				if (r.Response.Status == pushupesv1.AppendResponse_STATUS_FAIL) &&
-					(r.Response.ErrId == data.ErrIDSlotNotLocal || r.Response.ErrId == data.ErrIDMigrating) {
+					(r.Response.ErrId == client.ErrIDSlotNotLocal || r.Response.ErrId == client.ErrIDMigrating) {
 					next = append(next, pending{l2[idx[k]].req, r.Response.Node})
 					continue
 				}
@@ -203,13 +203,13 @@ func main() {
 	if e.Record == nil || e.Record.CommandId != "smoke-cmd-0" {
 		fail("exists must echo stored record: %+v", e)
 	}
-	c1 := check("smoke-agg-1", pushupesv1.AppendResponse_STATUS_FAIL, data.ErrIDVersionConflict)
+	c1 := check("smoke-agg-1", pushupesv1.AppendResponse_STATUS_FAIL, client.ErrIDVersionConflict)
 	if c1.CurrentVersion != 1 {
 		fail("conflict current_version: %d", c1.CurrentVersion)
 	}
 	// The duplicate pair: BOTH rejected, and agg-2 must still have exactly 1
 	// record (the v1 from phase A).
-	check("smoke-agg-2", pushupesv1.AppendResponse_STATUS_FAIL, data.ErrIDBadRequest)
+	check("smoke-agg-2", pushupesv1.AppendResponse_STATUS_FAIL, client.ErrIDBadRequest)
 	check("smoke-agg-3", pushupesv1.AppendResponse_STATUS_SUCCESS, 0)
 	fmt.Println("pass B: exists/1001/dup-reject/success in one batch, all aligned")
 

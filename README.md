@@ -234,10 +234,11 @@ admin 地址**，follower 一律拒绝（425 + 1005），不做转发。
 # 冒烟探针（MOVED 跟随 + 幂等 + 版本冲突 + 回读断言）
 go run ./cmd/grpccheck -addrs http://127.0.0.1:8591,http://127.0.0.1:8592,http://127.0.0.1:8593
 
-# 写压测（-nodes 传 admin 地址，自动从 status 解析 client 地址；
+# 写压测（-nodes 传 client 面 gRPC 地址，路由表经 PrefetchRoutes 解析并按
+# -route-refresh 周期刷新，MOVED/ASK 即时修补本地行；槽数取自应答长度；
 # -batch N 为每批条数，N=0 即一条 BatchAppend 只带一条记录）
-go run ./cmd/bench -nodes http://127.0.0.1:8091 -conns 8 -size 1024 -duration 30s
-go run ./cmd/bench -nodes http://127.0.0.1:8091 -conns 8 -size 1024 -batch 64 -duration 30s
+go run ./cmd/bench -nodes http://127.0.0.1:8591 -conns 8 -size 1024 -duration 30s
+go run ./cmd/bench -nodes http://127.0.0.1:8591,http://127.0.0.1:8592,http://127.0.0.1:8593 -conns 8 -size 1024 -batch 64 -duration 30s
 
 # BatchAppend 冒烟（success/exists/1001/批内重复拒绝/重定向跟随/空批，直打 8591）
 go run ./cmd/batchsmoke

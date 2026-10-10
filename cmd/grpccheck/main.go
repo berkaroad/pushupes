@@ -26,6 +26,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/berkaroad/pushupes/pkg/client"
 	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 )
 
@@ -201,6 +202,71 @@ func main() {
 			fatal("version-by-time@%s at=%d: want 0 got %d", a, t1-1, vb0.Version)
 		}
 		fmt.Printf("version-by-time@%s: at=%d -> 1, at=%d -> 2, before=%d -> 0 ok\n", a, t1, t2, t1-1)
+	}
+	// 7) PrefetchRoutes: the routing table is cluster state every node can
+	// answer (Raft-replicated), dense over slots (its length IS the slot
+	// count a client applies to client.SlotOf), every row pointing at a
+	// known node addr — and all nodes answer the same table. Then the
+	// smoke's own streams must be routable straight from it: a fresh
+	// command lands through the table's row for its slot, so a healthy
+	// cluster never needs a redirect hop to find the leader.
+	rt, err := cli(addrs[0]).PrefetchRoutes(ctx, &pushupesv1.PrefetchRoutesRequest{})
+	check(err)
+	if len(rt.NodeClientAddrs) == 0 || len(rt.SlotNodeIndex) == 0 {
+		fatal("prefetch: empty table (addrs=%d slots=%d)", len(rt.NodeClientAddrs), len(rt.SlotNodeIndex))
+	}
+	for _, idx := range rt.SlotNodeIndex {
+		if idx < 0 || int(idx) >= len(rt.NodeClientAddrs) {
+			fatal("prefetch: row index %d outside %d addrs", idx, len(rt.NodeClientAddrs))
+		}
+	}
+	for _, a := range addrs {
+		r2, err := cli(a).PrefetchRoutes(ctx, &pushupesv1.PrefetchRoutesRequest{})
+		check(err)
+		if len(r2.SlotNodeIndex) != len(rt.SlotNodeIndex) {
+			fatal("prefetch@%s: slot count %d != %d", a, len(r2.SlotNodeIndex), len(rt.SlotNodeIndex))
+		}
+		for slot, idx := range rt.SlotNodeIndex {
+			if r2.NodeClientAddrs[r2.SlotNodeIndex[slot]] != rt.NodeClientAddrs[idx] {
+				fatal("prefetch@%s: slot %d routes to %s, first answer said %s",
+					a, slot, r2.NodeClientAddrs[r2.SlotNodeIndex[slot]], rt.NodeClientAddrs[idx])
+			}
+		}
+	}
+	slotCount := len(rt.SlotNodeIndex)
+	ragg := fmt.Sprintf("%s-r", agg)
+	row := rt.SlotNodeIndex[client.SlotOf(ragg, slotCount)]
+	rr, err := cli(rt.NodeClientAddrs[row]).BatchAppend(ctx, &pushupesv1.BatchAppendRequest{
+		Records: []*pushupesv1.AppendRequest{{
+			AggregateId: ragg, Version: 1, CommandId: "rt-1",
+			Events: []*pushupesv1.Event{{Type: "RT", Body: []byte("{}")}},
+		}},
+	})
+	check(err)
+	rres := rr.Results[0].Response
+	if rres.Status != pushupesv1.AppendResponse_STATUS_SUCCESS &&
+		!(rres.Status == pushupesv1.AppendResponse_STATUS_FAIL &&
+			(rres.ErrId == client.ErrIDSlotNotLocal || rres.ErrId == client.ErrIDMigrating)) {
+		fatal("routed append: %+v", rres)
+	}
+	if rres.Status == pushupesv1.AppendResponse_STATUS_SUCCESS {
+		fmt.Printf("prefetch-routes: %d slots / %d addrs, table consistent across %d nodes, routed write hit leader directly\n",
+			slotCount, len(rt.NodeClientAddrs), len(addrs))
+	} else {
+		// the row moved (migration / unannounced leader): follow once, the
+		// hint-plus-self-heal contract in action.
+		fr, err := cli(rres.Node).BatchAppend(ctx, &pushupesv1.BatchAppendRequest{
+			Records: []*pushupesv1.AppendRequest{{
+				AggregateId: ragg, Version: 1, CommandId: "rt-1",
+				Events: []*pushupesv1.Event{{Type: "RT", Body: []byte("{}")}},
+			}},
+		})
+		check(err)
+		if fr.Results[0].Response.Status != pushupesv1.AppendResponse_STATUS_SUCCESS {
+			fatal("routed append after redirect: %+v", fr.Results[0].Response)
+		}
+		fmt.Printf("prefetch-routes: %d slots / %d addrs, table consistent across %d nodes, routed write followed 1 redirect\n",
+			slotCount, len(rt.NodeClientAddrs), len(addrs))
 	}
 	fmt.Println("GRPC SMOKE PASS")
 }
