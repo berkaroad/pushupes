@@ -34,7 +34,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/berkaroad/pushupes/internal/data"
-	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
+	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 )
 
 func main() {
@@ -91,9 +91,11 @@ func main() {
 			for v := uint32(1); v <= uint32(perAgg); v++ {
 				n := seq.Add(1)
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				_, err := cli.Append(ctx, &pushupesv1.AppendRequest{
-					AggregateId: agg, Version: v, CommandId: fmt.Sprintf("s-%d", n),
-					Events: []*pushupesv1.Event{{Type: "Seed", Body: body}},
+				_, err := cli.BatchAppend(ctx, &pushupesv1.BatchAppendRequest{
+					Records: []*pushupesv1.AppendRequest{{
+						AggregateId: agg, Version: v, CommandId: fmt.Sprintf("s-%d", n),
+						Events: []*pushupesv1.Event{{Type: "Seed", Body: body}},
+					}},
 				})
 				cancel()
 				if err != nil {

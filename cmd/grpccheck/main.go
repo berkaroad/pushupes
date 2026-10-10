@@ -26,7 +26,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
+	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 )
 
 var clientAddrs = flag.String("addrs", "127.0.0.1:9991,127.0.0.1:9992,127.0.0.1:9993", "comma list of node client-plane (gRPC) addrs")
@@ -42,6 +42,16 @@ func cli(addr string) pushupesv1.EventServiceClient {
 	return pushupesv1.NewEventServiceClient(conn)
 }
 
+// appendOne writes one record over BatchAppend — the client plane's single
+// write entry (a single write is a batch of one record).
+func appendOne(ctx context.Context, addr string, req *pushupesv1.AppendRequest) (*pushupesv1.AppendResponse, error) {
+	resp, err := cli(addr).BatchAppend(ctx, &pushupesv1.BatchAppendRequest{Records: []*pushupesv1.AppendRequest{req}})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Results[0].Response, nil
+}
+
 func main() {
 	flag.Parse()
 	addrs := splitList(*clientAddrs)
@@ -53,7 +63,7 @@ func main() {
 	target := addrs[0]
 	var v2OK bool
 	for pass := 0; pass < 3 && !v2OK; pass++ {
-		r, err := cli(target).Append(ctx, &pushupesv1.AppendRequest{
+		r, err := appendOne(ctx, target, &pushupesv1.AppendRequest{
 			AggregateId: agg, Version: 1, CommandId: "s-1",
 			Events: []*pushupesv1.Event{{Type: "Hello", Body: []byte(`{"g":"世界"}`)}},
 		})
@@ -67,7 +77,7 @@ func main() {
 			}
 			fatal("append v1: %v", r)
 		}
-		r2, err := cli(target).Append(ctx, &pushupesv1.AppendRequest{
+		r2, err := appendOne(ctx, target, &pushupesv1.AppendRequest{
 			AggregateId: agg, Version: 2, CommandId: "s-2",
 			Events: []*pushupesv1.Event{{Type: "Bin", Body: []byte{0, 1, 0xff, 'A'}}},
 		})
@@ -90,7 +100,7 @@ func main() {
 	fmt.Printf("wrote v1(seq via leader %s) + v2 (ISR-replicated), agg=%s\n", target, agg)
 
 	// 2) 1001 self-heal
-	r3, _ := cli(target).Append(ctx, &pushupesv1.AppendRequest{
+	r3, _ := appendOne(ctx, target, &pushupesv1.AppendRequest{
 		AggregateId: agg, Version: 9, CommandId: "s-3",
 		Events: []*pushupesv1.Event{{Type: "X", Body: []byte("{}")}},
 	})
@@ -114,7 +124,7 @@ func main() {
 	}
 
 	// 4) idempotent replay -> EXISTS
-	r4, _ := cli(target).Append(ctx, &pushupesv1.AppendRequest{
+	r4, _ := appendOne(ctx, target, &pushupesv1.AppendRequest{
 		AggregateId: agg, Version: 2, CommandId: "s-2",
 		Events: []*pushupesv1.Event{{Type: "Bin", Body: []byte{0, 1, 0xff, 'A'}}},
 	})
@@ -141,7 +151,7 @@ func main() {
 	tTarget := target
 	for pass := 0; pass < 3; pass++ {
 		okBoth := true
-		r, err := cli(tTarget).Append(ctx, &pushupesv1.AppendRequest{
+		r, err := appendOne(ctx, tTarget, &pushupesv1.AppendRequest{
 			AggregateId: tagg, Version: 1, UnixTime: t1, CommandId: "t-1",
 			Events: []*pushupesv1.Event{{Type: "T", Body: []byte("{}")}},
 		})
@@ -152,7 +162,7 @@ func main() {
 			fatal("append time v1: %+v", r)
 		}
 		if okBoth {
-			r2, err := cli(tTarget).Append(ctx, &pushupesv1.AppendRequest{
+			r2, err := appendOne(ctx, tTarget, &pushupesv1.AppendRequest{
 				AggregateId: tagg, Version: 2, UnixTime: t2, CommandId: "t-2",
 				Events: []*pushupesv1.Event{{Type: "T", Body: []byte("{}")}},
 			})

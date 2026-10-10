@@ -206,14 +206,14 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 
 事件读写只走 **gRPC client 面**（proto 契约 `proto/pushupes/v1/events.proto`）：
 
-- `EventService/Append`：事件写入。服务端校验幂等与版本（见「数据模型与
-  写入协议」），槽不在本节点时以响应字段返回重定向：`err_id=1003/1004`
-  （MOVED/ASK）+ `node`（槽 leader 的 client 地址），客户端据此重连。
-- `EventService/BatchAppend`：批量写入。一批携带多条 `AppendRequest`（批内
-  `aggregate_id` 必须各不相同，重复的那组整组 `fail/1002` 且不执行），逐条
-  独立走同一套写入规则，按请求同序返回逐条结果（回显 `aggregate_id`）。
-  服务端同槽串行、异槽并行（并发上限 `-batch-slot-parallelism`，默认 100）。单批必须装进 client 面
-  gRPC 消息上限（`-grpc-max-msg-size`，默认 4MiB）。
+- `EventService/BatchAppend`：事件写入的唯一入口，单次与批量写入都走它——
+  一条 `AppendRequest` 就是单条写，多条就是批量。服务端逐条校验幂等与版本
+  （见「数据模型与写入协议」），按请求同序返回逐条结果（回显
+  `aggregate_id`），槽不在本节点时以响应字段返回重定向：`err_id=1003/1004`
+  （MOVED/ASK）+ `node`（槽 leader 的 client 地址），客户端据此重连。批内
+  `aggregate_id` 必须各不相同，重复的那组整组 `fail/1002` 且不执行。服务端
+  同槽串行、异槽并行（并发上限 `-batch-slot-parallelism`，默认 100）。单批
+  必须装进 client 面 gRPC 消息上限（`-grpc-max-msg-size`，默认 4MiB）。
 - `EventService/ReadStream`：按聚合读取事件流（≤HW 语义）。
 - `EventService/ReadByCommand`：按 `command_id` 查询已写入的记录。
 
@@ -235,7 +235,7 @@ admin 地址**，follower 一律拒绝（425 + 1005），不做转发。
 go run ./cmd/grpccheck -addrs http://127.0.0.1:8591,http://127.0.0.1:8592,http://127.0.0.1:8593
 
 # 写压测（-nodes 传 admin 地址，自动从 status 解析 client 地址；
-# -batch N>0 切换为 BatchAppend 批量写，N=每批条数）
+# -batch N 为每批条数，N=0 即一条 BatchAppend 只带一条记录）
 go run ./cmd/bench -nodes http://127.0.0.1:8091 -conns 8 -size 1024 -duration 30s
 go run ./cmd/bench -nodes http://127.0.0.1:8091 -conns 8 -size 1024 -batch 64 -duration 30s
 
@@ -251,7 +251,8 @@ go run ./cmd/seed -slot 7 -mib 512
 go run ./cmd/slotcheck -admins http://127.0.0.1:8091,http://127.0.0.1:8092,http://127.0.0.1:8093
 ```
 
-修改 proto 后重新生成：`buf generate --template buf.gen.yaml proto`。
+修改 proto 后重新生成：`./scripts/genproto.sh`（buf 工具链在 `proto/` 下随仓库
+分发，生成产物落在 `pkg/grpcapi/`，勿手改）。
 
 ## 性能数据
 
@@ -265,7 +266,7 @@ go run ./cmd/slotcheck -admins http://127.0.0.1:8091,http://127.0.0.1:8092,http:
 
 #### 写入吞吐
 
-组合矩阵（节点数 × 连接数 × 批大小）实测。参数：1 KiB 事件体、`aggs=1000`、每组 30 秒；每组冷启动独立集群（单节点 RF=1、3 节点 RF=2），测完销毁数据重测。批量行的延迟按**批往返**计（整批一个样本），批大小=1 即单条 `Append`（一次 RPC 一条记录）。12 组均 fail=0、exists=0、redirects=0。
+组合矩阵（节点数 × 连接数 × 批大小）实测。参数：1 KiB 事件体、`aggs=1000`、每组 30 秒；每组冷启动独立集群（单节点 RF=1、3 节点 RF=2），测完销毁数据重测。批量行的延迟按**批往返**计（整批一个样本），批大小=1 即一条 `BatchAppend` 携带一条记录（一次 RPC 一条记录）。12 组均 fail=0、exists=0、redirects=0。
 
 | 节点 | 连接数 | 批大小 | 吞吐量 (msg/s) | p50 | p99 |
 |---|---|---|---|---|---|

@@ -18,7 +18,7 @@ import (
 	"context"
 	"testing"
 
-	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
+	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 )
 
 // ReadVersionByTime is the point-in-time anchor for client history replay:
@@ -34,7 +34,7 @@ func TestGRPCReadVersionByTime(t *testing.T) {
 	// Explicit stamps: version v carries unix_time = 2000+v (the Append
 	// request sets UnixTime; 0 would default to the server clock).
 	for v := uint32(1); v <= 5; v++ {
-		r, err := cli.Append(ctx, &pushupesv1.AppendRequest{
+		r, err := appendOne(ctx, cli, &pushupesv1.AppendRequest{
 			AggregateId: agg, Version: v, UnixTime: int64(2000 + v),
 			CommandId: "tc-" + string(rune('a'+v)),
 			Events:    []*pushupesv1.Event{{Type: "T", Body: []byte("{}")}},

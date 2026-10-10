@@ -27,10 +27,9 @@ import (
 
 	"github.com/berkaroad/pushupes/internal/cluster"
 	"github.com/berkaroad/pushupes/internal/data"
-	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 	"github.com/berkaroad/pushupes/internal/lease"
-	"github.com/berkaroad/pushupes/internal/payloadcodec"
 	"github.com/berkaroad/pushupes/internal/storage"
+	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 )
 
 // newTestClient spins up the gRPC server over an in-memory listener and
@@ -71,17 +70,29 @@ func appendReq(agg string, ver uint32, cmd, body string) *pushupesv1.AppendReque
 	}
 }
 
+// appendOne writes a single record through BatchAppend — the client plane's
+// only write entry (a single write is a batch of one record) — and hands back
+// that record's response.
+func appendOne(ctx context.Context, cli pushupesv1.EventServiceClient, req *pushupesv1.AppendRequest) (*pushupesv1.AppendResponse, error) {
+	resp, err := cli.BatchAppend(ctx, &pushupesv1.BatchAppendRequest{
+		Records: []*pushupesv1.AppendRequest{req},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Results[0].Response, nil
+}
+
 func TestGRPCAppendReadCycle(t *testing.T) {
 	// Run the cycle through the production codec, which aliases the request's
 	// event bodies into the receive buffer and holds a lease on it for the
 	// duration of the handler.
-	payloadcodec.InstallCodec()
 	leasesBefore := lease.Outstanding()
 
 	cli, _ := newTestClient(t)
 	ctx := context.Background()
 
-	resp, err := cli.Append(ctx, appendReq("agg-1", 1, "c-1", `{"a":1}`))
+	resp, err := appendOne(ctx, cli, appendReq("agg-1", 1, "c-1", `{"a":1}`))
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
@@ -96,7 +107,7 @@ func TestGRPCAppendReadCycle(t *testing.T) {
 
 	// idempotent replay -> EXISTS, which does carry the stored record (the one
 	// case the caller cannot reconstruct itself).
-	resp2, err := cli.Append(ctx, appendReq("agg-1", 1, "c-1", `{"a":1}`))
+	resp2, err := appendOne(ctx, cli, appendReq("agg-1", 1, "c-1", `{"a":1}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +119,7 @@ func TestGRPCAppendReadCycle(t *testing.T) {
 	}
 
 	// version skip -> FAIL 1001 + current_version for self-heal
-	resp3, err := cli.Append(ctx, appendReq("agg-1", 5, "c-2", `{}`))
+	resp3, err := appendOne(ctx, cli, appendReq("agg-1", 5, "c-2", `{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +128,7 @@ func TestGRPCAppendReadCycle(t *testing.T) {
 	}
 
 	// a second version lands
-	if r, err := cli.Append(ctx, appendReq("agg-1", 2, "c-3", `{"b":2}`)); err != nil || r.Status != pushupesv1.AppendResponse_STATUS_SUCCESS {
+	if r, err := appendOne(ctx, cli, appendReq("agg-1", 2, "c-3", `{"b":2}`)); err != nil || r.Status != pushupesv1.AppendResponse_STATUS_SUCCESS {
 		t.Fatalf("append2: %+v %v", r, err)
 	}
 
@@ -126,7 +137,7 @@ func TestGRPCAppendReadCycle(t *testing.T) {
 		AggregateId: "agg-bin", Version: 1, CommandId: "cb-1",
 		Events: []*pushupesv1.Event{{Type: "Raw", Body: []byte{0x00, 0x01, 0xff, 'A'}}},
 	}
-	if r, err := cli.Append(ctx, binReq); err != nil || r.Status != pushupesv1.AppendResponse_STATUS_SUCCESS {
+	if r, err := appendOne(ctx, cli, binReq); err != nil || r.Status != pushupesv1.AppendResponse_STATUS_SUCCESS {
 		t.Fatalf("append bin: %+v %v", r, err)
 	}
 	brr, err := cli.ReadStream(ctx, &pushupesv1.ReadStreamRequest{AggregateId: "agg-bin"})
@@ -177,7 +188,7 @@ func TestGRPCAppendReadCycle(t *testing.T) {
 func TestGRPCValidation(t *testing.T) {
 	cli, _ := newTestClient(t)
 	ctx := context.Background()
-	if r, err := cli.Append(ctx, &pushupesv1.AppendRequest{}); err != nil || r.Status != pushupesv1.AppendResponse_STATUS_FAIL || r.ErrId != 1002 {
+	if r, err := appendOne(ctx, cli, &pushupesv1.AppendRequest{}); err != nil || r.Status != pushupesv1.AppendResponse_STATUS_FAIL || r.ErrId != 1002 {
 		t.Fatalf("empty append: %+v %v", r, err)
 	}
 	if _, err := cli.ReadStream(ctx, &pushupesv1.ReadStreamRequest{}); err == nil {
@@ -210,7 +221,7 @@ func TestBatchAppendResults(t *testing.T) {
 	sameA, sameB, otherA := batchPair(t, st)
 
 	// Seed one record so the batch can produce an EXISTS against real state.
-	if r, err := cli.Append(ctx, appendReq(sameA, 1, "seed-1", "s")); err != nil ||
+	if r, err := appendOne(ctx, cli, appendReq(sameA, 1, "seed-1", "s")); err != nil ||
 		r.Status != pushupesv1.AppendResponse_STATUS_SUCCESS {
 		t.Fatalf("seed: %+v %v", r, err)
 	}
@@ -332,9 +343,7 @@ func TestBatchAppendEmptyAndSerial(t *testing.T) {
 }
 
 func TestBatchAppendLeaseRelease(t *testing.T) {
-	// Through the production codec: the batch's inner event bodies alias the
 	// receive buffer; the handler releases the whole-request lease once.
-	payloadcodec.InstallCodec()
 	leasesBefore := lease.Outstanding()
 	cli, _ := newTestClient(t)
 	ctx := context.Background()

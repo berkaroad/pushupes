@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package pushupes.v1;
 
-option go_package = "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1;pushupesv1";
+option go_package = "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1;pushupesv1";
 
 // PeerService is the inter-node data plane. It is served on the SAME port
 // as the Raft transport (the peer port): the connection demux routes the

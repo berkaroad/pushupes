@@ -1,0 +1,12 @@
+version: v1
+managed:
+  enabled: false
+plugins:
+  - name: go
+    out: ../pkg/grpcapi
+    opt: paths=source_relative
+    path: ./protoc-gen-go
+  - name: grpc-go
+    out: ../pkg/grpcapi
+    opt: paths=source_relative
+    path: ./protoc-gen-go-grpc

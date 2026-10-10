@@ -75,7 +75,8 @@ seq 升序重放同一批记录，把计数器重建到 LEO。
 
 ## 2. 业务规则（写入协议）
 
-`Append(aggregate_id, version, unix_time, command_id, events[])`：
+一条写入记录（`AppendRequest(aggregate_id, version, unix_time, command_id, events[])`，
+经 `BatchAppend` 提交，单条与批量同一路径）：
 
 1. **幂等**：command 索引（slot 内 `map[command_id]→seq`）命中
    → 返回 `status=exists` + 已存储的记录（按 command_id 反查 seq 后从 WAL 读出）。
@@ -202,7 +203,8 @@ Body: Record*，每条记录：
   单节点并发 1.45ms/op（p50 2.84ms、p99 3.72ms）、3 节点顺序 5.52ms/op
   （p99 6.68ms）；每 op 分配 17 allocs、2KB 级。
 - **数据面（专用拉取）**：
-  - 客户端把 `Append` 发给槽 leader 的 gRPC client 面；leader 追加本地
+  - 客户端把写入（`BatchAppend`，单条与批量同一路径）发给槽 leader 的 gRPC
+    client 面；leader 追加本地
     WAL 得到 seq。
   - follower 把「我作为副本跟随的槽」按 leader 分组，**每个 leader 一条
     常驻 PeerService.MFetch 长轮询会话**（gRPC，`peer.proto`，与 Raft 共用
@@ -236,7 +238,8 @@ Body: Record*，每条记录：
     （MFetch 的 sweep 标志位）为所有条目补戳，sweep 间隔远小于 stale 窗口；
     有数据的轮次只对真正推进过的槽即时补报 LEO（ReplicaProgress），
     不再全量重发。
-  - **写入成功的条件**：一次 `Append` 只有满足以下全部条件才对客户端回
+  - **写入成功的条件**：一条记录（`BatchAppend` 携带的每条 `AppendRequest`
+    各自适用）只有满足以下全部条件才对客户端回
     `success`——(1) 幂等与版本校验通过并落入 leader 的 WAL；(2) 该槽的高水位
     已覆盖此 seq，即**每个 in-sync 副本都已把同一记录写进自己的 WAL**。
     因此任何一个单节点故障都不会丢失已确认的写入。三个边界：ISR 内所有副本
@@ -462,8 +465,8 @@ Body: Record*，每条记录：
 
 - **client 面（gRPC，客户端事件写入/查询唯一入口，默认 `-client
   http://127.0.0.1:8591`，`PUSHUPES_CLIENT`）**：proto3 契约
-  `proto/pushupes/v1/events.proto`（`pushupes.v1.EventService`：`Append` +
-  `BatchAppend` + `ReadStream` + `ReadTails` + `ReadByCommand` +
+  `proto/pushupes/v1/events.proto`（`pushupes.v1.EventService`：`BatchAppend`（写入唯一入口）+
+  `ReadStream` + `ReadTails` + `ReadByCommand` +
   `ReadVersionByTime`）。body 为原始
   bytes，无 JSON/base64 层。client 面 gRPC 消息上限由 `-grpc-max-msg-size`
   配置（默认 4MiB，recv/send 同值）：`BatchAppend` 一整批要装进这个上限，
@@ -492,7 +495,7 @@ Body: Record*，每条记录：
   - 旧多端口格式 `id:peerport:adminport:clientport` / `id:host:peerport:adminport:clientport` 仍兼容（作为静态种子，注册落地后以自报值为准）。
 
 ```
-gRPC  EventService/Append         写入：幂等(command_id)/版本(+1)/等 ISR 高水位确认，MOVED/ASK
+gRPC  EventService/BatchAppend    写入唯一入口（单条=一条记录、批量=多条）：幂等(command_id)/版本(+1)/等 ISR 高水位确认，逐条结果同序返回，MOVED/ASK
 gRPC  EventService/ReadStream     范围查询（≤HW 语义）
 gRPC  EventService/ReadByCommand  command_id 幂等探针
 gRPC  EventService/ReadTails      批量取多个聚合的最新版本（resume 扫描用；按槽分组一次 RPC，非持有者按目标节点成组转发）
@@ -780,8 +783,8 @@ pushupes/
 │   │                          #   peer_mux.go（peer 端口首字节分流 Raft/gRPC），
 │   │                          #   migration.go（六步热迁移），register.go（地址自报 announcer+RPC）
 ├── internal/api/              # handler.go（仅管理：status/writes/plan/migrate/describe/pprof），server.go
-├── internal/grpcapi/          # gRPC 客户端数据面：server.go（Append/ReadStream/ReadTails/ReadByCommand/ReadVersionByTime）
-└── proto/pushupes/v1/         # events.proto 客户端契约 + peer.proto 节点间契约（buf 生成至 internal/grpcapi）
+├── internal/grpcapi/          # gRPC 客户端数据面：server.go（BatchAppend/ReadStream/ReadTails/ReadByCommand/ReadVersionByTime）
+└── proto/pushupes/v1/         # events.proto 客户端契约 + peer.proto 节点间契约（含 buf 工具链，生成至 pkg/grpcapi）
 ```
 
 ## 10. 设计要点小结

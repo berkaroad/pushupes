@@ -41,7 +41,6 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/berkaroad/pushupes/internal/grpcapi"
-	"github.com/berkaroad/pushupes/internal/payloadcodec"
 )
 
 // defaultGrpcMaxMsgBytes is the client-plane gRPC message cap: gRPC's own
@@ -108,14 +107,6 @@ func main() {
 	flag.Var(&grpcMaxMsg, "grpc-max-msg-size", "client-plane gRPC max message `size` in bytes (suffixes like 16MiB accepted; the gRPC default 4MiB applies when unset) (env PUSHUPES_GRPC_MAX_MSG_SIZE)")
 	flag.Var(&raftSegB, "raft-segment-bytes", "consensus WAL segment roll `size` (bytes, or a suffix like 64MiB) (env PUSHUPES_RAFT_SEGMENT_BYTES)")
 	flag.Parse()
-
-	// gRPC's stock buffer pool zeroes every buffer it hands out and its size
-	// classes are too sparse for event payloads (a 100KiB message would take a
-	// 1MiB buffer and pay a 1MiB memclr). Our codec then keeps the large bytes
-	// fields out of the copy path in both directions. Both must be installed
-	// before anything creates a client or server.
-	payloadcodec.InstallBufferPool()
-	payloadcodec.InstallCodec()
 
 	base := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	logger := base.With("node", *nodeID)

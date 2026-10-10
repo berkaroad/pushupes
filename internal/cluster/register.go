@@ -36,7 +36,7 @@ import (
 	"fmt"
 	"time"
 
-	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
+	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 )
 
 const (

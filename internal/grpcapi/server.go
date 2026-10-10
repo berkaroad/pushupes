@@ -35,9 +35,9 @@ import (
 
 	"github.com/berkaroad/pushupes/internal/cluster"
 	"github.com/berkaroad/pushupes/internal/data"
-	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 	"github.com/berkaroad/pushupes/internal/lease"
 	"github.com/berkaroad/pushupes/internal/storage"
+	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 )
 
 // Server implements pushupes.v1.EventService.
@@ -102,33 +102,15 @@ func (s *Server) leaderClient(addr string) (pushupesv1.EventServiceClient, error
 	return c, nil
 }
 
-// ---- Append -----------------------------------------------------------------
+// ---- Write ------------------------------------------------------------------
 
-func (s *Server) Append(ctx context.Context, req *pushupesv1.AppendRequest) (*pushupesv1.AppendResponse, error) {
-	// The codec aliases the event bodies into the receive buffer: the lease
-	// covers this handler, which is where the bytes reach the WAL.
-	defer lease.Release(req)
-	rec, failResp := toRecord(req)
-	if failResp != nil {
-		return failResp, nil
-	}
-	resp, err := s.engine.SubmitAppend(ctx, rec)
-	if err != nil {
-		var redir *cluster.RedirectError
-		if errors.As(err, &redir) {
-			return s.fail(redir.Kind, "redirect", 0, redir.Slot, cluster.HostPort(redir.Addr)), nil
-		}
-		if errors.Is(err, data.ErrSlotNotLocal) {
-			return s.fail(data.ErrIDSlotNotLocal, "slot not local", 0, 0, ""), nil
-		}
-		return nil, status.Errorf(codes.Internal, "append: %v", err)
-	}
-	return convertAppend(resp), nil
-}
+// The client plane has a single write entry, BatchAppend; a single write is a
+// batch of one record. toRecord/s0fail below carry the per-record validation
+// every write runs before touching the engine.
 
 // toRecord converts one request into the domain record, answering nil plus a
-// fail response when the request itself is invalid (the same 1002 rule the
-// single Append applies before touching the engine).
+// fail response when the request itself is invalid (the 1002 rule a rejected
+// record applies before it reaches the engine).
 func toRecord(req *pushupesv1.AppendRequest) (*data.EventRecord, *pushupesv1.AppendResponse) {
 	if req.AggregateId == "" || req.CommandId == "" || len(req.Events) == 0 {
 		return nil, s0fail("aggregate_id, command_id and at least one event are required")
@@ -149,8 +131,8 @@ func toRecord(req *pushupesv1.AppendRequest) (*data.EventRecord, *pushupesv1.App
 	return rec, nil
 }
 
-// s0fail builds the pre-engine 1002 fail (slot 0, no node): the shape the
-// Append handler used for its own argument validation.
+// s0fail builds the pre-engine 1002 fail (slot 0, no node): the shape of a
+// record rejected by argument validation.
 func s0fail(msg string) *pushupesv1.AppendResponse {
 	return &pushupesv1.AppendResponse{
 		Status:  pushupesv1.AppendResponse_STATUS_FAIL,
@@ -211,7 +193,8 @@ func (s *Server) batchSlot(ctx context.Context, slot int32, reqs []*pushupesv1.A
 
 // ---- BatchAppend -------------------------------------------------------------
 
-// BatchAppend appends many records in one call. Each record gets its own
+// BatchAppend appends records in one call — the only write entry on the
+// client plane, so a single write is a batch of one record. Each record gets its own
 // result (success/exists/fail) in the SAME ORDER as the request. The batch
 // must carry distinct aggregate_ids: every record sharing an aggregate_id
 // with another record in the same batch fails (1002) and none of them is
@@ -222,8 +205,8 @@ func (s *Server) batchSlot(ctx context.Context, slot int32, reqs []*pushupesv1.A
 //
 // Execution is slot-parallel and slot-serial: records are grouped by their
 // routing slot, one worker per slot runs them in request order through the
-// ordinary SubmitAppend path (write fence, routing, idempotency, version
-// check, HW wait — the same rules a single Append applies), and distinct
+// same write path as the engine's single append (write fence, routing,
+// idempotency, version check, HW wait), and distinct
 // slots run concurrently under the server's shared cap
 // (-batch-slot-parallelism, default DefaultBatchSlotParallelism). The slot WAL lock already
 // serialises appends to one slot; keeping the HW waits serial per slot as

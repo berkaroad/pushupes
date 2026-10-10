@@ -25,17 +25,17 @@ import (
 	"testing"
 	"time"
 
+	"net"
+	"sync"
+
 	"github.com/berkaroad/pushupes/internal/data"
-	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 	"github.com/berkaroad/pushupes/internal/lease"
-	"github.com/berkaroad/pushupes/internal/payloadcodec"
 	"github.com/berkaroad/pushupes/internal/storage"
+	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
-	"net"
-	"sync"
 )
 
 // aggInSlot finds an aggregate id that routes to the given slot.
@@ -450,7 +450,6 @@ func TestMigratingForwardFailureKeepsWriteAndSlot(t *testing.T) {
 // acknowledged off its durable local copy, the slot keeps migrating, and the
 // target is left to catch up over the ordinary fetch loop.
 func TestMigratingForwardNotContiguousKeepsWriteAndMigration(t *testing.T) {
-	payloadcodec.InstallCodec()
 	leader, st := newTestEngine(t, "node-1")
 	leader.node = newTestRaftNode(t, leader)
 
@@ -623,10 +622,6 @@ func TestMigrationTargetDoesNotGateHW(t *testing.T) {
 }
 
 func TestHandleFetchAndReplicateOverPeerPlane(t *testing.T) {
-	// The payload codec is installed here too, so this exercises the production
-	// decode path — including the receive-buffer leases the follower takes on
-	// fetched payloads and releases once they are written.
-	payloadcodec.InstallCodec()
 	leasesBefore := lease.Outstanding()
 	// Wire two engines through the real PeerService gRPC plane (over the
 	// peer-port mux demux) to prove replication end to end: fetch round,

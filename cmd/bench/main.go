@@ -47,7 +47,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/berkaroad/pushupes/internal/data"
-	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
+	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 )
 
 // clients caches one gRPC connection per address (HTTP/2 keep-alive).
@@ -87,7 +87,7 @@ func main() {
 	dur := flag.Duration("duration", 10*time.Second, "sustained write duration")
 	connsFlag := flag.Int("conns", 16, "workers; each worker owns a partition of the aggregates and appends one at a time (awaits each reply before sending the next), so throughput is bounded by conns / p50 — conns=1 measures a single serialized round trip, not cluster capacity")
 	size := flag.Int("size", 1024, "event body bytes (must be <= 1024 * 1024)")
-	batch := flag.Int("batch", 0, "records per BatchAppend call (>0 switches the write phase to batched appends: one record per aggregate in the chunk, grouped per slot leader; 0 = one Append RPC per record). Latency lines then report per-batch round trips")
+	batch := flag.Int("batch", 0, "records per BatchAppend call (the write path is always BatchAppend: 0 = one BatchAppend carrying a single record per round, >0 = a chunk of distinct aggregates grouped per slot leader). Latency lines report per-batch round trips")
 	reportEvery := flag.Duration("report", time.Second, "live report interval")
 	slotRate := flag.Bool("slot-rate", false, "print the per-slot durable write table (each slot's write speed) in the final report; off by default")
 	flag.Parse()
@@ -369,26 +369,26 @@ func main() {
 					}
 					seq++
 					ver[agg]++
-					cmd := fmt.Sprintf("b%d-%d-%d", w, seq, rng.Int63n(1<<40))
 					req := &pushupesv1.AppendRequest{
-						AggregateId: agg, Version: ver[agg], CommandId: cmd,
-						Events: []*pushupesv1.Event{{Type: "BenchAppend", Body: body}},
+						AggregateId: agg, Version: ver[agg],
+						CommandId: fmt.Sprintf("b%d-%d-%d", w, seq, rng.Int63n(1<<40)),
+						Events:    []*pushupesv1.Event{{Type: "BenchAppend", Body: body}},
 					}
 					t0 := time.Now()
-					resp, err := appendWithRetry(w, agg, req, routes, &routeMu)
+					resp := batchWithRetry(w, []*pushupesv1.AppendRequest{req}, routes, &routeMu)[0]
 					// version self-heal: if the leader reports a newer tail
 					// (resume estimate lagged), adopt it and retry once.
-					if err == nil && resp != nil &&
+					if resp != nil &&
 						resp.Status == pushupesv1.AppendResponse_STATUS_FAIL &&
 						resp.ErrId == data.ErrIDVersionConflict {
 						ver[agg] = resp.CurrentVersion
 						req.Version = resp.CurrentVersion + 1
 						t0 = time.Now()
-						resp, err = appendWithRetry(w, agg, req, routes, &routeMu)
+						resp = batchWithRetry(w, []*pushupesv1.AppendRequest{req}, routes, &routeMu)[0]
 					}
 					lat := float64(time.Since(t0).Microseconds()) / 1000.0
 					total.Add(1)
-					if err != nil {
+					if resp == nil {
 						failCnt.Add(1)
 						continue
 					}
@@ -533,43 +533,6 @@ func main() {
 		fmt.Println("NOTE: some appends failed; check cluster health")
 		os.Exit(1)
 	}
-}
-
-// appendWithRetry posts one append over gRPC, following MOVED/ASK at most
-// twice; redirect responses carry the leader's gRPC address and get cached
-// per slot.
-func appendWithRetry(w int, agg string, req *pushupesv1.AppendRequest,
-	routes map[int32]string, routeMu *sync.RWMutex) (*pushupesv1.AppendResponse, error) {
-	slot := data.SlotOf(agg, data.DefaultSlotCount)
-	routeMu.RLock()
-	addr, ok := routes[slot]
-	routeMu.RUnlock()
-	if !ok {
-		addr = anyGrpc[w%len(anyGrpc)]
-	}
-
-	for attempt := 0; attempt < 3; attempt++ {
-		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resp, err := eventClient(addr).Append(cctx, req)
-		cancel()
-		if err != nil {
-			// node may be gone: fall back to round-robin next attempt
-			addr = anyGrpc[(w+attempt)%len(anyGrpc)]
-			continue
-		}
-		switch resp.ErrId {
-		case data.ErrIDSlotNotLocal, data.ErrIDMigrating:
-			if resp.Node != "" {
-				routeMu.Lock()
-				routes[slot] = resp.Node
-				routeMu.Unlock()
-				addr = resp.Node
-				continue
-			}
-		}
-		return resp, nil
-	}
-	return nil, fmt.Errorf("append unreachable")
 }
 
 // batchWithRetry posts one batch over gRPC, following MOVED/ASK at most

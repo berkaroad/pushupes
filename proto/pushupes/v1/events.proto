@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package pushupes.v1;
 
-option go_package = "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1;pushupesv1";
+option go_package = "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1;pushupesv1";
 
 // EventService is the client-facing data plane: event writes and event
 // queries, served on its own port, independent of the HTTP admin/replication
@@ -10,12 +10,11 @@ option go_package = "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1;
 // version = tail+1, reads observe <=HW, MOVED/ASK redirects carry the
 // authoritative slot + node.
 service EventService {
-  // Append appends one record to one aggregate stream.
-  rpc Append(AppendRequest) returns (AppendResponse);
-  // BatchAppend appends many records in one call. Every record carries its
-  // own result (success/exists/fail) in request order; records sharing an
-  // aggregate_id within one batch are all failed (the batch must hold
-  // distinct aggregate ids), other streams are unaffected. The server
+  // BatchAppend appends records in one call — the only write entry on the
+  // client plane; a single write is a batch of one record. Every record
+  // carries its own result (success/exists/fail) in request order; records
+  // sharing an aggregate_id within one batch are all failed (the batch must
+  // hold distinct aggregate ids), other streams are unaffected. The server
   // executes one slot at a time serially and different slots concurrently.
   rpc BatchAppend(BatchAppendRequest) returns (BatchAppendResponse);
   // ReadStream reads a version range of one aggregate stream.

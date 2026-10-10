@@ -26,8 +26,8 @@ import (
 
 	"github.com/berkaroad/pushupes/internal/cluster"
 	"github.com/berkaroad/pushupes/internal/data"
-	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 	"github.com/berkaroad/pushupes/internal/storage"
+	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 )
 
 // A leader must be able to read its own durable log. Capping a LEADER's read at
