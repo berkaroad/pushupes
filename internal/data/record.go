@@ -21,6 +21,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+
+	"github.com/berkaroad/pushupes/pkg/client"
 )
 
 // ---- Field limits ---------------------------------------------------------
@@ -440,79 +442,34 @@ type ByteRange struct {
 // count later cannot move an aggregate to another node. It is also far above
 // the expected node count: cheap slot metadata, fine-grained placement and
 // migration units.
+//
+// This is server-side cluster state. The client contract (pkg/client) carries
+// the routing ALGORITHM — the one thing a client must compute identically —
+// while the slot count reaches clients through PrefetchRoutes, so it can
+// change without stranding any client build.
 const DefaultSlotCount = 1680
 
-// crc16Table is the CRC16/XMODEM (polynomial 0x1021) lookup table used by
-// slot hashing.
-var crc16Table = func() [256]uint16 {
-	var t [256]uint16
-	for i := 0; i < 256; i++ {
-		crc := uint16(i) << 8
-		for j := 0; j < 8; j++ {
-			if crc&0x8000 != 0 {
-				crc = (crc << 1) ^ 0x1021
-			} else {
-				crc <<= 1
-			}
-		}
-		t[i] = crc
-	}
-	return t
-}()
-
-// CRC16 computes the CRC16/XMODEM checksum of b.
-func CRC16(b []byte) uint16 {
-	crc := uint16(0)
-	for _, c := range b {
-		crc = (crc << 8) ^ crc16Table[byte(crc>>8)^c]
-	}
-	return crc
-}
-
-// mix64 is the splitmix64 finalizer: a bijection with full avalanche, applied
-// to the 64-bit id hash before it is narrowed to a slot index.
-func mix64(x uint64) uint64 {
-	x ^= x >> 30
-	x *= 0xbf58476d1ce4e5b9
-	x ^= x >> 27
-	x *= 0x94d049bb133111eb
-	return x ^ (x >> 31)
-}
-
-// SlotOf routes an aggregate ID to its slot.
-//
-// The ID is hashed with FNV-1a and avalanched with mix64 before the modulo,
-// rather than taken straight from CRC16. CRC16 is measurably non-uniform over
-// structured ids — the 16-bit histogram of zero-padded sequential ids scores
-// chi2/df 1.61 against 1.00 for random UUIDs — and that bias lands directly on
-// the slot split once ids are structured (at 1680 slots a 1.6-sigma id
-// histogram showed slot chi2/df ~2.5 and the largest slot 21% above the mean).
-// Whitening the 16-bit CRC afterwards cannot fix it: a bijection keeps the
-// bucket counts, so the mix has to happen before the value is narrowed.
-//
-// Modulo is over uint64, so the slot count is no longer limited to 65535.
+// SlotOf routes an aggregate ID to its slot. The algorithm lives in
+// pkg/client (see that package's doc): the client computes the same slot the
+// server routes by, from the same code. slotCount is the cluster's slot count
+// — the caller's view of DefaultSlotCount / the store's SlotCount.
 func SlotOf(aggregateID string, slotCount int) int32 {
-	if slotCount <= 0 {
-		panic("slotCount must be positive")
-	}
-	return int32(mix64(hashID(aggregateID)) % uint64(slotCount))
+	return client.SlotOf(aggregateID, slotCount)
 }
-
-// hashID is the id hash used for routing: FNV-1a over the raw UTF-8 bytes,
-// the same function that hashes command ids. Deterministic across processes and
-// restarts on purpose — a routing hash that moved would move data between slots.
-func hashID(id string) uint64 { return hashCommandBytes([]byte(id)) }
 
 // ---- Error IDs and domain errors ------------------------------------------
 
 // Wire-level error IDs returned in AppendResponse.ErrID on fail/MOVED/ASK.
+// The table lives in pkg/client (the client-facing wire contract — the
+// client side is where these ids are branched on); these are the server-side
+// names for the same numbers.
 const (
-	ErrIDVersionConflict = 1001
-	ErrIDBadRequest      = 1002
-	ErrIDSlotNotLocal    = 1003 // MOVED
-	ErrIDMigrating       = 1004 // ASK
-	ErrIDNotLeader       = 1005
-	ErrIDFlowControl     = 1006 // the node's flow control refused the append
+	ErrIDVersionConflict = client.ErrIDVersionConflict
+	ErrIDBadRequest      = client.ErrIDBadRequest
+	ErrIDSlotNotLocal    = client.ErrIDSlotNotLocal // MOVED
+	ErrIDMigrating       = client.ErrIDMigrating    // ASK
+	ErrIDNotLeader       = client.ErrIDNotLeader
+	ErrIDFlowControl     = client.ErrIDFlowControl // the node's flow control refused the append
 )
 
 var (
