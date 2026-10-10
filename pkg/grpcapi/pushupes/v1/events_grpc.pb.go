@@ -20,6 +20,7 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	EventService_BatchAppend_FullMethodName       = "/pushupes.v1.EventService/BatchAppend"
+	EventService_PrefetchRoutes_FullMethodName    = "/pushupes.v1.EventService/PrefetchRoutes"
 	EventService_ReadStream_FullMethodName        = "/pushupes.v1.EventService/ReadStream"
 	EventService_ReadTails_FullMethodName         = "/pushupes.v1.EventService/ReadTails"
 	EventService_ReadByCommand_FullMethodName     = "/pushupes.v1.EventService/ReadByCommand"
@@ -43,6 +44,13 @@ type EventServiceClient interface {
 	// hold distinct aggregate ids), other streams are unaffected. The server
 	// executes one slot at a time serially and different slots concurrently.
 	BatchAppend(ctx context.Context, in *BatchAppendRequest, opts ...grpc.CallOption) (*BatchAppendResponse, error)
+	// PrefetchRoutes hands out the whole write-routing table in one call, with
+	// no request: every node answers from its Raft-replicated slot table (no
+	// forwarding, no leader requirement). Clients call it once at startup and
+	// refresh periodically; a write's MOVED/ASK answer patches the cached row
+	// for that slot in between. The answer is a hint — append correctness never
+	// depends on this table being current.
+	PrefetchRoutes(ctx context.Context, in *PrefetchRoutesRequest, opts ...grpc.CallOption) (*PrefetchRoutesResponse, error)
 	// ReadStream reads a version range of one aggregate stream.
 	ReadStream(ctx context.Context, in *ReadStreamRequest, opts ...grpc.CallOption) (*ReadStreamResponse, error)
 	// ReadTails reports the latest version of many aggregates in one call.
@@ -68,6 +76,16 @@ func (c *eventServiceClient) BatchAppend(ctx context.Context, in *BatchAppendReq
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(BatchAppendResponse)
 	err := c.cc.Invoke(ctx, EventService_BatchAppend_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *eventServiceClient) PrefetchRoutes(ctx context.Context, in *PrefetchRoutesRequest, opts ...grpc.CallOption) (*PrefetchRoutesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PrefetchRoutesResponse)
+	err := c.cc.Invoke(ctx, EventService_PrefetchRoutes_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -131,6 +149,13 @@ type EventServiceServer interface {
 	// hold distinct aggregate ids), other streams are unaffected. The server
 	// executes one slot at a time serially and different slots concurrently.
 	BatchAppend(context.Context, *BatchAppendRequest) (*BatchAppendResponse, error)
+	// PrefetchRoutes hands out the whole write-routing table in one call, with
+	// no request: every node answers from its Raft-replicated slot table (no
+	// forwarding, no leader requirement). Clients call it once at startup and
+	// refresh periodically; a write's MOVED/ASK answer patches the cached row
+	// for that slot in between. The answer is a hint — append correctness never
+	// depends on this table being current.
+	PrefetchRoutes(context.Context, *PrefetchRoutesRequest) (*PrefetchRoutesResponse, error)
 	// ReadStream reads a version range of one aggregate stream.
 	ReadStream(context.Context, *ReadStreamRequest) (*ReadStreamResponse, error)
 	// ReadTails reports the latest version of many aggregates in one call.
@@ -154,6 +179,9 @@ type UnimplementedEventServiceServer struct{}
 
 func (UnimplementedEventServiceServer) BatchAppend(context.Context, *BatchAppendRequest) (*BatchAppendResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BatchAppend not implemented")
+}
+func (UnimplementedEventServiceServer) PrefetchRoutes(context.Context, *PrefetchRoutesRequest) (*PrefetchRoutesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrefetchRoutes not implemented")
 }
 func (UnimplementedEventServiceServer) ReadStream(context.Context, *ReadStreamRequest) (*ReadStreamResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReadStream not implemented")
@@ -202,6 +230,24 @@ func _EventService_BatchAppend_Handler(srv interface{}, ctx context.Context, dec
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(EventServiceServer).BatchAppend(ctx, req.(*BatchAppendRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _EventService_PrefetchRoutes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrefetchRoutesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EventServiceServer).PrefetchRoutes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EventService_PrefetchRoutes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EventServiceServer).PrefetchRoutes(ctx, req.(*PrefetchRoutesRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -288,6 +334,10 @@ var EventService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "BatchAppend",
 			Handler:    _EventService_BatchAppend_Handler,
+		},
+		{
+			MethodName: "PrefetchRoutes",
+			Handler:    _EventService_PrefetchRoutes_Handler,
 		},
 		{
 			MethodName: "ReadStream",

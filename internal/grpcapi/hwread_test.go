@@ -287,7 +287,7 @@ func serveEngine(t *testing.T, eng *cluster.Engine, store *storage.Store) pushup
 	t.Helper()
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer()
-	NewServer(eng, store, nil, 0).Register(gs)
+	NewServer(eng, store, nil, 0, "127.0.0.1:8591").Register(gs)
 	go gs.Serve(lis)
 	t.Cleanup(gs.Stop)
 	dialer := func(context.Context, string) (net.Conn, error) { return lis.Dial() }

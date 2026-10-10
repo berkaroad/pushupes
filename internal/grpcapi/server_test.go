@@ -45,7 +45,7 @@ func newTestClient(t *testing.T) (pushupesv1.EventServiceClient, *storage.Store)
 
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer()
-	NewServer(eng, st, nil, 0).Register(gs)
+	NewServer(eng, st, nil, 0, "bufnet-self").Register(gs)
 	go gs.Serve(lis)
 	t.Cleanup(gs.Stop)
 

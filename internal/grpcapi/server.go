@@ -48,6 +48,12 @@ type Server struct {
 	store  *storage.Store
 	logger *slog.Logger
 
+	// selfClientAddr is this node's client-plane address ("host:port"),
+	// the fallback entry PrefetchRoutes answers for slots the node cannot
+	// route elsewhere (unassigned, or a leader that has not announced a
+	// client address yet) — the same local-serve rule SubmitBatch applies.
+	selfClientAddr string
+
 	// batchParallelism caps how many slots one BatchAppend executes
 	// concurrently (see BatchAppend).
 	batchParallelism int
@@ -64,8 +70,9 @@ const DefaultBatchSlotParallelism = 100
 
 // NewServer wires the gRPC facade onto the engine + store. A
 // batchParallelism of zero or less means "the default cap" (callers that do
-// not tune the knob pass 0).
-func NewServer(eng *cluster.Engine, store *storage.Store, logger *slog.Logger, batchParallelism int) *Server {
+// not tune the knob pass 0). selfClientAddr is this node's client-plane
+// address (scheme-free "host:port"), used by PrefetchRoutes' fallback.
+func NewServer(eng *cluster.Engine, store *storage.Store, logger *slog.Logger, batchParallelism int, selfClientAddr string) *Server {
 	// A nil logger must not panic a handler half-way through: the read path
 	// logs (and continues) on a proxy failure, and a panic there replaces a
 	// "proxy dial failed" warning with a crash that hides the real reason.
@@ -76,6 +83,7 @@ func NewServer(eng *cluster.Engine, store *storage.Store, logger *slog.Logger, b
 		batchParallelism = DefaultBatchSlotParallelism
 	}
 	return &Server{engine: eng, store: store, logger: logger,
+		selfClientAddr:   cluster.HostPort(selfClientAddr),
 		batchParallelism: batchParallelism,
 		leaders:          map[string]pushupesv1.EventServiceClient{}}
 }
@@ -284,6 +292,46 @@ func (s *Server) BatchAppend(ctx context.Context, req *pushupesv1.BatchAppendReq
 		}(g)
 	}
 	wg.Wait()
+	return out, nil
+}
+
+// ---- PrefetchRoutes ----------------------------------------------------------
+
+// PrefetchRoutes answers the whole slot->node write-routing table from this
+// node's Raft-replicated placement view: any node serves it (no forwarding,
+// no leader requirement), and it never touches the WAL. The answer is a
+// routing HINT — write correctness is defined by the MOVED/ASK self-heal in
+// BatchAppend responses, not by this table's freshness — so clients call it
+// once at startup, refresh it periodically, and patch the row a redirect
+// names in between.
+func (s *Server) PrefetchRoutes(ctx context.Context, req *pushupesv1.PrefetchRoutesRequest) (*pushupesv1.PrefetchRoutesResponse, error) {
+	rows := s.engine.SlotRouteTable()
+	out := &pushupesv1.PrefetchRoutesResponse{
+		// slot_node_index is dense over slots: its length IS the cluster's
+		// slot count, which the client reads back from here instead of
+		// hard-coding a constant it has no business knowing.
+		SlotNodeIndex: make([]int32, len(rows)),
+	}
+	// Addresses de-duplicate in first-appearance order; the fallback entry
+	// (unassigned slot, or a leader whose registration has not landed) is
+	// this node's own client addr — the same local-serve rule SubmitBatch
+	// applies, so the array has no holes and needs no sentinel handling.
+	seen := map[string]int32{}
+	add := func(addr string) int32 {
+		if i, ok := seen[addr]; ok {
+			return i
+		}
+		i := int32(len(out.NodeClientAddrs))
+		seen[addr] = i
+		out.NodeClientAddrs = append(out.NodeClientAddrs, addr)
+		return i
+	}
+	for slot, addr := range rows {
+		if addr == "" {
+			addr = s.selfClientAddr
+		}
+		out.SlotNodeIndex[slot] = add(cluster.HostPort(addr))
+	}
 	return out, nil
 }
 

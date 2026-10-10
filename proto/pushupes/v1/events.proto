@@ -17,6 +17,13 @@ service EventService {
   // hold distinct aggregate ids), other streams are unaffected. The server
   // executes one slot at a time serially and different slots concurrently.
   rpc BatchAppend(BatchAppendRequest) returns (BatchAppendResponse);
+  // PrefetchRoutes hands out the whole write-routing table in one call, with
+  // no request: every node answers from its Raft-replicated slot table (no
+  // forwarding, no leader requirement). Clients call it once at startup and
+  // refresh periodically; a write's MOVED/ASK answer patches the cached row
+  // for that slot in between. The answer is a hint — append correctness never
+  // depends on this table being current.
+  rpc PrefetchRoutes(PrefetchRoutesRequest) returns (PrefetchRoutesResponse);
   // ReadStream reads a version range of one aggregate stream.
   rpc ReadStream(ReadStreamRequest) returns (ReadStreamResponse);
   // ReadTails reports the latest version of many aggregates in one call.
@@ -91,6 +98,27 @@ message BatchAppendResult {
 // ORDER as BatchAppendRequest.records.
 message BatchAppendResponse {
   repeated BatchAppendResult results = 1;
+}
+
+// PrefetchRoutesRequest carries nothing: the routing table is cluster-wide
+// state, not a per-query answer.
+message PrefetchRoutesRequest {}
+
+// PrefetchRoutesResponse is the whole slot->node routing table plus the
+// address book it indexes.
+message PrefetchRoutesResponse {
+  // node_client_addrs are the cluster members' client-plane ("host:port")
+  // addrs, de-duplicated in first-appearance order.
+  repeated string node_client_addrs = 1;
+  // slot_node_index is DENSE over slots: index s is the slot-s leader's
+  // position in node_client_addrs, for every s in 0..len-1. Its length is
+  // the cluster's slot count — the value is cluster state and reaches the
+  // client here, never as a client-side constant. Slots the answering node
+  // cannot map to a live client_addr (unassigned, or a leader whose
+  // registration has not landed yet) fall back to the answering node's own
+  // entry, the same local-serve rule SubmitBatch applies to such slots, so
+  // the array never has holes and needs no sentinel handling.
+  repeated int32 slot_node_index = 2;
 }
 
 message ReadStreamRequest {

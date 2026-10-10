@@ -535,6 +535,108 @@ func (x *BatchAppendResponse) GetResults() []*BatchAppendResult {
 	return nil
 }
 
+// PrefetchRoutesRequest carries nothing: the routing table is cluster-wide
+// state, not a per-query answer.
+type PrefetchRoutesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PrefetchRoutesRequest) Reset() {
+	*x = PrefetchRoutesRequest{}
+	mi := &file_pushupes_v1_events_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PrefetchRoutesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PrefetchRoutesRequest) ProtoMessage() {}
+
+func (x *PrefetchRoutesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_events_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PrefetchRoutesRequest.ProtoReflect.Descriptor instead.
+func (*PrefetchRoutesRequest) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{7}
+}
+
+// PrefetchRoutesResponse is the whole slot->node routing table plus the
+// address book it indexes.
+type PrefetchRoutesResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// node_client_addrs are the cluster members' client-plane ("host:port")
+	// addrs, de-duplicated in first-appearance order.
+	NodeClientAddrs []string `protobuf:"bytes,1,rep,name=node_client_addrs,json=nodeClientAddrs,proto3" json:"node_client_addrs,omitempty"`
+	// slot_node_index is DENSE over slots: index s is the slot-s leader's
+	// position in node_client_addrs, for every s in 0..len-1. Its length is
+	// the cluster's slot count — the value is cluster state and reaches the
+	// client here, never as a client-side constant. Slots the answering node
+	// cannot map to a live client_addr (unassigned, or a leader whose
+	// registration has not landed yet) fall back to the answering node's own
+	// entry, the same local-serve rule SubmitBatch applies to such slots, so
+	// the array never has holes and needs no sentinel handling.
+	SlotNodeIndex []int32 `protobuf:"varint,2,rep,packed,name=slot_node_index,json=slotNodeIndex,proto3" json:"slot_node_index,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PrefetchRoutesResponse) Reset() {
+	*x = PrefetchRoutesResponse{}
+	mi := &file_pushupes_v1_events_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PrefetchRoutesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PrefetchRoutesResponse) ProtoMessage() {}
+
+func (x *PrefetchRoutesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_events_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PrefetchRoutesResponse.ProtoReflect.Descriptor instead.
+func (*PrefetchRoutesResponse) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *PrefetchRoutesResponse) GetNodeClientAddrs() []string {
+	if x != nil {
+		return x.NodeClientAddrs
+	}
+	return nil
+}
+
+func (x *PrefetchRoutesResponse) GetSlotNodeIndex() []int32 {
+	if x != nil {
+		return x.SlotNodeIndex
+	}
+	return nil
+}
+
 type ReadStreamRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	AggregateId   string                 `protobuf:"bytes,1,opt,name=aggregate_id,json=aggregateId,proto3" json:"aggregate_id,omitempty"`
@@ -546,7 +648,7 @@ type ReadStreamRequest struct {
 
 func (x *ReadStreamRequest) Reset() {
 	*x = ReadStreamRequest{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[7]
+	mi := &file_pushupes_v1_events_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -558,7 +660,7 @@ func (x *ReadStreamRequest) String() string {
 func (*ReadStreamRequest) ProtoMessage() {}
 
 func (x *ReadStreamRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[7]
+	mi := &file_pushupes_v1_events_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -571,7 +673,7 @@ func (x *ReadStreamRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadStreamRequest.ProtoReflect.Descriptor instead.
 func (*ReadStreamRequest) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{7}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ReadStreamRequest) GetAggregateId() string {
@@ -606,7 +708,7 @@ type ReadStreamResponse struct {
 
 func (x *ReadStreamResponse) Reset() {
 	*x = ReadStreamResponse{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[8]
+	mi := &file_pushupes_v1_events_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -618,7 +720,7 @@ func (x *ReadStreamResponse) String() string {
 func (*ReadStreamResponse) ProtoMessage() {}
 
 func (x *ReadStreamResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[8]
+	mi := &file_pushupes_v1_events_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -631,7 +733,7 @@ func (x *ReadStreamResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadStreamResponse.ProtoReflect.Descriptor instead.
 func (*ReadStreamResponse) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{8}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ReadStreamResponse) GetRecords() []*Record {
@@ -665,7 +767,7 @@ type ReadTailsRequest struct {
 
 func (x *ReadTailsRequest) Reset() {
 	*x = ReadTailsRequest{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[9]
+	mi := &file_pushupes_v1_events_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -677,7 +779,7 @@ func (x *ReadTailsRequest) String() string {
 func (*ReadTailsRequest) ProtoMessage() {}
 
 func (x *ReadTailsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[9]
+	mi := &file_pushupes_v1_events_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -690,7 +792,7 @@ func (x *ReadTailsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadTailsRequest.ProtoReflect.Descriptor instead.
 func (*ReadTailsRequest) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{9}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ReadTailsRequest) GetAggregateIds() []string {
@@ -718,7 +820,7 @@ type ReadTailsResponse struct {
 
 func (x *ReadTailsResponse) Reset() {
 	*x = ReadTailsResponse{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[10]
+	mi := &file_pushupes_v1_events_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -730,7 +832,7 @@ func (x *ReadTailsResponse) String() string {
 func (*ReadTailsResponse) ProtoMessage() {}
 
 func (x *ReadTailsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[10]
+	mi := &file_pushupes_v1_events_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -743,7 +845,7 @@ func (x *ReadTailsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadTailsResponse.ProtoReflect.Descriptor instead.
 func (*ReadTailsResponse) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{10}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ReadTailsResponse) GetVersions() []uint32 {
@@ -763,7 +865,7 @@ type ReadByCommandRequest struct {
 
 func (x *ReadByCommandRequest) Reset() {
 	*x = ReadByCommandRequest{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[11]
+	mi := &file_pushupes_v1_events_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -775,7 +877,7 @@ func (x *ReadByCommandRequest) String() string {
 func (*ReadByCommandRequest) ProtoMessage() {}
 
 func (x *ReadByCommandRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[11]
+	mi := &file_pushupes_v1_events_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -788,7 +890,7 @@ func (x *ReadByCommandRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadByCommandRequest.ProtoReflect.Descriptor instead.
 func (*ReadByCommandRequest) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{11}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *ReadByCommandRequest) GetAggregateId() string {
@@ -815,7 +917,7 @@ type ReadByCommandResponse struct {
 
 func (x *ReadByCommandResponse) Reset() {
 	*x = ReadByCommandResponse{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[12]
+	mi := &file_pushupes_v1_events_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -827,7 +929,7 @@ func (x *ReadByCommandResponse) String() string {
 func (*ReadByCommandResponse) ProtoMessage() {}
 
 func (x *ReadByCommandResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[12]
+	mi := &file_pushupes_v1_events_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -840,7 +942,7 @@ func (x *ReadByCommandResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadByCommandResponse.ProtoReflect.Descriptor instead.
 func (*ReadByCommandResponse) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{12}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ReadByCommandResponse) GetFound() bool {
@@ -871,7 +973,7 @@ type ReadVersionByTimeRequest struct {
 
 func (x *ReadVersionByTimeRequest) Reset() {
 	*x = ReadVersionByTimeRequest{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[13]
+	mi := &file_pushupes_v1_events_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -883,7 +985,7 @@ func (x *ReadVersionByTimeRequest) String() string {
 func (*ReadVersionByTimeRequest) ProtoMessage() {}
 
 func (x *ReadVersionByTimeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[13]
+	mi := &file_pushupes_v1_events_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -896,7 +998,7 @@ func (x *ReadVersionByTimeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadVersionByTimeRequest.ProtoReflect.Descriptor instead.
 func (*ReadVersionByTimeRequest) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{13}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ReadVersionByTimeRequest) GetAggregateId() string {
@@ -922,7 +1024,7 @@ type ReadVersionByTimeResponse struct {
 
 func (x *ReadVersionByTimeResponse) Reset() {
 	*x = ReadVersionByTimeResponse{}
-	mi := &file_pushupes_v1_events_proto_msgTypes[14]
+	mi := &file_pushupes_v1_events_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -934,7 +1036,7 @@ func (x *ReadVersionByTimeResponse) String() string {
 func (*ReadVersionByTimeResponse) ProtoMessage() {}
 
 func (x *ReadVersionByTimeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_events_proto_msgTypes[14]
+	mi := &file_pushupes_v1_events_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -947,7 +1049,7 @@ func (x *ReadVersionByTimeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadVersionByTimeResponse.ProtoReflect.Descriptor instead.
 func (*ReadVersionByTimeResponse) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{14}
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ReadVersionByTimeResponse) GetVersion() uint32 {
@@ -1000,7 +1102,11 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x127\n" +
 	"\bresponse\x18\x02 \x01(\v2\x1b.pushupes.v1.AppendResponseR\bresponse\"O\n" +
 	"\x13BatchAppendResponse\x128\n" +
-	"\aresults\x18\x01 \x03(\v2\x1e.pushupes.v1.BatchAppendResultR\aresults\"o\n" +
+	"\aresults\x18\x01 \x03(\v2\x1e.pushupes.v1.BatchAppendResultR\aresults\"\x17\n" +
+	"\x15PrefetchRoutesRequest\"l\n" +
+	"\x16PrefetchRoutesResponse\x12*\n" +
+	"\x11node_client_addrs\x18\x01 \x03(\tR\x0fnodeClientAddrs\x12&\n" +
+	"\x0fslot_node_index\x18\x02 \x03(\x05R\rslotNodeIndex\"o\n" +
 	"\x11ReadStreamRequest\x12!\n" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x12!\n" +
 	"\ffrom_version\x18\x02 \x01(\rR\vfromVersion\x12\x14\n" +
@@ -1024,9 +1130,10 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x12\x1b\n" +
 	"\tunix_time\x18\x02 \x01(\x03R\bunixTime\"5\n" +
 	"\x19ReadVersionByTimeResponse\x12\x18\n" +
-	"\aversion\x18\x01 \x01(\rR\aversion2\xb7\x03\n" +
+	"\aversion\x18\x01 \x01(\rR\aversion2\x92\x04\n" +
 	"\fEventService\x12P\n" +
-	"\vBatchAppend\x12\x1f.pushupes.v1.BatchAppendRequest\x1a .pushupes.v1.BatchAppendResponse\x12M\n" +
+	"\vBatchAppend\x12\x1f.pushupes.v1.BatchAppendRequest\x1a .pushupes.v1.BatchAppendResponse\x12Y\n" +
+	"\x0ePrefetchRoutes\x12\".pushupes.v1.PrefetchRoutesRequest\x1a#.pushupes.v1.PrefetchRoutesResponse\x12M\n" +
 	"\n" +
 	"ReadStream\x12\x1e.pushupes.v1.ReadStreamRequest\x1a\x1f.pushupes.v1.ReadStreamResponse\x12J\n" +
 	"\tReadTails\x12\x1d.pushupes.v1.ReadTailsRequest\x1a\x1e.pushupes.v1.ReadTailsResponse\x12V\n" +
@@ -1046,7 +1153,7 @@ func file_pushupes_v1_events_proto_rawDescGZIP() []byte {
 }
 
 var file_pushupes_v1_events_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_pushupes_v1_events_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
+var file_pushupes_v1_events_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_pushupes_v1_events_proto_goTypes = []any{
 	(AppendResponse_Status)(0),        // 0: pushupes.v1.AppendResponse.Status
 	(*Event)(nil),                     // 1: pushupes.v1.Event
@@ -1056,14 +1163,16 @@ var file_pushupes_v1_events_proto_goTypes = []any{
 	(*BatchAppendRequest)(nil),        // 5: pushupes.v1.BatchAppendRequest
 	(*BatchAppendResult)(nil),         // 6: pushupes.v1.BatchAppendResult
 	(*BatchAppendResponse)(nil),       // 7: pushupes.v1.BatchAppendResponse
-	(*ReadStreamRequest)(nil),         // 8: pushupes.v1.ReadStreamRequest
-	(*ReadStreamResponse)(nil),        // 9: pushupes.v1.ReadStreamResponse
-	(*ReadTailsRequest)(nil),          // 10: pushupes.v1.ReadTailsRequest
-	(*ReadTailsResponse)(nil),         // 11: pushupes.v1.ReadTailsResponse
-	(*ReadByCommandRequest)(nil),      // 12: pushupes.v1.ReadByCommandRequest
-	(*ReadByCommandResponse)(nil),     // 13: pushupes.v1.ReadByCommandResponse
-	(*ReadVersionByTimeRequest)(nil),  // 14: pushupes.v1.ReadVersionByTimeRequest
-	(*ReadVersionByTimeResponse)(nil), // 15: pushupes.v1.ReadVersionByTimeResponse
+	(*PrefetchRoutesRequest)(nil),     // 8: pushupes.v1.PrefetchRoutesRequest
+	(*PrefetchRoutesResponse)(nil),    // 9: pushupes.v1.PrefetchRoutesResponse
+	(*ReadStreamRequest)(nil),         // 10: pushupes.v1.ReadStreamRequest
+	(*ReadStreamResponse)(nil),        // 11: pushupes.v1.ReadStreamResponse
+	(*ReadTailsRequest)(nil),          // 12: pushupes.v1.ReadTailsRequest
+	(*ReadTailsResponse)(nil),         // 13: pushupes.v1.ReadTailsResponse
+	(*ReadByCommandRequest)(nil),      // 14: pushupes.v1.ReadByCommandRequest
+	(*ReadByCommandResponse)(nil),     // 15: pushupes.v1.ReadByCommandResponse
+	(*ReadVersionByTimeRequest)(nil),  // 16: pushupes.v1.ReadVersionByTimeRequest
+	(*ReadVersionByTimeResponse)(nil), // 17: pushupes.v1.ReadVersionByTimeResponse
 }
 var file_pushupes_v1_events_proto_depIdxs = []int32{
 	1,  // 0: pushupes.v1.Record.events:type_name -> pushupes.v1.Event
@@ -1076,17 +1185,19 @@ var file_pushupes_v1_events_proto_depIdxs = []int32{
 	2,  // 7: pushupes.v1.ReadStreamResponse.records:type_name -> pushupes.v1.Record
 	2,  // 8: pushupes.v1.ReadByCommandResponse.record:type_name -> pushupes.v1.Record
 	5,  // 9: pushupes.v1.EventService.BatchAppend:input_type -> pushupes.v1.BatchAppendRequest
-	8,  // 10: pushupes.v1.EventService.ReadStream:input_type -> pushupes.v1.ReadStreamRequest
-	10, // 11: pushupes.v1.EventService.ReadTails:input_type -> pushupes.v1.ReadTailsRequest
-	12, // 12: pushupes.v1.EventService.ReadByCommand:input_type -> pushupes.v1.ReadByCommandRequest
-	14, // 13: pushupes.v1.EventService.ReadVersionByTime:input_type -> pushupes.v1.ReadVersionByTimeRequest
-	7,  // 14: pushupes.v1.EventService.BatchAppend:output_type -> pushupes.v1.BatchAppendResponse
-	9,  // 15: pushupes.v1.EventService.ReadStream:output_type -> pushupes.v1.ReadStreamResponse
-	11, // 16: pushupes.v1.EventService.ReadTails:output_type -> pushupes.v1.ReadTailsResponse
-	13, // 17: pushupes.v1.EventService.ReadByCommand:output_type -> pushupes.v1.ReadByCommandResponse
-	15, // 18: pushupes.v1.EventService.ReadVersionByTime:output_type -> pushupes.v1.ReadVersionByTimeResponse
-	14, // [14:19] is the sub-list for method output_type
-	9,  // [9:14] is the sub-list for method input_type
+	8,  // 10: pushupes.v1.EventService.PrefetchRoutes:input_type -> pushupes.v1.PrefetchRoutesRequest
+	10, // 11: pushupes.v1.EventService.ReadStream:input_type -> pushupes.v1.ReadStreamRequest
+	12, // 12: pushupes.v1.EventService.ReadTails:input_type -> pushupes.v1.ReadTailsRequest
+	14, // 13: pushupes.v1.EventService.ReadByCommand:input_type -> pushupes.v1.ReadByCommandRequest
+	16, // 14: pushupes.v1.EventService.ReadVersionByTime:input_type -> pushupes.v1.ReadVersionByTimeRequest
+	7,  // 15: pushupes.v1.EventService.BatchAppend:output_type -> pushupes.v1.BatchAppendResponse
+	9,  // 16: pushupes.v1.EventService.PrefetchRoutes:output_type -> pushupes.v1.PrefetchRoutesResponse
+	11, // 17: pushupes.v1.EventService.ReadStream:output_type -> pushupes.v1.ReadStreamResponse
+	13, // 18: pushupes.v1.EventService.ReadTails:output_type -> pushupes.v1.ReadTailsResponse
+	15, // 19: pushupes.v1.EventService.ReadByCommand:output_type -> pushupes.v1.ReadByCommandResponse
+	17, // 20: pushupes.v1.EventService.ReadVersionByTime:output_type -> pushupes.v1.ReadVersionByTimeResponse
+	15, // [15:21] is the sub-list for method output_type
+	9,  // [9:15] is the sub-list for method input_type
 	9,  // [9:9] is the sub-list for extension type_name
 	9,  // [9:9] is the sub-list for extension extendee
 	0,  // [0:9] is the sub-list for field type_name
@@ -1103,7 +1214,7 @@ func file_pushupes_v1_events_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pushupes_v1_events_proto_rawDesc), len(file_pushupes_v1_events_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   15,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

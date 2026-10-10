@@ -287,7 +287,7 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 		grpc.MaxSendMsgSize(int(grpcMaxMsgBytes)),
 	}
 	grpcSrv := grpc.NewServer(grpcOpts...)
-	grpcapi.NewServer(eng, store, logger, batchParallelism).Register(grpcSrv)
+	grpcapi.NewServer(eng, store, logger, batchParallelism, clientAddr).Register(grpcSrv)
 	grpcLis, err := net.Listen("tcp", cluster.HostPort(clientAddr))
 	if err != nil {
 		return fmt.Errorf("client listen %s: %w", clientAddr, err)

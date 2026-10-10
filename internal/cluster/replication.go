@@ -928,6 +928,24 @@ func (e *Engine) clientAddr(nodeID string) string {
 	return e.table.Peers[nodeID].ClientAddr
 }
 
+// SlotRouteTable snapshots the write-routing table for PrefetchRoutes: one
+// entry per slot in slot order (length = the table's slot count), carrying
+// the slot leader's client-plane addr. An entry is "" when the slot is
+// unassigned or its leader has not announced a client address yet — the
+// caller decides the fallback (the answering node itself, matching
+// SubmitBatch's local-serve rule for such slots).
+func (e *Engine) SlotRouteTable() []string {
+	e.tableMu.RLock()
+	defer e.tableMu.RUnlock()
+	out := make([]string, e.table.SlotCount)
+	for s := range out {
+		if p, ok := e.table.Slots[int32(s)]; ok && p.Leader != "" {
+			out[s] = e.table.Peers[p.Leader].ClientAddr
+		}
+	}
+	return out
+}
+
 // localAppend runs the business rules against the local WAL, then waits for
 // the slot's high watermark to cover the record before reporting success:
 // an append acknowledged without that wait could vanish if the leader died
