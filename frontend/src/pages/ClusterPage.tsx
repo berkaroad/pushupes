@@ -5,6 +5,11 @@ import type { ClusterStatus, FlowControlDetail, NodeWrites } from '../types'
 import { humanBytes, humanBytesPerSec } from '../format'
 import { addClusterNode, clearFlowControl, ensureLeader, fetchFlowControl, fetchNodeWrites, removeClusterNode, setReplicaPolicy, setFlowControl, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
 import { PeerCard, isOnlinePeer } from '../PeerCard'
+import type { NodeRatePoint } from '../NodeRateChart'
+
+// NODE_RATE_POINTS is the card chart's ring size: 60 samples x 2s = the
+// same two-minute window the slot drawer's rate chart keeps.
+const NODE_RATE_POINTS = 60
 
 // The write-speed cards sample every node's durable counters on the same
 // cadence the slots page polls them at (2s): the rate is the diff between two
@@ -121,6 +126,19 @@ export default function ClusterPage() {
   const [writeRate, setWriteRate] = useState<{ msg: number; bytes: number } | null>(null)
   const lastSample = useRef<{ at: number; writes: number; bytes: number } | null>(null)
 
+  // The per-node card charts: same poll, same one-leader rule applied to
+  // ONE node's led slots only (the card answers "what lands on this node
+  // as a leader", which is also the face flow control governs). Ring
+  // buffers of NODE_RATE_POINTS samples (2 min at 2s, the drawer's window);
+  // a sample is skipped when the node's leaders did not all report both
+  // counters — a partial total would diff into a fake jump or dip. The
+  // series lives in state (cards re-render as it grows), the per-node last
+  // sample and a mirror ref in refs, so the 2s tick only pushes state when
+  // some node actually gained a sample.
+  const [nodeRates, setNodeRates] = useState<Record<string, NodeRatePoint[]>>({})
+  const nodeRatesRef = useRef<Record<string, NodeRatePoint[]>>({})
+  const lastNodeSample = useRef<Record<string, { at: number; writes: number; bytes: number }>>({})
+
   useEffect(() => {
     let stop = false
     const tick = async () => {
@@ -163,6 +181,52 @@ export default function ClusterPage() {
         // leader). Skipping an incomplete sample rather than storing it
         // keeps the diff windows honest: a partial sum held as "last" would
         // turn the next full sum into a fake jump, and the reverse a dip.
+        // Per-node totals for the card charts (see nodeRates): sum each
+        // node's LED slots only; skip the node when any led slot's counter
+        // array is missing or short. A node that leads nothing sums 0/0 —
+        // the flat line is the truthful picture of "no led writes".
+        const nowMs = Date.now()
+        const prevNode = lastNodeSample.current
+        const nextNode: Record<string, { at: number; writes: number; bytes: number }> = {}
+        let ratesChanged = false
+        const nr = { ...nodeRatesRef.current }
+        for (const p of Object.values(st.peers)) {
+          let w = 0
+          let b = 0
+          let ok = true
+          for (const [slotStr, sp] of Object.entries(st.slots)) {
+            if (sp.leader !== p.id) continue
+            const m = perNode[p.admin_addr]
+            const s = Number(slotStr)
+            if (!m?.writes || s >= m.writes.length || !m.write_bytes || s >= m.write_bytes.length) {
+              ok = false
+              break
+            }
+            w += m.writes[s]
+            b += m.write_bytes[s]
+          }
+          if (!ok) continue
+          nextNode[p.id] = { at: nowMs, writes: w, bytes: b }
+          const prev = prevNode[p.id]
+          if (!prev || nowMs <= prev.at) continue
+          const dt = (nowMs - prev.at) / 1000
+          // Counters only move forward; a slot changing leaders retargets
+          // which node answers for it, so clamp negatives (one flat sample
+          // at the boundary beats a fake dip).
+          const arr = [...(nr[p.id] ?? []), {
+            t: nowMs,
+            msg: Math.max(0, (w - prev.writes) / dt),
+            kib: Math.max(0, (b - prev.bytes) / dt / 1024),
+          }]
+          nr[p.id] = arr.length > NODE_RATE_POINTS ? arr.slice(arr.length - NODE_RATE_POINTS) : arr
+          ratesChanged = true
+        }
+        lastNodeSample.current = nextNode
+        if (ratesChanged) {
+          nodeRatesRef.current = nr
+          setNodeRates(nr)
+        }
+
         const writes = leaderWriteTotals(st, perNode, 'writes')
         const bytes = leaderWriteTotals(st, perNode, 'write_bytes')
         if (writes === null || bytes === null) return
@@ -502,6 +566,7 @@ export default function ClusterPage() {
                 removing={removingId === p.id}
                 flowControlConfigured={flowConfigured[p.id] ?? false}
                 flowControlFiring={!!flowFiring[p.id]}
+                ratePoints={nodeRates[p.id]}
                 onFlowControl={isOnlinePeer(p) ? openFlowControl : undefined} />
             </Col>
           ))}

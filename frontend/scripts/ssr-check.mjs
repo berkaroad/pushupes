@@ -337,6 +337,31 @@ assert('a marked-down peer with announced addresses is still tagged 离线',
 const onlineCard = pc({ peer: { id: 'node-1', peer_addr: 'http://h:8391', admin_addr: 'http://h:8091', client_addr: 'http://h:8591' }, current: true, slots: 561 })
 assert('an online peer renders no 离线 tag', !onlineCard.includes('离线') && onlineCard.includes('当前') && !/border-style:dashed/.test(onlineCard))
 
+// The node-card dual-axis chart: two polylines (msg/s left axis primary,
+// KiB/s right axis orange) over one time axis, and the sampling hint below
+// two points.
+const { NodeRateChart } = await vite.ssrLoadModule('/src/NodeRateChart.tsx')
+const nrPoints = [
+  { t: Date.parse('2026-10-10T08:00:00'), msg: 100, kib: 12 },
+  { t: Date.parse('2026-10-10T08:00:02'), msg: 200, kib: 25 },
+  { t: Date.parse('2026-10-10T08:00:04'), msg: 150, kib: 18 },
+  { t: Date.parse('2026-10-10T08:00:06'), msg: 300, kib: 30 },
+]
+const nrChart = renderToString(
+  React.createElement(ConfigProvider, { theme: { algorithm: theme.defaultAlgorithm } },
+    React.createElement(NodeRateChart, { points: nrPoints })),
+)
+assert('node chart draws two polylines', (nrChart.match(/<polyline/g) ?? []).length === 2)
+assert('node chart labels both y axes', nrChart.includes('msg/s') && nrChart.includes('KiB/s'))
+assert('node chart legend names both lines with latest values',
+  nrChart.includes('写入速度（数量）300') && nrChart.includes('写入速度（大小）30'))
+assert('node chart ticks the x axis with sample times', (nrChart.match(/\d{2}:\d{2}:\d{2}/g) ?? []).length >= 2)
+const nrEmpty = renderToString(
+  React.createElement(ConfigProvider, { theme: { algorithm: theme.defaultAlgorithm } },
+    React.createElement(NodeRateChart, { points: nrPoints.slice(0, 1) })),
+)
+assert('node chart asks for samples while collecting', nrEmpty.includes('采集中') && !nrEmpty.includes('<polyline'))
+
 let failed = 0
 for (const [name, ok] of checks) {
   if (!ok) failed++

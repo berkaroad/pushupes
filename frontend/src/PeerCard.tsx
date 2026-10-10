@@ -1,6 +1,7 @@
 import { Button, Card, Descriptions, Space, Tag } from 'antd'
 import { ControlOutlined } from '@ant-design/icons'
 import type { Peer } from './types'
+import { NodeRateChart, type NodeRatePoint } from './NodeRateChart'
 
 // isOnlinePeer mirrors the cluster's own offline rule (Peer.Offline, the
 // basis of Table.OnlinePeerIDs): a peer counts as reachable by clients only
@@ -29,7 +30,7 @@ export function isOnlinePeer(p: Pick<Peer, 'client_addr' | 'down'>): boolean {
 // rendered for EVERY card at a fixed height (the small-button 24px line):
 // cards keep an invisible placeholder per absent button, so all cards in
 // the grid stay the same height whether or not they carry actions.
-export function PeerCard({ peer, current, slots, onRemove, removing, flowControlConfigured, flowControlFiring, onFlowControl }: {
+export function PeerCard({ peer, current, slots, onRemove, removing, flowControlConfigured, flowControlFiring, onFlowControl, ratePoints }: {
   peer: Peer
   current: boolean
   slots: number
@@ -38,6 +39,7 @@ export function PeerCard({ peer, current, slots, onRemove, removing, flowControl
   flowControlConfigured?: boolean
   flowControlFiring?: boolean
   onFlowControl?: (id: string) => void
+  ratePoints?: NodeRatePoint[]
 }) {
   const online = isOnlinePeer(peer)
   // Every card — online or offline — is the same solid bordered card: the
@@ -59,6 +61,13 @@ export function PeerCard({ peer, current, slots, onRemove, removing, flowControl
         {onRemove
           ? <Button danger size="small" loading={removing} onClick={() => onRemove(peer.id)}>移除</Button>
           : <span style={{ visibility: 'hidden' }} aria-hidden><Button danger size="small">移除</Button></span>}
+      </div>
+      {/* The node's own write-rate history (msg/s + KiB/s, dual axis): what
+          this node lands as a LEADER, the same face flow control governs.
+          The card chart is the per-node mirror of the cluster write-speed
+          cards above — fed by the page's existing 2s writes poll. */}
+      <div style={{ marginTop: 12 }}>
+        <NodeRateChart points={ratePoints ?? []} />
       </div>
     </Card>
   )
