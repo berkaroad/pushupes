@@ -84,6 +84,25 @@ func TestReadTailsMatchesPerAggregateProbe(t *testing.T) {
 		}
 	}
 
+	// Read admission seeds (see hwread_test): node-1 replicates the slots it
+	// does not lead, and a replica answers locally only once the fetch
+	// ledger has PROVEN its sync. The fixture's peer addresses reach no live
+	// server (a forward would hang the test, and the honest failure mode is
+	// admission, not dialing), so every replicated slot is seeded synced at
+	// its local LEO — the steady state a real session reaches within one
+	// sweep round, and exactly the state whose ANSWERS this test pins.
+	for slot, p := range eng.TableSnapshot().Slots {
+		if p.Leader == "node-1" {
+			continue
+		}
+		for _, r := range p.Replicas {
+			if r == "node-1" {
+				eng.NoteHwLedger(slot, store.LastSeqOf(slot))
+				break
+			}
+		}
+	}
+
 	cli := serveEngine(t, eng, store)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

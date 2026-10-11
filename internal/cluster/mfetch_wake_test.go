@@ -50,6 +50,17 @@ func TestMFetchLongPollWakesOnAppend(t *testing.T) {
 	e.tableMu.Unlock()
 
 	const wait = 2 * time.Second
+	// Prime: the round carrying node-2's FIRST report books its ledger (new
+	// seat -> progress changed) and, since the tightened echo, answers that
+	// booking at once instead of parking on it. After the prime the seat is
+	// known and unchanged, so the observed round books nothing and parks —
+	// the shape this test is about (the wake, not the deadline, ends it).
+	if _, err := e.HandleMFetch(MFetchRequest{
+		Follower: "node-2", WaitMS: 0, Slots: []int32{3},
+		FromSeqs: []uint64{store.LastSeqOf(3) + 1},
+	}); err != nil {
+		t.Fatalf("prime round: %v", err)
+	}
 	done := make(chan *MFetchResponse, 1)
 	start := time.Now()
 	go func() {
@@ -158,6 +169,15 @@ func TestMFetchBurstDrainAllWaiters(t *testing.T) {
 				leo = sl.LastSeq()
 			}
 			froms = append(froms, leo+1)
+		}
+		// Prime: report the CURRENT positions on a no-wait round so they are
+		// already known (changed is empty) when the observed round starts —
+		// since the tightened echo, a round that BOOKS a ledger value answers
+		// immediately, and the burst must catch the observed round parked.
+		if _, err := e.HandleMFetch(MFetchRequest{
+			Follower: "node-2", WaitMS: 0, Slots: slots, FromSeqs: froms,
+		}); err != nil {
+			t.Fatalf("prime round %d: %v", attempt, err)
 		}
 		before := leos()
 		done := make(chan *MFetchResponse, 1)

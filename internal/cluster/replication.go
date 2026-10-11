@@ -37,6 +37,11 @@ import (
 	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 )
 
+type epochHW struct {
+	epoch int64 // placement epoch the sample was taken at
+	hw    uint64
+}
+
 // Engine is the application-level cluster state: it owns the slot table
 // (replicated through Raft via the Applier interface), routes client appends
 // to slot leaders, runs the follower fetch loop, and tracks ISR/high
@@ -69,6 +74,18 @@ type Engine struct {
 	// hwGates wakes the calls parked in waitForHW when a slot's watermark
 	// moves (see hwwake.go). Indexed by slot id, read-only after construction.
 	hwGates []hwGate
+
+	// hwPing is the aggregated watermark-advance signal for parked fetch
+	// rounds — a generation BROADCAST (one channel per generation under a
+	// mutex, the hwGate shape): every parked round holds the current
+	// generation and kickHW CLOSES it, waking all parked rounds at once; a
+	// single buffered channel would let one round drain the wake and starve
+	// the rest (a stolen wake). A woken round re-scans its own armed handles
+	// and answers early with the fresh ledger, so a replica's read-admission
+	// proof never trails the acked watermark by a report round (see
+	// HandleMFetchCtx). Guarded by hwPingMu.
+	hwPingMu sync.Mutex
+	hwPing   chan struct{} // closed by kickHW; the next waiter arms a fresh one
 
 	// rotation cursor for the mfetch payload budget
 	fetchRot atomic.Uint64
@@ -122,7 +139,6 @@ type Engine struct {
 	ledMu   sync.Mutex
 	ledPrev map[int32]bool
 
-	// one replication session per slot leader (multiplexed long-poll fetch)
 	sessMu   sync.Mutex
 	sessions map[string]*fetchSession
 	// sessKick wakes replicaLoop to reconcile sessions when the table
@@ -131,6 +147,20 @@ type Engine struct {
 	// gets a replica report within one RPC round trip instead of waiting for
 	// any polling cadence).
 	sessKick chan struct{}
+
+	// read-admission ledger (replica side): slot -> the latest high watermark
+	// this node has SEEN from that slot's leader (via each fetch round's HW
+	// ledger). A replica serves a slot's reads locally only once its durable
+	// LEO reaches the bound — until then the slot's confirmed data may outrun
+	// this copy's log and a local read would be a short read, so the read
+	// proxies to the leader (see LocalRead). Samples are keyed by the
+	// placement EPOCH they were taken at: an epoch change (a failover, a
+	// migration commit) invalidates every sample taken under the old leader
+	// and forces re-sync against the new one. Reset on process start — a
+	// restarted replica re-proves its sync from the first ledger round, which
+	// costs a few seconds of leader-proxy reads and no correctness.
+	hwMu   sync.Mutex
+	hwSeen map[int32]epochHW
 
 	// controller liveness: consecutive health-probe failures per peer.
 	// A single failure is not enough — a peer still booting (HTTP not yet
@@ -490,6 +520,7 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logge
 		ledPrev:     map[int32]bool{},
 		fenceSet:    map[int32]bool{},
 		diverged:    map[int32]string{},
+		hwSeen:      map[int32]epochHW{},
 		migrating:   map[int32]struct{}{},
 		// post-migration cleanup: the former source keeps its copy for this
 		// long once it sees the hand-over committed (-drop-after).
@@ -1386,6 +1417,29 @@ func (e *Engine) replicaCount(slot int32) int {
 // peerDown reports whether the replicated directory has this peer marked down
 // (the controller's liveness verdict): a node whose slots have already failed
 // over must not hold this leader's watermark back either. Caller holds replMu.
+// seatVouchable reports whether node holds a seat whose watermark sample the
+// leader may VOUCH for read admission: reported inside the staleness window,
+// connection alive, not marked down — advanceHW's in-sync set as seen from
+// one follower. The ack gate waits on the min over exactly this set, so an
+// acknowledged record sits at or below every vouchable seat's LEO: vouching
+// the watermark to such a seat is sound, and its own durable head is then a
+// safe local read bound (see readAdmission). A seat outside the window is
+// NOT covered by the ack promise; its ledger sample gets clamped to the
+// leader's durable LEO — the only bound an unvouchable copy satisfies by
+// catching up in full — so it forwards until proven, never answers short.
+// Caller holds replMu (peerDown nests tableMu; advanceHW parks in the same
+// order).
+func (e *Engine) seatVouchable(sr *slotRepl, node string) bool {
+	i := sr.find(node)
+	if i < 0 || !sr.lastOK[i].After(time.Now().Add(-isrStaleAfter)) {
+		return false
+	}
+	if e.sessionGone(node, sr.lastOK[i]) {
+		return false
+	}
+	return !e.peerDown(node)
+}
+
 func (e *Engine) peerDown(node string) bool {
 	e.tableMu.RLock()
 	defer e.tableMu.RUnlock()
@@ -1810,11 +1864,48 @@ func (e *Engine) hwGateOf(slot int32) *hwGate {
 	return &e.hwGates[slot]
 }
 
-// kickHW wakes the waiters parked on a slot's high watermark.
+// kickHW wakes the waiters parked on a slot's high watermark: the ack
+// callers waiting on that slot, plus — through the engine-wide hwPing
+// signal — any fetch round parked with armed handles, which re-scans, books
+// the moved slots' fresh watermarks into its own response, and answers
+// early. That second wake is the tight echo: an acknowledged watermark
+// reaches the follower inside the round already waiting, not one report
+// round later.
 func (e *Engine) kickHW(slot int32) {
 	if g := e.hwGateOf(slot); g != nil {
 		g.kick()
 	}
+	e.hwPingMu.Lock()
+	if e.hwPing != nil {
+		close(e.hwPing)
+		e.hwPing = nil // nothing armed: the next waiter creates the generation
+	}
+	e.hwPingMu.Unlock()
+}
+
+// hwPingWait returns the current wake generation for parked fetch rounds,
+// creating one if none is armed (the hwGate discipline: a kick with no
+// waiter allocates nothing). Callers take the handle BEFORE parking — a
+// kick between the handle and the park closes what they hold, so the first
+// scan sees it (no-lost-wake).
+func (e *Engine) hwPingWait() chan struct{} {
+	e.hwPingMu.Lock()
+	defer e.hwPingMu.Unlock()
+	if e.hwPing == nil {
+		e.hwPing = make(chan struct{})
+	}
+	return e.hwPing
+}
+
+// reArmHW returns the slot's watermark-gate handle for a parked fetch entry:
+// armed at park time and re-armed in the hwPing scan BEFORE each fresh
+// watermark read — the same no-lost-wake order as the store handle in the
+// data branch and as waitForHW's park.
+func (e *Engine) reArmHW(slot int32) <-chan struct{} {
+	if g := e.hwGateOf(slot); g != nil {
+		return g.wait()
+	}
+	return nil
 }
 
 // ---- Replication diagnostics -------------------------------------------------
@@ -1835,6 +1926,7 @@ type replDiag struct {
 	mfetchParked  atomic.Uint64 // ... that parked waiting for data
 	mfetchStarved atomic.Uint64 // ... that answered early: the fetch budget was spent
 	mfetchByWake  atomic.Uint64 // ... whose park ended on a data wake
+	mfetchByHW    atomic.Uint64 // ... whose park ended on an early watermark echo
 	mfetchByDeadl atomic.Uint64 // ... whose park ended on the wait deadline
 	mfetchByCtx   atomic.Uint64 // ... whose park ended because the caller went away
 	parkedNow     atomic.Int64  // parked rounds right now
@@ -1867,6 +1959,7 @@ type ReplMfetchView struct {
 	StarvedRounds   uint64 `json:"starved_rounds"`
 	EndedByWake     uint64 `json:"ended_by_wake"`
 	EndedByDeadline uint64 `json:"ended_by_deadline"`
+	EndedByHW       uint64 `json:"ended_by_hw_echo"`
 	EndedByCtx      uint64 `json:"ended_by_ctx"`
 	ParkedNow       int64  `json:"parked_now"`
 }
@@ -1929,6 +2022,7 @@ func (e *Engine) ReplStatsTop(worstN int) ReplView {
 			Rounds: d.mfetchRounds.Load(), ServedRounds: d.mfetchServed.Load(),
 			ParkedRounds: d.mfetchParked.Load(), StarvedRounds: d.mfetchStarved.Load(),
 			EndedByWake: d.mfetchByWake.Load(), EndedByDeadline: d.mfetchByDeadl.Load(),
+			EndedByHW:  d.mfetchByHW.Load(),
 			EndedByCtx: d.mfetchByCtx.Load(), ParkedNow: d.parkedNow.Load(),
 		},
 		Fetch: ReplFetchView{
@@ -2287,6 +2381,12 @@ type MFetchRequest struct {
 type MFetchResponse struct {
 	Follower string      `json:"follower"`
 	Items    []FetchItem `json:"items"`
+	// HwSlots[i]/HwValues[i]: this round's HW ledger for the requesting
+	// follower (see the proto field comment): the leader-side watermark of
+	// every slot the follower reported a position for, so a replica's
+	// read-admission bound flows even on an idle round.
+	HwSlots  []int32  `json:"hw_slots,omitempty"`
+	HwValues []uint64 `json:"hw_values,omitempty"`
 }
 
 // Item finds the response entry for one slot (sparse responses omit empty
@@ -2376,6 +2476,13 @@ type parkedEntry struct {
 	slot int32
 	from uint64
 	h    <-chan struct{}
+	// hwWake is the slot's watermark-gate handle, armed under the ledger
+	// replMu hold right after that hold read the watermark it guards — the
+	// no-lost-wake order (an advance before the hold shows in the value the
+	// hold books; an advance after it closes the handle the hold arms, and
+	// the hwPing scan books it and answers early: the tight echo). Re-armed
+	// by the scan after every fire, before the fresh read.
+	hwWake <-chan struct{}
 }
 
 // HandleMFetchCtx serves PeerService.MFetch: one multiplexed replica fetch
@@ -2438,6 +2545,11 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 	e.store.ScanFetchState(req.Slots, req.FromSeqs, scan.moved, scan.wakes)
 
 	out := &MFetchResponse{Follower: req.Follower, Items: make([]FetchItem, 0, 64)}
+	// Ledger snapshot: the slots this round reports the follower's positions
+	// for. prog.apply advances the watermarks and empties the batch, so the
+	// slot list is kept here and the post-advance watermarks are read after
+	// it — the ledger always carries the FRESHEST bound the leader knows.
+	var ledgerSlots []int32
 	e.diag.mfetchRounds.Add(1)
 	budget := int64(maxPayloadBytes)
 	starved := false
@@ -2481,14 +2593,14 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 				if scan.moved[i] {
 					starved = true
 				} else {
-					parked = append(parked, parkedEntry{s, from, h})
+					parked = append(parked, parkedEntry{s, from, h, nil})
 				}
 			}
 			continue
 		}
 		if !scan.moved[i] {
 			if h != nil {
-				parked = append(parked, parkedEntry{s, from, h})
+				parked = append(parked, parkedEntry{s, from, h, nil})
 			}
 			continue // empty slot: implied absent in the sparse response
 		}
@@ -2505,7 +2617,7 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 			// trimmed between the two): park like an empty slot rather
 			// than answering with an empty item.
 			if h != nil {
-				parked = append(parked, parkedEntry{s, from, h})
+				parked = append(parked, parkedEntry{s, from, h, nil})
 			}
 			continue
 		}
@@ -2513,7 +2625,101 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 		served = true
 		out.Items = append(out.Items, FetchItem{Slot: s, FromSeq: from, NextSeq: next, Payload: payload})
 	}
+	// Ledger cadence: a sweep round carries EVERY slot this follower reports
+	// a position for (its whole followed set — the baseline that seeds a new
+	// or restarted replica); an ordinary round carries the slots whose HW
+	// computation moved (progressBatch.changed: a LEO that grew or a
+	// re-joined replica — the ONLY events that can advance a watermark)
+	// PLUS every slot it SERVED data for (the tightened echo: the proof
+	// must never trail records already written to the replica's disk — see
+	// the merge below). A steady round with no data and no movement still
+	// costs zero ledger bytes, and HW never moves silently: advanceHW runs
+	// exactly on the changed set.
+	sweepLedger := req.Sweep && req.Follower != "" && req.Follower != e.self && len(prog.slots) > 0
+	if sweepLedger {
+		ledgerSlots = append(ledgerSlots[:0], prog.slots...)
+	}
 	prog.apply(e)
+	if req.Follower != "" && req.Follower != e.self {
+		if !sweepLedger {
+			// Tightened echo: the ledger carries prog.changed (slots whose
+			// HW computation moved on this round's reports) PLUS every slot
+			// this round SERVED data for. The served set is what kills the
+			// last round of ack-visibility lag: a follower that receives a
+			// record in THIS response has already moved up to the acked
+			// watermark the moment it writes it, but the leader's HW only
+			// folds that in once the NEXT round's progress report lands —
+			// until then a synced replica's proof could trail the data
+			// sitting on its own disk. Shipping the post-report HW next to
+			// the payloads costs a few (slot, hw) pairs against KB-sized
+			// items and lets the replica prove-synced in the same round the
+			// data arrived. Steady rounds with no data and no movement
+			// still carry zero ledger bytes.
+			ledgerSlots = prog.changed // post-report: the slots advanceHW touched
+			if len(out.Items) > 0 {
+				merged := make([]int32, 0, len(ledgerSlots)+len(out.Items))
+				merged = append(merged, ledgerSlots...)
+				for k := range out.Items {
+					s := out.Items[k].Slot
+					dup := false
+					for _, o := range merged {
+						if o == s {
+							dup = true
+							break
+						}
+					}
+					if !dup {
+						merged = append(merged, s)
+					}
+				}
+				ledgerSlots = merged
+			}
+		}
+		// HW ledger: for every slot in this round's ledger, the post-report
+		// watermark (0 for slots with no bookkeeping entry yet — brand-new
+		// seats, answered-but-not-led windows). The follower seeds its
+		// read-admission bound from it (see hwSeen). One replMu hold for the
+		// whole sweep: the entries a progress apply just touched are warm in
+		// the map and 560 lock round-trips would dominate a quiet round.
+		//
+		// Vouch discipline: the sample is the leader's PROMISE that every
+		// acknowledged record at or below it sits on the REQUESTING replica's
+		// disk, and that promise is sound only for a seat the ack actually
+		// covered — an in-sync, live, not-down seat (see seatVouchable; the
+		// ack gate waits on exactly that set's min). A seat that dropped out
+		// of the window cannot be vouched for: echoing the slot's HW to it
+		// would admit a local read capped at a watermark that acked PAST its
+		// own log — the short read of acknowledged data this fence exists to
+		// kill. For such a seat the sample is clamped to the leader's whole
+		// durable LEO, the only bound an unvouchable copy satisfies by
+		// catching up in full; until then admission forwards (or serves
+		// empty) and never answers short.
+		e.replMu.Lock()
+		for _, s := range ledgerSlots {
+			hw := uint64(0)
+			if sr := e.repl[s]; sr != nil {
+				hw = sr.hw
+				if !e.seatVouchable(sr, req.Follower) {
+					hw = e.store.LastSeqOf(s)
+				}
+			}
+			out.HwSlots = append(out.HwSlots, s)
+			out.HwValues = append(out.HwValues, hw)
+		}
+		// Arm the parked slots' hw handles INSIDE this hold: the hold just
+		// read the watermark they guard, so any advance from here on closes
+		// a handle this round holds — the hwPing scan then books the fresh
+		// value into this same response and answers early. Slots already
+		// booked above need no handle for THIS value's sake; the arm keeps
+		// them covered for advances after the hold.
+		for k := range parked {
+			pe := &parked[k]
+			if pe.hwWake == nil {
+				pe.hwWake = e.reArmHW(pe.slot)
+			}
+		}
+		e.replMu.Unlock()
+	}
 	// The scan buffer's tenure ENDS here: everything below works off `parked`
 	// (slot, from, wake handle) and re-reads the store by slot. Putting it back a
 	// second time from the wait loop let two concurrent rounds hold the same
@@ -2529,7 +2735,14 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 	if starved {
 		e.diag.mfetchStarved.Add(1)
 	}
-	if len(parked) > 0 && waitMS > 0 && !starved && !served {
+	// A round that booked ledger values answers NOW even when it has no
+	// payload: the sample this round computed is exactly what the follower's
+	// read admission waits on, and parking would hold it back until the next
+	// data wake or the wait deadline (up to fetchWait — the stall that made
+	// an acknowledged watermark visibly trail at a synced replica on the
+	// live cluster). Pure-changed rounds are rare and cheap (a report lift,
+	// an ISR re-join); data rounds already answer now via `served`.
+	if len(parked) > 0 && waitMS > 0 && !starved && !served && len(out.HwSlots) == 0 {
 		e.diag.mfetchParked.Add(1)
 		e.diag.parkedNow.Add(1)
 		defer e.diag.parkedNow.Add(-1)
@@ -2538,6 +2751,50 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 			wait = fetchMaxWait
 		}
 		deadline := time.After(wait)
+		ping := e.hwPingWait() // arm BEFORE parking (see hwPingWait)
+		// The wake scan body, shared by the ping case and the one-shot
+		// catch-up scan below (an advance kicked between this round's
+		// ledger hold and the ping arm must still end the wait early —
+		// its value was already booked, but a LATER advance's value was
+		// not, and the handles captured pre-kick are closed).
+		scanHwWake := func() bool {
+			anyHW := false
+			for k := range parked {
+				pe := &parked[k]
+				if pe.hwWake == nil {
+					continue // slot without a gate: the sweep is its backstop
+				}
+				select {
+				case <-pe.hwWake:
+				default:
+					continue
+				}
+				anyHW = true
+			}
+			return anyHW
+		}
+		if scanHwWake() {
+			e.replMu.Lock()
+			for k := range parked {
+				pe := &parked[k]
+				select {
+				case <-pe.hwWake:
+					pe.hwWake = e.reArmHW(pe.slot)
+					hw := uint64(0)
+					if sr := e.repl[pe.slot]; sr != nil {
+						hw = sr.hw
+					}
+					out.HwSlots = append(out.HwSlots, pe.slot)
+					out.HwValues = append(out.HwValues, hw)
+				default:
+				}
+			}
+			e.replMu.Unlock()
+			e.diag.mfetchByHW.Add(1)
+			e.parkedPool.Put(parked[:0])
+			e.progressPool.Put(prog.reset())
+			return out, nil
+		}
 	waitLoop:
 		for {
 			// One select over THREE cases instead of one case per parked
@@ -2554,6 +2811,57 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 				e.parkedPool.Put(parked[:0])
 				e.progressPool.Put(prog.reset())
 				return nil, ctx.Err() // client went away
+			case <-ping:
+				// A watermark advanced on some slot this node leads. Scan
+				// the armed handles to find WHICH parked entries it moved,
+				// book their fresh values into this response's ledger, and
+				// answer: the early exit is the tight echo. Payload work is
+				// untouched — a pure watermark movement carries no data, and
+				// the ledger alone is the answer the follower needs.
+				anyHW := false
+				for k := range parked {
+					pe := &parked[k]
+					if pe.hwWake == nil {
+						continue // slot without a gate: the sweep is its backstop
+					}
+					select {
+					case <-pe.hwWake:
+					default:
+						continue
+					}
+					// A slot booked EARLIER in this round may also have
+					// moved since that booking (the round's own apply, then
+					// a late report): ship the fresh value as a SECOND
+					// entry — applyHwLedger applies the ledger in order, so
+					// the last value for a slot wins on the follower. The
+					// wire cost is one (slot, hw) pair; the alternative —
+					// skipping — would answer with the stale booking,
+					// which is exactly the lag this wake exists to kill.
+					anyHW = true
+					// Re-arm BEFORE reading the watermark (no-lost-wake,
+					// same order as the data branch's store re-arm): an
+					// advance landing between the two closes the fresh
+					// handle and the next scan (or the next round's armed
+					// copy) sees it.
+					e.replMu.Lock()
+					pe.hwWake = e.reArmHW(pe.slot)
+					hw := uint64(0)
+					if sr := e.repl[pe.slot]; sr != nil {
+						hw = sr.hw
+					}
+					e.replMu.Unlock()
+					out.HwSlots = append(out.HwSlots, pe.slot)
+					out.HwValues = append(out.HwValues, hw)
+				}
+				if anyHW {
+					e.diag.mfetchByHW.Add(1)
+					break waitLoop
+				}
+				// The generation fired but NO parked slot moved (the ping is
+				// engine-wide; the advance was another slot's). Hold a fresh
+				// generation before looping again: the consumed one stays
+				// closed forever.
+				ping = e.hwPingWait()
 			case <-bus:
 				// Burst drain with a coalescing window: one wake answers
 				// for EVERY slot that has data, not just the one that
@@ -2831,6 +3139,7 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 	if err != nil {
 		return false, err
 	}
+	e.applyHwLedger(leader, fr.HwSlots, fr.HwValues)
 	// The payloads alias the response's receive buffer; releasing the lease
 	// returns that buffer to the pool, so it must happen after the round has
 	// written everything it took.
@@ -3066,32 +3375,151 @@ func (e *Engine) LeaderReplica(slot int32) (leader, clientAddr string, local, fo
 	}
 	for _, r := range p.Replicas {
 		if r == e.self {
-			return leader, clientAddr, true, true // local replica, <=LEO semantics apply
+			return leader, clientAddr, true, true // local replica (read admission is LocalRead's question)
 		}
 	}
 	return leader, clientAddr, false, true
 }
 
-// ReadProxyAddr returns the slot leader's gRPC address when this node
-// holds neither the slot nor any of its replicas; it returns "" when reads
-// can be served locally. Serving an empty local result instead of
-// forwarding would silently mis-report aggregates through single-endpoint
-// front-ends (e.g. the console proxy).
-//
-// This runs on EVERY read RPC (ReadStream, ReadTails, ReadByCommand,
-// ReadVersionByTime), so the
-// placement lookup behind it is the single-lock LeaderReplica rather than a
-// whole-table snapshot (see its doc for the measured cost).
-//
-// The three "" cases are the contract and stay exactly as they were: an
-// unassigned slot, this node is the leader, or this node is a replica (local
-// reads keep their own <=LEO bounding). Anything else is forwarded.
-func (e *Engine) ReadProxyAddr(slot int32) string {
-	_, clientAddr, local, found := e.LeaderReplica(slot)
-	if !found || local {
-		return ""
+func (e *Engine) LocalRead(slot int32) (uptoSeq uint64, serveEmpty bool, proxy string, leader string) {
+	bound, leader, _, proxy := e.readAdmission(slot)
+	switch {
+	case proxy != "":
+		return 0, false, proxy, leader // forward
+	case bound == nilBounded:
+		return 0, false, "", leader // leader path / unassigned: unbounded local
+	case bound == 0:
+		return 0, true, "", leader // synced but nothing confirmed: empty
+	default:
+		return bound, false, "", leader // synced replica: ceiling = the synced watermark
 	}
-	return clientAddr
+}
+
+// nilBounded marks the leader's "no ceiling" in readAdmission's bound. A
+// synced watermark can itself be 0 (serveEmpty); the leader's 0 means
+// unbounded, so the two are distinguished by which node leads.
+const nilBounded = ^uint64(0)
+
+// readAdmission resolves one slot's placement and replica-sync proof into
+// (bound, leader, leaderClientAddr, proxy) with bound=nilBounded when the
+// leader path applies. Unassigned slots answer locally (0 = unbounded) as
+// before — there is no leader to forward to.
+func (e *Engine) readAdmission(slot int32) (bound uint64, leader string, leaderAddr string, proxy string) {
+	e.tableMu.RLock()
+	p, found := e.table.Slots[slot]
+	if !found {
+		e.tableMu.RUnlock()
+		return nilBounded, "", "", "" // unassigned: local empty answer, unchanged contract
+	}
+	leader = p.Leader
+	leaderAddr = e.table.Peers[leader].ClientAddr
+	epoch, held := p.Epoch, replicaListHas(p.Replicas, e.self)
+	e.tableMu.RUnlock()
+	if leader == e.self {
+		return nilBounded, leader, leaderAddr, "" // the leader owns its log
+	}
+	if !held {
+		return 0, leader, leaderAddr, leaderAddr // a non-holder forwards, as ever
+	}
+	e.hwMu.Lock()
+	s, has := e.hwSeen[slot]
+	e.hwMu.Unlock()
+	// The PROOF is the sample itself: an unsampled replica (no ledger round
+	// has answered for it yet — a fresh boot, a new seat) is unproven and
+	// forwards even when its LEO is 0, because "0 records visible" and
+	// "nothing vouched yet" look identical in the log but not in safety:
+	// forwarding cannot answer short. A zero-HW SAMPLE is a different fact —
+	// the leader vouched that nothing is confirmed — and admits a local read
+	// with an empty visibility answer (serveEmpty).
+	// The ceiling is the SAMPLE, never the replica's own LEO: the records
+	// above the sampled watermark have not been acknowledged yet (the ack
+	// gate is the in-sync min, and the sample is the leader's vouch for it),
+	// and serving the replica's unacked tail would expose records a new
+	// leader could drop — the dirty-read class the HW rule exists to kill.
+	// The lag between an ack and its echo at the replica (the short-read
+	// window found on the live cluster) is closed on the TIMELINESS axis,
+	// not the bound axis: the served∪changed ledger plus the hwPing early
+	// answer keep the sample within one round-trip of the acked watermark.
+	// The ceiling is the SAMPLE, never the replica's own LEO: records above
+	// the sampled watermark are not (yet) vouched confirmed; serving them
+	// locally would expose a tail a new leader could drop (the dirty-read
+	// class the ≤HW rule kills), and capping BELOW the replica's head is
+	// sound precisely because of the ledger VOUCH discipline (see the
+	// HandleMFetchCtx hold): a seat that does not live in the ack promise —
+	// caught-up staleness, a building or re-joining copy — receives the
+	// leader's whole durable log as its sample, an equality it cannot reach
+	// by partial catch-up, so leo >= hw on such a seat means "fully caught
+	// up" and its local reads answer complete. A fresh echo of the acked
+	// watermark then lands via the served∪changed ledger and the hwPing
+	// early answer (the tight echo); what trails an ack on a vouched seat
+	// is only the record set the ack itself never covered.
+	if has && s.epoch == epoch && e.store.LastSeqOf(slot) >= s.hw {
+		return s.hw, leader, leaderAddr, "" // synced replica: local, ceiling = the synced HW
+	}
+	return 0, leader, leaderAddr, leaderAddr // not proven in sync: forward
+}
+
+// NoteHwLedger seeds one slot's read-admission bound directly, at this
+// node's current placement epoch for the slot — the follower-side test seam
+// for the fetch round's ledger (see NoteReplicaProgress, the leader-side
+// twin). Production callers go through applyHwLedger.
+func (e *Engine) NoteHwLedger(slot int32, hw uint64) {
+	e.tableMu.RLock()
+	p, ok := e.table.Slots[slot]
+	var epoch int64
+	if ok {
+		epoch = p.Epoch
+	}
+	e.tableMu.RUnlock()
+	if !ok {
+		return
+	}
+	e.hwMu.Lock()
+	if e.hwSeen == nil {
+		e.hwSeen = map[int32]epochHW{}
+	}
+	e.hwSeen[slot] = epochHW{epoch: epoch, hw: hw}
+	e.hwMu.Unlock()
+}
+
+// applyHwLedger seeds this node's read-admission bound from one HW ledger --
+// either a fetch round's (MFetchResponse.HwSlots/HwValues) or the echo of a
+// progress report (ReplicaProgressResponse, the zero-lag channel: the report
+// that completes an append's ack carries the watermark that append needs).
+// Samples are keyed by the placement EPOCH of the slot's current leader as
+// this node's table sees it: the round answered by `leader` is only
+// authoritative for the placement epoch that leader leads under, and an epoch
+// bump (failover, migration commit) invalidates every sample taken at the old
+// leader -- the replica re-proves its sync against the new one before serving
+// local reads again. A slot the table says this node does not replicate, or
+// that a different leader answers for, is skipped (no sample to trust).
+func (e *Engine) applyHwLedger(leader string, slots []int32, values []uint64) {
+	if len(slots) == 0 {
+		return
+	}
+	type sample struct {
+		slot  int32
+		epoch int64
+		hw    uint64
+	}
+	buf := make([]sample, 0, len(slots))
+	e.tableMu.RLock()
+	for i, slot := range slots {
+		if i >= len(values) {
+			break
+		}
+		p, ok := e.table.Slots[slot]
+		if !ok || p.Leader != leader || !replicaListHas(p.Replicas, e.self) {
+			continue
+		}
+		buf = append(buf, sample{slot, p.Epoch, values[i]})
+	}
+	e.tableMu.RUnlock()
+	e.hwMu.Lock()
+	for _, s := range buf {
+		e.hwSeen[s.slot] = epochHW{epoch: s.epoch, hw: s.hw}
+	}
+	e.hwMu.Unlock()
 }
 
 // ---- Controller: membership + failover ---------------------------------------

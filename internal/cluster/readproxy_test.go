@@ -15,23 +15,33 @@
 package cluster
 
 import (
+	"context"
+	"strconv"
 	"testing"
 
+	"github.com/berkaroad/pushupes/internal/data"
 	"github.com/berkaroad/pushupes/internal/storage"
 )
 
-// ReadProxyAddr decides, on every read RPC, whether this node serves a slot
-// locally or forwards it to the slot leader. It used to answer that by cloning
-// the whole slot table (a pointer, a slice and a map write per slot) — measured
-// at 94% of ReadStream's CPU and ~25% of a live node's, for a question about one
-// slot.
+// LocalRead decides, on every read RPC, whether this node serves a slot
+// locally or forwards it to the slot leader — and with what visibility
+// ceiling when it serves. The contract:
 //
-// The rewrite reads the placement and the leader's client address under one
-// table lock instead. These tests pin the answer itself, which is the contract
-// that must not move: a wrong answer serves a read locally where it should be
-// forwarded (returning nothing, silently) or forwards a read the node could
-// serve from its own log.
-func TestReadProxyAddrMatchesTableSemantics(t *testing.T) {
+//   - the slot LEADER serves locally, unbounded (own durable LEO): a leader
+//     read capped at a watermark would hide records it already acknowledged;
+//   - a REPLICA serves locally only once its sync is PROVEN: a ledger sample
+//     (the fetch round's HW echo) taken at the slot's CURRENT placement
+//     epoch, with this copy's durable LEO at or above the sampled watermark.
+//     Ceiling = that watermark: exactly the confirmed prefix, no more.
+//   - a sample of zero admits the replica but shows NOTHING (nothing has
+//     been confirmed yet — serving the log tail would leak unacked records
+//     the store's 0-means-unbounded convention cannot express as a ceiling);
+//   - an unproven copy (new seat, lagging, or one whose proof predates a
+//     failover: the epoch key invalidates it) and any NON-HOLDER forward.
+//
+// These tests pin the answer table itself; the forwarding it prevents is a
+// silently short read of acknowledged data.
+func TestLocalReadMatchesTableSemantics(t *testing.T) {
 	e, _ := newTestEngine(t, "node-1")
 	join(t, e, "node-1", "127.0.0.1:1")
 	join(t, e, "node-2", "127.0.0.1:2")
@@ -43,142 +53,260 @@ func TestReadProxyAddrMatchesTableSemantics(t *testing.T) {
 		t.Fatal("test setup: no placements")
 	}
 
-	// The reference semantics, spelled out from the table for every slot.
-	want := func(slot int32) string {
-		p, ok := tbl.Slots[slot]
-		if !ok {
-			return ""
-		}
-		if p.Leader == e.self {
-			return ""
-		}
-		for _, r := range p.Replicas {
-			if r == e.self {
-				return ""
-			}
-		}
-		return tbl.Peers[p.Leader].ClientAddr
-	}
-
 	locals, forwards := 0, 0
-	for slot := range tbl.Slots {
-		got, exp := e.ReadProxyAddr(slot), want(slot)
-		if got != exp {
-			t.Fatalf("slot %d: ReadProxyAddr = %q, want %q (leader=%s replicas=%v)",
-				slot, got, exp, tbl.Slots[slot].Leader, tbl.Slots[slot].Replicas)
-		}
-		if got == "" {
+	for slot, p := range tbl.Slots {
+		_, _, proxy, _ := e.LocalRead(slot)
+		switch {
+		case p.Leader == e.self:
+			if proxy != "" {
+				t.Fatalf("slot %d: leader must serve locally, got proxy %q", slot, proxy)
+			}
 			locals++
-		} else {
+		case replicaListHas(p.Replicas, e.self):
+			// No ledger sample yet: unproven sync — forward.
+			if proxy != tbl.Peers[p.Leader].ClientAddr {
+				t.Fatalf("slot %d: unsynced replica must forward to the leader client addr %q, got %q",
+					slot, tbl.Peers[p.Leader].ClientAddr, proxy)
+			}
+			forwards++
+		default:
+			if proxy != tbl.Peers[p.Leader].ClientAddr {
+				t.Fatalf("slot %d: non-holder must forward to %q, got %q", slot, tbl.Peers[p.Leader].ClientAddr, proxy)
+			}
 			forwards++
 		}
 	}
-	// Both directions must be exercised or this test proves nothing about the
-	// branch it skipped.
-	if locals == 0 {
-		t.Error("no slot resolved locally: a node must serve the slots it leads")
-	}
-	if forwards == 0 {
-		t.Error("no slot forwarded: with present replicas this node should not hold every slot")
+	if locals == 0 || forwards == 0 {
+		t.Fatalf("fixture must exercise both branches (locals=%d forwards=%d)", locals, forwards)
 	}
 
-	// An unassigned slot answers "" (local behavior), never a panic or a bogus
+	// An unassigned slot answers locally (empty), never a panic or a bogus
 	// forward.
 	for s := int32(0); s < 8192; s++ {
 		if _, ok := tbl.Slots[s]; !ok {
-			if got := e.ReadProxyAddr(s); got != "" {
-				t.Errorf("unassigned slot %d: got %q, want \"\"", s, got)
+			if _, _, proxy, _ := e.LocalRead(s); proxy != "" {
+				t.Errorf("unassigned slot %d: got proxy %q, want local empty", s, proxy)
 			}
 			break
 		}
 	}
 }
 
-// The three "" cases, isolated so a change in one fails as that case rather than
-// as an unexplained mismatch. Each is built from a slot this node does not hold
-// by default, then made local one way.
-func TestReadProxyAddrLocalCases(t *testing.T) {
-	e, _ := newTestEngine(t, "node-1")
+// The three local-serve shapes on one replicated slot, isolated so a change
+// in one fails as that case rather than as an unexplained mismatch.
+func TestLocalReadReplicaShapes(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
 	join(t, e, "node-1", "127.0.0.1:1")
 	join(t, e, "node-2", "127.0.0.1:2")
 	join(t, e, "node-3", "127.0.0.1:3")
 	applyCmd(t, e, &Command{Op: OpPlanSlots})
-
 	tbl := e.TableSnapshot()
 
-	// Find, from the real planning, a slot this node LEADS and one it only
-	// REPLICATES, plus one it does not hold at all.
-	//
-	// "Not held" must be checked against BOTH roles: with RF=2 over 3 nodes this
-	// node replicates most slots it does not lead, so taking the first slot led
-	// elsewhere would pick one it actually holds and make the forward assertion
-	// fail (map iteration order made that flaky, not just wrong).
-	var led, replicated, remote int32 = -1, -1, -1
+	var replicated int32 = -1
 	for s, p := range tbl.Slots {
-		if p.Leader == "node-1" {
-			led = s
-			continue
-		}
-		if replicaListHas(p.Replicas, "node-1") {
-			if replicated < 0 {
-				replicated = s
-			}
-			continue
-		}
-		if remote < 0 {
-			remote = s
+		if p.Leader != "node-1" && replicaListHas(p.Replicas, "node-1") {
+			replicated = s
+			break
 		}
 	}
-	if led < 0 {
-		t.Fatalf("test setup: node-1 leads no slot (led=%d)", led)
+	if replicated < 0 {
+		t.Fatal("test setup: node-1 replicates no slot")
 	}
-	if remote < 0 {
-		// The planning hands this node a copy of every slot when the replica
-		// factor covers the cluster; trim one so the forward case is real
-		// rather than skipped.
-		for s, p := range tbl.Slots {
-			if p.Leader != "node-1" && replicaListHas(p.Replicas, "node-1") && len(p.Replicas) > 1 {
-				applyCmd(t, e, &Command{Op: OpSlotRemoveReplica, Slots: []int32{s}, NodeID: "node-1"})
-				remote = s
-				break
-			}
-		}
-	}
-	if remote < 0 {
-		t.Fatal("test setup: could not place a slot this node does not hold")
-	}
-	tbl = e.TableSnapshot()
-	if replicaListHas(tbl.Slots[remote].Replicas, "node-1") || tbl.Slots[remote].Leader == "node-1" {
-		t.Fatalf("test setup: slot %d is still held by node-1 (leader=%s replicas=%v)",
-			remote, tbl.Slots[remote].Leader, tbl.Slots[remote].Replicas)
+	wantLeaderAddr := tbl.Peers[tbl.Slots[replicated].Leader].ClientAddr
+
+	// Shape 1: unsynced (no sample) — forward.
+	if _, _, proxy, _ := e.LocalRead(replicated); proxy != wantLeaderAddr {
+		t.Fatalf("unsynced replica: proxy=%q, want %q", proxy, wantLeaderAddr)
 	}
 
-	if got := e.ReadProxyAddr(led); got != "" {
-		t.Errorf("leader slot %d: got %q, want \"\" (a leader reads its own log)", led, got)
-	}
-	if replicated >= 0 {
-		if got := e.ReadProxyAddr(replicated); got != "" {
-			t.Errorf("replica slot %d: got %q, want \"\" (a replica reads its own log, bounded by its LEO)",
-				replicated, got)
-		}
+	// Shape 2: sampled at zero — admitted but empty (NOT unbounded: the
+	// store reads a 0 ceiling as "whole log", which would leak).
+	e.NoteHwLedger(replicated, 0)
+	upto, serveEmpty, proxy, _ := e.LocalRead(replicated)
+	if proxy != "" || !serveEmpty || upto != 0 {
+		t.Fatalf("zero-watermark replica: upto=%d empty=%v proxy=%q, want 0/true/\"\"", upto, serveEmpty, proxy)
 	}
 
-	// The remote case forwards to the leader's CLIENT address.
-	got := e.ReadProxyAddr(remote)
-	want := tbl.Peers[tbl.Slots[remote].Leader].ClientAddr
-	if got != want {
-		t.Errorf("remote slot %d: got %q, want the leader's client addr %q", remote, got, want)
+	// Shape 3: synced at LEO with records on disk — local, ceiling = the
+	// sampled watermark.
+	appendOne := func(agg string) {
+		if _, err := st.Append(&data.EventRecord{
+			AggregateID: agg, Version: 1, CommandID: "cmd-" + agg,
+			Events: []data.Event{{Type: "E", Body: []byte("x")}},
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if got == "" {
-		t.Error("remote slot resolved locally: the read would silently return nothing")
+	// one record ON this slot, then seed the watermark at its LEO. The
+	// aggregate must hash to the chosen slot or the LEO never moves and the
+	// shape under test degenerates (pick by the slot function, like the table
+	// itself does).
+	agg := ""
+	for i := 0; i < 4096 && agg == ""; i++ {
+		id := "lr-synced-" + strconv.Itoa(i)
+		if e.SlotOf(id) == replicated {
+			agg = id
+		}
+	}
+	if agg == "" {
+		t.Fatal("test setup: no aggregate hashes to the replicated slot")
+	}
+	appendOne(agg)
+	leo := st.LastSeqOf(replicated)
+	if leo == 0 {
+		t.Fatalf("test setup: append did not land on slot %d (leo=%d)", replicated, leo)
+	}
+	e.NoteHwLedger(replicated, leo)
+	upto, serveEmpty, proxy, _ = e.LocalRead(replicated)
+	if proxy != "" || serveEmpty || upto != leo {
+		t.Fatalf("synced replica: upto=%d empty=%v proxy=%q, want %d/false/local", upto, serveEmpty, proxy, leo)
+	}
+
+	// An LEO that has not reached the sample yet stays unproven: a sample of
+	// leo+5 cannot exist before those records land, so drive it directly.
+	e.NoteHwLedger(replicated, leo+5)
+	if _, _, proxy, _ := e.LocalRead(replicated); proxy != wantLeaderAddr {
+		t.Fatalf("LEO below the sampled watermark must forward, got proxy %q", proxy)
+	}
+
+	// Epoch invalidation: the sample was taken under the OLD leader. A
+	// leader move bumps the epoch; the stale proof must not admit the read.
+	// The new leader is another MEMBER of the slot's replica set (the table
+	// only accepts moves within the set).
+	var other string
+	for _, r := range tbl.Slots[replicated].Replicas {
+		if r != "node-1" && r != tbl.Slots[replicated].Leader {
+			other = r
+			break
+		}
+	}
+	if other == "" {
+		t.Skip("test setup: no third seat in the slot's replica set")
+	}
+	applyCmd(t, e, &Command{Op: OpLeaderMove, Slots: []int32{replicated}, NewLeader: other})
+	if _, _, proxy, _ := e.LocalRead(replicated); proxy == "" {
+		t.Fatal("stale-epoch sample admitted a local read after a failover: epoch key is broken")
+	}
+	// The round under the NEW leader re-proves it: reads land locally again.
+	e.NoteHwLedger(replicated, st.LastSeqOf(replicated))
+	if _, _, proxy, _ := e.LocalRead(replicated); proxy != "" {
+		t.Fatalf("post-failover sample must admit the local read, proxy=%q", proxy)
 	}
 }
 
-// LeaderReplica is the primitive the read paths share: one table-lock read
-// answering "who leads this slot, where is that leader's gRPC plane, and do I
-// hold the slot (as leader or replica)?". ReadProxyAddr is one policy on top of
-// it; anything else that needs the same facts must not go back to cloning the
-// table.
+// The ledger is the fetch round's post-report view: HandleMFetchCtx must
+// carry, for the slots it reports, the watermark as it stands AFTER applying
+// this round's progress (so a replica's ceiling tracks its own landing), and
+// applyHwLedger must seed a follower's admission from it — only for slots
+// this node replicates at the leader that answered.
+func TestHwLedgerRoundTrip(t *testing.T) {
+	st, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	lead := NewEngine(nil, st, "node-1", nil)
+	join(t, lead, "node-1", "127.0.0.1:1")
+	join(t, lead, "node-2", "127.0.0.1:2")
+	applyCmd(t, lead, &Command{Op: OpConfig, Replicas: 2})
+	applyCmd(t, lead, &Command{Op: OpPlanSlots})
+	tbl := lead.TableSnapshot()
+	var slot int32 = -1
+	for s, p := range tbl.Slots {
+		if p.Leader == "node-1" && replicaListHas(p.Replicas, "node-2") {
+			slot = s
+			break
+		}
+	}
+	if slot < 0 {
+		t.Fatal("test setup: no slot led by node-1 with node-2 replicating")
+	}
+	if _, err := st.Append(&data.EventRecord{
+		AggregateID: "ledger-agg", Version: 1, CommandID: "ledger-cmd",
+		Events: []data.Event{{Type: "E", Body: []byte("x")}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	leo := st.LastSeqOf(slot)
+
+	// A SWEEP round from the follower reports its position: the ledger must
+	// cover every reported slot, and the watermark must be the POST-report
+	// value (node-2 at LEO => HW == LEO for a two-seat set).
+	resp, err := lead.HandleMFetchCtx(context.Background(), MFetchRequest{
+		Follower: "node-2", Slots: []int32{slot}, FromSeqs: []uint64{leo + 1}, Sweep: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hw, found := 0, false
+	for i, s := range resp.HwSlots {
+		if s == slot {
+			hw, found = int(resp.HwValues[i]), true
+		}
+	}
+	if !found {
+		t.Fatalf("sweep ledger missing slot %d: %+v", slot, resp.HwSlots)
+	}
+	if uint64(hw) != leo {
+		t.Fatalf("ledger hw=%d, want post-report watermark %d", hw, leo)
+	}
+
+	// An ORDINARY round with no movement carries an EMPTY ledger (no changed
+	// slots): steady sessions cost zero ledger bytes.
+	resp2, err := lead.HandleMFetchCtx(context.Background(), MFetchRequest{
+		Follower: "node-2", Slots: []int32{slot}, FromSeqs: []uint64{leo + 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp2.HwSlots) != 0 {
+		t.Fatalf("idle round carried a %d-entry ledger, want 0", len(resp2.HwSlots))
+	}
+
+	// applyHwLedger on the follower side seeds admission.
+	fs, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	fe := NewEngine(nil, fs, "node-2", nil)
+	join(t, fe, "node-1", "127.0.0.1:1")
+	join(t, fe, "node-2", "127.0.0.1:2")
+	applyCmd(t, fe, &Command{Op: OpConfig, Replicas: 2})
+	applyCmd(t, fe, &Command{Op: OpPlanSlots})
+	fe.applyHwLedger("node-1", []int32{slot}, []uint64{uint64(hw)})
+	upto, _, proxy, _ := fe.LocalRead(slot)
+	if proxy != "" || upto != uint64(hw) {
+		t.Fatalf("follower after ledger seed: upto=%d proxy=%q, want %d/local", upto, proxy, hw)
+	}
+	// A ledger answered by a node the follower's table does NOT see as the
+	// slot's leader is ignored (a split-brain or stale session must not
+	// admit reads on someone else's word).
+	fresh, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	fe2 := NewEngine(nil, fresh, "node-2", nil)
+	join(t, fe2, "node-1", "127.0.0.1:1")
+	join(t, fe2, "node-2", "127.0.0.1:2")
+	applyCmd(t, fe2, &Command{Op: OpConfig, Replicas: 2})
+	applyCmd(t, fe2, &Command{Op: OpPlanSlots})
+	leader := tbl.Slots[slot].Leader
+	if leader != "node-1" {
+		t.Fatalf("fixture: slot %d leader is %q", slot, leader)
+	}
+	fe2.applyHwLedger("node-ghost", []int32{slot}, []uint64{uint64(hw)})
+	if _, _, proxy, _ := fe2.LocalRead(slot); proxy == "" {
+		t.Fatal("a ledger from a non-leader admitted the local read")
+	}
+}
+
+// LeaderReplica is the primitive the OTHER (write/redirect) paths share: one
+// table-lock read answering "who leads this slot, where is that leader's
+// gRPC plane, and do I hold the slot (as leader or replica)?". LocalRead is
+// the read-path policy built alongside it; anything that needs the same
+// facts must not go back to cloning the table.
 func TestLeaderReplicaReportsPlacement(t *testing.T) {
 	e, _ := newTestEngine(t, "node-1")
 	join(t, e, "node-1", "127.0.0.1:1")
@@ -202,20 +330,13 @@ func TestLeaderReplicaReportsPlacement(t *testing.T) {
 		if want := tbl.Peers[p.Leader].ClientAddr; addr != want {
 			t.Fatalf("slot %d: addr %q, want the leader's client addr %q", slot, addr, want)
 		}
-		// local must mean "leads OR replicates", which is what makes a read
-		// serviceable here.
+		// local must mean "leads OR replicates" — ownership, not admission:
+		// a replica may hold the slot and still forward reads until its
+		// sync is proven (see TestLocalReadReplicaShapes).
 		wantLocal := p.Leader == e.self || replicaListHas(p.Replicas, e.self)
 		if local != wantLocal {
 			t.Fatalf("slot %d: local=%v, want %v (leader=%s replicas=%v self=%s)",
 				slot, local, wantLocal, p.Leader, p.Replicas, e.self)
-		}
-		// Consistency with the policy built on top of it.
-		wantProxy := ""
-		if !local {
-			wantProxy = addr
-		}
-		if got := e.ReadProxyAddr(slot); got != wantProxy {
-			t.Fatalf("slot %d: ReadProxyAddr=%q, want %q from LeaderReplica", slot, got, wantProxy)
 		}
 	}
 
@@ -278,10 +399,10 @@ func TestLeaderReplicaRemoteSlot(t *testing.T) {
 	}
 }
 
-// The address must be the CLIENT-plane one: a reader dials it as a gRPC event
-// client, so handing back the peer (raft) address would aim reads at the raft
-// listener.
-func TestReadProxyAddrUsesClientPlane(t *testing.T) {
+// The forward address must be the CLIENT-plane one: a reader dials it as a
+// gRPC event client, so handing back the peer (raft) address would aim reads
+// at the raft listener. The read path now answers it through LocalRead.
+func TestLocalReadForwardsToClientPlane(t *testing.T) {
 	st, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
 	if err != nil {
 		t.Fatal(err)
@@ -301,9 +422,8 @@ func TestReadProxyAddrUsesClientPlane(t *testing.T) {
 	applyCmd(t, e, &Command{Op: OpPlanSlots})
 
 	// A slot led by node-2 with node-1 removed from its replica set, so this
-	// node holds no part of it. With RF=2 over 3 nodes the planning gives
-	// node-1 a copy of every slot, so the set has to be trimmed explicitly —
-	// otherwise this test skips and proves nothing about the client plane.
+	// node holds no part of it. With RF=2 over 2 nodes the planning gives
+	// node-1 a copy of every slot, so the set has to be trimmed explicitly.
 	tbl := e.TableSnapshot()
 	target := int32(-1)
 	for s, p := range tbl.Slots {
@@ -326,8 +446,8 @@ func TestReadProxyAddrUsesClientPlane(t *testing.T) {
 	if want == "" || want == tbl.Peers[leader].PeerAddr {
 		t.Fatalf("test setup: leader %s has no distinct client addr (%q)", leader, want)
 	}
-	if got := e.ReadProxyAddr(target); got != want {
-		t.Errorf("ReadProxyAddr = %q, want the client-plane address %q (peer addr is %q)",
-			got, want, tbl.Peers[leader].PeerAddr)
+	if _, _, proxy, _ := e.LocalRead(target); proxy != want {
+		t.Errorf("LocalRead proxy addr = %q, want the client-plane address %q (peer addr is %q)",
+			proxy, want, tbl.Peers[leader].PeerAddr)
 	}
 }

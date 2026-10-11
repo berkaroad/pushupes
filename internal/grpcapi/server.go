@@ -387,10 +387,15 @@ func (s *Server) ReadStream(ctx context.Context, req *pushupesv1.ReadStreamReque
 	}
 	slot := s.store.SlotOf(req.AggregateId)
 
-	// This node holds neither the slot nor a replica of it: proxy the read
-	// to the slot leader's gRPC data plane.
-	if addr := s.engine.ReadProxyAddr(slot); addr != "" {
-		client, err := s.leaderClient(addr)
+	// Read admission: forward when this node cannot be trusted to answer
+	// locally (a non-holder, or a replica whose sync with the slot's current
+	// leader is not yet proven); serve locally when it can — the leader up to
+	// its own LEO, a synced replica up to the watermark it synced at, and a
+	// synced-but-nothing-confirmed replica the empty answer. See
+	// Engine.LocalRead for the rule and its reasoning.
+	uptoSeq, serveEmpty, proxy, _ := s.engine.LocalRead(slot)
+	if proxy != "" {
+		client, err := s.leaderClient(proxy)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "read proxy dial: %v", err)
 		}
@@ -398,29 +403,16 @@ func (s *Server) ReadStream(ctx context.Context, req *pushupesv1.ReadStreamReque
 			AggregateId: req.AggregateId, FromVersion: from, Limit: req.Limit,
 		})
 	}
-
-	// A leader owns its log: it reads up to its own durable LEO. Bounding a
-	// leader read by the replication high watermark would hide records it has
-	// already accepted — and therefore already acknowledged — because
-	// the HW can lag the LEO whenever a replica falls behind, turning a
-	// complete stream into a SILENT short read.
-	//
-	// A replica's local read is bounded by its own durable LEO as well. The
-	// watermark is leader-side bookkeeping, so HW() reports it only for a
-	// slot this node currently leads and 0 for every other node — a replica
-	// (including one that led this slot before stepping down) falls through
-	// to its local LEO and returns everything its own log holds, never a
-	// frozen former-leader watermark.
-	hw := uint64(0)
-	if !s.engine.Leads(slot) {
-		hw = s.engine.HW(slot) // 0 unless this node leads the slot
-		if hw == 0 {
-			hw = s.store.LastSeqOf(slot) // bound by the durable local LEO
+	var (
+		recs []*data.EventRecord
+		seqs []uint64
+		err  error
+	)
+	if !serveEmpty {
+		recs, seqs, err = s.store.ReadAggregate(req.AggregateId, from, req.Limit, uptoSeq)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "read: %v", err)
 		}
-	}
-	recs, seqs, err := s.store.ReadAggregate(req.AggregateId, from, req.Limit, hw)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "read: %v", err)
 	}
 	out := &pushupesv1.ReadStreamResponse{Records: make([]*pushupesv1.Record, len(recs))}
 	for i, rec := range recs {
@@ -488,18 +480,24 @@ func (s *Server) ReadTails(ctx context.Context, req *pushupesv1.ReadTailsRequest
 	fwd := map[string]*fwdBatch{}
 	var fwdOrder []string
 	var localIdx []int
+	localBound := map[int32]uint64{} // slot -> visibility ceiling (admission)
 
 	for _, slot := range slots {
 		idx := bySlot[slot]
-		if addr := s.engine.ReadProxyAddr(slot); addr == "" {
+		uptoSeq, serveEmpty, proxy, _ := s.engine.LocalRead(slot)
+		if proxy == "" {
+			if serveEmpty {
+				continue // admitted but nothing confirmed: every version 0
+			}
+			localBound[slot] = uptoSeq
 			localIdx = append(localIdx, idx...)
 			continue
 		} else {
-			b := fwd[addr]
+			b := fwd[proxy]
 			if b == nil {
-				b = &fwdBatch{addr: addr}
-				fwd[addr] = b
-				fwdOrder = append(fwdOrder, addr)
+				b = &fwdBatch{addr: proxy}
+				fwd[proxy] = b
+				fwdOrder = append(fwdOrder, proxy)
 			}
 			for _, i := range idx {
 				b.idx = append(b.idx, i)
@@ -509,9 +507,11 @@ func (s *Server) ReadTails(ctx context.Context, req *pushupesv1.ReadTailsRequest
 	}
 
 	// Local answers: one slot lookup per aggregate inside the store, but no
-	// routing clone and no extra RPC.
+	// routing clone and no extra RPC. A synced replica bounds by its synced
+	// watermark (the same ceiling ReadStream carries on this node); the
+	// leader path passes its own durable LEO (bounded=false).
 	for _, i := range localIdx {
-		v, err := s.store.TailVersionOf(req.AggregateIds[i], 0)
+		v, err := s.store.TailVersionOf(req.AggregateIds[i], localBound[s.store.SlotOf(req.AggregateIds[i])])
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "read tails: %v", err)
 		}
@@ -553,8 +553,9 @@ func (s *Server) ReadByCommand(ctx context.Context, req *pushupesv1.ReadByComman
 		return nil, status.Error(codes.InvalidArgument, "aggregate_id and command_id required")
 	}
 	slot := s.store.SlotOf(req.AggregateId)
-	if addr := s.engine.ReadProxyAddr(slot); addr != "" {
-		client, err := s.leaderClient(addr)
+	uptoSeq, serveEmpty, proxy, _ := s.engine.LocalRead(slot)
+	if proxy != "" {
+		client, err := s.leaderClient(proxy)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "read proxy dial: %v", err)
 		}
@@ -562,9 +563,26 @@ func (s *Server) ReadByCommand(ctx context.Context, req *pushupesv1.ReadByComman
 			AggregateId: req.AggregateId, CommandId: req.CommandId,
 		})
 	}
-	rec, seq, err := s.store.RecordByCommand(req.AggregateId, req.CommandId)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "by-command: %v", err)
+	var (
+		rec *data.EventRecord
+		seq uint64
+		err error
+	)
+	if !serveEmpty {
+		// the store's 0 convention is unbounded (the leader path); a synced
+		// replica's ceiling is its watermark, and a record past it is NOT
+		// confirmed here — report not-found rather than leak it.
+		bound := uptoSeq
+		if bound == 0 {
+			bound = s.store.LastSeqOf(slot)
+		}
+		rec, seq, err = s.store.RecordByCommand(req.AggregateId, req.CommandId)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "by-command: %v", err)
+		}
+		if rec != nil && seq > bound {
+			rec = nil
+		}
 	}
 	if rec == nil {
 		return &pushupesv1.ReadByCommandResponse{Found: false}, nil
@@ -588,8 +606,9 @@ func (s *Server) ReadVersionByTime(ctx context.Context, req *pushupesv1.ReadVers
 		return nil, status.Error(codes.InvalidArgument, "aggregate_id required")
 	}
 	slot := s.store.SlotOf(req.AggregateId)
-	if addr := s.engine.ReadProxyAddr(slot); addr != "" {
-		client, err := s.leaderClient(addr)
+	uptoSeq, serveEmpty, proxy, _ := s.engine.LocalRead(slot)
+	if proxy != "" {
+		client, err := s.leaderClient(proxy)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "read proxy dial: %v", err)
 		}
@@ -597,14 +616,14 @@ func (s *Server) ReadVersionByTime(ctx context.Context, req *pushupesv1.ReadVers
 			AggregateId: req.AggregateId, UnixTime: req.UnixTime,
 		})
 	}
-	hw := uint64(0)
-	if !s.engine.Leads(slot) {
-		hw = s.engine.HW(slot) // 0 unless this node leads the slot
-		if hw == 0 {
-			hw = s.store.LastSeqOf(slot) // bound by the durable local LEO
+	var err error
+	v := uint32(0)
+	if !serveEmpty {
+		v, err = s.store.VersionAtOrBeforeTime(req.AggregateId, req.UnixTime, uptoSeq)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "version by time: %v", err)
 		}
 	}
-	v, err := s.store.VersionAtOrBeforeTime(req.AggregateId, req.UnixTime, hw)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "version by time: %v", err)
 	}

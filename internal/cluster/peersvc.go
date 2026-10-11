@@ -129,7 +129,12 @@ func (s *peerServer) MFetch(ctx context.Context, req *pushupesv1.MFetchRequest) 
 		s.e.noteFollowerSessionLost(req.Follower, req.Slots)
 		return nil, err
 	}
-	return &pushupesv1.MFetchResponse{Follower: resp.Follower, Items: protoItems(resp.Items)}, nil
+	return &pushupesv1.MFetchResponse{
+		Follower: resp.Follower,
+		Items:    protoItems(resp.Items),
+		HwSlots:  resp.HwSlots,
+		HwValues: resp.HwValues,
+	}, nil
 }
 
 func (s *peerServer) ReplicaProgress(_ context.Context, req *pushupesv1.ReplicaProgressRequest) (*pushupesv1.ReplicaProgressResponse, error) {
@@ -144,7 +149,30 @@ func (s *peerServer) ReplicaProgress(_ context.Context, req *pushupesv1.ReplicaP
 	// The leader's half of the acknowledgement hop: what a follower's report
 	// costs before the parked calls can see the new watermark.
 	s.e.ack.progressHandle.observe(time.Since(t0))
-	return &pushupesv1.ReplicaProgressResponse{}, nil
+	// Zero-lag read-admission echo: the post-report watermark of EVERY slot
+	// this report covered rides back on the same response (see the proto
+	// comment). The append that got acknowledged by exactly this report is
+	// visible to THIS replica's local reads on return — no fetch round in
+	// between. Slots without a repl entry answer 0 (a leader that just took
+	// the slot over: the replica re-proves on the next echo or fetch ledger).
+	// Both arrays are built in the same iteration: the request's parallel
+	// arrays can be ragged (a malformed entry skipped), and truncating one
+	// after the fact would mis-align the pairs the follower indexes by slot.
+	out := &pushupesv1.ReplicaProgressResponse{}
+	s.e.replMu.Lock()
+	for i, slot := range req.Slots {
+		if i >= len(req.FromSeqs) || slot < 0 || req.FromSeqs[i] == 0 {
+			continue // not a position the batch recorded
+		}
+		hw := uint64(0)
+		if sr := s.e.repl[slot]; sr != nil {
+			hw = sr.hw
+		}
+		out.HwSlots = append(out.HwSlots, slot)
+		out.HwValues = append(out.HwValues, hw)
+	}
+	s.e.replMu.Unlock()
+	return out, nil
 }
 
 func (s *peerServer) Replicate(_ context.Context, req *pushupesv1.ReplicateRequest) (*pushupesv1.ReplicateResponse, error) {
@@ -305,7 +333,12 @@ func (e *Engine) peerMFetch(ctx context.Context, addr string, req *MFetchRequest
 	// The items' payloads alias presp's receive buffer, so the lease has to be
 	// released by the caller once the payloads have been written to the WAL.
 	release := func() { lease.Release(presp) }
-	return &MFetchResponse{Follower: presp.Follower, Items: fetchItemsFromProto(presp.Items)}, release, nil
+	return &MFetchResponse{
+		Follower: presp.Follower,
+		Items:    fetchItemsFromProto(presp.Items),
+		HwSlots:  presp.HwSlots,
+		HwValues: presp.HwValues,
+	}, release, nil
 }
 
 func (e *Engine) peerReplicate(ctx context.Context, addr string, slot int32, seq uint64, payload []byte) error {
@@ -322,8 +355,17 @@ func (e *Engine) peerProgress(ctx context.Context, addr, follower string, slots 
 	if err != nil {
 		return err
 	}
-	_, err = c.ReplicaProgress(ctx, &pushupesv1.ReplicaProgressRequest{Follower: follower, Slots: slots, FromSeqs: froms, Stamp: stamp})
-	return err
+	resp, err := c.ReplicaProgress(ctx, &pushupesv1.ReplicaProgressRequest{Follower: follower, Slots: slots, FromSeqs: froms, Stamp: stamp})
+	if err != nil {
+		return err
+	}
+	// Zero-lag read admission: the leader's post-report watermarks ride back on
+	// this very response — the report that completed an append's ack carries
+	// the watermark that append needs. applyHwLedger is epoch-keyed, so a
+	// stale or ghost round (a demoted leader answering late) cannot poison it;
+	// an empty ledger from an old binary is simply a no-op.
+	e.applyHwLedger(addr, resp.GetHwSlots(), resp.GetHwValues())
+	return nil
 }
 
 func (e *Engine) peerLeo(ctx context.Context, addr string, slot int32) (uint64, error) {

@@ -473,9 +473,15 @@ Body: Record*，每条记录：
   配置（默认 4MiB，recv/send 同值）：`BatchAppend` 一整批要装进这个上限，
   批次大小随它一起调。
   MOVED/ASK 重定向的 `node` 字段携带槽 leader 的 **client 地址**（路由表
-  Peer 同时记 PeerAddr/AdminAddr/ClientAddr），客户端据此重连。本节点既无槽又无副本
-  时，服务端向 leader 的 client 面代理转发（`ReadProxyAddr` 返回 leader
-  client 地址）。
+  Peer 同时记 PeerAddr/AdminAddr/ClientAddr），客户端据此重连。读准入
+  （`Engine.LocalRead`）决定服务端是否本地作答：**leader 恒本地**（读自己的
+  durable LEO，不受水位约束）；**副本必须「同步已证明」才本地**——取到过该
+  槽**当前 placement epoch** 的 HW 账本样本、且本副本 durable LEO ≥ 样本水位，
+  本地读上界即该水位（恰好是已确认前缀）；样本为 0 表示尚无确认，本地答空
+  （绝不因 store 的 0=无界约定泄露未确认尾巴）。未证明同步的副本（新入集的
+  follower 还在追、掉队的副本、或 epoch 换代后失效的旧证明）与不持有该槽的
+  节点一样，向 leader 的 client 面代理转发——这正是「新 follower 副本不可读、
+  同步完成才可读」的落点：ack 等过 ISR 高水位，leader 上确认数据必然完整。
 
   **`PrefetchRoutes` 是客户端的路由预取接口**：无请求参数（路由表是集群级
   状态，不是逐查询的答案），返回 `node_client_addrs`（集群各节点 client 面
@@ -511,7 +517,7 @@ gRPC  EventService/BatchAppend    写入唯一入口（单条=一条记录、批
 gRPC  EventService/ReadStream     范围查询（≤HW 语义）
 gRPC  EventService/ReadByCommand  command_id 幂等探针
 gRPC  EventService/ReadTails      批量取多个聚合的最新版本（resume 扫描用；按槽分组一次 RPC，非持有者按目标节点成组转发）
-gRPC  EventService/ReadVersionByTime  按聚合 id + unix_time 查询「时间戳早于或等于给定时间」的最大 version（客户端按时间点追溯历史：先定锚点版本，再 ReadStream 回放；恰好写在给定时刻的记录计入锚点；0=该时间点及之前无可见记录；从索引作答、不读 WAL 帧；按本节点 durable LEO 约束，非持有者代理转发）
+gRPC  EventService/ReadVersionByTime  按聚合 id + unix_time 查询「时间戳早于或等于给定时间」的最大 version（客户端按时间点追溯历史：先定锚点版本，再 ReadStream 回放；恰好写在给定时刻的记录计入锚点；0=该时间点及之前无可见记录；从索引作答、不读 WAL 帧；可见性按读准入判据（leader=自身 LEO、同步副本=已证水位），未证明同步的副本与非持有者代理转发）
 gRPC  EventService/PrefetchRoutes  路由表预取（无请求参数；返回全集群节点 client 地址表 + 按槽稠密的 leader 下标表，长度即槽数；客户端初始一次 + 周期刷新 + MOVED 即时修补）
 
 # ---- peer 面（PeerService gRPC，与 Raft 同端口，proto/pushupes/v1/peer.proto）----
@@ -599,7 +605,15 @@ Raft 配置（谁投票）与复制的成员目录（槽表里的成员列表）
   leader 转发），与 `Register` 同一套 relay 语义。
 
 读语义只暴露 `seq ≤ HW` 的记录：查询不读未达高水位的数据，防止副本回滚后
-出现脏读。
+出现脏读。副本侧这条约束由准入判据兑现：本地作答的副本把水位作为读的可见上界
+（`LocalRead` 的 `uptoSeq`），未证明同步前直接问 leader；leader 本地读不受此界
+（已确认的记录必须可见）。水位样本经复制面下发，两条通道互补：ReplicaProgress
+应答**零滞后回声**——副本上报落盘位置的那次请求，其应答携带 leader 推进后的新
+水位，完成 ack 的同一 RTT 内该副本即获证明（acked 数据对副本读立即可见，无轮间
+延迟）；MFetch 每轮应答带 HW 账本（sweep 轮全量、普通轮只带水位变化的槽）负责
+兜底——重启/新入集的副本、以及多副本集里由**其他席位**的上报推进的水位，在 ≤2s
+的 sweep 内补齐。follower 据此记 `hwSeen`（epoch 键控，换代即失效、读自动回退到
+代理直到新一轮证明）。
 
 槽位事件流列表（`/admin/slots/{slot}/streams`）回答的是**槽内索引**：每条事件流的
 聚合 id + 最新版本号 + 该最新记录的 `unix_time`（控制台「最近UTC时间」列；

@@ -126,18 +126,19 @@ func TestLeaderReadIsNotCappedByHighWatermark(t *testing.T) {
 	}
 }
 
-// A node that once led a slot keeps the leader-side replication bookkeeping
-// (repl[slot]) it accumulated while leading: nothing clears it when the table
-// moves the slot's leadership elsewhere. The high watermark inside it is then
-// FROZEN at the step-down point, and a replica read that trusted it silently
-// truncates there — zero records for an aggregate written after the step-down,
-// a few short for one that straddles it, and no error either way.
+// A replica's local read is admitted only by PROVEN sync with the slot's
+// current leader: a ledger sample taken at the slot's current placement
+// epoch whose watermark the copy's durable LEO has reached. This replaces the
+// old "a replica reads its whole local log" rule, which let a NOT-YET-SYNCED
+// copy (a new seat mid-catch-up) serve acknowledged records it did not hold —
+// a short read of acked data.
 //
-// A replica's local read must be bounded by its OWN durable LEO instead: it
-// returns every record its log actually holds, and a leftover watermark that
-// only ever described what a former leader had confirmed against its
-// followers must not narrow that.
-func TestSteppedDownReplicaReadsItsOwnLog(t *testing.T) {
+// The same rule closes the historical step-down hole: a node that once led a
+// slot keeps leader-side bookkeeping (repl[slot], its frozen watermark) that
+// nothing clears when leadership moves. It was never part of admission — the
+// read path consults the follower-side ledger only — so a frozen former-leader
+// watermark cannot silently truncate anything.
+func TestSteppedDownReplicaForwardsUntilReProven(t *testing.T) {
 	store, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
 	if err != nil {
 		t.Fatal(err)
@@ -197,18 +198,20 @@ func TestSteppedDownReplicaReadsItsOwnLog(t *testing.T) {
 		}
 	}
 
-	// Three versions while node-1 leads, with a live watermark (the replica
-	// caught up to 3): this is the value that freezes at step-down.
+	// Three versions while node-1 leads, and a ledger sample node-1 would have
+	// as a replica: proof at the CURRENT epoch (the fixture seeds it directly;
+	// production grows it from fetch rounds).
 	for v := 1; v <= 3; v++ {
 		appendV(v)
 	}
-	eng.NoteReplicaProgress(slot, follower, 3)
-	if hw := eng.HW(slot); hw != 3 {
-		t.Fatalf("test setup: want live watermark 3 while leading, got %d", hw)
+	eng.NoteHwLedger(slot, 3)
+	if _, _, proxy, _ := eng.LocalRead(slot); proxy != "" {
+		t.Fatalf("test setup: synced replica at epoch %d should read locally, proxy=%q", tbl.Slots[slot].Epoch, proxy)
 	}
 
 	// node-1 steps down: the table hands the slot to the follower and node-1
-	// is left as an ordinary replica (still in the replica set).
+	// is left as an ordinary replica (still in the replica set). The epoch
+	// bumps; the proof was taken under the OLD leader.
 	if _, err := eng.ApplyCommand((&cluster.Command{
 		Op: cluster.OpLeaderMove, Slots: []int32{slot}, NewLeader: follower,
 	}).Encode()); err != nil {
@@ -217,25 +220,41 @@ func TestSteppedDownReplicaReadsItsOwnLog(t *testing.T) {
 	if eng.Leads(slot) {
 		t.Fatalf("test setup: node-1 should no longer lead slot %d", slot)
 	}
+	// Root cause the OLD rule could not see: the stepped-down node still
+	// reports the leader-side watermark frozen at its step-down point. It
+	// must report 0 — and the read path never consults it either way.
+	if hw := eng.HW(slot); hw != 0 {
+		t.Fatalf("stepped-down replica reports frozen watermark %d, want 0: the "+
+			"watermark is leader-side bookkeeping and is not valid on a non-leader", hw)
+	}
+	// The stale proof must NOT admit: forwarding beats serving a log the new
+	// leader cannot vouch for.
+	if _, _, proxy, _ := eng.LocalRead(slot); proxy == "" {
+		t.Fatal("stale-epoch proof admitted a local read after the step-down")
+	}
 
-	// One more version lands AFTER the step-down - exactly what the new leader
-	// accepts and this replica fetches. The aggregate now straddles the
-	// step-down point.
+	// One more version lands AFTER the step-down - what the new leader
+	// accepts; this replica's log already holds v4 in the fixture (the store
+	// is shared with the old leader's writes).
 	appendV(4)
 	if leo := store.LastSeqOf(slot); leo != 4 {
 		t.Fatalf("test setup: local LEO %d want 4", leo)
 	}
 
+	// Re-prove sync at the NEW epoch — at a watermark of 2, i.e. the cluster
+	// has only confirmed through seq 2. The replica reads LOCALLY but shows
+	// exactly the confirmed prefix: v4 in its log is not visible, because it
+	// is not acked. The read itself must not fail or forward.
+	eng.NoteHwLedger(slot, 2)
 	cli := serveEngine(t, eng, store)
 	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	resp, err := cli.ReadStream(cctx, &pushupesv1.ReadStreamRequest{AggregateId: agg, FromVersion: 1, Limit: 100})
 	if err != nil {
-		t.Fatalf("read: %v", err)
+		t.Fatalf("read on a re-proven replica: %v", err)
 	}
-	if len(resp.Records) != 4 {
-		t.Fatalf("stepped-down replica read returned %d records (up to v%d); its local log "+
-			"holds all 4 (v1..v4) - a frozen watermark must not silently short-read a replica",
+	if len(resp.Records) != 2 {
+		t.Fatalf("replica at watermark 2 returned %d records (last version %d): must show exactly the confirmed prefix",
 			len(resp.Records), resp.LastVersion)
 	}
 	for i, r := range resp.Records {
@@ -243,15 +262,92 @@ func TestSteppedDownReplicaReadsItsOwnLog(t *testing.T) {
 			t.Fatalf("record %d has version %d, want %d: silent gap in the stream", i, r.Version, i+1)
 		}
 	}
-	if resp.NextVersion != 5 || resp.LastVersion != 4 {
-		t.Fatalf("next/last version %d/%d want 5/4", resp.NextVersion, resp.LastVersion)
+
+	// Advance the ledger to the LEO: the stream is whole again.
+	eng.NoteHwLedger(slot, 4)
+	resp, err = cli.ReadStream(cctx, &pushupesv1.ReadStreamRequest{AggregateId: agg, FromVersion: 1, Limit: 100})
+	if err != nil {
+		t.Fatalf("re-read after the ledger advanced: %v", err)
 	}
-	// Root cause: the stepped-down node still reports the leader-side
-	// watermark frozen at its step-down point. It must report 0 instead —
-	// that is what makes the read fall back to the node's own durable LEO.
-	if hw := eng.HW(slot); hw != 0 {
-		t.Fatalf("stepped-down replica reports frozen watermark %d, want 0: the "+
-			"watermark is leader-side bookkeeping and is not valid on a non-leader", hw)
+	if len(resp.Records) != 4 || resp.NextVersion != 5 || resp.LastVersion != 4 {
+		t.Fatalf("synced-to-LEO replica read returned %d records next/last %d/%d, want 4 5/4",
+			len(resp.Records), resp.NextVersion, resp.LastVersion)
+	}
+}
+
+// A replica whose ledger sample is zero — every record it fetched is still
+// un-acknowledged (the ack path parks them above the watermark) — admits the
+// read but shows NOTHING. Serving its durable tail would hand the caller
+// records the cluster has not committed; the store's 0-means-unbounded
+// convention makes a zero ceiling unrepresentable, so the read path answers
+// the empty shape itself (serveEmpty).
+func TestZeroWatermarkReplicaShowsNothing(t *testing.T) {
+	store, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	eng := cluster.NewEngine(nil, store, "node-1", nil)
+	for _, id := range []string{"node-1", "node-2", "node-3"} {
+		c := &cluster.Command{Op: cluster.OpJoinNode, Peer: &cluster.Peer{
+			ID: id, PeerAddr: "127.0.0.1:1", AdminAddr: "127.0.0.1:1", ClientAddr: "127.0.0.1:1",
+		}}
+		if _, err := eng.ApplyCommand(c.Encode()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pinTwoReplicas(t, eng)
+	if _, err := eng.ApplyCommand((&cluster.Command{Op: cluster.OpPlanSlots}).Encode()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A slot node-1 REPLICATES (it does not lead it), with one record for an
+	// aggregate on that slot in node-1's log: the copy is real, confirmed is
+	// nothing.
+	var repSlot int32 = -1
+	var repAgg string
+	for i := 0; i < 8192 && repSlot < 0; i++ {
+		id := "zwhw-agg-" + itoa(i)
+		s := eng.SlotOf(id)
+		p, ok := eng.TableSnapshot().Slots[s]
+		if !ok || p.Leader == "node-1" {
+			continue
+		}
+		for _, r := range p.Replicas {
+			if r == "node-1" {
+				repSlot, repAgg = s, id
+				break
+			}
+		}
+	}
+	if repSlot < 0 {
+		t.Fatal("test setup: node-1 replicates no slot")
+	}
+	if _, err := store.Append(&data.EventRecord{
+		AggregateID: repAgg, Version: 1, CommandID: "zwhw-cmd",
+		Events: []data.Event{{Type: "E", Body: []byte("x")}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if store.LastSeqOf(repSlot) == 0 {
+		t.Fatalf("test setup: record did not land on slot %d", repSlot)
+	}
+
+	eng.NoteHwLedger(repSlot, 0)
+	upto, serveEmpty, proxy, _ := eng.LocalRead(repSlot)
+	if proxy != "" || !serveEmpty || upto != 0 {
+		t.Fatalf("zero-watermark replica: upto=%d serveEmpty=%v proxy=%q, want 0/true/local", upto, serveEmpty, proxy)
+	}
+	// The gRPC answer is the empty stream shape, not an error and not the log.
+	cli := serveEngine(t, eng, store)
+	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := cli.ReadStream(cctx, &pushupesv1.ReadStreamRequest{AggregateId: repAgg, FromVersion: 1, Limit: 100})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(resp.Records) != 0 {
+		t.Fatalf("zero-watermark replica served %d records from an unconfirmed log", len(resp.Records))
 	}
 }
 

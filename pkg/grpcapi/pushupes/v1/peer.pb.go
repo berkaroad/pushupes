@@ -730,9 +730,22 @@ func (x *MFetchRequest) GetSweep() bool {
 }
 
 type MFetchResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Follower      string                 `protobuf:"bytes,1,opt,name=follower,proto3" json:"follower,omitempty"`
-	Items         []*FetchItem           `protobuf:"bytes,2,rep,name=items,proto3" json:"items,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Follower string                 `protobuf:"bytes,1,opt,name=follower,proto3" json:"follower,omitempty"`
+	Items    []*FetchItem           `protobuf:"bytes,2,rep,name=items,proto3" json:"items,omitempty"`
+	// hw_slots[i] / hw_values[i]: the round's HW ledger — the leader-side high
+	// watermark for every slot the follower reported a position for this round
+	// (the request's own owned set: idle rounds have no data items but the
+	// ledger still flows). It seeds each replica's READ-ADMISSION bound: a
+	// replica serves a slot locally only once its durable LEO reaches the
+	// latest ledger hw for that slot at that slot's CURRENT epoch; until then
+	// (a new seat catching up, a lagging copy, a node that just restarted) the
+	// read proxies to the leader, so acknowledged data is never short-read on a
+	// follower that has not synced. The bound cannot falsely admit: hw moves
+	// only on reports that justify it, and an epoch change invalidates every
+	// sample it produced.
+	HwSlots       []int32  `protobuf:"varint,3,rep,packed,name=hw_slots,json=hwSlots,proto3" json:"hw_slots,omitempty"`
+	HwValues      []uint64 `protobuf:"varint,4,rep,packed,name=hw_values,json=hwValues,proto3" json:"hw_values,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -777,6 +790,20 @@ func (x *MFetchResponse) GetFollower() string {
 func (x *MFetchResponse) GetItems() []*FetchItem {
 	if x != nil {
 		return x.Items
+	}
+	return nil
+}
+
+func (x *MFetchResponse) GetHwSlots() []int32 {
+	if x != nil {
+		return x.HwSlots
+	}
+	return nil
+}
+
+func (x *MFetchResponse) GetHwValues() []uint64 {
+	if x != nil {
+		return x.HwValues
 	}
 	return nil
 }
@@ -852,8 +879,20 @@ func (x *ReplicaProgressRequest) GetStamp() bool {
 	return false
 }
 
+// ReplicaProgressResponse echoes the HW ledger for every slot the request
+// reported (the POST-report watermarks, after progressBatch.apply). This is
+// the zero-lag channel of read admission: an append is acknowledged exactly
+// when the last required replica report advances HW, and that report's own
+// response carries the new watermark — the replica that completed the ack
+// learns "seq N is confirmed" on the same round trip the client's SUCCESS
+// rides on, so its local read never hides acknowledged data behind a stale
+// sample. The MFetch ledger stays as the catch-up/baseline channel (a
+// restarted or new-seat replica, and multi-replica sets where another seat's
+// report moved HW: that seat catches up within one sweep round, ≤2s).
 type ReplicaProgressResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	HwSlots       []int32                `protobuf:"varint,1,rep,packed,name=hw_slots,json=hwSlots,proto3" json:"hw_slots,omitempty"`
+	HwValues      []uint64               `protobuf:"varint,2,rep,packed,name=hw_values,json=hwValues,proto3" json:"hw_values,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -886,6 +925,20 @@ func (x *ReplicaProgressResponse) ProtoReflect() protoreflect.Message {
 // Deprecated: Use ReplicaProgressResponse.ProtoReflect.Descriptor instead.
 func (*ReplicaProgressResponse) Descriptor() ([]byte, []int) {
 	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *ReplicaProgressResponse) GetHwSlots() []int32 {
+	if x != nil {
+		return x.HwSlots
+	}
+	return nil
+}
+
+func (x *ReplicaProgressResponse) GetHwValues() []uint64 {
+	if x != nil {
+		return x.HwValues
+	}
+	return nil
 }
 
 type ReplicateRequest struct {
@@ -1631,16 +1684,20 @@ const file_pushupes_v1_peer_proto_rawDesc = "" +
 	"\await_ms\x18\x02 \x01(\x03R\x06waitMs\x12\x18\n" +
 	"\x05slots\x18\x03 \x03(\x05B\x02\x10\x01R\x05slots\x12\x1f\n" +
 	"\tfrom_seqs\x18\x04 \x03(\x04B\x02\x10\x01R\bfromSeqs\x12\x14\n" +
-	"\x05sweep\x18\x05 \x01(\bR\x05sweep\"Z\n" +
+	"\x05sweep\x18\x05 \x01(\bR\x05sweep\"\x9a\x01\n" +
 	"\x0eMFetchResponse\x12\x1a\n" +
 	"\bfollower\x18\x01 \x01(\tR\bfollower\x12,\n" +
-	"\x05items\x18\x02 \x03(\v2\x16.pushupes.v1.FetchItemR\x05items\"\x85\x01\n" +
+	"\x05items\x18\x02 \x03(\v2\x16.pushupes.v1.FetchItemR\x05items\x12\x1d\n" +
+	"\bhw_slots\x18\x03 \x03(\x05B\x02\x10\x01R\ahwSlots\x12\x1f\n" +
+	"\thw_values\x18\x04 \x03(\x04B\x02\x10\x01R\bhwValues\"\x85\x01\n" +
 	"\x16ReplicaProgressRequest\x12\x1a\n" +
 	"\bfollower\x18\x01 \x01(\tR\bfollower\x12\x18\n" +
 	"\x05slots\x18\x02 \x03(\x05B\x02\x10\x01R\x05slots\x12\x1f\n" +
 	"\tfrom_seqs\x18\x03 \x03(\x04B\x02\x10\x01R\bfromSeqs\x12\x14\n" +
-	"\x05stamp\x18\x04 \x01(\bR\x05stamp\"\x19\n" +
-	"\x17ReplicaProgressResponse\"R\n" +
+	"\x05stamp\x18\x04 \x01(\bR\x05stamp\"Y\n" +
+	"\x17ReplicaProgressResponse\x12\x1d\n" +
+	"\bhw_slots\x18\x01 \x03(\x05B\x02\x10\x01R\ahwSlots\x12\x1f\n" +
+	"\thw_values\x18\x02 \x03(\x04B\x02\x10\x01R\bhwValues\"R\n" +
 	"\x10ReplicateRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x10\n" +
 	"\x03seq\x18\x02 \x01(\x04R\x03seq\x12\x18\n" +

@@ -155,6 +155,19 @@ message MFetchRequest {
 message MFetchResponse {
   string follower = 1;
   repeated FetchItem items = 2;
+  // hw_slots[i] / hw_values[i]: the round's HW ledger — the leader-side high
+  // watermark for every slot the follower reported a position for this round
+  // (the request's own owned set: idle rounds have no data items but the
+  // ledger still flows). It seeds each replica's READ-ADMISSION bound: a
+  // replica serves a slot locally only once its durable LEO reaches the
+  // latest ledger hw for that slot at that slot's CURRENT epoch; until then
+  // (a new seat catching up, a lagging copy, a node that just restarted) the
+  // read proxies to the leader, so acknowledged data is never short-read on a
+  // follower that has not synced. The bound cannot falsely admit: hw moves
+  // only on reports that justify it, and an epoch change invalidates every
+  // sample it produced.
+  repeated int32 hw_slots = 3 [packed = true];
+  repeated uint64 hw_values = 4 [packed = true];
 }
 
 message ReplicaProgressRequest {
@@ -166,7 +179,20 @@ message ReplicaProgressRequest {
   // ones. False = record only positions that actually changed.
   bool stamp = 4;
 }
-message ReplicaProgressResponse {}
+// ReplicaProgressResponse echoes the HW ledger for every slot the request
+// reported (the POST-report watermarks, after progressBatch.apply). This is
+// the zero-lag channel of read admission: an append is acknowledged exactly
+// when the last required replica report advances HW, and that report's own
+// response carries the new watermark — the replica that completed the ack
+// learns "seq N is confirmed" on the same round trip the client's SUCCESS
+// rides on, so its local read never hides acknowledged data behind a stale
+// sample. The MFetch ledger stays as the catch-up/baseline channel (a
+// restarted or new-seat replica, and multi-replica sets where another seat's
+// report moved HW: that seat catches up within one sweep round, ≤2s).
+message ReplicaProgressResponse {
+  repeated int32 hw_slots = 1 [packed = true];
+  repeated uint64 hw_values = 2 [packed = true];
+}
 
 message ReplicateRequest {
   int32 slot = 1;

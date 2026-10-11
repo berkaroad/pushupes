@@ -43,8 +43,15 @@ func TestReplStatsTracksStuckWatermarkAndParkedRounds(t *testing.T) {
 		t.Fatalf("append: %v", err)
 	}
 
-	// The follower reports LEO 1 (it holds everything) and asks for seq 2,
-	// which does not exist yet: the round must park and say so.
+	// Prime the seat (the first report books a ledger value and now answers
+	// immediately — see the tightened echo), then the OBSERVED round re-
+	// reports the unchanged LEO 1 and asks for seq 2, which does not exist
+	// yet: nothing booked, so the round must park and say so.
+	if _, err := e.HandleMFetch(MFetchRequest{
+		Follower: "node-2", WaitMS: 0, Slots: []int32{3}, FromSeqs: []uint64{2},
+	}); err != nil {
+		t.Fatalf("prime round: %v", err)
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -63,7 +70,7 @@ func TestReplStatsTracksStuckWatermarkAndParkedRounds(t *testing.T) {
 	waitFor(t, 3*time.Second, func() bool { return e.ReplStats().Mfetch.ParkedNow == 1 }, "fetch round to park")
 
 	v := e.ReplStats()
-	if v.Mfetch.Rounds != 1 || v.Mfetch.ParkedRounds != 1 || v.Mfetch.ServedRounds != 0 {
+	if v.Mfetch.Rounds != 2 || v.Mfetch.ParkedRounds != 1 || v.Mfetch.ServedRounds != 0 {
 		t.Fatalf("rounds=%d parked=%d served=%d, want 1/1/0",
 			v.Mfetch.Rounds, v.Mfetch.ParkedRounds, v.Mfetch.ServedRounds)
 	}
