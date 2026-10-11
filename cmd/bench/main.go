@@ -139,7 +139,7 @@ func main() {
 		cancel()
 	}()
 
-	var total, okCnt, existsCnt, failCnt, noRespCnt atomic.Int64
+	var total, okCnt, existsCnt, failCnt, noRespCnt, windowDropped atomic.Int64
 	var errIDMu sync.Mutex
 	errIDCnt := map[uint32]*atomic.Int64{} // per wire error id of batch failures
 	var latMu sync.Mutex
@@ -217,29 +217,37 @@ func main() {
 							recs[k] = bump(agg)
 						}
 						t0 := time.Now()
-						// the write-window ctx is deliberately NOT passed: a batch
-						// in flight when the window closes gets its answer
-						// (the client bounds each attempt by CallTimeout
-						// internally), same as before the client refactor.
-						resps, berr := cl.BatchAppend(context.Background(), recs)
-						if berr != nil {
+						// The write-window ctx IS passed: a batch in flight at
+						// the deadline must not drain a throttled node's
+						// backlog past -duration — the library releases its
+						// gate on ctx death and answers what it can; records
+						// left unanswered because the WINDOW closed are counted
+						// as window-dropped, never as failures.
+						resps, berr := cl.BatchAppend(ctx, recs)
+						if berr != nil && ctx.Err() == nil {
 							errSampleMu.Lock()
 							if len(errSamples) < 8 {
 								errSamples = append(errSamples, berr.Error())
 							}
 							errSampleMu.Unlock()
 						}
-						lat := float64(time.Since(t0).Microseconds()) / 1000.0
-						total.Add(int64(len(recs)))
-						latMu.Lock()
-						latencies = append(latencies, lat)
-						latMu.Unlock()
+						answered := 0
 						for k, resp := range resps {
 							if resp == nil {
-								failCnt.Add(1)
-								noRespCnt.Add(1)
+								// The only way a record goes unanswered is
+								// the window closing mid-backpressure (the
+								// attempt loop itself answers or requeues
+								// every record); count it as dropped, not
+								// failed.
+								if ctx.Err() != nil {
+									windowDropped.Add(1)
+								} else {
+									failCnt.Add(1)
+									noRespCnt.Add(1)
+								}
 								continue
 							}
+							answered++
 							switch resp.Status {
 							case pushupesv1.AppendResponse_STATUS_SUCCESS:
 								okCnt.Add(1)
@@ -263,6 +271,18 @@ func main() {
 								}
 							}
 						}
+						// Throughput counts ANSWERED records only (the
+						// window-cut drops are reported separately) and the
+						// round-trip sample is recorded only for calls that
+						// completed inside the window — a call cut at the
+						// deadline has no real latency to report.
+						total.Add(int64(answered))
+						if ctx.Err() == nil {
+							lat := float64(time.Since(t0).Microseconds()) / 1000.0
+							latMu.Lock()
+							latencies = append(latencies, lat)
+							latMu.Unlock()
+						}
 					}
 				}
 				return
@@ -280,7 +300,7 @@ func main() {
 						Events:    []*pushupesv1.Event{{Type: "BenchAppend", Body: body}},
 					}
 					t0 := time.Now()
-					resp := singleAppend(cl, req)
+					resp := singleAppend(cl, ctx, req)
 					// version self-heal: if the leader reports a newer tail
 					// (resume estimate lagged), adopt it and retry once.
 					if resp != nil &&
@@ -289,14 +309,20 @@ func main() {
 						ver[agg] = resp.CurrentVersion
 						req.Version = resp.CurrentVersion + 1
 						t0 = time.Now()
-						resp = singleAppend(cl, req)
+						resp = singleAppend(cl, ctx, req)
+					}
+					if resp == nil {
+						// unanswered only ever means the window closed
+						// mid-backpressure — dropped, not failed
+						if ctx.Err() != nil {
+							windowDropped.Add(1)
+						} else {
+							failCnt.Add(1)
+						}
+						continue
 					}
 					lat := float64(time.Since(t0).Microseconds()) / 1000.0
 					total.Add(1)
-					if resp == nil {
-						failCnt.Add(1)
-						continue
-					}
 					latMu.Lock()
 					latencies = append(latencies, lat)
 					latMu.Unlock()
@@ -348,6 +374,12 @@ func main() {
 	fmt.Printf("\n== bench done in %s ==\n", elapsed.Round(time.Millisecond))
 	fmt.Printf("attempts=%d ok=%d exists=%d fail=%d redirects=%d\n",
 		total.Load(), okCnt.Load(), existsCnt.Load(), failCnt.Load(), cl.Redirects())
+	if n := windowDropped.Load(); n > 0 {
+		// Records in flight when -duration expired and the cluster was
+		// still refusing them: counted neither in attempts/ok/fail nor in
+		// the throughput numerator — the window is the window.
+		fmt.Printf("window-dropped=%d (records caught by a throttled node's backpressure at the deadline, excluded from all counts)\n", n)
+	}
 	if *batch > 0 {
 		// batch failures need their cause spelled out: unreachable-vs-answer
 		// and which wire error dominated (1001 self-heal races vs 1005 HW)
@@ -382,11 +414,12 @@ func main() {
 
 // singleAppend writes one record through the client (a batch of exactly one
 // AppendRequest) and answers its position-0 response.
-func singleAppend(cl *client.Client, req *pushupesv1.AppendRequest) *pushupesv1.AppendResponse {
-	// Detached from the write window: an append in flight when the window
-	// closes gets its answer (the client bounds each attempt by CallTimeout
-	// internally), same as before the client refactor.
-	resps, _ := cl.BatchAppend(context.Background(), []*pushupesv1.AppendRequest{req})
+func singleAppend(cl *client.Client, ctx context.Context, req *pushupesv1.AppendRequest) *pushupesv1.AppendResponse {
+	// The write-window ctx is passed: an append caught in a throttled
+	// node's backpressure at the deadline returns unanswered (nil) instead
+	// of draining the node's backlog past -duration. The caller counts nil
+	// as a window-drop, never a failure.
+	resps, _ := cl.BatchAppend(ctx, []*pushupesv1.AppendRequest{req})
 	return resps[0]
 }
 

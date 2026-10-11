@@ -265,7 +265,9 @@ go run ./cmd/grpccheck -addrs http://127.0.0.1:8591,http://127.0.0.1:8592,http:/
 
 # 写压测（-nodes 传 client 面 gRPC 地址，路由表经 PrefetchRoutes 解析并按
 # -route-refresh 周期刷新，MOVED/ASK 即时修补本地行；槽数取自应答长度；
-# -batch N 为每批条数，N=0 即一条 BatchAppend 只带一条记录）
+# -batch N 为每批条数，N=0 即一条 BatchAppend 只带一条记录；-duration 是硬
+# 窗口：到点时在飞调用不再排干限流积压，未答记录单记 window-dropped，
+# 不计入吞吐与 fail）
 go run ./cmd/bench -nodes http://127.0.0.1:8591 -conns 8 -size 1024 -duration 30s
 go run ./cmd/bench -nodes http://127.0.0.1:8591,http://127.0.0.1:8592,http://127.0.0.1:8593 -conns 8 -size 1024 -batch 64 -duration 30s
 
