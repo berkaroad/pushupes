@@ -69,26 +69,24 @@ const (
 	// late-joined replica catches up; a fast tick matters because the batch
 	// (not the tick) is the throughput knob the operator thinks about.
 	DefaultRebalanceInterval = 2 * time.Second
-	// DefaultRebalanceBatch caps the hand-overs one round may execute. With
-	// 1680 slots the worst case (a node that led 560 slots died) converges
-	// in 20 rounds at the default batch; moves stay strictly serial within
-	// a round, so one commit fence freezes exactly one slot at a time and a
-	// round may run longer than the tick (the ticker simply skips ahead).
-	// A smaller batch trades convergence time for a longer tail of the
-	// failover layout.
-	DefaultRebalanceBatch = 28
+	// rebalanceCommitsPerRound is how many layout commits one controller round
+	// executes: exactly one. A commit's fence freezes one slot's writes, so a
+	// strictly serial commit loop keeps the frozen-slot count at one and the
+	// write-latency noise bounded to a single slot; convergence is paced by
+	// the round interval instead (a node that led 560 slots returns in 560
+	// rounds, and a factor decrease reclaims one surplus seat per round).
+	rebalanceCommitsPerRound = 1
 )
 
-// SetRebalanceConfig wires the -rebalance-interval / -rebalance-batch knobs.
-// An interval or batch <= 0 disables the rebalancer; startup validation
-// rejects negative values, so 0 is the operator's "off" switch.
-func (e *Engine) SetRebalanceConfig(interval time.Duration, batch int) {
+// SetRebalanceConfig wires the -rebalance-interval knob. An interval <= 0
+// disables the rebalancer; startup validation rejects negative values, so 0 is
+// the operator's "off" switch.
+func (e *Engine) SetRebalanceConfig(interval time.Duration) {
 	e.rebalanceInterval = interval
-	e.rebalanceBatch = batch
 }
 
 func (e *Engine) rebalanceEnabled() bool {
-	return e.rebalanceInterval > 0 && e.rebalanceBatch > 0
+	return e.rebalanceInterval > 0
 }
 
 // RunRebalancer is the leader-rebalance loop: one round every
@@ -109,12 +107,12 @@ func (e *Engine) RunRebalancer(ctx context.Context) {
 		if e.node == nil || !e.node.IsLeader() {
 			continue
 		}
-		e.rebalanceRound(ctx, e.rebalanceBatch)
+		e.rebalanceRound(ctx, rebalanceCommitsPerRound)
 		// Surplus-seat reclaim: the other half of a re-layout. A re-layout only
 		// ADDS seats (Table.applyReplanSlots), so a set left oversized by a
 		// factor change converges here — one seat per round, and only once the
 		// copies that stay are in sync (see reclaimRound).
-		e.reclaimRound(ctx, e.rebalanceBatch)
+		e.reclaimRound(ctx, rebalanceCommitsPerRound)
 	}
 }
 

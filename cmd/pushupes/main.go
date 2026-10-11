@@ -84,8 +84,6 @@ func main() {
 			"post-migration retention: how long the FORMER SOURCE keeps its local copy of a migrated slot before dropping it (positive = that window, 0 = the default 30s; negative is rejected; the cleanup cannot be disabled — env PUSHUPES_DROP_AFTER)")
 		rebalanceInterval = flag.Duration("rebalance-interval", envDurationOr("PUSHUPES_REBALANCE_INTERVAL", cluster.DefaultRebalanceInterval),
 			"how often the controller checks the leader layout against the slot ring and hands deviated slots back (a node that died returns to its own slots after failover; 0 disables the rebalancer; negative is rejected — env PUSHUPES_REBALANCE_INTERVAL)")
-		rebalanceBatch = flag.Int("rebalance-batch", envIntOr("PUSHUPES_REBALANCE_BATCH", cluster.DefaultRebalanceBatch),
-			"max leader hand-overs one rebalance round executes, run serially (smaller = gentler write-latency noise, larger = faster convergence; 0 disables the rebalancer; negative is rejected — env PUSHUPES_REBALANCE_BATCH)")
 		// The client plane keeps gRPC's stock 4MiB message cap by default.
 		// BatchAppend asks for one batch to fit inside the cap, so the
 		// operator raises it together with typical batch size (a 4MiB cap
@@ -111,13 +109,13 @@ func main() {
 	base := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	logger := base.With("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, *replicaPolicy, int64(segmentB), int64(grpcMaxMsg), *batchPar, *flushN, *flushD, *dropAfter, *fetchSettleD, *rebalanceInterval, *rebalanceBatch, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, *replicaPolicy, int64(segmentB), int64(grpcMaxMsg), *batchPar, *flushN, *flushD, *dropAfter, *fetchSettleD, *rebalanceInterval, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
 		logger.Error("pushupes exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount int, replicaPolicy string, segmentBytes, grpcMaxMsgBytes int64, batchParallelism int, flushN int64, flushD, dropAfter, fetchSettle time.Duration, rebalanceInterval time.Duration, rebalanceBatch int, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount int, replicaPolicy string, segmentBytes, grpcMaxMsgBytes int64, batchParallelism int, flushN int64, flushD, dropAfter, fetchSettle, rebalanceInterval time.Duration, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
 	// Canonical form for every stored address: scheme required. A bare
 	// host:port gets the default "http://" prefix; an explicit protocol
 	// is honoured as passed. TCP-level uses (listen/dial) strip it again.
@@ -213,24 +211,22 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 	// count, re-derived by the controller every round — so a cluster that
 	// grows at runtime raises its own copy count under the high tier, while
 	// low/medium hold theirs.
-	// Leader rebalance: 0 on either knob is the operator's off switch; a
-	// negative value is a startup error (same fail-fast rule as -drop-after).
+	// Leader rebalance: interval 0 is the operator's off switch; a negative
+	// value is a startup error (same fail-fast rule as -drop-after). Commits
+	// are strictly serial inside the loop, so this cadence paces convergence.
 	if rebalanceInterval < 0 {
 		return fmt.Errorf("-rebalance-interval %s must not be negative (positive = the check cadence, 0 = the rebalancer is off)", rebalanceInterval)
 	}
-	if rebalanceBatch < 0 {
-		return fmt.Errorf("-rebalance-batch %d must not be negative (positive = hand-overs per round, 0 = the rebalancer is off)", rebalanceBatch)
-	}
-	eng.SetRebalanceConfig(rebalanceInterval, rebalanceBatch)
+	eng.SetRebalanceConfig(rebalanceInterval)
 	if fetchSettle < 0 {
 		return fmt.Errorf("-fetch-settle %s must not be negative", fetchSettle)
 	}
 	eng.SetFetchSettle(fetchSettle)
-	if rebalanceInterval > 0 && rebalanceBatch > 0 {
-		logger.Info("leader rebalance: the controller hands deviated slots back to the ring layout",
-			"interval", rebalanceInterval.String(), "batch", rebalanceBatch)
+	if rebalanceInterval > 0 {
+		logger.Info("leader rebalance: the controller hands deviated slots back to the ring layout, one commit per round (serial)",
+			"interval", rebalanceInterval.String())
 	} else {
-		logger.Info("leader rebalance disabled (-rebalance-interval or -rebalance-batch is 0)")
+		logger.Info("leader rebalance disabled (-rebalance-interval is 0)")
 	}
 
 	node, peerGRPC, err := cluster.NewNode(cluster.Config{

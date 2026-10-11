@@ -184,9 +184,8 @@ type Engine struct {
 
 	// leader rebalance (balance.go): how often the controller re-checks the
 	// ring layout and how many leader hand-overs one round may execute.
-	// Set from the -rebalance-interval / -rebalance-batch flags.
+	// Set from the -rebalance-interval flag.
 	rebalanceInterval time.Duration
-	rebalanceBatch    int
 
 	// bootPolicy is the -replica-policy seed: it applies to the FIRST plan
 	// of a brand-new cluster (an unreplicated table), once per process.
@@ -545,9 +544,8 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logge
 		// wait). Tests shorten it.
 		hwWait: defaultHWWaitTimeout,
 		// leader rebalance: enabled by default, tuned with -rebalance-interval
-		// and -rebalance-batch (an interval or batch of 0 turns it off).
+		// (an interval of 0 turns it off).
 		rebalanceInterval: DefaultRebalanceInterval,
-		rebalanceBatch:    DefaultRebalanceBatch,
 		// per-slot ack-chain tallies, indexed by slot id (read-only after this)
 		ack:         ackDiag{slots: make([]slotAck, store.SlotCount)},
 		hwGates:     make([]hwGate, store.SlotCount),
