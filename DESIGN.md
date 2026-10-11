@@ -836,7 +836,7 @@ pushupes/
 │   │                          #   migration.go（六步热迁移），register.go（地址自报 announcer+RPC）
 ├── internal/api/              # handler.go（仅管理：status/writes/plan/migrate/describe/pprof），server.go
 ├── internal/grpcapi/          # gRPC 客户端数据面：server.go（BatchAppend/ReadStream/ReadTails/ReadByCommand/ReadVersionByTime/PrefetchRoutes）
-└── proto/pushupes/v1/         # events.proto 客户端契约 + peer.proto 节点间契约（含 buf 工具链，生成至 pkg/grpcapi）
+└── proto/pushupes/v1/         # events.proto 客户端契约（生成至 pkg/grpcapi）+ peer.proto 节点间契约（生成至 internal/grpcapi；含 buf 工具链）
 ```
 
 ## 10. 设计要点小结

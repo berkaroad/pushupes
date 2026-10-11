@@ -29,9 +29,9 @@ import (
 	"sync"
 
 	"github.com/berkaroad/pushupes/internal/data"
+	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 	"github.com/berkaroad/pushupes/internal/lease"
 	"github.com/berkaroad/pushupes/internal/storage"
-	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"

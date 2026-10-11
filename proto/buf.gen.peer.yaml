@@ -1,0 +1,15 @@
+version: v1
+# PeerService (peer.proto) is the inter-node data plane: internal surface, so it
+# is generated into internal/grpcapi. Client-facing events.proto stays on the
+# default template (../pkg/grpcapi).
+managed:
+  enabled: false
+plugins:
+  - name: go
+    out: ../internal/grpcapi
+    opt: paths=source_relative
+    path: ./protoc-gen-go
+  - name: grpc-go
+    out: ../internal/grpcapi
+    opt: paths=source_relative
+    path: ./protoc-gen-go-grpc

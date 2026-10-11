@@ -1,4 +1,7 @@
 version: v1
+# Default template: the client-facing API (events.proto) is public surface and
+# is generated into pkg/grpcapi. The peer plane is internal -> buf.gen.peer.yaml.
+# Generate through ./scripts/genproto.sh so each proto lands in its own tree.
 managed:
   enabled: false
 plugins:

@@ -288,7 +288,7 @@ go run ./cmd/slotcheck -admins http://127.0.0.1:8091,http://127.0.0.1:8092,http:
 ```
 
 修改 proto 后重新生成：`./scripts/genproto.sh`（buf 工具链在 `proto/` 下随仓库
-分发，生成产物落在 `pkg/grpcapi/`，勿手改）。
+分发；events.proto 生成到 `pkg/grpcapi/`，peer.proto 生成到 `internal/grpcapi/`，勿手改）。
 
 ## 性能数据
 
