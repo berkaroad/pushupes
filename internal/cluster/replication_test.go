@@ -1207,6 +1207,86 @@ func TestBuildingSeatDoesNotParkTheAck(t *testing.T) {
 	}
 }
 
+// TestFetchServesAckCriticalTailBeforeBacklog pins the fetch round's visit
+// order. An append's watermark is lifted by the report that carries ITS slot's
+// record, so that record must not queue behind another slot's catch-up chunk:
+// bulk catch-up moves megabytes per slot under the round's payload budget, and
+// on a cluster whose per-slot logs run to tens of megabytes one rotation lap
+// outlasts the append's wait deadline — the append then fails/1005 and its
+// idempotent retry answers exists (measured: gap=1, in_isr, building=false).
+// The budget is shrunk here so the ORDER decides, and the request lists the
+// backlog slot first with the rotation pinned: under a plain rotation order the
+// backlog eats the whole budget and the one record a live append waits on is
+// starved.
+func TestFetchServesAckCriticalTailBeforeBacklog(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	bulk, tail := int32(-1), int32(-1)
+	for s := int32(0); s < st.SlotCount; s++ {
+		if !e.Leads(s) {
+			continue
+		}
+		if bulk < 0 {
+			bulk = s
+			continue
+		}
+		tail = s
+		break
+	}
+	if bulk < 0 || tail < 0 {
+		t.Fatalf("need two slots led by %s (bulk=%d tail=%d)", e.self, bulk, tail)
+	}
+
+	// The backlog slot: far more records than the round's budget can carry.
+	bulkAgg := aggInSlot(t, e, bulk)
+	for v := uint32(1); v <= 200; v++ {
+		if _, err := st.Append(makeRecord(bulkAgg, v, fmt.Sprintf("bulk-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The ack-critical slot: three records, and the follower needs the last one.
+	tailAgg := aggInSlot(t, e, tail)
+	for v := uint32(1); v <= 3; v++ {
+		if _, err := st.Append(makeRecord(tailAgg, v, fmt.Sprintf("tail-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	e.fetchBudget = 2048         // one round can carry either side, not both
+	e.fetchRot.Store(^uint64(0)) // pin rot=0: the request order is the visit order
+	req := MFetchRequest{
+		Follower: "node-2",
+		Slots:    []int32{bulk, tail}, // backlog first: a rotation visit starves the tail
+		FromSeqs: []uint64{1, 3},      // tail: one record behind its head
+	}
+	resp, err := e.HandleMFetch(req)
+	if err != nil {
+		t.Fatalf("mfetch: %v", err)
+	}
+	if _, ok := resp.Item(tail); !ok {
+		t.Fatalf("the ack-critical slot's record was not delivered this round (%d items, slots %v): an append parked on it would wait out its deadline behind the backlog",
+			len(resp.Items), itemSlots(resp.Items))
+	}
+	// And it must come FIRST: the round's payload is applied in item order, and
+	// the follower reports a slot's position only at the end of the round, so a
+	// tail behind the backlog would still be reported a whole bulk apply later.
+	if len(resp.Items) == 0 || resp.Items[0].Slot != tail {
+		t.Fatalf("the ack-critical slot must lead the round, got slots %v", itemSlots(resp.Items))
+	}
+}
+
+// itemSlots lists a response's slots for failure messages.
+func itemSlots(items []FetchItem) []int32 {
+	out := make([]int32, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.Slot)
+	}
+	return out
+}
+
 // TestFollowerSessionLossReleasesHW pins the fast half of "a replica that is no
 // longer being served must not pin the writes": a killed node's fetch long poll
 // ends without an answer, and from that moment its frozen LEO must stop gating

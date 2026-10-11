@@ -47,12 +47,20 @@ func TestScanFetchState(t *testing.T) {
 	froms := []uint64{1, 1, 3, 1, 1}
 	moved := make([]bool, len(slots))
 	wakes := make([]<-chan struct{}, len(slots))
-	st.ScanFetchState(slots, froms, moved, wakes)
+	leos := make([]uint64, len(slots))
+	st.ScanFetchState(slots, froms, moved, wakes, leos)
 
+	// The LEO is what lets the caller tell an ACK-CRITICAL position (the
+	// follower is at or near the head) from bulk catch-up; it is the same
+	// counter `moved` is derived from, so both must agree.
+	wantLEO := []uint64{2, 0, 2, 0, 0}
 	want := []bool{true, false, false, false, false}
 	for i := range want {
 		if moved[i] != want[i] {
 			t.Errorf("entry %d (slot %d from %d): moved=%v want %v", i, slots[i], froms[i], moved[i], want[i])
+		}
+		if leos[i] != wantLEO[i] {
+			t.Errorf("entry %d (slot %d): leo=%d want %d", i, slots[i], leos[i], wantLEO[i])
 		}
 	}
 	for i, s := range slots {
@@ -69,7 +77,7 @@ func TestScanFetchState(t *testing.T) {
 
 	// The parked handle must fire on the next append (no-lost-wake).
 	watch := make([]<-chan struct{}, 1)
-	st.ScanFetchState([]int32{5}, []uint64{1}, make([]bool, 1), watch)
+	st.ScanFetchState([]int32{5}, []uint64{1}, make([]bool, 1), watch, make([]uint64, 1))
 	if watch[0] == nil {
 		t.Fatal("slot 5: no wake handle to park on")
 	}

@@ -574,17 +574,20 @@ func (st *Store) WakeChan(slotID int32) <-chan struct{} {
 }
 
 // ScanFetchState answers a whole batch of follower positions in one call:
-// moved[i] reports whether slots[i] holds anything at or beyond froms[i], and
-// wakes[i] is the handle to park on. It exists because a fetch session reports
-// EVERY slot it follows (thousands) every round, and per-slot accessors put two
-// method calls, error paths and a lock-free lookup between the loop and the two
-// atomic loads it actually needs.
+// moved[i] reports whether slots[i] holds anything at or beyond froms[i],
+// wakes[i] is the handle to park on, and leos[i] is the slot's durable LEO —
+// the leader needs it to tell an ACK-CRITICAL position (the follower is at or
+// near the head: its next report is what lifts a live append's watermark) from
+// bulk catch-up, and this walk already reads that counter. It exists because a
+// fetch session reports EVERY slot it follows (thousands) every round, and
+// per-slot accessors put two method calls, error paths and a lock-free lookup
+// between the loop and the atomic loads it actually needs.
 //
 // The handle is read before the position (no-lost-wake discipline): an append
 // landing in between closes the handle handed back here, so the caller's wait
 // fires immediately rather than sleeping to the deadline. Slots that this node
 // does not have read as "no data, no wake".
-func (st *Store) ScanFetchState(slots []int32, froms []uint64, moved []bool, wakes []<-chan struct{}) {
+func (st *Store) ScanFetchState(slots []int32, froms []uint64, moved []bool, wakes []<-chan struct{}, leos []uint64) {
 	n := len(slots)
 	if len(froms) < n {
 		n = len(froms)
@@ -595,10 +598,13 @@ func (st *Store) ScanFetchState(slots []int32, froms []uint64, moved []bool, wak
 	if len(wakes) < n {
 		n = len(wakes)
 	}
+	if len(leos) < n {
+		n = len(leos)
+	}
 	for i := 0; i < n; i++ {
 		s := slots[i]
 		if s < 0 || int(s) >= len(st.slots) {
-			moved[i], wakes[i] = false, nil
+			moved[i], wakes[i], leos[i] = false, nil, 0
 			continue
 		}
 		sp := st.slots[s].Load()
@@ -609,7 +615,7 @@ func (st *Store) ScanFetchState(slots []int32, froms []uint64, moved []bool, wak
 			// (once per slot); every later round reads the loaded pointer.
 			var err error
 			if sp, err = st.Slot(s); err != nil {
-				moved[i], wakes[i] = false, nil
+				moved[i], wakes[i], leos[i] = false, nil, 0
 				continue
 			}
 		}
@@ -619,7 +625,9 @@ func (st *Store) ScanFetchState(slots []int32, froms []uint64, moved []bool, wak
 		} else {
 			wakes[i] = nil
 		}
-		moved[i] = sp.seqCounter.Load() >= froms[i]
+		leo := sp.seqCounter.Load()
+		leos[i] = leo
+		moved[i] = leo >= froms[i]
 	}
 }
 

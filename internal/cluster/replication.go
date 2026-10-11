@@ -97,7 +97,8 @@ type Engine struct {
 	orderPool        sync.Pool // []int, cap >= followed slots
 	parkedPool       sync.Pool // []parkedEntry
 	progressPool     sync.Pool // *progressBatch
-	scanPool         sync.Pool // *fetchScan (per-position "has data" + wake handle)
+	scanPool         sync.Pool // *fetchScan (per-position "has data" + wake handle + LEO)
+	fetchBudget      int64     // bytes one fetch round may carry (maxPayloadBytes; tests shrink it to pin the visit order)
 	fetchScratchPool sync.Pool // *fetchScratch (per-round positions + report)
 
 	// ownership bitmap: which slots this node leads, rebuilt only when
@@ -469,6 +470,13 @@ const (
 	isrStaleAfter        = 10 * time.Second // must exceed fetchWait+fetchMaxBackoff
 	defaultHWWaitTimeout = 10 * time.Second // the write-ack watermark deadline
 
+	// fetchTailRecords is how close to a slot's head a follower counts as
+	// ACK-CRITICAL: a position within this many records is served before the
+	// round's bulk backlog share. It is a record count (not bytes) because the
+	// property being protected is "the follower is one round's production
+	// behind", and a writer produces records, not bytes; a tail's byte size is
+	// still bounded by the round budget's per-slot read cap.
+	fetchTailRecords = 64
 	// maxPayloadBytes caps one long-poll response: during a backlog the
 	// session streams item by item across rounds instead of building a
 	// gigabyte JSON blob of every slot at once.
@@ -544,6 +552,7 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logge
 	e.parkedPool.New = func() any { return make([]parkedEntry, 0, 64) }
 	e.progressPool.New = func() any { return &progressBatch{} }
 	e.scanPool.New = func() any { return &fetchScan{} }
+	e.fetchBudget = maxPayloadBytes
 	e.fetchScratchPool.New = func() any { return &fetchScratch{} }
 	e.fences = make([]slotFence, store.SlotCount)
 	if e.logger == nil {
@@ -2479,6 +2488,13 @@ type fetchScan struct {
 	slots []int32
 	moved []bool
 	wakes []<-chan struct{}
+	// leos[i] is the slot's durable LEO at scan time: with froms[i] it says how
+	// far behind the follower is, which is what separates an ACK-CRITICAL
+	// position from bulk catch-up (see the visit order in HandleMFetchCtx).
+	leos []uint64
+	// order is scratch for the visit order's backlog class (the pooled order
+	// slice holds the round's own visit order).
+	order []int
 }
 
 func (f *fetchScan) resize(n int) {
@@ -2488,8 +2504,29 @@ func (f *fetchScan) resize(n int) {
 	if cap(f.wakes) < n {
 		f.wakes = make([]<-chan struct{}, n*2)
 	}
+	if cap(f.leos) < n {
+		f.leos = make([]uint64, n*2)
+	}
 	f.moved = f.moved[:n]
 	f.wakes = f.wakes[:n]
+	f.leos = f.leos[:n]
+}
+
+// ackCritical reports whether position i is one a live append is waiting on:
+// the slot has data for the follower and the follower is within
+// fetchTailRecords of that slot's head. Those are the records whose delivery
+// is what lifts a parked append's watermark, so the round serves them before
+// the bulk (see the visit-order note in HandleMFetchCtx).
+func (f *fetchScan) ackCritical(i int, froms []uint64) bool {
+	if i >= len(f.moved) || i >= len(f.leos) || i >= len(froms) || !f.moved[i] {
+		return false
+	}
+	from := froms[i]
+	if from == 0 {
+		return false
+	}
+	// moved implies leo >= from, so the gap is at least 1 and never underflows.
+	return f.leos[i]+1-from <= fetchTailRecords
 }
 
 // reset clears the wake handles before the buffer goes back to the pool, so a
@@ -2540,16 +2577,6 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 	// handle. Scanning every parked handle per bus fire is ~1.4k cheap
 	// select-defaults — far cheaper than the old reflect.Select over
 	// 1400+ cases per round.
-	order := e.orderPool.Get().([]int)
-	if cap(order) < n {
-		order = make([]int, n*2)
-	}
-	order = order[:n]
-	rot := int(e.fetchRot.Add(1)) % max(1, n)
-	for i := range order {
-		order[i] = (i + rot) % n
-	}
-
 	parked := e.parkedPool.Get().([]parkedEntry)[:0]
 
 	// Capture the wake bus BEFORE any slot read: an append landing
@@ -2573,7 +2600,45 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 	// own CPU at small body sizes.
 	scan := e.scanPool.Get().(*fetchScan)
 	scan.resize(n)
-	e.store.ScanFetchState(req.Slots, req.FromSeqs, scan.moved, scan.wakes)
+	e.store.ScanFetchState(req.Slots, req.FromSeqs, scan.moved, scan.wakes, scan.leos)
+
+	// Visit order: the ACK-CRITICAL positions first, then the bulk. A position
+	// the follower is at or near the head of is the one a live append is waiting
+	// on — the follower's next report is what lifts that append's watermark —
+	// while bulk catch-up moves up to 4MiB PER SLOT under this round's budget,
+	// so a rotation over a few hundred catching-up seats answers only ~8 of them
+	// per round and one lap can outlast the append's wait deadline even though
+	// the replica is in ISR and reporting every round (measured: gap=1, in_isr,
+	// building=false stalls repeating deadline after deadline on a cluster whose
+	// per-slot logs run to tens of megabytes — the record had simply not been
+	// delivered to that slot yet). A tail is a handful of records, so serving it
+	// first costs the bulk almost nothing and bounds the appended record's
+	// delivery by one round trip. Both classes keep the rotation order, so no
+	// backlog slot can starve its peers.
+	order := e.orderPool.Get().([]int)
+	if cap(order) < n {
+		order = make([]int, n*2)
+	}
+	order = order[:n]
+	rest := scan.order
+	if cap(rest) < n {
+		rest = make([]int, n)
+	}
+	rest = rest[:n]
+	scan.order = rest
+	rot := int(e.fetchRot.Add(1)) % max(1, n)
+	head, bulk := 0, 0
+	for k := 0; k < n; k++ {
+		i := (k + rot) % n
+		if scan.ackCritical(i, req.FromSeqs) {
+			order[head] = i
+			head++
+			continue
+		}
+		rest[bulk] = i
+		bulk++
+	}
+	copy(order[head:], rest[:bulk])
 
 	out := &MFetchResponse{Follower: req.Follower, Items: make([]FetchItem, 0, 64)}
 	// Ledger snapshot: the slots this round reports the follower's positions
@@ -2582,7 +2647,7 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 	// it — the ledger always carries the FRESHEST bound the leader knows.
 	var ledgerSlots []int32
 	e.diag.mfetchRounds.Add(1)
-	budget := int64(maxPayloadBytes)
+	budget := e.fetchBudget
 	starved := false
 	served := false
 	// Progress piggyback is applied in bulk after phase 1: per-item calls
