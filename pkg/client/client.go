@@ -277,9 +277,12 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 
 // BatchAppend writes a batch of records through the data plane. Records
 // are grouped by the cached slot leader, one BatchAppend per destination,
-// and MOVED/ASK answers patch that slot's row and re-send just those
-// records (up to Config.Attempts rounds; a transport failure rotates the
-// row onto the next entry node instead). The returned slice is in the
+// AND ALL DESTINATIONS ARE DRIVEN CONCURRENTLY — a node under flow
+// control parks only its own records (and only writes destined for it),
+// never the rest of the batch. MOVED/ASK answers patch that slot's row and
+// re-send just those records (up to Config.Attempts rounds; a transport
+// failure rotates the row onto the next entry node instead). The returned
+// slice is in the
 // order of recs; a nil entry means the record was still redirected or
 // unanswered when the attempts ran out — the error (last transport
 // failure, informational) says which. Business outcomes (success/exists/
@@ -312,64 +315,155 @@ func (c *Client) BatchAppend(ctx context.Context,
 			}
 			byAddr[addr] = append(byAddr[addr], i)
 		}
+		// Destinations are driven CONCURRENTLY: one goroutine per node, so
+		// a throttle on one never parks the others inside the same call —
+		// serial sends would make every record of the batch wait behind
+		// the throttled node's backpressure loop. Records belong to exactly
+		// one group per round, so writes to out are disjoint; next and
+		// lastErr are joined under mu. The round ends when all destinations
+		// answer (or the ctx dies), which is what a flow-control pause
+		// costs a multi-node batch: one node's window, not the sum.
+		var wg sync.WaitGroup
+		var mu sync.Mutex
 		var next []int
 		for _, addr := range order {
-			idx := byAddr[addr]
-			batch := make([]*pushupesv1.AppendRequest, len(idx))
-			for k, i := range idx {
-				batch[k] = recs[i]
-			}
-			// Flow-control backpressure: park while another caller holds
-			// this node's gate (the node is refusing writes). Waiting
-			// happens OUTSIDE the attempt clock — time behind a gate must
-			// not burn the caller's Attempts — and only costs a map miss
-			// plus one atomic load while no throttle is active.
-			if gate := c.peekGate(addr); gate != nil && !gate.isOpen() {
-				if werr := gate.waitOpen(ctx); werr != nil {
-					lastErr = werr
-					next = append(next, idx...)
-					continue
+			wg.Add(1)
+			go func(addr string, idx []int) {
+				defer wg.Done()
+				requeue, err := c.sendGroup(ctx, attempt, addr, idx, recs, out)
+				mu.Lock()
+				next = append(next, requeue...)
+				if err != nil {
+					lastErr = err
 				}
+				mu.Unlock()
+			}(addr, byAddr[addr])
+		}
+		wg.Wait()
+		pending = next
+		c.rr.Add(1)
+	}
+	return out, lastErr
+}
+
+// sendGroup drives one destination's subset of one attempt round: it parks
+// behind that node's flow-control gate while another caller holds it,
+// sends the batch, consumes the answer (redirect rows patched, business
+// answers written to out), and runs the backpressure loop for refused
+// records. It returns the indices the round could not answer (redirected,
+// throttled-until-cancelled, or unanswered) for re-queueing, and the last
+// error seen (informational, like BatchAppend's).
+func (c *Client) sendGroup(ctx context.Context, attempt int, addr string,
+	idx []int, recs []*pushupesv1.AppendRequest, out []*pushupesv1.AppendResponse,
+) ([]int, error) {
+
+	var next []int
+	var lastErr error
+	batch := make([]*pushupesv1.AppendRequest, len(idx))
+	for k, i := range idx {
+		batch[k] = recs[i]
+	}
+	// Flow-control backpressure: park while another caller holds this
+	// node's gate (the node is refusing writes). Waiting happens OUTSIDE
+	// the attempt clock — time behind a gate must not burn the caller's
+	// Attempts — and only costs a map miss plus one atomic load while no
+	// throttle is active.
+	if gate := c.peekGate(addr); gate != nil && !gate.isOpen() {
+		if werr := gate.waitOpen(ctx); werr != nil {
+			return append(next, idx...), werr
+		}
+	}
+	cctx, cancel := context.WithTimeout(ctx, c.cfg.CallTimeout)
+	resp, err := c.event(addr).BatchAppend(cctx, &pushupesv1.BatchAppendRequest{Records: batch})
+	cancel()
+	if err != nil {
+		lastErr = err
+	}
+	if err != nil || len(resp.GetResults()) != len(batch) {
+		// transport failure or misaligned answer: rotate the route and
+		// requeue these records for the next attempt. A rotation is a
+		// guess, not a redirect the cluster told us — the Redirects()
+		// counter stays out of it.
+		for _, i := range idx {
+			c.routes.patch(c.slotOf(recs[i].AggregateId),
+				c.routes.entries[(int(c.rr.Load())+attempt+1)%len(c.routes.entries)])
+		}
+		return append(next, idx...), lastErr
+	}
+	// the batch protocol echoes aggregate_id per result; an echo mismatch
+	// means the answer does not line up with the request — check before
+	// consuming, and requeue like a misaligned answer.
+	aligned := true
+	for k, r := range resp.Results {
+		if r.GetAggregateId() != recs[idx[k]].GetAggregateId() {
+			aligned = false
+			lastErr = fmt.Errorf("batch result echo mismatch at %d: %q, requeued", k, r.GetAggregateId())
+			break
+		}
+	}
+	if !aligned {
+		for _, i := range idx {
+			c.routes.patch(c.slotOf(recs[i].AggregateId), c.routes.entries[(int(c.rr.Load())+attempt+1)%len(c.routes.entries)])
+		}
+		return append(next, idx...), lastErr
+	}
+	var throttled []int
+	for k, r := range resp.Results {
+		i := idx[k]
+		switch r.Response.GetErrId() {
+		case ErrIDSlotNotLocal, ErrIDMigrating:
+			if r.Response.GetNode() != "" {
+				c.routes.patch(c.slotOf(recs[i].AggregateId), hostPort(r.Response.GetNode()))
+			}
+			c.redirects.Add(1)
+			next = append(next, i)
+		case ErrIDFlowControl:
+			throttled = append(throttled, i)
+		default:
+			out[i] = r.Response
+		}
+	}
+	// The node's token bucket refused part of the batch: become the gate
+	// holder (concurrent contenders for the same throttle park in hold),
+	// sleep FlowBackoff, and re-send ONLY the refused records until an
+	// answer carries no 1006, then release the gate. Re-sending is safe:
+	// append idempotency keys on command_id, so a record the node wrote
+	// before throttling answers exists on the next round, never twice. The
+	// loop runs past Config.Attempts on purpose — Attempts counts REDIRECT
+	// rounds; throttling is waiting, not retrying, and ends when the node
+	// recovers or ctx dies (a dead holder releases the gate and requeues
+	// its records like a transport failure). Other destinations, driven in
+	// their own goroutines, are unaffected by this node's window.
+	if len(throttled) > 0 {
+		gate := c.gateFor(addr)
+		if !gate.hold(ctx) {
+			return append(next, throttled...), ctx.Err()
+		}
+		c.flowPauses.Add(1)
+		th := throttled
+		for len(th) > 0 {
+			if !sleepCtx(ctx, c.cfg.FlowBackoff) {
+				lastErr = ctx.Err()
+				next = append(next, th...)
+				break
+			}
+			thBatch := make([]*pushupesv1.AppendRequest, len(th))
+			for k, i := range th {
+				thBatch[k] = recs[i]
 			}
 			cctx, cancel := context.WithTimeout(ctx, c.cfg.CallTimeout)
-			resp, err := c.event(addr).BatchAppend(cctx, &pushupesv1.BatchAppendRequest{Records: batch})
+			thResp, thErr := c.event(addr).BatchAppend(cctx, &pushupesv1.BatchAppendRequest{Records: thBatch})
 			cancel()
-			if err != nil {
-				lastErr = err
+			if thErr != nil {
+				lastErr = thErr
 			}
-			if err != nil || len(resp.GetResults()) != len(batch) {
-				// transport failure or misaligned answer: rotate the route
-				// and requeue these records for the next attempt. A rotation
-				// is a guess, not a redirect the cluster told us — the
-				// Redirects() counter stays out of it.
-				for _, i := range idx {
-					c.routes.patch(c.slotOf(recs[i].AggregateId),
-						c.routes.entries[(int(c.rr.Load())+attempt+1)%len(c.routes.entries)])
-				}
-				next = append(next, idx...)
-				continue
+			if thErr != nil || len(thResp.GetResults()) != len(thBatch) {
+				next = append(next, th...)
+				break
 			}
-			// the batch protocol echoes aggregate_id per result; an echo
-			// mismatch means the answer does not line up with the request —
-			// check before consuming, and requeue like a misaligned answer.
-			aligned := true
-			for k, r := range resp.Results {
-				if r.GetAggregateId() != recs[idx[k]].GetAggregateId() {
-					aligned = false
-					lastErr = fmt.Errorf("batch result echo mismatch at %d: %q, requeued", k, r.GetAggregateId())
-					break
-				}
-			}
-			if !aligned {
-				for _, i := range idx {
-					c.routes.patch(c.slotOf(recs[i].AggregateId), c.routes.entries[(int(c.rr.Load())+attempt+1)%len(c.routes.entries)])
-				}
-				next = append(next, idx...)
-				continue
-			}
-			var throttled []int
-			for k, r := range resp.Results {
-				i := idx[k]
+			var again []int
+			for k, r := range thResp.Results {
+				i := th[k]
 				switch r.Response.GetErrId() {
 				case ErrIDSlotNotLocal, ErrIDMigrating:
 					if r.Response.GetNode() != "" {
@@ -378,80 +472,20 @@ func (c *Client) BatchAppend(ctx context.Context,
 					c.redirects.Add(1)
 					next = append(next, i)
 				case ErrIDFlowControl:
-					throttled = append(throttled, i)
+					again = append(again, i)
 				default:
 					out[i] = r.Response
 				}
 			}
-			// The node's token bucket refused part of the batch: become the
-			// gate holder (concurrent contenders for the same throttle park
-			// in hold), sleep FlowBackoff, and re-send ONLY the refused
-			// records until an answer carries no 1006, then release the
-			// gate. Re-sending is safe: append idempotency keys on
-			// command_id, so a record the node wrote before throttling
-			// answers exists on the next round, never twice. The loop runs
-			// past Config.Attempts on purpose — Attempts counts REDIRECT
-			// rounds; throttling is waiting, not retrying, and ends when
-			// the node recovers or ctx dies (a dead holder releases the
-			// gate and requeues its records like a transport failure).
-			if len(throttled) > 0 {
-				gate := c.gateFor(addr)
-				if !gate.hold(ctx) {
-					lastErr = ctx.Err()
-					next = append(next, throttled...)
-				} else {
-					c.flowPauses.Add(1)
-					th := throttled
-					for len(th) > 0 {
-						if !sleepCtx(ctx, c.cfg.FlowBackoff) {
-							lastErr = ctx.Err()
-							next = append(next, th...)
-							break
-						}
-						thBatch := make([]*pushupesv1.AppendRequest, len(th))
-						for k, i := range th {
-							thBatch[k] = recs[i]
-						}
-						cctx, cancel := context.WithTimeout(ctx, c.cfg.CallTimeout)
-						thResp, thErr := c.event(addr).BatchAppend(cctx, &pushupesv1.BatchAppendRequest{Records: thBatch})
-						cancel()
-						if thErr != nil {
-							lastErr = thErr
-						}
-						if thErr != nil || len(thResp.GetResults()) != len(thBatch) {
-							next = append(next, th...)
-							break
-						}
-						var again []int
-						for k, r := range thResp.Results {
-							i := th[k]
-							switch r.Response.GetErrId() {
-							case ErrIDSlotNotLocal, ErrIDMigrating:
-								if r.Response.GetNode() != "" {
-									c.routes.patch(c.slotOf(recs[i].AggregateId), hostPort(r.Response.GetNode()))
-								}
-								c.redirects.Add(1)
-								next = append(next, i)
-							case ErrIDFlowControl:
-								again = append(again, i)
-							default:
-								out[i] = r.Response
-							}
-						}
-						if len(again) == 0 {
-							break
-						}
-						th = again
-						c.flowPauses.Add(1)
-					}
-					gate.release()
-				}
+			if len(again) == 0 {
+				break
 			}
+			th = again
+			c.flowPauses.Add(1)
 		}
-		pending = next
-		c.rr.Add(1)
+		gate.release()
 	}
-	return out, lastErr
+	return next, lastErr
 }
 
 // ReadStream reads a version range of one aggregate stream (from_version

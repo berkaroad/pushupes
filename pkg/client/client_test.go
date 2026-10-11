@@ -266,6 +266,67 @@ func TestClientFlowControlGateIsPerNode(t *testing.T) {
 	}
 }
 
+// TestClientBatchAppendSendsNodesConcurrently proves one BatchAppend call
+// drives its destinations in parallel: with A's node throttled (three
+// refused rounds at 100ms backoff) and B's node healthy, B's batch must
+// land within the FIRST round trip — under a serial send loop it would
+// only start after A's whole backpressure window. A is deliberately the
+// first destination of the round so a regression to serial order fails
+// this test, not by accident of grouping.
+func TestClientBatchAppendSendsNodesConcurrently(t *testing.T) {
+	nodes, addrs := fakeCluster(t, 2)
+	a, b := nodes[SlotOf("a-x", 8)%2], nodes[SlotOf("b-x", 8)%2]
+	var bMu sync.Mutex
+	var tB time.Time
+	a.onAppend = func(n int, req *pushupesv1.BatchAppendRequest) *pushupesv1.BatchAppendResponse {
+		if n < 3 {
+			return throttleResp(req) // refused rounds: 3 x FlowBackoff
+		}
+		return nil
+	}
+	b.onAppend = func(n int, req *pushupesv1.BatchAppendRequest) *pushupesv1.BatchAppendResponse {
+		if n == 0 {
+			bMu.Lock()
+			tB = time.Now()
+			bMu.Unlock()
+		}
+		return nil
+	}
+	c, err := New([]string{addrs[0]}, &Config{RouteRefresh: time.Hour, FlowBackoff: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	t0 := time.Now()
+	resps, err := c.BatchAppend(ctx, []*pushupesv1.AppendRequest{rec("a-x"), rec("b-x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resps[0] == nil || resps[0].GetErrId() == ErrIDFlowControl {
+		t.Fatalf("a-x answered %v", resps[0])
+	}
+	if resps[1] == nil || resps[1].GetErrId() == ErrIDFlowControl {
+		t.Fatalf("b-x answered %v", resps[1])
+	}
+	bMu.Lock()
+	arrived := tB
+	bMu.Unlock()
+	// The whole call spans A's backpressure (>=2 refused sleeps), but B's
+	// first arrival must be inside the first window — parallel sending.
+	if time.Since(t0) < 200*time.Millisecond {
+		t.Fatalf("call returned in %v: A was never throttled, fixture broken", time.Since(t0))
+	}
+	if arrived.IsZero() {
+		t.Fatal("healthy node never saw B's batch")
+	}
+	if bStart := arrived.Sub(t0); bStart > 150*time.Millisecond {
+		t.Fatalf("B's batch arrived %v into the call (A throttled ~3x100ms): destinations were sent serially", bStart)
+	}
+}
+
 func TestClientFlowControlGateParksConcurrentWriters(t *testing.T) {
 	nodes, addrs := fakeCluster(t, 1)
 	node := nodes[0]
