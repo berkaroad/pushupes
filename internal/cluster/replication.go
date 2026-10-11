@@ -1309,6 +1309,13 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 	tick := time.NewTicker(hwWaitTick)
 	defer tick.Stop()
 	for {
+		// Same eligibility rule as the watermark min in advanceHW, computed
+		// before the lock like advanceHW does: only a seat that IS an ack
+		// holder may park an append. A seat left out of the min contributes
+		// nothing to sr.hw, so waiting for its report waits for an event that
+		// cannot move the watermark.
+		target := e.migrationTargetOf(slot)
+		members := e.tableReplicasOf(slot)
 		e.replMu.Lock()
 		sr := e.repl[slot]
 		hw := uint64(0)
@@ -1318,8 +1325,13 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 			hw = sr.hw
 			hwAt = sr.hwAt
 			cutoff := time.Now().Add(-isrStaleAfter)
-			for i, node := range sr.node {
-				if !sr.lastOK[i].After(cutoff) {
+			leaderLEO := e.store.LastSeqOf(slot)
+			for _, node := range members {
+				if node == e.self {
+					continue
+				}
+				i := sr.find(node)
+				if i < 0 || !sr.lastOK[i].After(cutoff) {
 					continue
 				}
 				// A replica whose connection died (or that the controller
@@ -1328,6 +1340,23 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 				// instead of blocking on a watermark that was pinned by it.
 				if e.sessionGone(node, sr.lastOK[i]) || e.peerDown(node) {
 					continue
+				}
+				// Still being built: not an ack holder. On a low->medium flip
+				// a slot's ONLY other copy is such a seat (its first report is
+				// leo=0, and freshness alone made it read as in-isr), so every
+				// append parked the full deadline behind the seat's catch-up:
+				// the client's own call timeout then requeued the batch and
+				// the idempotent retry answered exists (measured on a 3-node
+				// flip with --batch 100: +100 exists per stalled window, and
+				// hw_wait max pinned at the 10s deadline while every measured
+				// term of the report round was under 30ms). The seat's own
+				// report cadence is not the promise: it enters the ack set the
+				// moment advanceHW lets it into the min (caught up).
+				if sr.isBuilding(node) {
+					continue
+				}
+				if node == target && sr.leo[i] < leaderLEO {
+					continue // catching-up migration target: not an ack holder yet
 				}
 				inSync = true
 				break
@@ -1382,17 +1411,19 @@ func (e *Engine) logHWStall(slot int32, seq, hw uint64) {
 	e.replMu.Lock()
 	sr := e.repl[slot]
 	type rep struct {
-		Node  string `json:"node"`
-		LEO   uint64 `json:"leo"`
-		AgeS  int64  `json:"age_s"`
-		InISR bool   `json:"in_isr"`
+		Node     string `json:"node"`
+		LEO      uint64 `json:"leo"`
+		AgeS     int64  `json:"age_s"`
+		InISR    bool   `json:"in_isr"`
+		Building bool   `json:"building"`
 	}
 	var reps []rep
 	if sr != nil {
 		cutoff := time.Now().Add(-isrStaleAfter)
 		now := time.Now()
 		for i, node := range sr.node {
-			reps = append(reps, rep{node, sr.leo[i], int64(now.Sub(sr.lastOK[i]).Seconds()), sr.lastOK[i].After(cutoff)})
+			reps = append(reps, rep{node, sr.leo[i], int64(now.Sub(sr.lastOK[i]).Seconds()),
+				sr.lastOK[i].After(cutoff), sr.isBuilding(node)})
 		}
 	}
 	e.replMu.Unlock()

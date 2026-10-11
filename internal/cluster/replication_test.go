@@ -1155,6 +1155,58 @@ func TestReLayoutSeatDoesNotGateHW(t *testing.T) {
 	}
 }
 
+// TestBuildingSeatDoesNotParkTheAck pins the ack-side half of "a copy being
+// built does not gate the watermark": advanceHW already keeps a fresh seat out
+// of the watermark min, so an append must not park on that seat's report
+// either — waiting for it waits for an event that cannot move the watermark.
+// On a low->medium flip a slot's only other copy IS such a seat, and the
+// parked appends rode the full wait deadline into fail/1005 plus an
+// idempotent-retry exists (measured on a 3-node flip: hw_wait max pinned at
+// the deadline while every term of the report round stayed under 30ms, and
+// bench printed +100 exists per stalled batch).
+func TestBuildingSeatDoesNotParkTheAck(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	applyCmd(t, e, &Command{Op: OpSetPolicy, Policy: string(ReplicaPolicyLow)})
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	agg := aggInSlot(t, e, 0)
+	for v := uint32(1); v <= 5; v++ {
+		if _, err := st.Append(makeRecord(agg, v, fmt.Sprintf("park-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Factor 1: nothing to wait for.
+	if _, err := e.waitForHW(context.Background(), 0, 5, 150*time.Millisecond); err != nil {
+		t.Fatalf("a single-copy slot must acknowledge at once: %v", err)
+	}
+
+	// The flip seats a fresh copy. Its first report is an empty log: a copy
+	// being built. Appends must still be acknowledged — the watermark follows
+	// the leader's own log while no ack holder exists.
+	applyCmd(t, e, &Command{Op: OpSetPolicy, Policy: string(ReplicaPolicyMedium)})
+	applyCmd(t, e, &Command{Op: OpSlotAddReplica, Slots: []int32{0}, NodeID: "node-2"})
+	e.NoteReplicaProgress(0, "node-2", 0)
+	if _, err := st.Append(makeRecord(agg, 6, "park-6")); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, err := e.waitForHW(context.Background(), 0, 6, 150*time.Millisecond); err != nil {
+		t.Fatalf("an append parked on a copy still being built (%v after %v): that seat is not in the watermark min, so waiting for it waits for nothing", err, time.Since(start))
+	}
+
+	// Once that copy catches up it IS an ack holder, and an append above its
+	// report gates again: the rule is "wait for ack holders", not "never wait".
+	e.NoteReplicaProgress(0, "node-2", 6)
+	if _, err := st.Append(makeRecord(agg, 7, "park-7")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.waitForHW(context.Background(), 0, 7, 150*time.Millisecond); err == nil {
+		t.Fatal("a caught-up replica must gate the next append again")
+	}
+}
+
 // TestFollowerSessionLossReleasesHW pins the fast half of "a replica that is no
 // longer being served must not pin the writes": a killed node's fetch long poll
 // ends without an answer, and from that moment its frozen LEO must stop gating
