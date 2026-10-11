@@ -66,9 +66,9 @@ func TestApplyFetchItemsParallelKeepsSlotsIndependent(t *testing.T) {
 	}
 	var mu sync.Mutex
 	reported := map[int32]uint64{}
-	productive, err := follower.applyFetchItems(items, func(slot int32, from uint64) {
+	productive, err := follower.applyFetchItems(items, func(it *FetchItem, from uint64) {
 		mu.Lock()
-		reported[slot] = from
+		reported[it.Slot] = from
 		mu.Unlock()
 	})
 	if err != nil {

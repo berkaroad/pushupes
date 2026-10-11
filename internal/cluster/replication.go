@@ -477,6 +477,11 @@ const (
 	// behind", and a writer produces records, not bytes; a tail's byte size is
 	// still bounded by the round budget's per-slot read cap.
 	fetchTailRecords = 64
+	// maxEarlyReportsPerRound caps how many ACK-CRITICAL positions a round
+	// reports the moment they land (see fetchRound): each is one small RPC, so
+	// the cap bounds a round whose tails are unusually many without ever
+	// letting the urgent ones wait for the round's bulk apply.
+	maxEarlyReportsPerRound = 16
 	// maxPayloadBytes caps one long-poll response: during a backlog the
 	// session streams item by item across rounds instead of building a
 	// gigabyte JSON blob of every slot at once.
@@ -2553,6 +2558,16 @@ type parkedEntry struct {
 	hwWake <-chan struct{}
 }
 
+// ackCritical reports whether a served item is an ACK-CRITICAL position: the
+// leader serves those before the round's bulk (see the visit order in
+// HandleMFetchCtx) because the follower's next report of that slot is what
+// lifts a parked append's watermark. A tail carries at most fetchTailRecords
+// records, which is what identifies it on this side. Unset NextSeq reads as
+// "unknown", never as a tail.
+func (it *FetchItem) ackCritical() bool {
+	return it.NextSeq > it.FromSeq && it.NextSeq-it.FromSeq <= fetchTailRecords
+}
+
 // HandleMFetchCtx serves PeerService.MFetch: one multiplexed replica fetch
 // round (all slots a follower takes from this leader, long-polled as a
 // unit). ctx cancels the long-poll (client disconnect / deadline).
@@ -3250,10 +3265,19 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 	var productive bool
 	if len(fr.Items) > 0 {
 		// The round's landing positions, collected from whichever worker applied
-		// each slot and reported once, after the round (a productive round on a
-		// busy leader touches tens of slots, not the full 1.4k set). Reporting
-		// is what advances the leader's watermark, so the collection must stay
-		// safe under the apply pool. A quarantined slot is skipped by applyItem.
+		// each slot. Reporting is what advances the leader's watermark, so the
+		// collection must stay safe under the apply pool. A quarantined slot is
+		// skipped by applyItem.
+		//
+		// An ACK-CRITICAL position is reported the moment it lands instead of
+		// at the end of the round: the leader served those tails first (a live
+		// append is parked on one), and the round's bulk apply can take seconds
+		// on a catching-up replica — waiting for it is what a single-in-flight
+		// writer pays as its whole round trip (measured on a cluster whose
+		// per-slot logs run to tens of megabytes: acknowledged writes fell to
+		// ~100 msg/s with clean node-side counters, i.e. the append waited on
+		// the bulk apply, not on anything broken). A tail item carries at most
+		// fetchTailRecords records, which is what identifies it here.
 		//
 		// replicaApply times the landing itself (the apply pool's wall time for
 		// this round's items): the follower's term of hw_wait's residual, from
@@ -3261,16 +3285,33 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 		var repMu sync.Mutex
 		var changed []int32
 		var leos []uint64
-		tApply := time.Now()
-		productive, err = e.applyFetchItems(fr.Items, func(slot int32, from uint64) {
+		earlyReports := 0
+		flush := func() {
 			repMu.Lock()
-			changed = append(changed, slot)
-			leos = append(leos, from)
+			c, l := changed, leos
+			changed, leos = nil, nil
 			repMu.Unlock()
+			if len(c) > 0 {
+				e.reportProgress(addr, c, l, true)
+			}
+		}
+		tApply := time.Now()
+		productive, err = e.applyFetchItems(fr.Items, func(it *FetchItem, from uint64) {
+			repMu.Lock()
+			changed = append(changed, it.Slot)
+			leos = append(leos, from)
+			early := earlyReports < maxEarlyReportsPerRound && it.ackCritical()
+			if early {
+				earlyReports++
+			}
+			repMu.Unlock()
+			if early {
+				flush()
+			}
 		})
 		e.ack.replicaApply.observe(time.Since(tApply))
-		if err == nil && len(changed) > 0 {
-			e.reportProgress(addr, changed, leos, true)
+		if err == nil {
+			flush()
 		}
 	} else {
 		productive, err = e.applyFetchItems(fr.Items, nil)
@@ -3289,7 +3330,7 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 // the whole multiplexed session (which used to back the session off and leave
 // every other slot of that leader without a fetch round — the 10s watermark
 // freeze). A genuine failure (a malformed frame) still aborts the round.
-func (e *Engine) applyFetchItems(items []FetchItem, report func(slot int32, from uint64)) (bool, error) {
+func (e *Engine) applyFetchItems(items []FetchItem, report func(it *FetchItem, from uint64)) (bool, error) {
 	if len(items) == 0 {
 		return false, nil
 	}
@@ -3343,7 +3384,7 @@ func (e *Engine) applyFetchItems(items []FetchItem, report func(slot int32, from
 // applyItem lands one slot's share of a round: its records in seq order, then
 // its new position to report. A quarantined slot is deliberately not reported,
 // so a replica holding different bytes cannot stand in for an in-sync one.
-func (e *Engine) applyItem(it *FetchItem, report func(slot int32, from uint64)) error {
+func (e *Engine) applyItem(it *FetchItem, report func(it *FetchItem, from uint64)) error {
 	dvg, err := applyFetchPayload(e.store, it.Slot, it.NextSeq, it.Payload)
 	if len(dvg) > 0 {
 		e.noteDivergence(it.Slot, dvg)
@@ -3352,7 +3393,7 @@ func (e *Engine) applyItem(it *FetchItem, report func(slot int32, from uint64)) 
 		return err
 	}
 	if report != nil && !e.isDiverged(it.Slot) {
-		report(it.Slot, e.store.LastSeqOf(it.Slot)+1)
+		report(it, e.store.LastSeqOf(it.Slot)+1)
 	}
 	return nil
 }

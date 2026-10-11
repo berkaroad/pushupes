@@ -1287,6 +1287,33 @@ func itemSlots(items []FetchItem) []int32 {
 	return out
 }
 
+// TestFetchItemAckCritical pins what counts as an ACK-CRITICAL item: the leader
+// serves the tails first (a live append is parked on one), and the follower
+// reports those positions the moment they land rather than at the end of the
+// round — the round's bulk apply can take seconds, and that wait is what a
+// single-in-flight writer pays as its whole round trip (measured: acknowledged
+// writes at ~100 msg/s with clean node-side counters).
+func TestFetchItemAckCritical(t *testing.T) {
+	cases := []struct {
+		name string
+		item FetchItem
+		want bool
+	}{
+		{"one record (the canonical tail)", FetchItem{FromSeq: 9, NextSeq: 10}, true},
+		{"the tail threshold", FetchItem{FromSeq: 1, NextSeq: 1 + fetchTailRecords}, true},
+		{"one over the threshold", FetchItem{FromSeq: 1, NextSeq: 2 + fetchTailRecords}, false},
+		{"a bulk chunk", FetchItem{FromSeq: 1, NextSeq: 4097}, false},
+		{"unset NextSeq is unknown, not a tail", FetchItem{FromSeq: 5}, false},
+		{"empty payload", FetchItem{FromSeq: 5, NextSeq: 5}, false},
+	}
+	for _, c := range cases {
+		it := c.item
+		if got := it.ackCritical(); got != c.want {
+			t.Errorf("%s: ackCritical()=%v want %v (from=%d next=%d)", c.name, got, c.want, it.FromSeq, it.NextSeq)
+		}
+	}
+}
+
 // TestFollowerSessionLossReleasesHW pins the fast half of "a replica that is no
 // longer being served must not pin the writes": a killed node's fetch long poll
 // ends without an answer, and from that moment its frozen LEO must stop gating
