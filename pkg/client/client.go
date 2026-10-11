@@ -33,7 +33,7 @@ import (
 type Config struct {
 	RouteRefresh time.Duration // slot->leader table re-fetch interval; 0 = fetch once at startup (default 30s)
 	Attempts     int           // max send rounds per BatchAppend call, retries of redirected records included (default 3)
-	CallTimeout  time.Duration // per-attempt RPC timeout inside BatchAppend (default 10s)
+	CallTimeout  time.Duration // per-attempt RPC timeout inside BatchAppend (default 30s)
 	FlowBackoff  time.Duration // pause after a node answers 1006 (flow control); the refused records re-send and the node's gate stays closed until one answer comes back un-throttled (default 100ms)
 }
 
@@ -89,7 +89,14 @@ func New(nodes []string, cfg *Config) (*Client, error) {
 		c.cfg.Attempts = 3
 	}
 	if c.cfg.CallTimeout <= 0 {
-		c.cfg.CallTimeout = 10 * time.Second
+		// Deliberately longer than the cluster's write-ack watermark deadline
+		// (10s by default): when a leader cannot confirm a record it answers
+		// fail/1005, and that answer must reach the caller. If the two
+		// timeouts coincide the RPC dies first, the library requeues the
+		// records it never saw an answer for, and the retry hits the
+		// idempotency fence and answers exists — a stalled append reported as
+		// a duplicate write.
+		c.cfg.CallTimeout = 30 * time.Second
 	}
 	if c.cfg.FlowBackoff <= 0 {
 		c.cfg.FlowBackoff = 100 * time.Millisecond
