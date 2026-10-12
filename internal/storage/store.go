@@ -715,6 +715,26 @@ func (st *Store) slotReadRange(slot *Slot, r data.ByteRange, buf []byte) error {
 	return err
 }
 
+// FlushSlot makes one slot's outstanding records durable now and answers the log
+// end offset that is on disk afterwards (everything appended before the call is
+// covered; a concurrent append may land above it and is not claimed). It is the
+// migration commit fence's durability probe: the target must prove the frozen
+// tail is on disk before the leader move commits.
+func (st *Store) FlushSlot(slotID int32) (uint64, error) {
+	if slotID < 0 || slotID >= st.SlotCount {
+		return 0, fmt.Errorf("slot %d out of range", slotID)
+	}
+	s := st.slots[slotID].Load()
+	if s == nil {
+		return 0, fmt.Errorf("slot %d is not open on this node", slotID)
+	}
+	leo := st.LastSeqOf(slotID)
+	if err := s.Flush(); err != nil {
+		return 0, err
+	}
+	return leo, nil
+}
+
 // Flush flushes every loaded slot.
 func (st *Store) Flush() error {
 	slots := make([]*Slot, 0, len(st.slots))

@@ -16,6 +16,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -76,19 +77,20 @@ func TestSlotAddReplicaJoinsOneSlot(t *testing.T) {
 	}
 }
 
-// TestStartMigrationAcceptsTargetOutsideReplicaSet is the regression test for
+// TestMigrateSlotAcceptsTargetOutsideReplicaSet is the regression test for
 // "migrate a slot to a node outside its current replica set". The controller
 // used to refuse such a target outright ("target X is not a replica of slot
 // N") even though the console offers every node as a target, so a move could
 // not be expressed at all. It must instead join the target to the replica set
-// first (that is the precondition of the snapshot/catch-up steps, which are
-// driven by the target following the slot) and then run the same six steps.
+// first — that admission is what starts the target's fetch, which is now the
+// only way the data gets there — and commit only once the target holds the log.
 //
-// Nothing listens on the test's peer addresses, so the migration aborts at its
-// first network step — what is asserted is the state the controller commits
-// before it: the target joined the replica set, and the slot is not left
-// migrating.
-func TestStartMigrationAcceptsTargetOutsideReplicaSet(t *testing.T) {
+// Nothing listens on the test's peer addresses, so the handover aborts while
+// waiting for the copy: what is asserted is the state the controller commits
+// before that — the target joined the replica set, the slot is not left
+// migrating (the migrating_out mark is only taken at the commit), and an
+// in-set target does not grow the set.
+func TestMigrateSlotAcceptsTargetOutsideReplicaSet(t *testing.T) {
 	e, _ := newTestEngine(t, "node-1")
 	e.node = newTestRaftNode(t, e)
 	join(t, e, "node-1", "127.0.0.1:1")
@@ -101,9 +103,9 @@ func TestStartMigrationAcceptsTargetOutsideReplicaSet(t *testing.T) {
 		t.Fatalf("test setup: slot 0 placement %+v", before)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	err := e.StartMigration(ctx, 0, "node-3")
+	err := e.MigrateSlot(ctx, 0, "node-3")
 	if err != nil && strings.Contains(err.Error(), "is not a replica") {
 		t.Fatalf("a target outside the replica set must be accepted, got %v", err)
 	}
@@ -123,10 +125,165 @@ func TestStartMigrationAcceptsTargetOutsideReplicaSet(t *testing.T) {
 	if !replicaSetHas(inside.Replicas, "node-3") {
 		t.Fatalf("test setup: slot 1 placement %+v", inside)
 	}
-	_ = e.StartMigration(ctx, 1, "node-3")
+	_ = e.MigrateSlot(ctx, 1, "node-3")
 	got, _ := e.TableSnapshot().Slots[1]
 	if len(got.Replicas) != len(inside.Replicas) {
 		t.Fatalf("an in-set target must not add a replica: %+v (was %+v)", got.Replicas, inside.Replicas)
+	}
+}
+
+// TestReclaimYieldsToAnInFlightHandover pins the race between the surplus-seat
+// reclaim and a hand-over: an operator may name a target the ring plan does not
+// prescribe for the slot, so the reclaim would see the seat the hand-over is
+// building as surplus and drop it mid-catch-up (a commit then fails with
+// "is not a replica yet"). The seat must survive while the hand-over is in
+// flight, and go back to being surplus once it is over.
+//
+// The copies that stay answer over the peer plane (they are empty here, so they
+// report in sync), which is what the reclaim waits for before dropping anything.
+func TestReclaimYieldsToAnInFlightHandover(t *testing.T) {
+	src, _ := newTestEngine(t, "node-1")
+	src.node = newTestRaftNode(t, src)
+	peer, _ := newTestEngine(t, "node-2")
+	peerAddr := newPeerHarness(t, peer)
+
+	join(t, src, "node-1", "127.0.0.1:1")
+	join(t, src, "node-2", peerAddr)
+	join(t, src, "node-3", "127.0.0.1:3")
+	applyCmd(t, src, &Command{Op: OpPlanSlots})
+	ctx := context.Background()
+
+	before, _ := src.TableSnapshot().Slots[0]
+	if replicaSetHas(before.Replicas, "node-3") {
+		t.Fatalf("test setup: slot 0 placement %+v", before)
+	}
+	grow := func() {
+		applyCmd(t, src, &Command{Op: OpSlotAddReplica, Slots: []int32{0}, NodeID: "node-3"})
+		if p, _ := src.TableSnapshot().Slots[0]; !replicaSetHas(p.Replicas, "node-3") {
+			t.Fatalf("test setup: node-3 not admitted: %+v", p)
+		}
+	}
+
+	// Baseline: a surplus seat the plan does not prescribe is reclaimed.
+	grow()
+	if n := src.reclaimRound(ctx, 1); n != 1 {
+		t.Fatalf("reclaim dropped %d seats, want 1", n)
+	}
+	if p, _ := src.TableSnapshot().Slots[0]; replicaSetHas(p.Replicas, "node-3") {
+		t.Fatalf("surplus seat kept: %+v", p)
+	}
+
+	// With a hand-over in flight the same seat is off limits.
+	grow()
+	src.markMigrationInFlight(0)
+	if n := src.reclaimRound(ctx, 1); n != 0 {
+		t.Fatalf("reclaim dropped %d seats during a hand-over, want 0", n)
+	}
+	if p, _ := src.TableSnapshot().Slots[0]; !replicaSetHas(p.Replicas, "node-3") {
+		t.Fatalf("reclaim dropped the seat a hand-over was building: %+v", p)
+	}
+
+	// Once the hand-over is over the seat is surplus again.
+	src.clearMigrationInFlight(0)
+	if n := src.reclaimRound(ctx, 1); n != 1 {
+		t.Fatalf("reclaim dropped %d seats after the hand-over, want 1", n)
+	}
+	if p, _ := src.TableSnapshot().Slots[0]; replicaSetHas(p.Replicas, "node-3") {
+		t.Fatalf("surplus seat kept after the hand-over: %+v", p)
+	}
+}
+
+// TestFenceDurabilityProbeMakesTheTailDurable pins the commit fence's new gate:
+// the target must be able to prove the frozen tail is ON DISK, not merely
+// applied. HandleSlotFlush flushes the slot and answers the offset that landed;
+// a slot this node does not hold answers 0, which never satisfies a frozen tail.
+func TestFenceDurabilityProbeMakesTheTailDurable(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	addr := newPeerHarness(t, e)
+	slot := int32(1)
+	agg := aggInSlotOf(t, e, slot, "durable-")
+	for v := 1; v <= 3; v++ {
+		if _, err := st.Append(makeRecord(agg, uint32(v), fmt.Sprintf("d-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	leo := st.LastSeqOf(slot)
+	durable, err := e.HandleSlotFlush(slot)
+	if err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if leo == 0 || durable < leo {
+		t.Fatalf("flush answered durable=%d, want durable >= leo=%d > 0", durable, leo)
+	}
+
+	// The same probe over the peer plane, which is how the fence asks.
+	ctx := context.Background()
+	dur, err := e.peerDurableLEO(ctx, addr, slot)
+	if err != nil {
+		t.Fatalf("peer durable probe: %v", err)
+	}
+	if dur < leo {
+		t.Fatalf("peer durable probe answered %d, want >= %d", dur, leo)
+	}
+
+	// A slot this node does not hold can never satisfy a frozen tail.
+	other := e.store.SlotCount - 1
+	if other == slot {
+		t.Fatalf("test setup: slot %d is both held and unheld", slot)
+	}
+	if held, err := e.HandleSlotFlush(other); err != nil || held != 0 {
+		t.Fatalf("unheld slot answered (%d, %v), want (0, nil)", held, err)
+	}
+}
+
+// TestHandoverEntryPointGuards pins the two entry points of the handover state
+// machine on a live table: the admission step is idempotent and leaves the slot
+// stable under its leader (no fence, no epoch bump), and the commit step refuses
+// a target that was never admitted — the data would not be there, and moving the
+// leader onto an empty copy is the fork the gate exists to prevent.
+func TestHandoverEntryPointGuards(t *testing.T) {
+	e, _ := newTestEngine(t, "node-1")
+	e.node = newTestRaftNode(t, e)
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	join(t, e, "node-3", "127.0.0.1:3")
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+	ctx := context.Background()
+
+	base, _ := e.TableSnapshot().Slots[0]
+	if base.Leader != "node-1" || replicaSetHas(base.Replicas, "node-3") {
+		t.Fatalf("test setup: slot 0 placement %+v", base)
+	}
+
+	// commit before stage: refused, and nothing moves.
+	if err := e.commitMigration(ctx, 0, "node-3"); err == nil {
+		t.Fatal("committing a handover to a node that is not a replica must be refused")
+	}
+	if p, _ := e.TableSnapshot().Slots[0]; p.Leader != base.Leader || p.Epoch != base.Epoch {
+		t.Fatalf("a refused handover must not move the leader: %+v", p)
+	}
+
+	// stage: admit the target; the slot stays stable under its leader.
+	changed, err := e.stageMigration(ctx, 0, "node-3")
+	if err != nil || !changed {
+		t.Fatalf("stage: changed=%v err=%v", changed, err)
+	}
+	after, _ := e.TableSnapshot().Slots[0]
+	if !replicaSetHas(after.Replicas, "node-3") {
+		t.Fatalf("stage did not admit the target: %+v", after)
+	}
+	if after.State != SlotStable || after.Leader != base.Leader || after.Epoch != base.Epoch {
+		t.Fatalf("staging must leave the slot stable under its leader: %+v", after)
+	}
+
+	// stage again: idempotent.
+	if changed, err := e.stageMigration(ctx, 0, "node-3"); err != nil || changed {
+		t.Fatalf("staging an in-set target must be a no-op: changed=%v err=%v", changed, err)
+	}
+	// staging the slot's own leader is refused (that is a commit, not a stage).
+	if _, err := e.stageMigration(ctx, 0, base.Leader); err == nil {
+		t.Fatal("staging the current leader must be refused")
 	}
 }
 
@@ -263,7 +420,7 @@ func TestRemoveReplicaCombination(t *testing.T) {
 		t.Fatalf("test setup: slot 0 placement %+v", base)
 	}
 
-	// 1. stage: admit the out-of-set target (StartMigration's first step)
+	// 1. stage: admit the out-of-set target (MigrateSlot's first step)
 	applyCmd(t, e, &Command{Op: OpSlotAddReplica, Slots: []int32{0}, NodeID: "node-3"})
 
 	// 2. roll the staging back: drop the target again
@@ -306,8 +463,8 @@ func TestRemoveReplicaCombination(t *testing.T) {
 }
 
 // TestMigrationAbortKeepsSourceLeaderAndExplainableSet pins the failure side of
-// the migration contract. When the migration aborts BEFORE the leader move
-// (here the snapshot/catch-up step cannot reach any peer), the slot must not be
+// the handover contract. When the handover aborts BEFORE the leader move (here
+// the copy cannot be shown to hold the source's log: nothing answers), the slot must not be
 // left leaderless or empty: the source still leads and is still a replica, the
 // staged target is the only surplus member, and the epoch has not moved. This
 // is the state a manual remove-replica (or a retry) can undo.
@@ -325,9 +482,9 @@ func TestMigrationAbortKeepsSourceLeaderAndExplainableSet(t *testing.T) {
 		t.Fatalf("test setup: slot 0 placement %+v (factor %d)", base, factor)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := e.StartMigration(ctx, 0, "node-3"); err == nil {
+	if err := e.MigrateSlot(ctx, 0, "node-3"); err == nil {
 		t.Fatal("a migration to an unreachable target must not report success")
 	}
 

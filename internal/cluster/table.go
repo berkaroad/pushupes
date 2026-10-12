@@ -43,6 +43,58 @@ type Placement struct {
 	State    SlotState `json:"state"`
 	// MigratingTo is the target node while State is migrating_out.
 	MigratingTo string `json:"migrating_to,omitempty"`
+	// SeatGrant labels WHY a node holds a replica seat of this slot: ring =
+	// the ring layout gives it this slot (it joined, rejoined, or the ring
+	// re-spread after a member left), factor = the replica factor rose and
+	// the set had to grow. A ring seat is load the node has to carry, a
+	// factor seat is redundancy; the fetch round serves the former first
+	// (see HandleMFetchCtx and DESIGN §5).
+	SeatGrant map[string]string `json:"seat_grant,omitempty"`
+}
+
+// Seat grant kinds (Placement.SeatGrant).
+const (
+	SeatGrantRing   = "ring"   // the ring layout's own seat: load, not redundancy
+	SeatGrantFactor = "factor" // granted because the replica factor rose
+)
+
+// stampRingGrants labels every seat of a freshly planned placement as a ring
+// grant: a brand-new layout's seats are all the ring's own.
+func stampRingGrants(p *Placement) {
+	if len(p.Replicas) == 0 {
+		return
+	}
+	p.SeatGrant = make(map[string]string, len(p.Replicas))
+	for _, r := range p.Replicas {
+		p.SeatGrant[r] = SeatGrantRing
+	}
+}
+
+// containsNode reports whether a node-id list holds the node.
+func containsNode(list []string, id string) bool {
+	for _, x := range list {
+		if x == id {
+			return true
+		}
+	}
+	return false
+}
+
+// sameMembers reports whether two node-id lists hold the same members.
+func sameMembers(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(a))
+	for _, x := range a {
+		seen[x] = struct{}{}
+	}
+	for _, x := range b {
+		if _, ok := seen[x]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // Table is the replicated slot assignment table plus the peer directory.
@@ -56,6 +108,12 @@ type Table struct {
 	Policy ReplicaPolicy        `json:"policy"`
 	Peers  map[string]Peer      `json:"peers"`
 	Slots  map[int32]*Placement `json:"slots"`
+	// PlanMembers is the member directory the current layout was planned
+	// under. A replan that runs while it differs from the directory now grants
+	// RING seats (the ring just took the node on); one that runs under the same
+	// directory grants FACTOR seats (only the factor grew). See
+	// Placement.SeatGrant.
+	PlanMembers []string `json:"plan_members,omitempty"`
 }
 
 // NewTable makes an empty table with an explicit replica factor. The policy
@@ -109,8 +167,15 @@ func (t *Table) Clone() *Table {
 	for s, p := range t.Slots {
 		p2 := *p
 		p2.Replicas = append([]string(nil), p.Replicas...)
+		if p.SeatGrant != nil {
+			p2.SeatGrant = make(map[string]string, len(p.SeatGrant))
+			for k, v := range p.SeatGrant {
+				p2.SeatGrant[k] = v
+			}
+		}
 		out.Slots[s] = &p2
 	}
+	out.PlanMembers = append([]string(nil), t.PlanMembers...)
 	return out
 }
 
@@ -307,6 +372,9 @@ func (t *Table) applyReplanSlots() bool {
 	for s, p := range planned {
 		cur, ok := t.Slots[s]
 		if !ok {
+			// A slot the table assigns for the first time gets the ring's own
+			// seats, so they read as load like any other ring grant.
+			stampRingGrants(p)
 			t.Slots[s] = p
 			changed = true
 			continue
@@ -333,9 +401,32 @@ func (t *Table) applyReplanSlots() bool {
 		}
 		grown := unionReplicas(cur.Replicas, p.Replicas)
 		if len(grown) != len(cur.Replicas) {
+			// Label what this replan grants: running while the member
+			// directory differs from the one the last plan ran under, every
+			// seat it adds is the ring settling a new set of members (a join,
+			// a rejoin, a departure that re-spread the shares) — load, and the
+			// whole ring has to converge, so it all leads. Only a replan under
+			// an unchanged directory adds pure redundancy.
+			kind := SeatGrantFactor
+			if !sameMembers(t.PlanMembers, nodes) {
+				kind = SeatGrantRing
+			}
+			if cur.SeatGrant == nil {
+				cur.SeatGrant = map[string]string{}
+			}
+			for _, r := range grown {
+				if containsNode(cur.Replicas, r) {
+					continue
+				}
+				cur.SeatGrant[r] = kind
+			}
 			cur.Replicas = grown
 			changed = true
 		}
+	}
+	if !sameMembers(t.PlanMembers, nodes) {
+		t.PlanMembers = append([]string(nil), nodes...)
+		changed = true
 	}
 	return changed
 }
@@ -571,6 +662,12 @@ func (t *Table) Apply(c *Command) error {
 		delete(t.Peers, c.NodeID)
 		for _, p := range t.Slots {
 			p.Replicas = removeString(p.Replicas, c.NodeID)
+			if p.SeatGrant != nil {
+				delete(p.SeatGrant, c.NodeID)
+			}
+			if p.SeatGrant != nil {
+				delete(p.SeatGrant, c.NodeID)
+			}
 			if p.MigratingTo == c.NodeID {
 				p.MigratingTo = ""
 				if p.State == SlotMigratingOut || p.State == SlotImportingIn {
@@ -634,6 +731,10 @@ func (t *Table) Apply(c *Command) error {
 			return fmt.Errorf("plan_slots: no members")
 		}
 		t.Slots = PlanSlots(nodes, t.SlotCount, t.Replicas)
+		for _, p := range t.Slots {
+			stampRingGrants(p)
+		}
+		t.PlanMembers = append([]string(nil), nodes...)
 	case OpReplanSlots:
 		// Converge the layout on the current member directory: fill in any
 		// slot that is still unassigned, and add the ring's seats to every
@@ -726,6 +827,13 @@ func (t *Table) Apply(c *Command) error {
 			}
 			if !found {
 				p.Replicas = append(p.Replicas, c.NodeID)
+				// A staged admission seats a hand-over target: the copy it
+				// builds is load it is about to take over, so its catch-up
+				// leads the factor seats in the fetch round.
+				if p.SeatGrant == nil {
+					p.SeatGrant = map[string]string{}
+				}
+				p.SeatGrant[c.NodeID] = SeatGrantRing
 			}
 		}
 	case OpSlotRemoveReplica:
@@ -759,6 +867,9 @@ func (t *Table) Apply(c *Command) error {
 				continue // not a replica: nothing to do, no error
 			}
 			p.Replicas = removeString(p.Replicas, c.NodeID)
+			if p.SeatGrant != nil {
+				delete(p.SeatGrant, c.NodeID)
+			}
 		}
 	case OpSlotState:
 		for _, s := range c.Slots {

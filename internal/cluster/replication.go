@@ -94,12 +94,24 @@ type Engine struct {
 	// rotation order and parked set fresh every time; a hot leader
 	// serves thousands of rounds per second and these were the
 	// dominant malloc traffic in the profile.
-	orderPool        sync.Pool // []int, cap >= followed slots
-	parkedPool       sync.Pool // []parkedEntry
-	progressPool     sync.Pool // *progressBatch
-	scanPool         sync.Pool // *fetchScan (per-position "has data" + wake handle + LEO)
-	fetchBudget      int64     // bytes one fetch round may carry (maxPayloadBytes; tests shrink it to pin the visit order)
-	fetchScratchPool sync.Pool // *fetchScratch (per-round positions + report)
+	orderPool    sync.Pool // []int, cap >= followed slots
+	parkedPool   sync.Pool // []parkedEntry
+	progressPool sync.Pool // *progressBatch
+	scanPool     sync.Pool // *fetchScan (per-position "has data" + wake handle + LEO)
+	fetchBudget  int64     // bytes one fetch round may carry (maxPayloadBytes; tests shrink it to pin the visit order)
+	// fetchRingMu guards fetchRingBusy: the followers that last reported being
+	// behind on a ring seat. While one is, the other sessions are served at
+	// half the round budget — that node's catch-up is what a layout change
+	// waits on, the rest is redundancy. The ack-critical tail leads the round
+	// outside the budget class, so a live append is never slowed by this.
+	fetchRingMu   sync.Mutex
+	fetchRingBusy map[string]time.Time
+	// divSeen holds the last diverged reading of a copy a round has not acted
+	// on yet (see confirmDiverged). rebMu in balance.go guards it with the
+	// retry maps.
+	divSeen          map[int32]rebalanceAttempt
+	divergedConfirm  time.Duration // window before a diverged reading may drop a copy
+	fetchScratchPool sync.Pool     // *fetchScratch (per-round positions + report)
 
 	// ownership bitmap: which slots this node leads, rebuilt only when
 	// the Raft table version advances. Per-item map lookups under the
@@ -109,17 +121,6 @@ type Engine struct {
 	own   atomic.Pointer[ownership]
 	// tableGen bumps with every applied table change (holds tableMu).
 	tableGen uint64
-
-	// migration forwarding: slot -> target addr while migrating_out
-	fwdMu sync.RWMutex
-	fwd   map[int32]string
-
-	// when this leader first saw a slot in migrating_out, so a target that
-	// never catches up cannot keep the best-effort mirror alive forever
-	// (see migrationForwardExpired). Cleared as soon as the slot is no
-	// longer migrating_out.
-	migFwdMu    sync.Mutex
-	migFwdSince map[int32]time.Time
 
 	// migration commit fence: one preallocated write gate per slot (a writer
 	// must be able to register its in-flight append without racing the fence
@@ -523,12 +524,10 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logge
 		// transport needed a large idle-conn pool to avoid re-dial churn).
 		peers:       newPeerClient(),
 		repl:        map[int32]*slotRepl{},
-		fwd:         map[int32]string{},
 		sessions:    map[string]*fetchSession{},
 		sessKick:    make(chan struct{}, 1),
 		storageKick: make(chan struct{}, 1),
 		failStreak:  map[string]int{},
-		migFwdSince: map[int32]time.Time{},
 		ledPrev:     map[int32]bool{},
 		fenceSet:    map[int32]bool{},
 		diverged:    map[int32]string{},
@@ -556,6 +555,7 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logge
 	e.progressPool.New = func() any { return &progressBatch{} }
 	e.scanPool.New = func() any { return &fetchScan{} }
 	e.fetchBudget = maxPayloadBytes
+	e.divergedConfirm = divergedConfirmWindow
 	e.fetchScratchPool.New = func() any { return &fetchScratch{} }
 	e.fences = make([]slotFence, store.SlotCount)
 	if e.logger == nil {
@@ -677,8 +677,8 @@ func (e *Engine) HandleSlotLeader(slot int32) (string, int64) {
 // SlotOf routes an aggregate to its slot.
 func (e *Engine) SlotOf(aggregateID string) int32 { return e.store.SlotOf(aggregateID) }
 
-// syncMigrationState refreshes the write-forwarding map from the table and
-// drives the post-migration cleanup countdown (localdrop.go).
+// syncMigrationState drives the post-handover cleanup countdown (localdrop.go)
+// from the table's replica-set membership.
 //
 // The countdown follows REPLICA-SET MEMBERSHIP, not the migration itself: this
 // node arms one for a slot exactly when a table change takes it OUT of that
@@ -717,16 +717,12 @@ func (e *Engine) syncMigrationState() {
 	after := make(map[int32]leaderEpoch, len(fenced))
 
 	e.tableMu.RLock()
-	fwd := make(map[int32]string, 4)
 	member := make(map[int32]bool, len(e.table.Slots))
 	fenceOK := make(map[int32]bool, 4) // slots a held fence is still valid for
 	var surplus []int32                // left the replica set while holding a copy: arm a countdown
 	for s, p := range e.table.Slots {
 		if fencedSet[s] {
 			after[s] = leaderEpoch{p.Leader, p.Epoch}
-		}
-		if p.State == SlotMigratingOut && p.MigratingTo != "" {
-			fwd[s] = p.MigratingTo
 		}
 		// A fence is only meaningful while this node still leads a slot that
 		// is still migrating out. The moment the commit (leader_move) or an
@@ -766,10 +762,6 @@ func (e *Engine) syncMigrationState() {
 	}
 
 	e.setReplicaMembership(member)
-	e.fwdMu.Lock()
-	e.fwd = fwd
-	e.fwdMu.Unlock()
-
 	// Leadership bookkeeping: a slot this node just STARTED leading carries
 	// the previous term's follower positions in e.repl. Their leos are as of
 	// the old leader's last progress sample — often far below this node's own
@@ -816,24 +808,6 @@ func (e *Engine) syncMigrationState() {
 		sr.syncSeats(ledSeats[s])
 	}
 	e.replMu.Unlock()
-
-	// Deadline bookkeeping for the best-effort forward: stamp the moment the
-	// leader first sees a slot in migrating_out, so a target that never
-	// catches up cannot keep the mirror alive forever (see
-	// migrationForwardExpired). Anything no longer migrating is dropped.
-	now := time.Now()
-	e.migFwdMu.Lock()
-	for s := range e.migFwdSince {
-		if _, ok := fwd[s]; !ok {
-			delete(e.migFwdSince, s)
-		}
-	}
-	for s := range fwd {
-		if _, ok := e.migFwdSince[s]; !ok {
-			e.migFwdSince[s] = now
-		}
-	}
-	e.migFwdMu.Unlock()
 
 	// A copy this node is on again is not surplus: cancel whatever was queued
 	// for it (the pending map holds at most a handful of slots).
@@ -890,15 +864,13 @@ func (e *Engine) submitAppendLocked(ctx context.Context, rec *data.EventRecord, 
 
 	// Copy the routing fields under the lock: the placement is mutated in
 	// place by the Raft apply loop (OpSlotState/OpLeaderMove), so holding the
-	// *Placement past RUnlock raced a concurrent rollback — it read
-	// MigratingTo as "" mid-write and the forward then dialed an empty peer
-	// address.
+	// *Placement past RUnlock raced a concurrent rollback.
 	e.tableMu.RLock()
 	pp, ok := e.table.Slots[slot]
 	var pState SlotState
-	var pMigratingTo, pLeader string
+	var pLeader string
 	if ok {
-		pState, pMigratingTo, pLeader = pp.State, pp.MigratingTo, pp.Leader
+		pState, pLeader = pp.State, pp.Leader
 	}
 	e.tableMu.RUnlock()
 	if !ok {
@@ -907,33 +879,13 @@ func (e *Engine) submitAppendLocked(ctx context.Context, rec *data.EventRecord, 
 	}
 
 	switch {
-	case pState == SlotMigratingOut && pMigratingTo != "" && pLeader == e.self:
-		// step 4 of migration: source stays leader and keeps serving writes,
-		// and every accepted record is also pushed to the target at the same
-		// seq so the two copies converge before the commit step.
-		//
-		// The push is BEST EFFORT. The target is a replica of this slot, so
-		// the ordinary fetch loop already carries the same records to it and
-		// the migration only commits after the target has caught up
-		// (awaitCaughtUp). A push that fails because the target is not ready
-		// yet — no contiguous prefix locally, a snapshot still importing, no
-		// reachable peer address — therefore must NOT fail the client's
-		// write (it is already durable in the leader's WAL) and must NOT roll
-		// the whole migration back. Failing it did both, and turned every
-		// in-flight append in the migration window into a 10s
-		// watermark timeout plus a duplicated failure on the client's retry.
-		resp, err := e.localAppend(slot, rec)
-		if err != nil {
-			return nil, err
-		}
-		switch {
-		case resp.Status == data.StatusSuccess && resp.Seq > 0:
-			e.forwardBestEffort(ctx, slot, pMigratingTo, resp.Seq, rec)
-		case resp.Status == data.StatusExists && resp.Seq > 0 && resp.Record != nil:
-			// a retried command: make sure the target converged too
-			e.forwardBestEffort(ctx, slot, pMigratingTo, resp.Seq, resp.Record)
-		}
-		return resp, nil
+	case pState == SlotMigratingOut && pLeader == e.self:
+		// The source stays leader for the whole commit window and keeps
+		// serving writes: they queue behind the commit fence and are released
+		// (or redirected) the moment the leader move is applied. There is no
+		// mirroring step — the target is an ordinary replica of this slot and
+		// the fetch path carries every record to it.
+		return e.localAppend(slot, rec)
 	case pState == SlotMigratingOut:
 		// someone else leads a migrating slot: the leader handles forwarding
 		addr := e.clientAddr(pLeader)
@@ -1127,27 +1079,21 @@ func (e *Engine) SubmitBatch(ctx context.Context, slot int32, recs []*data.Event
 	e.tableMu.RLock()
 	pp, ok := e.table.Slots[slot]
 	var pState SlotState
-	var pMigratingTo, pLeader string
+	var pLeader string
 	if ok {
-		pState, pMigratingTo, pLeader = pp.State, pp.MigratingTo, pp.Leader
+		pState, pLeader = pp.State, pp.Leader
 	}
 	e.tableMu.RUnlock()
 
 	switch {
 	case !ok:
 		// single-node / unassigned: serve locally
-		return e.batchLocal(ctx, slot, recs, "")
-	case pState == SlotMigratingOut:
-		if pMigratingTo != "" && pLeader == e.self {
-			// step 4 of migration: source keeps serving and mirrors accepted
-			// records to the target (see submitAppendLocked for why the push is
-			// best effort)
-			return e.batchLocal(ctx, slot, recs, pMigratingTo)
-		} else {
-			return nil, &RedirectError{Kind: data.ErrIDMigrating, Slot: slot, Node: pLeader, Addr: e.clientAddr(pLeader)}
-		}
+		return e.batchLocal(ctx, slot, recs)
+	case pState == SlotMigratingOut && pLeader != e.self:
+		// A migrating slot another node leads: the commit window is theirs.
+		return nil, &RedirectError{Kind: data.ErrIDMigrating, Slot: slot, Node: pLeader, Addr: e.clientAddr(pLeader)}
 	case pLeader == e.self:
-		return e.batchLocal(ctx, slot, recs, "")
+		return e.batchLocal(ctx, slot, recs)
 	default:
 		addr := e.clientAddr(pLeader)
 		if addr == "" {
@@ -1160,7 +1106,7 @@ func (e *Engine) SubmitBatch(ctx context.Context, slot int32, recs []*data.Event
 // batchLocal is the local-execution half of SubmitBatch: land every record in
 // request order, mirror accepted ones to a migration target when set, then
 // wait for the watermark once against the group's max seq.
-func (e *Engine) batchLocal(ctx context.Context, slot int32, recs []*data.EventRecord, fwdTarget string) ([]*data.AppendResponse, error) {
+func (e *Engine) batchLocal(ctx context.Context, slot int32, recs []*data.EventRecord) ([]*data.AppendResponse, error) {
 	out := make([]*data.AppendResponse, len(recs))
 	if s := e.slotAckOf(slot); s != nil {
 		s.appends.Add(uint64(len(recs)))
@@ -1201,14 +1147,6 @@ func (e *Engine) batchLocal(ctx context.Context, slot int32, recs []*data.EventR
 		if resp.Status == data.StatusSuccess && resp.Seq > maxSeq {
 			maxSeq = resp.Seq
 		}
-		if fwdTarget != "" && resp.Seq > 0 {
-			switch resp.Status {
-			case data.StatusSuccess:
-				e.forwardBestEffort(ctx, slot, fwdTarget, resp.Seq, rec)
-			case data.StatusExists:
-				e.forwardBestEffort(ctx, slot, fwdTarget, resp.Seq, resp.Record)
-			}
-		}
 	}
 	e.noteLand(slot, time.Since(tLand))
 	if maxSeq == 0 {
@@ -1233,58 +1171,6 @@ func (e *Engine) batchLocal(ctx context.Context, slot int32, recs []*data.EventR
 		}
 	}
 	return out, nil
-}
-
-// forwardTo pushes a just-appended record (with its leader-assigned seq) to
-// the migration target's WAL. Idempotent: the target ignores records it
-// already has at that seq (e.g. replicated earlier via ordinary fetch).
-func (e *Engine) forwardTo(ctx context.Context, toAddr string, slot int32, seq uint64, rec *data.EventRecord) error {
-	// peer plane: one Replicate RPC carries the raw encoded record (the
-	// old HTTP round-trip base64-wrapped it inside JSON).
-	return e.peerReplicate(ctx, toAddr, slot, seq, rec.EncodeBinary(nil))
-}
-
-// migrationForwardTimeout bounds how long a slot leader keeps mirroring writes
-// to a migration target that is not making progress.
-//
-// The mirror in forwardBestEffort is only a convergence accelerator: the
-// target is a replica and the fetch loop carries the same records to it, so
-// stopping the push can never lose data — the migration commit is gated on
-// the target having caught up (awaitCaughtUp), never on this push. Past this
-// bound the leader stops pushing (writes stay plain leader writes, which is
-// what keeps a stuck migration from taxing every append) and the migration
-// controller's own catch-up timeout aborts the migration cleanly. This is the
-// "a slot must not sit in migrating_out forever" fallback.
-const migrationForwardTimeout = 30 * time.Second
-
-// forwardBestEffort mirrors one accepted record to the migration target and
-// swallows every failure. It never fails the caller's write and never rolls
-// the migration back (see SubmitAppend): a failure means "the target is not
-// ready yet", which the replica fetch loop and the migration's own catch-up
-// wait handle.
-func (e *Engine) forwardBestEffort(ctx context.Context, slot int32, toNode string, seq uint64, rec *data.EventRecord) {
-	if toNode == "" || e.migrationForwardExpired(slot) {
-		return
-	}
-	addr := e.peerAddr(toNode)
-	if addr == "" {
-		return // target not registered (yet); fetch catches up when it is
-	}
-	if err := e.forwardTo(ctx, addr, slot, seq, rec); err != nil {
-		e.logger.Debug("migration forward skipped; target catches up via fetch",
-			"slot", slot, "target", toNode, "error", err)
-	}
-}
-
-// migrationForwardExpired reports whether a slot has been migrating_out longer
-// than migrationForwardTimeout, i.e. its target is not making progress. The
-// exact duration is recorded when the leader first sees the slot migrating
-// (see syncMigrationState).
-func (e *Engine) migrationForwardExpired(slot int32) bool {
-	e.migFwdMu.Lock()
-	since, ok := e.migFwdSince[slot]
-	e.migFwdMu.Unlock()
-	return ok && time.Since(since) > migrationForwardTimeout
 }
 
 // HandleReplicate serves PeerService.Replicate: a migration forwarding push.
@@ -1836,7 +1722,7 @@ func (e *Engine) recordUnreachable(reporter, suspect string) {
 // A migration TARGET that is still catching up does not gate the watermark.
 // It is an extra copy the migration is building (the admission grew the set to
 // factor+1) and not yet one of the replicas the slot's durability promise
-// rests on — the migration only commits after it caught up (awaitCaughtUp).
+// rests on — the handover only commits once the gate proved it caught up.
 // Counting its low LEO froze the watermark below the leader's LEO and made
 // every append block to the 10s wait deadline: the seconds-long pause
 // around a migration. The slot's ordinary replicas still gate normally, so
@@ -1972,14 +1858,19 @@ type replDiag struct {
 	mfetchByHW    atomic.Uint64 // ... whose park ended on an early watermark echo
 	mfetchByDeadl atomic.Uint64 // ... whose park ended on the wait deadline
 	mfetchByCtx   atomic.Uint64 // ... whose park ended because the caller went away
-	parkedNow     atomic.Int64  // parked rounds right now
-	fetchRounds   atomic.Uint64 // follower: fetch rounds issued
-	fetchData     atomic.Uint64 // ... that landed payloads
-	fetchBytes    atomic.Uint64 // payload bytes landed
-	reportsSent   atomic.Uint64 // progress reports posted
-	reportsSlots  atomic.Uint64 // slots covered by those reports
-	lastRoundNS   atomic.Int64  // follower: when the last round returned (0 = never)
-	lastReportNS  atomic.Int64  // follower: when the last report was posted (0 = never)
+	// The catch-up priority's own view (DESIGN §5): how often a follower was
+	// behind on a ring seat (its catch-up is what a layout change waits on) and
+	// how often another session was therefore served at half the budget.
+	mfetchRingCatchUp atomic.Uint64
+	mfetchHalfBudget  atomic.Uint64
+	parkedNow         atomic.Int64  // parked rounds right now
+	fetchRounds       atomic.Uint64 // follower: fetch rounds issued
+	fetchData         atomic.Uint64 // ... that landed payloads
+	fetchBytes        atomic.Uint64 // payload bytes landed
+	reportsSent       atomic.Uint64 // progress reports posted
+	reportsSlots      atomic.Uint64 // slots covered by those reports
+	lastRoundNS       atomic.Int64  // follower: when the last round returned (0 = never)
+	lastReportNS      atomic.Int64  // follower: when the last report was posted (0 = never)
 }
 
 // ReplPeerView is the leader's view of one follower, summed over the slots this
@@ -2005,6 +1896,11 @@ type ReplMfetchView struct {
 	EndedByHW       uint64 `json:"ended_by_hw_echo"`
 	EndedByCtx      uint64 `json:"ended_by_ctx"`
 	ParkedNow       int64  `json:"parked_now"`
+	// Catch-up priority (DESIGN §5): rounds where a follower was behind on a
+	// seat the ring granted it, and rounds another session was served at half
+	// the payload budget because of one.
+	RingCatchUpRounds uint64 `json:"ring_catch_up_rounds"`
+	HalfBudgetRounds  uint64 `json:"half_budget_rounds"`
 }
 
 // ReplFetchView is this node's own tally as a follower.
@@ -2067,6 +1963,7 @@ func (e *Engine) ReplStatsTop(worstN int) ReplView {
 			EndedByWake: d.mfetchByWake.Load(), EndedByDeadline: d.mfetchByDeadl.Load(),
 			EndedByHW:  d.mfetchByHW.Load(),
 			EndedByCtx: d.mfetchByCtx.Load(), ParkedNow: d.parkedNow.Load(),
+			RingCatchUpRounds: d.mfetchRingCatchUp.Load(), HalfBudgetRounds: d.mfetchHalfBudget.Load(),
 		},
 		Fetch: ReplFetchView{
 			Rounds: d.fetchRounds.Load(), DataRounds: d.fetchData.Load(),
@@ -2569,6 +2466,48 @@ func (it *FetchItem) ackCritical() bool {
 // HandleMFetchCtx serves PeerService.MFetch: one multiplexed replica fetch
 // round (all slots a follower takes from this leader, long-polled as a
 // unit). ctx cancels the long-poll (client disconnect / deadline).
+// ringCatchUpWindow bounds how long a follower's ring-catch-up report keeps the
+// other sessions at half budget: a session that stopped reporting (its node went
+// away, the slots moved) must not throttle them forever.
+const ringCatchUpWindow = 30 * time.Second
+
+// noteRingCatchUp records whether the follower reported being behind on a ring
+// seat, which makes its catch-up the critical path of a layout change.
+func (e *Engine) noteRingCatchUp(follower string, pending bool) {
+	if follower == "" || follower == e.self {
+		return
+	}
+	e.fetchRingMu.Lock()
+	defer e.fetchRingMu.Unlock()
+	if pending {
+		if e.fetchRingBusy == nil {
+			e.fetchRingBusy = map[string]time.Time{}
+		}
+		e.fetchRingBusy[follower] = time.Now()
+		return
+	}
+	delete(e.fetchRingBusy, follower)
+}
+
+// ringCatchUpBusy reports whether another follower is currently behind on a
+// ring seat, i.e. whether this round shares the budget with a layout change.
+func (e *Engine) ringCatchUpBusy(self string) bool {
+	e.fetchRingMu.Lock()
+	defer e.fetchRingMu.Unlock()
+	busy := false
+	now := time.Now()
+	for f, at := range e.fetchRingBusy {
+		if now.Sub(at) > ringCatchUpWindow {
+			delete(e.fetchRingBusy, f) // stale: the session stopped reporting
+			continue
+		}
+		if f != self {
+			busy = true
+		}
+	}
+	return busy
+}
+
 func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetchResponse, error) {
 	n := len(req.Slots)
 	if n != len(req.FromSeqs) || n > 8192 {
@@ -2640,7 +2579,15 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 	rest = rest[:n]
 	scan.order = rest
 	rot := int(e.fetchRot.Add(1)) % max(1, n)
-	head, bulk := 0, 0
+	// Within the bulk, the follower's RING seats lead its factor seats. A ring
+	// seat is a share of the layout the node has to carry — it joined, came
+	// back after a failure, or the ring re-spread when a member left — and a
+	// layout change waits for it; a factor seat is an extra copy, pure
+	// redundancy, and can lag. Both classes keep the rotation order inside
+	// themselves, so neither starves its peers.
+	ringSeats := own.ring[req.Follower]
+	head, ringN, bulk := 0, 0, 0
+	ringPending := false
 	for k := 0; k < n; k++ {
 		i := (k + rot) % n
 		if scan.ackCritical(i, req.FromSeqs) {
@@ -2648,10 +2595,20 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 			head++
 			continue
 		}
-		rest[bulk] = i
+		if _, isRing := ringSeats[req.Slots[i]]; isRing && scan.moved[i] {
+			rest[ringN] = i
+			ringN++
+			ringPending = true
+			continue
+		}
+		rest[ringN+bulk] = i
 		bulk++
 	}
-	copy(order[head:], rest[:bulk])
+	copy(order[head:], rest[:ringN+bulk])
+	e.noteRingCatchUp(req.Follower, ringPending)
+	if ringPending {
+		e.diag.mfetchRingCatchUp.Add(1)
+	}
 
 	out := &MFetchResponse{Follower: req.Follower, Items: make([]FetchItem, 0, 64)}
 	// Ledger snapshot: the slots this round reports the follower's positions
@@ -2661,6 +2618,15 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 	var ledgerSlots []int32
 	e.diag.mfetchRounds.Add(1)
 	budget := e.fetchBudget
+	shared := e.ringCatchUpBusy(req.Follower)
+	if shared {
+		e.diag.mfetchHalfBudget.Add(1)
+	}
+	if shared {
+		// Sharing the round with a node whose ring seats a layout change is
+		// waiting on: this session's redundancy traffic takes half.
+		budget /= 2
+	}
 	starved := false
 	served := false
 	// Progress piggyback is applied in bulk after phase 1: per-item calls
@@ -3041,6 +3007,11 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 type ownership struct {
 	gen   uint64
 	words []uint64
+	// ring lists, per follower, the slots whose seat the ring granted it: the
+	// fetch round's priority class (see HandleMFetchCtx). Built with the
+	// snapshot — a grant lands in the table, so it is fresh — and nil while no
+	// layout change is converging, which is the steady state.
+	ring map[string]map[int32]struct{}
 }
 
 func (e *Engine) ownershipSnapshot() *ownership {
@@ -3056,14 +3027,27 @@ func (e *Engine) ownershipSnapshot() *ownership {
 		return o
 	}
 	words := make([]uint64, (e.store.SlotCount+63)/64)
+	var ring map[string]map[int32]struct{}
 	e.tableMu.RLock()
 	for s, p := range e.table.Slots {
 		if p.Leader == e.self && s >= 0 && int(s>>6) < len(words) {
 			words[s>>6] |= 1 << (s & 63)
 		}
+		for node, kind := range p.SeatGrant {
+			if kind != SeatGrantRing || node == e.self {
+				continue
+			}
+			if ring == nil {
+				ring = map[string]map[int32]struct{}{}
+			}
+			if ring[node] == nil {
+				ring[node] = map[int32]struct{}{}
+			}
+			ring[node][s] = struct{}{}
+		}
 	}
 	e.tableMu.RUnlock()
-	o := &ownership{gen: gen, words: words}
+	o := &ownership{gen: gen, words: words, ring: ring}
 	e.own.Store(o)
 	return o
 }

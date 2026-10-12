@@ -218,3 +218,91 @@ func TestTableSnapshotRestore(t *testing.T) {
 		}
 	}
 }
+
+// TestSeatGrantsLabelWhyTheSeatAppeared pins the reason a seat exists, which is
+// what the fetch round's priority class reads: seats the ring hands a node (it
+// joined, came back, or the ring re-spread) are LOAD, seats the replica factor
+// adds to an unchanged membership are redundancy. The two look identical in the
+// data (both are just "behind"), so the label is recorded when the seat appears.
+func TestSeatGrantsLabelWhyTheSeatAppeared(t *testing.T) {
+	e, _ := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	// The initial layout's seats are the ring's own.
+	for s, p := range e.TableSnapshot().Slots {
+		for _, r := range p.Replicas {
+			if got := p.SeatGrant[r]; got != SeatGrantRing {
+				t.Fatalf("slot %d: initial seat %s labelled %q, want %q", s, r, got, SeatGrantRing)
+			}
+		}
+	}
+
+	// A member joins: every seat the ring hands it is load.
+	join(t, e, "node-3", "127.0.0.1:3")
+	applyCmd(t, e, &Command{Op: OpReplanSlots})
+	taken := 0
+	for s, p := range e.TableSnapshot().Slots {
+		if !replicaSetHas(p.Replicas, "node-3") {
+			continue
+		}
+		taken++
+		if got := p.SeatGrant["node-3"]; got != SeatGrantRing {
+			t.Fatalf("slot %d: the joining member's seat is labelled %q, want %q", s, got, SeatGrantRing)
+		}
+	}
+	if taken == 0 {
+		t.Fatal("test setup: the joining member took no seat")
+	}
+
+	// The same membership with a higher factor: only the added seats are new
+	// (and they are redundancy).
+	before := map[int32][]string{}
+	for s, p := range e.TableSnapshot().Slots {
+		before[s] = append([]string(nil), p.Replicas...)
+	}
+	applyCmd(t, e, &Command{Op: OpConfig, Replicas: 3})
+	applyCmd(t, e, &Command{Op: OpReplanSlots})
+	added := 0
+	for s, p := range e.TableSnapshot().Slots {
+		for _, r := range p.Replicas {
+			if replicaSetHas(before[s], r) {
+				continue
+			}
+			added++
+			if got := p.SeatGrant[r]; got != SeatGrantFactor {
+				t.Fatalf("slot %d: seat %s added by a factor rise is labelled %q, want %q", s, r, got, SeatGrantFactor)
+			}
+		}
+	}
+	if added == 0 {
+		t.Fatal("test setup: no slot grew when the factor rose")
+	}
+
+	// A member joins WHILE the factor rises: the whole replan is the ring
+	// settling a new member set, so every seat it adds — the joiner's share and
+	// the churn the repacking gives the members already there — leads.
+	before = map[int32][]string{}
+	for s, p := range e.TableSnapshot().Slots {
+		before[s] = append([]string(nil), p.Replicas...)
+	}
+	join(t, e, "node-4", "127.0.0.1:4")
+	applyCmd(t, e, &Command{Op: OpConfig, Replicas: 4})
+	applyCmd(t, e, &Command{Op: OpReplanSlots})
+	added = 0
+	for s, p := range e.TableSnapshot().Slots {
+		for _, r := range p.Replicas {
+			if replicaSetHas(before[s], r) {
+				continue
+			}
+			added++
+			if got := p.SeatGrant[r]; got != SeatGrantRing {
+				t.Fatalf("slot %d: seat %s added while a member joined is labelled %q, want %q", s, r, got, SeatGrantRing)
+			}
+		}
+	}
+	if added == 0 {
+		t.Fatal("test setup: no slot changed when the member joined")
+	}
+}

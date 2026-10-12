@@ -60,8 +60,8 @@ func TestFollowerRefusesControllerCommandsWithControllerInfo(t *testing.T) {
 		name string
 		call func() error
 	}{
-		{"migrate (StartMigration)", func() error {
-			return e.StartMigration(context.Background(), 0, "node-3")
+		{"migrate (MigrateSlot)", func() error {
+			return e.MigrateSlot(context.Background(), 0, "node-3")
 		}},
 		{"remove-replica (RemoveReplica)", func() error {
 			return e.RemoveReplica(context.Background(), 0, "node-3")

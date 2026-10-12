@@ -16,6 +16,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
@@ -405,7 +406,7 @@ func TestRebalanceHandBackEndToEnd(t *testing.T) {
 
 	// The final round: slot 0 is equivalent now, slot 6 still waits — both
 	// hand back, and slot 0's migration must take the fast path (the
-	// equivalence skip, the fence's ensureTargetConsistent seeing matching
+	// equivalence skip, the fence's last-resort digest check seeing matching
 	// digests: no segment is re-shipped for a copy that is already there).
 	if done := neu.rebalanceRound(ctx, 8); done != 2 {
 		t.Fatalf("want slot 0 back (caught up) + slot 6 (queued last round), got %d moves", done)
@@ -422,6 +423,130 @@ func TestRebalanceHandBackEndToEnd(t *testing.T) {
 	}
 	if left := PlanLeaderRebalance(neu.TableSnapshot()); len(left) != 0 {
 		t.Fatalf("after the hand-backs the ring is reached; leftovers: %v", left)
+	}
+}
+
+// TestRebalanceDropsADivergedTargetAndBacksOff pins step 6's "a forked copy is
+// dropped and re-enters from empty": a target that reports the source's log end
+// offset with a DIFFERENT directory can never converge by fetching (the records
+// above its gap sit in its WAL unreadable), so the rebalance round drops the
+// local copy instead of waiting on it forever — and backs off, or a target that
+// keeps diverging would be dropped every round.
+func TestRebalanceDropsADivergedTargetAndBacksOff(t *testing.T) {
+	src, srcStore := newTestEngine(t, "node-1")
+	src.node = newTestRaftNode(t, src)
+	dst, dstStore := newTestEngine(t, "node-2")
+	srcAddr := newPeerHarness(t, src)
+	dstAddr := newPeerHarness(t, dst)
+
+	join(t, src, "node-1", srcAddr)
+	join(t, src, "node-2", dstAddr)
+	join(t, src, "node-3", "127.0.0.1:3")
+	applyCmd(t, src, &Command{Op: OpPlanSlots})
+
+	// The ring leads slot 1 from node-2 and keeps node-2 in the set; moving the
+	// leadership to node-1 makes the round want to hand it back to node-2.
+	slot := int32(1)
+	base, _ := src.TableSnapshot().Slots[slot]
+	if base.Leader != "node-2" || !replicaSetHas(base.Replicas, "node-2") {
+		t.Fatalf("test setup: slot %d placement %+v", slot, base)
+	}
+	applyCmd(t, src, &Command{Op: OpLeaderMove, Slots: []int32{slot}, NewLeader: "node-1"})
+	ctx := context.Background()
+	if moves := PlanLeaderRebalance(src.TableSnapshot()); len(moves) == 0 {
+		t.Fatalf("test setup: the round has no move for the deviated slot %d", slot)
+	}
+
+	// Source: one aggregate, four versions. Target: the SAME log end offset
+	// reached through two aggregates — the "high LEO, short stream" shape the
+	// digest exists to catch.
+	aggA := aggInSlotOf(t, src, slot, "forkA-")
+	for v := 1; v <= 4; v++ {
+		if _, err := srcStore.Append(makeRecord(aggA, uint32(v), fmt.Sprintf("a-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, prefix := range []string{"forkB-", "forkC-"} {
+		agg := aggInSlotOf(t, src, slot, prefix)
+		if agg == aggA {
+			t.Fatalf("test setup: %s collides with the source aggregate", prefix)
+		}
+		for v := 1; v <= 2; v++ {
+			if _, err := dstStore.Append(makeRecord(agg, uint32(v), fmt.Sprintf("%s-%d", prefix, v))); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if got, want := dstStore.LastSeqOf(slot), srcStore.LastSeqOf(slot); got != want {
+		t.Fatalf("test setup: the fork needs the same log end offset (target %d, source %d)", got, want)
+	}
+
+	// One reading is not evidence: a copy's directory lags its log end offset
+	// while an apply batch lands, which reads exactly like a fork. The window is
+	// zero here so the NEXT round confirms instead of the test waiting.
+	src.divergedConfirm = 0
+	if n := src.rebalanceRound(ctx, 1); n != 0 {
+		t.Fatalf("the round acted %d times on the first diverged reading, want 0 (confirm first)", n)
+	}
+	if got := dstStore.LastSeqOf(slot); got == 0 {
+		t.Fatal("the copy was dropped on its first diverged reading, before any confirmation")
+	}
+	if n := src.rebalanceRound(ctx, 1); n != 1 {
+		t.Fatalf("the confirming round acted %d times, want 1 (the diverged copy dropped)", n)
+	}
+	if got := dstStore.LastSeqOf(slot); got != 0 {
+		t.Fatalf("the diverged copy was not dropped: the target still holds LEO %d", got)
+	}
+	// The drop is heavy (the copy is pulled from scratch), so it backs off
+	// rather than repeating every round.
+	if n := src.rebalanceRound(ctx, 1); n != 0 {
+		t.Fatalf("the round acted %d times right after a drop, want 0 (backoff)", n)
+	}
+	if got := dstStore.LastSeqOf(slot); got != 0 {
+		t.Fatalf("the empty copy should still be empty one round later, got LEO %d", got)
+	}
+}
+
+// TestDivergedConfirmWaitsForTheWindow pins the other half of the confirmation:
+// with the window not elapsed yet, a second reading still does not drop — a
+// directory that is merely settling must survive round after round until it
+// reads consistent again.
+func TestDivergedConfirmWaitsForTheWindow(t *testing.T) {
+	src, srcStore := newTestEngine(t, "node-1")
+	src.node = newTestRaftNode(t, src)
+	dst, dstStore := newTestEngine(t, "node-2")
+	srcAddr := newPeerHarness(t, src)
+	dstAddr := newPeerHarness(t, dst)
+	join(t, src, "node-1", srcAddr)
+	join(t, src, "node-2", dstAddr)
+	join(t, src, "node-3", "127.0.0.1:3")
+	applyCmd(t, src, &Command{Op: OpPlanSlots})
+
+	slot := int32(1)
+	applyCmd(t, src, &Command{Op: OpLeaderMove, Slots: []int32{slot}, NewLeader: "node-1"})
+	aggA := aggInSlotOf(t, src, slot, "waitA-")
+	for v := 1; v <= 4; v++ {
+		if _, err := srcStore.Append(makeRecord(aggA, uint32(v), fmt.Sprintf("a-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, prefix := range []string{"waitB-", "waitC-"} {
+		agg := aggInSlotOf(t, src, slot, prefix)
+		for v := 1; v <= 2; v++ {
+			if _, err := dstStore.Append(makeRecord(agg, uint32(v), fmt.Sprintf("%s-%d", prefix, v))); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	ctx := context.Background()
+	src.divergedConfirm = time.Hour // far away: nothing may be dropped
+	for i := 0; i < 3; i++ {
+		if n := src.rebalanceRound(ctx, 1); n != 0 {
+			t.Fatalf("round %d acted %d times while the confirmation window had not elapsed, want 0", i+1, n)
+		}
+	}
+	if got := dstStore.LastSeqOf(slot); got == 0 {
+		t.Fatal("the copy was dropped although its diverged reading was never confirmed")
 	}
 }
 

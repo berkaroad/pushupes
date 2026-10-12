@@ -116,17 +116,20 @@ func (e *Engine) RunRebalancer(ctx context.Context) {
 	}
 }
 
-// rebalanceRound runs one controller round and returns the number of
-// hand-overs it committed. Exported-to-package test surface: the gates are
-// observable through the return value even when the moves themselves abort on
-// unreachable peers (the engine harness has no data plane).
+// rebalanceRound runs one controller round and returns how many layout
+// transitions it executed. A transition is one step of the handover state
+// machine (see migration.go): stage a target that is not a replica yet, drop a
+// copy that can never converge, or commit a target that already holds the
+// slot's log. The limit bounds steps per round; one step per round makes the
+// loop strictly serial, which is what keeps the number of slots frozen by a
+// commit fence at one.
 func (e *Engine) rebalanceRound(ctx context.Context, limit int) int {
 	if limit <= 0 {
 		return 0
 	}
 	tbl := e.TableSnapshot()
 	if len(tbl.Peers) < 2 || !layoutSettled(tbl) {
-		return 0 // single-node cluster, or a live migration owns the layout: yield to it
+		return 0 // single-node cluster, or a live handover owns the layout: yield to it
 	}
 	moves := PlanLeaderRebalance(tbl)
 	if len(moves) == 0 {
@@ -142,64 +145,76 @@ func (e *Engine) rebalanceRound(ctx context.Context, limit int) int {
 		if srcAddr == "" || dstAddr == "" {
 			continue // a peer that has not registered yet: next round
 		}
-		// Re-read the placement immediately before acting: the round's plan
-		// was computed from a snapshot, and a human migrate may have staged
-		// or committed this slot since. Staging over a live migration would
-		// hijack its target, and a committed move may already be the one we
-		// were going to make (leader == ring leader: nothing to do).
+		// Re-read the placement immediately before acting: the round's plan was
+		// computed from a snapshot, and a human migrate may have staged or
+		// committed this slot since.
 		cur, ok := e.TableSnapshot().Slots[m.Slot]
 		if !ok || cur.State != SlotStable || cur.Leader == m.To {
 			continue
 		}
 		if !e.alive(dstAddr) {
-			continue // the move-back target must be reachable (its liveness
-			// is also what failover is about to re-shape: do not race it)
+			continue // the move-back target must be reachable (its liveness is
+			// also what failover is about to re-shape: do not race it)
 		}
-		// A move that keeps not sticking is throttled before anything is
-		// probed or shipped: without this a target that cannot converge (a
-		// diverged copy) is REPAIRED once per round — a full slot snapshot
-		// every two seconds, forever.
-		if !e.rebalanceRetryReady(m.Slot, m.From, m.To, time.Now()) {
+		// 1) stage: a target outside the replica set has no copy to catch up
+		// from. Joining it to the set is the cheap half of the handover and it
+		// is what starts the fetch; the commit waits for a later round. No
+		// backoff here: nothing was asked of a peer yet and the command is
+		// idempotent.
+		if !replicaListHas(cur.Replicas, m.To) {
+			if _, err := e.stageMigration(ctx, m.Slot, m.To); err != nil {
+				e.loggerf("rebalance: staging slot %d to %s failed: %v (retried next round)", m.Slot, m.To, err)
+				continue
+			}
+			e.logger.Info("rebalance: handover staged; the target now pulls the slot over the fetch path",
+				"slot", m.Slot, "target", m.To, "op", OpSlotAddReplica)
+			done++
 			continue
 		}
-		// Gate the move on the target's copy. Two different refusals live
-		// here, and they must not be conflated:
-		//
-		//   - the target is BEHIND (its fetch is still catching up): wait.
-		//     Handing leadership over now would make the hand-back a full
-		//     snapshot migration, and the point of the ring layout is that
-		//     the data does NOT have to move twice;
-		//
-		//   - the target is DIVERGED (same or higher LEO, different
-		//     directory): wait forever, which is what this used to do. Its
-		//     aggregate directory stopped adopting versions at a gap, so the
-		//     records above that point sit in its WAL unreadable and no
-		//     amount of fetching repairs them — the copy is structurally
-		//     short while its LEO says "in sync". Skipping it leaves the ring
-		//     permanently unbalanced for that slot (observed: 5 slots stuck
-		//     at a settled 559/563/558, rebalance round after round, with no
-		//     log line saying why).
-		//
-		// So a diverged target is handed to the ordinary migration path
-		// instead: StartMigration's ensureTargetConsistent drops such a copy
-		// and rebuilds it from this source before moving leadership, which is
-		// the only thing that repairs it. The move is expensive — a real
-		// rebuild under the fence — and that is the honest price of healing a
-		// replica the leader is still counting as in-sync.
-		equivalent, behind, err := e.slotCopyStatus(ctx, m.Slot, srcAddr, dstAddr)
+		// 2) gate: the target must hold the source's log. BEHIND means the
+		// fetch path still has work — wait, and do not accumulate backoff:
+		// nothing failed. A copy with the same (or a higher) log end offset but
+		// a DIFFERENT directory can never converge by fetching (the records
+		// above the gap sit in its WAL unreadable), so it is dropped here and
+		// pulls again from empty.
+		ready, diverged, err := e.handoverReady(ctx, m.Slot, m.From, m.To)
 		if err != nil {
 			continue // peer-plane error: it will either heal or be caught next round
 		}
-		if behind {
+		if diverged {
+			// One reading is not evidence: confirm it next round first, so a
+			// directory still settling behind its log end offset is not
+			// mistaken for a fork (see confirmDiverged).
+			if !e.confirmDiverged(m.Slot, m.From, m.To, time.Now()) {
+				continue
+			}
+			// The drop is heavy (the copy is pulled from scratch), so it backs
+			// off: without that, a target that keeps diverging would be dropped
+			// every round, forever.
+			if !e.rebalanceRetryReady(m.Slot, m.From, m.To, time.Now()) {
+				continue
+			}
+			e.recordRebalanceAttempt(m.Slot, m.From, m.To, time.Now())
+			e.logger.Warn("rebalance: target holds the source's log end offset but a different directory; dropping it to pull again",
+				"slot", m.Slot, "from", m.From, "to", m.To, "op", "rebalance_repair")
+			if err := e.peerDropSlot(ctx, dstAddr, m.Slot, m.To); err != nil {
+				continue
+			}
+			done++
+			continue
+		}
+		e.clearDiverged(m.Slot) // a consistent or merely-behind reading: forget any fork
+		if !ready {
 			continue // still catching up: the cheap hand-back waits for it
 		}
-		if !equivalent {
-			e.logger.Warn("rebalance: target copy has the source's LEO but a different directory; rebuilding it before handing leadership back",
-				"slot", m.Slot, "from", m.From, "to", m.To, "op", "rebalance_repair")
+		// 3) commit: the fence freezes this slot for the length of a leader
+		// move. A commit that keeps failing backs off.
+		if !e.rebalanceRetryReady(m.Slot, m.From, m.To, time.Now()) {
+			continue
 		}
 		e.recordRebalanceAttempt(m.Slot, m.From, m.To, time.Now())
-		if err := e.StartMigration(ctx, m.Slot, m.To); err != nil {
-			e.loggerf("rebalance: moving slot %d back to %s failed: %v (retried with backoff)", m.Slot, m.To, err)
+		if err := e.commitMigration(ctx, m.Slot, m.To); err != nil {
+			e.loggerf("rebalance: committing slot %d to %s failed: %v (retried with backoff)", m.Slot, m.To, err)
 			continue
 		}
 		e.logger.Info("leader rebalanced back to the ring layout",
@@ -207,29 +222,6 @@ func (e *Engine) rebalanceRound(ctx context.Context, limit int) int {
 		done++
 	}
 	return done
-}
-
-// slotCopyEquivalent reports whether the target's copy of a slot is equivalent
-// to the source's: the same directory digest (aggregate count, total versions,
-// resolvable versions) and not behind the source's LEO. Both nodes are reached
-// over the peer plane; an empty srcAddr means THIS node is the source and reads
-// its own store.
-//
-// The digest — not just the LEO — is what makes the comparison safe to skip
-// a snapshot with. A caught-up in-set replica pulls every record from the
-// current leader's log by seq (idempotent appendAtSeq; a fork is quarantined
-// by the fetch loop, so a diverged copy can never report matching sums). A
-// same-LEO-but-short-stream copy (DESIGN §1.1 rule 3's gap: bytes in the WAL
-// above a stream's tail) fails the digest and takes the ordinary
-// snapshot/rebuild path. This is ensureTargetConsistent's comparison, used
-// before the fence instead of under it: the fence window must stay O(tail).
-//
-// Callers that must tell "not caught up yet" from "never will be" want
-// slotCopyStatus instead — this wrapper is for the migration fast path, which
-// only asks whether the snapshot can be skipped.
-func (e *Engine) slotCopyEquivalent(ctx context.Context, slot int32, srcAddr, dstAddr string) (bool, error) {
-	equivalent, _, err := e.slotCopyStatus(ctx, slot, srcAddr, dstAddr)
-	return equivalent, err
 }
 
 // ---- Retry backoff for hand-overs that do not stick --------------------------
@@ -270,6 +262,41 @@ func rebalanceRetryDelay(attempts int) time.Duration {
 // rebalanceRetryReady reports whether this move may be attempted now. Read-only:
 // it never counts an attempt, so a slot that is merely WAITING (its target still
 // catching up) does not accumulate backoff.
+// divergedConfirmWindow is how long a copy must keep reading as diverged (same
+// log end offset, different directory) before a round acts on it. A copy's
+// directory lags its log end offset for a moment while an apply batch lands,
+// and that reads exactly like a fork: measured on a rejoining node, two slots
+// read diverged with no repair action, and the same data read clean a minute
+// later. Dropping on one reading would make the node pull the whole slot again
+// for nothing.
+const divergedConfirmWindow = 2 * time.Second
+
+// confirmDiverged records this reading and reports whether the copy has been
+// reading as diverged long enough to drop it. The window lives on the engine so
+// tests can pin the confirmation without waiting.
+func (e *Engine) confirmDiverged(slot int32, from, to string, now time.Time) bool {
+	e.rebMu.Lock()
+	defer e.rebMu.Unlock()
+	if e.divSeen == nil {
+		e.divSeen = map[int32]rebalanceAttempt{}
+	}
+	cur, ok := e.divSeen[slot]
+	if ok && cur.from == from && cur.to == to && now.Sub(cur.notBefore) >= e.divergedConfirm {
+		delete(e.divSeen, slot)
+		return true
+	}
+	e.divSeen[slot] = rebalanceAttempt{from: from, to: to, notBefore: now}
+	return false
+}
+
+// clearDiverged forgets a copy's diverged reading: a round has just read it as
+// consistent or merely behind, so a later fork confirms from scratch.
+func (e *Engine) clearDiverged(slot int32) {
+	e.rebMu.Lock()
+	delete(e.divSeen, slot)
+	e.rebMu.Unlock()
+}
+
 func (e *Engine) rebalanceRetryReady(slot int32, from, to string, now time.Time) bool {
 	e.rebMu.Lock()
 	defer e.rebMu.Unlock()
@@ -386,6 +413,9 @@ func (e *Engine) reclaimRound(ctx context.Context, limit int) int {
 		drop := surplusSeatForReplan(cur, tbl.Replicas, planned[s].Replicas)
 		if drop == "" {
 			continue
+		}
+		if e.migrationInFlight(s) {
+			continue // a handover is building a copy of this slot: its seat is not surplus
 		}
 		if !e.seatRetryReady(s, drop, time.Now()) {
 			continue

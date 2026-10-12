@@ -194,7 +194,7 @@ Body: Record*，每条记录：
   节点一律以记录为准（`-peers` 只当种子）；之后增删成员走运行时变更（admin 加删成员，
   见下文 §运行时成员变更）。不支持 PreVote/ReadIndex。
   它只复制元数据——
-  slot 分配表（`slot → {leader, replicas[], epoch, state}`）、集群成员、
+  slot 分配表（`slot → {leader, replicas[], epoch, state, seat_grant[]}`）、集群成员、
   节点数据面地址（`OpRegister`，见 §6 peer 面）。FSM 模型：
   `Applier` 接口 + 快照/恢复（快照为二进制表编码 `table_bin.go`，1680 槽
   ~350KB JSON → 几 KB）。成员集合由静态 voter 集唯一决定；路由表里每个成员
@@ -223,7 +223,7 @@ Body: Record*，每条记录：
     收到的裸 WAL 字节按 seq 校验后**原样写入**（`Slot.AppendFrameAtSeq` /
     `Segment.AppendFrame`），内存索引只从帧头解析（`data.DecodeRecordMeta`，
     不物化事件体）——复制路径不 decode 成记录再 re-encode，100KiB 事件体下
-    每条省掉两份大分配与两次全量拷贝（迁移写转发 `Replicate` 同路径）。
+    每条省掉两份大分配与两次全量拷贝（提交栅栏的冻结尾巴推送 `Replicate` 同路径）。
     leader 端还设有全局 payload 预算与轮转游标，防止积压的槽被饿死。
     应答语义：**请求到达时已有数据的槽立即随响应返回（有数据即答，不在长轮询
     里滞留）**，全部为空才进入等待；等待期间任一槽被 append 唤醒时做
@@ -331,18 +331,16 @@ Body: Record*，每条记录：
   自报 client 地址（clientAddr）的节点才算在线，只 join 未注册的节点既不在环
   上、也绝不会成为回切目标，因此宕机期间剩余在线节点之间也会互相平衡，节点
   重新注册后自动回到环上）的 stable 槽，每轮**只提交一次**（主关键路径严格串行：
-  任一时刻只有一个槽在交接栅栏上；回切目标与源端摘要等价，单个交接=元数据+
-  毫秒级栅栏，560 槽最坏情况 560 轮收敛）经**既有六步热迁移**的 leader_move 通道迁回环上的预期
-  leader。安全门禁：任一秒位在迁移中（如人工 migrate 在飞）整轮让路；回切目标
-  必须已完成注册且 Ping 存活；目标副本必须与源端**摘要等价**（LEO 不低于源且
-  aggregates/versions/resolvable 三元组相等）才动手——因此回切全程走迁移的快
-  路径（摘要等价即跳过快照，不重传封段；副本追平 leader 走的是普通 fetch，
-  与再平衡无关）。**没成的交接按槽退避重试**（2s→4s→…→上限 1 分钟；记录按
-  (from,to) 键控，故障切换换了端点即视为新交接、立刻可试）：目标摘要永远修不好时，
-  没有它就会每轮做一次整槽重建（封段重传），也就是「每 2 秒一次全槽快照」；等待
-  目标追平（LEO 落后）不计入退避，只是让路。0=关闭再平衡；负数启动即报错。每一轮
-  先做 leader 交接、再做**席位回收**（`reclaimRound`，见下面「副本集重排」）：两件事
-  共用同一个 cadence、batch 与让路门禁。
+  任一时刻只有一个槽在交接栅栏上；560 槽最坏情况 560 轮收敛）由控制器驱动 §5 的三阶段
+  链路迁回环上的预期 leader。安全门禁：任一秒位在迁移中（如人工 migrate 在飞）整轮让路；
+  回切目标必须已完成注册且 Ping 存活。每轮按槽推进**一步**：目标不在副本集就入场
+  （`OpSlotAddReplica`），在副本集且已持有源端日志就提交（fence + `OpLeaderMove`），
+  摘要不一致（同 LEO 不同目录）则丢弃该副本让它重新入场；等待目标追平（LEO 落后）
+  只是让路，不计入退避。**失败按槽退避重试**（2s→4s→…→上限 1 分钟；记录按
+  (from,to) 键控，故障切换换了端点即视为新交接、立刻可试）——丢弃副本与提交栅栏都会
+  按这个退避重试，所以一个修不好的目标不会每轮被丢一次。0=关闭再平衡；负数启动即报错。
+  每一轮先做 leader 交接、再做**席位回收**（`reclaimRound`，见下面「副本集重排」）：
+  两件事共用同一个 cadence 与让路门禁，且各自每轮推进一次提交。
 - **默认拓扑**：`slot_count=1680`（固定）。每槽副本数由**副本策略**（replica
   policy）分档决定，策略值存放在 Raft 复制的槽表里、全集群一份：
   `low` = 1 份、`medium` = 2 份（默认）、`high` = 容错节点数 + 1，即
@@ -408,57 +406,85 @@ Body: Record*，每条记录：
   预期 leader（epoch 递增，与其它换主路径同一把栅栏），而同一次补席已经把这个 leader 补进了
   它的副本集，所以补完即有写者、无需再交接。
 
-## 5. 槽位热迁移（文件级搬运）
+## 5. 槽位热迁移（副本构建三阶段）
 
-槽是迁移的原子单位；WAL 段文件自包含，迁移的大部分工作是**整文件拷贝**，
-不需要解析事件——这正是按槽迁移相较按聚合迁移的核心优势。
+槽是布局变更的原子单位。任何让某个槽多一个副本、或换一个 leader 的动作都走同一条链路，
+**不区分起因**（副本因子提升、节点加入/重加入、leader 回切、分叉副本修复）：
 
-槽状态：`stable → migrating(源) / importing(目标) → stable`（epoch 递增）。
+**一次布局变更 = 入场 → 追平 → 提交**
 
-六步热迁移（源 S → 目标 T，由 controller 发起，全程不停写）：
+1. **入场（stage，Raft 命令，便宜）**：把目标节点加入该槽的副本集
+   （`OpSlotAddReplica`，幂等）。不动 leader、不搬数据、不冻结写入。目标从此以**普通副本**身份
+   跟随该槽——与晚加入的副本完全同构。
+2. **追平（catch up，只走 fetch）**：目标用复制协议（`PeerService.MFetch`）按 seq 拉取，
+   每槽每轮 ≤4MiB、整轮 ≤`maxPayloadBytes`（32MiB，尾巴优先）。追平中的席位不参与该槽的
+   水位 min（`advanceHW` 排除），也不被写入等待（`waitForHW` 只等 ack holder），
+   所以写入不受影响：追平速度只影响布局收敛时间。
+   追平也**不按先来后到**：环席位（节点新加入 / 重加入、或成员离开后环重新分摊得到的槽）先于
+   因子补的席位。判据不能从"谁落后"推——因子提升同样让每个节点在大量槽上落后，形态一样——所以由
+   **席位授权时的原因**决定并随表复制：`Placement.SeatGrant[node] ∈ {ring, factor}` ——
+   一次 replan 若发生在成员目录相对上次规划有变化时（加入 / 重加入 / 成员离开后环重新分摊），
+   它补的席位整批记 `ring`（加载，整环都要收敛，所以一起优先）；成员集合不变、只是因子抬升
+   补出来的席位记 `factor`（冗余）。`OpSlotAddReplica` 的席位是交接目标，也记 `ring`。fetch 轮在同一会话内把位置分三类——
+   ack 关键尾巴 → 环席位 → 因子席位，类内保持轮转顺序；跨会话则让正在追平环席位的节点拿满轮预算、
+   其余会话按半预算服务。尾巴不参与预算让路，所以写入 ack 永不被这条规则牵连。规则自己可见：
+   `/admin/stats` 的 `repl.mfetch.ring_catch_up_rounds` / `half_budget_rounds`；注意单副本布局
+   （因子 1）里一个节点的环席位就是它自己领的槽，停机再拉起后不存在副本侧的环追平，计数为 0。
+3. **提交（commit，有界、串行）**：只有 leader 交还需要提交——
+   （a）置 `slot → migrating_out, migrating_to=T`（读客户端提前改道，写请求进入栅栏排队）；
+   （b）**commit fence**：源端冻结该槽写入（排队，不失败）、吸干在途写、把**冻结尾巴**按 seq
+   推给目标（`PeerService.Replicate`，O(尾巴)），并只在目标**确认持有冻结 LEO 且已落盘**
+   （`SlotLeo{flush:true}` → `durable_leo ≥ 冻结 LEO`，有界等待）后才返回——已提交的 leader_move
+   是终态，源端副本随后不再是可恢复的那一份，单副本布局下目标若带着未刷盘的尾巴掉电会丢已确认写；
+   （c）`OpLeaderMove`（epoch+1）原子切换 leader；
+   （d）回收多余席位（`OpSlotRemoveReplica`，best effort）。
+   栅栏是唯一的冻结窗口，且每轮 controller 只提交一次（严格串行），所以任一时刻被冻结的槽 ≤1。
 
-1. **准备**：controller 经 Raft 把 `slot → T` 写入 T 分配表（state=importing），
-   S 置 state=migrating。
-2. **快照拷贝**：S 上该槽所有**已封段**（非活动段）经 `PeerService.PushSegments`
-   **client-streaming 分块**（≤4MiB/块）流式拷到 T，两端内存占用为 O(块)
-   而非 O(槽)；payload 为原始 WAL 字节，无 base64/JSON 层；T 从流的前 20
-   字节装配并校验每段 header 的 magic/slotID/baseSeq 后才落盘（写 .tmp 再改名）。
-3. **增量追平**：T 从 `lastCopiedSeq+1` 起用与复制相同的 PeerService.MFetch
-   协议向 S 拉增量记录；迁移协调者轮询双端 LEO（`PeerService.SlotLeo`）直到
-   `T.leo >= S.leo`（超时 30s 回滚）。期间写请求仍由 S 正常处理。
-4. **写转发窗口**：S 对该槽新写入经 `PeerService.Replicate` **同步转发** T 落盘
-   （seq 以 S 为准，T 按相同 seq 追加），直到 S 侧无积压。窗口毫秒级，对客户端只是该槽写延迟
-   微增。
-5. **切换提交**：controller 经 Raft 原子更新分配表：`slot leader=T,
-   epoch+1, state=stable`；S 置 `backing-up`。
-6. **清理**：S 在**自己观察到已离开该槽的副本集**（既不是 leader、也不在
-   `replicas` 里）之后，才在**本地**开始倒计时——计时由源节点自己掌握，
-   不依赖控制器：控制器既不持有那份副本，也不该为一次可能回滚的迁移启动
-   保留期。倒计时到期即 `DropSlot` 删除本地副本。开始倒计时的条件是**副本集成员
-   资格的丢失**，而不是"当过迁移源"：
-   - **集外迁移**（目标不在副本集）：T 先被加进副本集（集合变成 factor+1），leader
-     切到 T 后由回收步骤（`OpSlotRemoveReplica`）把 S 移出集合 —— S 这才真正变成
-     多余副本，开始倒计时；
-   - **集内迁移**（目标本来就在副本集里）：没有任何成员被移除，S 仍是 RF 的一部分，
-     **不启动倒计时、不置灰、数据永不删** —— 如果按"谁当过迁移源"来判断，就会在这个场景里删错数据。
-   每次丢失成员资格都**重新开始**倒计时；上一轮的调度一律作废，绝不复用旧的到期时刻
-   （复用会让新一轮的副本在旧窗口到点时被立刻删掉，延迟删除就变成了立即删除）。
-   时长 = `-drop-after`（默认 30s，`0` 取默认值，负数启动即报错）；**没有关闭选项**：
-   前源节点的那份副本已成死数据，长期留在盘上会把节点写满。倒计时期间该调度对
-   admin 面可见（`/admin/writes` 的 `dropping[]`、`/admin/slots/{slot}/describe` 的
-   `pending_drop_at`），控制台据此把该副本置灰（它已不在 `replicas` 里，因此渲染在
-   副本集旁边）。若期间该槽又回到本节点名下（回滚、故障切换或又被加回副本集），
-   取消调度、保留数据；到期时还会**再查一次表**，成员/leader 的副本一律不删。
-   倒计时只存在于内存：进程重启即丢失，副本保留（等下一轮迁移或人工回收），
-   **重启绝不删数据**。
+**提交前置判据（唯一）**：`slotCopyStatus` 比较两端目录摘要与 LEO——
+
+- 目标 LEO 落后 ⇒ 等待（fetch 还有活干，不累计退避）；
+- 摘要一致且不落后 ⇒ 可提交；
+- **同一 LEO、摘要不同** ⇒ 目标的结构性短缺（§1.1 规则 3），fetch 永远修不好 ⇒
+  丢弃该副本（`PeerService.DropSlot`）让它从空重新拉，而不是原地修。这个「分叉」判定要
+  **复核确认**：副本的聚合目录在 apply 批落地前会短暂落后于自己的 LEO，读起来与分叉一样
+  （实测抓到过这种瞬时读数，一分钟后再读已干净）。所以门只在**同一分叉读数持续到下一轮**时
+  才动手丢（`confirmDiverged`，窗口 2s），读到一致或仅落后即清候选。
+
+完整性由**提交门**负责（摘要一致 + 目标不落后，在栅栏之前完成）；fence 内的守卫只拦
+**分叉**方向——目标持有源端没有的版本；提交窗口因此保持 O(尾巴)。
+
+`Replicate` 只服务提交栅栏的**冻结尾巴**（一次一条记录、同 seq 幂等落盘）。
+**槽状态**：`stable → migrating_out(源) → stable`（epoch 递增）。`migrating_out` 只在提交窗口
+出现：入场与追平期间槽保持 stable，读写照常由源端服务。
+
+**回收让路**：`reclaimRound` 跳过在飞交接的槽——操作员点名的目标可以不是环上预期的席位，
+回收不得把正在追平的那个副本当成多余副本删掉（否则提交时会发现目标已不在副本集）。
+
+**清理（前源副本）**：源节点在**自己观察到已失去该槽副本集成员资格**之后才开始倒计时——
+计时由源节点自己掌握，不依赖控制器：控制器既不持有那份副本，也不该为一次可能回滚的迁移启动
+保留期。倒计时到期即 `DropSlot` 删除本地副本。开始倒计时的条件是**成员资格的丢失**，
+而不是"当过迁移源"：
+
+- **目标不在副本集**（入场加过席位）：leader 切到 T 后由回收步骤（`OpSlotRemoveReplica`）
+  把 S 移出集合——S 这才真正变成多余副本，开始倒计时；
+- **目标本来就在副本集里**：没有任何成员被移除，S 仍是 RF 的一部分，**不启动倒计时、不置灰、
+  数据永不删**——如果按"谁当过迁移源"来判断，就会在这个场景里删错数据。
+
+每次丢失成员资格都**重新开始**倒计时；上一轮的调度一律作废，绝不复用旧的到期时刻
+（复用会让新一轮的副本在旧窗口到点时被立刻删掉，延迟删除就变成了立即删除）。
+时长 = `-drop-after`（默认 30s，`0` 取默认值，负数启动即报错）；**没有关闭选项**：前源节点的
+那份副本已成死数据，长期留在盘上会把节点写满。倒计时期间该调度对 admin 面可见
+（`/admin/writes` 的 `dropping[]`、`/admin/slots/{slot}/describe` 的 `pending_drop_at`），
+控制台据此把该副本置灰。若期间该槽又回到本节点名下（回滚、故障切换或又被加回副本集），
+取消调度、保留数据；到期时还会**再查一次表**，成员/leader 的副本一律不删。倒计时只存在于
+内存：进程重启即丢失，副本保留（等下一轮迁移或人工回收），**重启绝不删数据**。
 
 客户端路由：
 
-- 本地缓存 `slot → node` 路由表（gRPC `node` 字段携带目标节点 client 地址），
-  MOVED 驱动刷新。
-- 迁移窗口内写 S：S 内部转发（对读请求返回 ASK 重定向指向 T）。
+- 本地缓存 `slot → node` 路由表（gRPC `node` 字段携带目标节点 client 地址），MOVED 驱动刷新。
+- 提交窗口内写源端：写请求在 fence 上排队后照常落盘；读请求返回 ASK 重定向指向 T。
 - 提交后命中旧路由：返回 `MOVED(1003)` 重定向。
-- 幂等规则保证转发写不产生重复：两侧 command_id 相同，命中 exists 即收敛。
+- 幂等规则保证重试不产生重复：两侧 command_id 相同，命中 exists 即收敛。
 
 ## 6. API 设计
 
@@ -506,7 +532,7 @@ Body: Record*，每条记录：
   旧的 `{"_b64":...}` 方案在大 body 上要付出 json.Valid 全量校验 + base64 重建 +
   解码往返的 CPU（实测 100KiB body 下占 leader CPU 一半），已随 HTTP 事件面退役
   一并删除。
-- **peer 面（Raft + PeerService gRPC，默认 `-peer http://127.0.0.1:8391`，`PUSHUPES_PEER`）**：复制槽位分配表等元数据（Raft），并承载**全部节点间数据面**——副本拉取、LEO 上报/探活、迁移快照/段拷贝/写转发/LEO 追平、地址注册协议（proto3 契约 `proto/pushupes/v1/peer.proto`，`pushupes.v1.PeerService`，服务端 `peersvc.go`）。**运维只配这一个端口**：`-peers` 主格式 `node-id=http://ip:peerport`（或裸 `ip:peerport`，地址兼作节点 id）。**地址统一规范：存储/路由表/status JSON 中所有 admin/client/peer 地址都带 scheme——未写协议默认补 `http://`，显式协议以传入为准；TCP 拨号（listen/dial/gRPC/Raft transport）前再剥掉 scheme**（`cluster.NormalizeAddr`/`HostPort`）。admin/client 地址不配置，由各节点自报进路由表：
+- **peer 面（Raft + PeerService gRPC，默认 `-peer http://127.0.0.1:8391`，`PUSHUPES_PEER`）**：复制槽位分配表等元数据（Raft），并承载**全部节点间数据面**——副本拉取、LEO 上报/探活、提交栅栏的冻结尾巴推送、LEO 追平、地址注册协议（proto3 契约 `proto/pushupes/v1/peer.proto`，`pushupes.v1.PeerService`，服务端 `peersvc.go`）。**运维只配这一个端口**：`-peers` 主格式 `node-id=http://ip:peerport`（或裸 `ip:peerport`，地址兼作节点 id）。**地址统一规范：存储/路由表/status JSON 中所有 admin/client/peer 地址都带 scheme——未写协议默认补 `http://`，显式协议以传入为准；TCP 拨号（listen/dial/gRPC/Raft transport）前再剥掉 scheme**（`cluster.NormalizeAddr`/`HostPort`）。admin/client 地址不配置，由各节点自报进路由表：
   - peer 端口上是复用监听器（`peerMux`/`peer_mux.go`，实现共识层的 `raft.Transport`）：按连接**首字节 `P`**（HTTP/2 client preface `"PRI ..."` 以 `P` 开头）把 PeerService gRPC 流量与共识流量分流（自研 Raft 的握手首字节是 magic `0x9E`，**断言 ≠ 'P'**，永不冲突；两路都经 `replayConn` 回填被 peek 消费的字节）。gRPC 服务端由 `Engine.ServePeer` 挂在该分流 listener 上，peer 面与共识层从此共用一个端口、一套 gRPC 语义（HTTP/2 多路复用，每对节点一条缓存连接 `peerClient`，keepalive 10s，服务端放宽 enforcement）。
   - leader 收到注册 RPC 后提交 `OpRegister`（就地修补路由表中该成员的 `AdminAddr/ClientAddr`，不新增成员——成员集合仍由 Raft 配置决定）；follower 收到则转发给 leader 的 peer 地址。
   - announcer 幂等周期重试（启动期 1s，收敛后转 10s 心跳），任意启动顺序都能收敛；节点换端口重启也会被自报值修补。
@@ -523,10 +549,9 @@ gRPC  EventService/PrefetchRoutes  路由表预取（无请求参数；返回全
 # ---- peer 面（PeerService gRPC，与 Raft 同端口，proto/pushupes/v1/peer.proto）----
 gRPC  PeerService/MFetch          副本拉取（长轮询，多槽复用，payload=裸 WAL 字节）
 gRPC  PeerService/ReplicaProgress 副本 LEO 上报（批量）
-gRPC  PeerService/Replicate       迁移写转发（同 seq 落盘）
-gRPC  PeerService/SlotLeo         查询节点某槽 LEO（迁移追平判定，见 §5 步骤3+4）
-gRPC  PeerService/PushSegments    迁移段拷贝（client-streaming，≤4MiB 分块，原始 bytes）
-gRPC  PeerService/TriggerSnapshot 迁移快照（源端向目标推封段）
+gRPC  PeerService/Replicate       提交栅栏的冻结尾巴推送（同 seq 落盘，幂等）
+gRPC  PeerService/SlotLeo         查询节点某槽 LEO（提交前置判据，见 §5）
+gRPC  PeerService/DropSlot        丢弃对端某槽本地副本（分叉副本重新入场用）
 gRPC  PeerService/Ping            探活（controller 故障切换）
 gRPC  PeerService/Register        数据面地址自报（OpRegister 提交/转发）
 gRPC  PeerService/Adopt           新节点自报入编（add_member 提交/转发，见 §6.1）
@@ -753,7 +778,7 @@ UI 只在治理发生的对象——节点——上呈现。数据都不走新�
   flush 策略与复制确认语义（leader 等 ISR 高水位覆盖该 seq 才回 success），
   组提交合并（dirty 集合定向刷盘，不遍历全槽）。
 - **二进制协议面**：节点间流量全部 PeerService gRPC（protobuf 二进制帧，
-  `FetchItem.payload`/`PushSegmentsRequest.data` 为裸 WAL 字节区间，不经
+  `FetchItem.payload`（以及 `ReplicateRequest` 的裸记录）为裸 WAL 字节区间，不经
   base64/重编码）；客户端事件面 gRPC protobuf，body 原始 bytes。
   路由表快照同为二进制编码（字符串字典 + varint + gzip）。
   **sendfile 零拷贝已实测否决**：payload 约 40-64KiB、需用户态解码过滤、

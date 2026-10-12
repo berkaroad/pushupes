@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// A migration is staged by StartMigration's first step (a replicated
+// A handover is staged by the admission step (a replicated
 // migrating_out placement) and cleared only by the goroutine that staged it.
 // When that goroutine is gone — the controller restarted mid-hand-over — the
 // slot stays non-stable forever: replan_slots skips non-stable slots and the

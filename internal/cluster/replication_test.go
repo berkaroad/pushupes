@@ -18,10 +18,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -48,6 +44,21 @@ func aggInSlot(t *testing.T, e *Engine, slot int32) string {
 		}
 	}
 	t.Fatalf("no aggregate lands on slot %d", slot)
+	return ""
+}
+
+// aggInSlotOf finds an aggregate id with the given prefix that routes to the
+// slot. Prefixes keep the caller's aggregates distinct from each other, which
+// is what a divergence shape needs (two aggregates where the source has one).
+func aggInSlotOf(t *testing.T, e *Engine, slot int32, prefix string) string {
+	t.Helper()
+	for i := 0; i < 100000; i++ {
+		cand := fmt.Sprintf("%s%d", prefix, i)
+		if e.SlotOf(cand) == slot {
+			return cand
+		}
+	}
+	t.Fatalf("no aggregate with prefix %q routes to slot %d", prefix, slot)
 	return ""
 }
 
@@ -275,221 +286,6 @@ func TestSubmitAppendMigratingRedirectsToSource(t *testing.T) {
 	}
 }
 
-// ---- migration abort path ---------------------------------------------------
-
-// fakeChunks plays back a chunk list through the chunkSource interface.
-type fakeChunks struct {
-	chunks []*pushupesv1.PushSegmentsRequest
-	i      int
-}
-
-func (f *fakeChunks) Recv() (*pushupesv1.PushSegmentsRequest, error) {
-	if f.i >= len(f.chunks) {
-		return nil, io.EOF
-	}
-	c := f.chunks[f.i]
-	f.i++
-	return c, nil
-}
-
-func TestWriteSegmentsRejectsCorrupt(t *testing.T) {
-	e, _ := newTestEngine(t, "node-2")
-	// header claims slot 5 but the stream says slot 0
-	seg, err := storage.CreateSegment(t.TempDir(), 5, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	segPath := seg.Path
-	seg.Close()
-	raw, err := os.ReadFile(segPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = e.writeSegments(&fakeChunks{chunks: []*pushupesv1.PushSegmentsRequest{
-		{Slot: 0, Name: "x.wal", Size: uint64(len(raw))},
-		{Slot: 0, Data: raw},
-	}})
-	if err == nil || !strings.Contains(err.Error(), "header slot") {
-		t.Fatalf("expected slot mismatch refusal, got %v", err)
-	}
-	// first chunk shorter than the WAL header and the stream then ends:
-	// the header never assembles, so the file comes up short
-	err = e.writeSegments(&fakeChunks{chunks: []*pushupesv1.PushSegmentsRequest{
-		{Slot: 0, Name: "y.wal", Size: 8},
-		{Slot: 0, Data: raw[:8]},
-	}})
-	if err == nil || !strings.Contains(err.Error(), "got 0 of 8") {
-		t.Fatalf("expected incomplete-stream refusal, got %v", err)
-	}
-	// announced size never fully arrives (valid slot-0 header, one byte short)
-	seg0, err := storage.CreateSegment(t.TempDir(), 0, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := seg0.Append(1, makeRecord("agg-1", 1, "c-1")); err != nil {
-		t.Fatal(err)
-	}
-	seg0.Close()
-	raw0, err := os.ReadFile(seg0.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = e.writeSegments(&fakeChunks{chunks: []*pushupesv1.PushSegmentsRequest{
-		{Slot: 0, Name: "z.wal", Size: uint64(len(raw0))},
-		{Slot: 0, Data: raw0[:len(raw0)-1]},
-	}})
-	if err == nil || !strings.Contains(err.Error(), "bytes") {
-		t.Fatalf("expected incomplete-stream refusal, got %v", err)
-	}
-	// nothing landed, no .tmp debris
-	entries, _ := os.ReadDir(e.store.SlotDir(0))
-	for _, en := range entries {
-		t.Fatalf("unexpected file after refused imports: %s", en.Name())
-	}
-}
-
-func TestWriteSegmentsAcceptsGoodStream(t *testing.T) {
-	e, _ := newTestEngine(t, "node-2")
-	dir := t.TempDir()
-	seg, err := storage.CreateSegment(dir, 0, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := seg.Append(1, makeRecord("agg-1", 1, "c-1")); err != nil {
-		t.Fatal(err)
-	}
-	segPath := seg.Path
-	seg.Close()
-	raw, err := os.ReadFile(segPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	name := filepath.Base(segPath)
-	// split into 3-byte chunks: header must survive streaming regardless
-	var chunks []*pushupesv1.PushSegmentsRequest
-	chunks = append(chunks, &pushupesv1.PushSegmentsRequest{Slot: 0, Name: name, Size: uint64(len(raw))})
-	for off := 0; off < len(raw); off += 3 {
-		end := min(off+3, len(raw))
-		chunks = append(chunks, &pushupesv1.PushSegmentsRequest{Slot: 0, Data: raw[off:end]})
-	}
-	if err := e.writeSegments(&fakeChunks{chunks: chunks}); err != nil {
-		t.Fatalf("good stream refused: %v", err)
-	}
-	got, err := os.ReadFile(filepath.Join(e.store.SlotDir(0), name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != len(raw) {
-		t.Fatalf("imported %d bytes want %d", len(got), len(raw))
-	}
-}
-
-// TestMigratingForwardFailureKeepsWriteAndSlot replaces the old
-// "a failed write forward rolls the slot back" expectation. A dead migration
-// target (nothing listening on its peer address) must not fail the client's
-// write — it is already durable in the source WAL — and must not roll the
-// whole migration back either. The source stays leader, keeps serving, and
-// leaves the abort decision to the migration controller's own catch-up
-// timeout (awaitCaughtUp), which is the only place with the whole picture.
-func TestMigratingForwardFailureKeepsWriteAndSlot(t *testing.T) {
-	e, st := newTestEngine(t, "node-1")
-	e.node = newTestRaftNode(t, e)
-
-	join(t, e, "node-1", "127.0.0.1:1")
-	join(t, e, "node-2", "127.0.0.1:9") // nothing listening there
-	applyCmd(t, e, &Command{Op: OpPlanSlots})
-
-	// 2 records so there is content, in slot 0 which node-1 leads.
-	aggAB := aggInSlot(t, e, 0)
-	for v := uint64(1); v <= 2; v++ {
-		if _, err := st.Append(makeRecord(aggAB, uint32(v), fmt.Sprintf("ab-%d", v))); err != nil {
-			t.Fatal(err)
-		}
-	}
-	applyCmd(t, e, &Command{Op: OpSlotState, Slots: []int32{0}, State: SlotMigratingOut, MigratingTo: "node-2"})
-	e.syncMigrationState()
-	e.fwdMu.RLock()
-	_, forwarding := e.fwd[0]
-	e.fwdMu.RUnlock()
-	if !forwarding {
-		t.Fatal("expected forwarding map populated during migrating_out")
-	}
-
-	// The write during the window is served by the source and its mirror push
-	// to the dead target fails fast: the write must still be acknowledged.
-	out, err := e.SubmitAppend(context.Background(), makeRecord(aggAB, 3, "ab-3"))
-	if err != nil {
-		t.Fatalf("a failed migration push must not fail the client write: %v", err)
-	}
-	if out == nil || out.Status != data.StatusSuccess || out.Seq != 3 {
-		t.Fatalf("write not acknowledged off the local copy: %+v", out)
-	}
-	if leo := st.LastSeqOf(0); leo != 3 {
-		t.Fatalf("source LEO %d want 3", leo)
-	}
-	// the slot keeps migrating: only a per-write push failed, not the migration
-	if p, _ := e.TableSnapshot().Slots[0]; p.State != SlotMigratingOut || p.MigratingTo != "node-2" {
-		t.Fatalf("a failed push rolled the migration back: %+v", p)
-	}
-	// a replayed command after the failed push is still idempotent
-	out, err = e.SubmitAppend(context.Background(), makeRecord(aggAB, 3, "ab-3"))
-	if err != nil || out.Status != data.StatusExists {
-		t.Fatalf("post-push replay: %+v %v", out, err)
-	}
-}
-
-// TestMigratingForwardNotContiguousKeepsWriteAndMigration is the regression
-// test for the migration-forward stall. The target is a LIVE peer that does
-// not hold the slot yet (its seq counter is 0 — a snapshot/catch-up still in
-// flight, or a replica the post-migration cleanup recycled), so the push of
-// seq 3 is refused with "seq 3 not contiguous (counter 0)". That refusal is an
-// internal catch-up fact, not a client failure: before the fix the engine
-// returned it to the client AND rolled the migration back, which turned every
-// in-flight append in the migration window into a failure — and the client's
-// retry (which takes the EXISTS path) into another one. Now the write is
-// acknowledged off its durable local copy, the slot keeps migrating, and the
-// target is left to catch up over the ordinary fetch loop.
-func TestMigratingForwardNotContiguousKeepsWriteAndMigration(t *testing.T) {
-	leader, st := newTestEngine(t, "node-1")
-	leader.node = newTestRaftNode(t, leader)
-
-	// a live target peer whose local copy of the slot does not exist yet
-	tgt, tgtStore := newTestEngine(t, "node-2")
-	tgtAddr := newPeerHarness(t, tgt)
-
-	join(t, leader, "node-1", "127.0.0.1:1")
-	join(t, leader, "node-2", tgtAddr)
-	applyCmd(t, leader, &Command{Op: OpPlanSlots})
-
-	agg := aggInSlot(t, leader, 0)
-	for v := uint64(1); v <= 2; v++ {
-		if _, err := st.Append(makeRecord(agg, uint32(v), fmt.Sprintf("nc-%d", v))); err != nil {
-			t.Fatal(err)
-		}
-	}
-	applyCmd(t, leader, &Command{Op: OpSlotState, Slots: []int32{0}, State: SlotMigratingOut, MigratingTo: "node-2"})
-	leader.syncMigrationState()
-
-	resp, err := leader.SubmitAppend(context.Background(), makeRecord(agg, 3, "nc-3"))
-	if err != nil {
-		t.Fatalf("a forward the target refuses as non-contiguous must not fail the write: %v", err)
-	}
-	if resp == nil || resp.Status != data.StatusSuccess || resp.Seq != 3 {
-		t.Fatalf("write not acknowledged off the local copy: %+v", resp)
-	}
-	if leo := st.LastSeqOf(0); leo != 3 {
-		t.Fatalf("leader LEO %d want 3", leo)
-	}
-	// the migration was NOT rolled back and the slot is still writable here
-	if p, _ := leader.TableSnapshot().Slots[0]; p.State != SlotMigratingOut || p.MigratingTo != "node-2" {
-		t.Fatalf("migration must stay staged, got %+v", p)
-	}
-	// the target genuinely had no prefix: the push really was refused
-	if leo := tgtStore.LastSeqOf(0); leo != 0 {
-		t.Fatalf("target LEO %d want 0 (the push must really have failed)", leo)
-	}
-}
-
 // TestLeaderGainDropsStaleFollowerHW pins the leadership-change reset. A node
 // that starts leading a slot used to keep the previous term's follower
 // positions in its replication bookkeeping; their LEOs are as of the old
@@ -528,44 +324,6 @@ func TestLeaderGainDropsStaleFollowerHW(t *testing.T) {
 	e.replMu.Unlock()
 	if positions != 0 || hw != 0 {
 		t.Fatalf("a newly gained leader must drop the previous term's stale follower positions: %d position(s), hw %d", positions, hw)
-	}
-}
-
-// TestMigratingForwardExpires pins the migrating_out timeout fallback: a slot
-// that has been migrating_out past migrationForwardTimeout stops mirroring,
-// so a target that never catches up cannot keep every write paying for a
-// doomed push (the persistent-collapse path). Returning to stable clears the
-// deadline so a later migration starts with a fresh window.
-func TestMigrationForwardExpires(t *testing.T) {
-	e, _ := newTestEngine(t, "node-1")
-	e.node = newTestRaftNode(t, e)
-	join(t, e, "node-1", "127.0.0.1:1")
-	join(t, e, "node-2", "127.0.0.1:9")
-	applyCmd(t, e, &Command{Op: OpPlanSlots})
-
-	applyCmd(t, e, &Command{Op: OpSlotState, Slots: []int32{0}, State: SlotMigratingOut, MigratingTo: "node-2"})
-	e.syncMigrationState()
-	if e.migrationForwardExpired(0) {
-		t.Fatal("a freshly staged migration must still mirror")
-	}
-	e.migFwdMu.Lock()
-	if _, ok := e.migFwdSince[0]; !ok {
-		e.migFwdMu.Unlock()
-		t.Fatal("staging must record the forward deadline")
-	}
-	e.migFwdSince[0] = time.Now().Add(-migrationForwardTimeout - time.Second)
-	e.migFwdMu.Unlock()
-	if !e.migrationForwardExpired(0) {
-		t.Fatal("a migration older than the timeout must stop mirroring")
-	}
-
-	applyCmd(t, e, &Command{Op: OpSlotState, Slots: []int32{0}, State: SlotStable})
-	e.syncMigrationState()
-	e.migFwdMu.Lock()
-	_, still := e.migFwdSince[0]
-	e.migFwdMu.Unlock()
-	if still {
-		t.Fatal("a slot back to stable must not keep a forward deadline")
 	}
 }
 
@@ -1275,6 +1033,142 @@ func TestFetchServesAckCriticalTailBeforeBacklog(t *testing.T) {
 	// tail behind the backlog would still be reported a whole bulk apply later.
 	if len(resp.Items) == 0 || resp.Items[0].Slot != tail {
 		t.Fatalf("the ack-critical slot must lead the round, got slots %v", itemSlots(resp.Items))
+	}
+}
+
+// TestFetchServesRingSeatsBeforeFactorSeats pins the priority class inside the
+// bulk: a seat the ring granted a node is load it has to carry and the layout
+// change waits for it, an extra seat the factor added is redundancy. Both look
+// the same in the data (the follower is behind on both), so the table's seat
+// label decides — and the request here lists the factor seat FIRST, so a plain
+// rotation would serve it first.
+func TestFetchServesRingSeatsBeforeFactorSeats(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	join(t, e, "node-3", "127.0.0.1:3")
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	// Two slots led here: one where node-2 keeps the seat the ring's own plan
+	// gave it, one where its seat arrives from a factor rise.
+	var ringSlot, factorSlot int32 = -1, -1
+	for s := int32(0); s < st.SlotCount; s++ {
+		if !e.Leads(s) || !replicaSetHas(e.TableSnapshot().Slots[s].Replicas, "node-2") {
+			continue
+		}
+		if ringSlot < 0 {
+			ringSlot = s
+			continue
+		}
+		factorSlot = s
+		break
+	}
+	if ringSlot < 0 || factorSlot < 0 {
+		t.Fatalf("need two slots led here holding node-2 (ring=%d factor=%d)", ringSlot, factorSlot)
+	}
+
+	// factorSlot: drop node-2's seat, then let the factor rise add it back —
+	// an unchanged membership, so the seat it gets is redundancy.
+	applyCmd(t, e, &Command{Op: OpSlotRemoveReplica, Slots: []int32{factorSlot}, NodeID: "node-2"})
+	applyCmd(t, e, &Command{Op: OpConfig, Replicas: 3})
+	applyCmd(t, e, &Command{Op: OpReplanSlots})
+	for slot, want := range map[int32]string{ringSlot: SeatGrantRing, factorSlot: SeatGrantFactor} {
+		if got := e.TableSnapshot().Slots[slot].SeatGrant["node-2"]; got != want {
+			t.Fatalf("test setup: slot %d grant for node-2 is %q, want %q", slot, got, want)
+		}
+	}
+
+	// Both slots carry more than one round's budget and node-2 needs both from
+	// their start.
+	for _, s := range []int32{ringSlot, factorSlot} {
+		agg := aggInSlot(t, e, s)
+		for v := uint32(1); v <= 200; v++ {
+			if _, err := st.Append(makeRecord(agg, v, fmt.Sprintf("s%d-%d", s, v))); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	e.fetchBudget = 2048         // one round can carry either side, not both
+	e.fetchRot.Store(^uint64(0)) // pin rot=0: the request order is the visit order
+	req := MFetchRequest{
+		Follower: "node-2",
+		Slots:    []int32{factorSlot, ringSlot}, // redundancy first: rotation would serve it first
+		FromSeqs: []uint64{1, 1},
+	}
+	resp, err := e.HandleMFetch(req)
+	if err != nil {
+		t.Fatalf("mfetch: %v", err)
+	}
+	if len(resp.Items) == 0 || resp.Items[0].Slot != ringSlot {
+		t.Fatalf("the ring seat must lead the round, got slots %v (%d items)", itemSlots(resp.Items), len(resp.Items))
+	}
+}
+
+// TestFetchSharesTheBudgetWithARingCatchUp pins the cross-session rule: while a
+// follower is behind on a ring seat, the other sessions are served at half the
+// round budget — that follower's catch-up is what a layout change waits on,
+// the others are redundancy work that can lag. The rule must expire with the
+// catch-up, or a stopped session would throttle the cluster forever.
+func TestFetchSharesTheBudgetWithARingCatchUp(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	slot := int32(-1)
+	for s := int32(0); s < st.SlotCount; s++ {
+		if e.Leads(s) {
+			slot = s
+			break
+		}
+	}
+	if slot < 0 {
+		t.Fatal("need a slot led here")
+	}
+	agg := aggInSlot(t, e, slot)
+	for v := uint32(1); v <= 400; v++ {
+		if _, err := st.Append(makeRecord(agg, v, fmt.Sprintf("s-%d", v))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// node-2 is seated as a hand-over target: its seat is a ring grant, and its
+	// catch-up is the layout change's critical path.
+	applyCmd(t, e, &Command{Op: OpSlotAddReplica, Slots: []int32{slot}, NodeID: "node-2"})
+	e.fetchBudget = 4096
+
+	pull := func(follower string, from uint64) *MFetchResponse {
+		t.Helper()
+		resp, err := e.HandleMFetch(MFetchRequest{Follower: follower, Slots: []int32{slot}, FromSeqs: []uint64{from}})
+		if err != nil {
+			t.Fatalf("mfetch %s: %v", follower, err)
+		}
+		return resp
+	}
+	served := func(resp *MFetchResponse) int {
+		n := 0
+		for _, it := range resp.Items {
+			n += len(it.Payload)
+		}
+		return n
+	}
+
+	// The ring holder reports itself behind: it takes the whole budget.
+	if n := served(pull("node-2", 1)); n == 0 {
+		t.Fatal("the ring catch-up round was served nothing")
+	}
+	// Another follower's round now shares the round with it: half the budget.
+	half := served(pull("node-3", 1))
+	if half == 0 {
+		t.Fatal("the sharing round was served nothing")
+	}
+	if half > int(e.fetchBudget)/2 {
+		t.Fatalf("a round shared with a ring catch-up served %d bytes, want at most %d", half, e.fetchBudget/2)
+	}
+	// The ring holder reports nothing left behind: the budget is whole again.
+	pull("node-2", 401)
+	full := served(pull("node-3", 1))
+	if full <= int(e.fetchBudget)/2 {
+		t.Fatalf("a round with no ring catch-up served %d bytes, want more than %d", full, e.fetchBudget/2)
 	}
 }
 

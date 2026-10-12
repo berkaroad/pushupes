@@ -40,8 +40,14 @@ import (
 
 const (
 	tableMagic = "PTAB"
-	// v4 adds the replica policy tier after the replica count in the header.
-	tableVer = byte(4)
+	// v5 appends, after the slots, the member directory the layout was planned
+	// under and — per slot — why each seat exists (ring = load, factor =
+	// redundancy). The fetch round ranks a node's catch-up by that label, so it
+	// has to survive a snapshot. v4 is the same file without them.
+	tableVer = byte(5)
+	// tableVerNoGrant is the v4 form: the replica policy tier in the header,
+	// and no seat grants.
+	tableVerNoGrant = byte(4)
 	// tableVerPolicy is the v3 form: it predates the policy tier, and its
 	// factor was the fault-tolerance derivation — the high tier says exactly
 	// that, so a v3 snapshot restores as high and the controller re-derives
@@ -129,6 +135,12 @@ func (t *Table) EncodeTableBinary() []byte {
 		if p.MigratingTo != "" {
 			nodeID(p.MigratingTo)
 		}
+		for name := range p.SeatGrant {
+			nodeID(name)
+		}
+	}
+	for _, m := range t.PlanMembers {
+		nodeID(m)
 	}
 
 	var body bytes.Buffer
@@ -189,6 +201,30 @@ func (t *Table) EncodeTableBinary() []byte {
 		} else {
 			body.WriteByte(noNode)
 		}
+		// v5: the seats of this slot with a reason (sorted for determinism).
+		granted := make([]string, 0, len(p.SeatGrant))
+		for name := range p.SeatGrant {
+			granted = append(granted, name)
+		}
+		sort.Strings(granted)
+		n = binary.PutUvarint(tmp[:], uint64(len(granted)))
+		body.Write(tmp[:n])
+		for _, name := range granted {
+			body.WriteByte(nodeID(name))
+			if p.SeatGrant[name] == SeatGrantRing {
+				body.WriteByte(seatGrantRingCode)
+			} else {
+				body.WriteByte(seatGrantFactorCode)
+			}
+		}
+	}
+	// v5: the directory the layout was planned under.
+	planned := append([]string(nil), t.PlanMembers...)
+	sort.Strings(planned)
+	n = binary.PutUvarint(tmp[:], uint64(len(planned)))
+	body.Write(tmp[:n])
+	for _, m := range planned {
+		body.WriteByte(nodeID(m))
 	}
 
 	var out bytes.Buffer
@@ -213,10 +249,11 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return nil, fmt.Errorf("table: short header: %w", err)
 	}
-	if string(hdr[0:4]) != tableMagic || (hdr[4] != tableVer && hdr[4] != tableVerPolicy) {
+	if string(hdr[0:4]) != tableMagic || (hdr[4] != tableVer && hdr[4] != tableVerNoGrant && hdr[4] != tableVerPolicy) {
 		return nil, fmt.Errorf("table: bad snapshot magic/version")
 	}
-	policyInHeader := hdr[4] == tableVer // v4 carries the tier in the header
+	policyInHeader := hdr[4] != tableVerPolicy // v4 and later carry the tier in the header
+	withGrants := hdr[4] == tableVer           // v5 carries the seat grants
 	var tmp4 [4]byte
 	readU32 := func() (uint32, error) {
 		if _, err := io.ReadFull(r, tmp4[:]); err != nil {
@@ -355,10 +392,73 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 				return nil, err
 			}
 		}
-		t.Slots[int32(slot)] = &Placement{Leader: leader, Replicas: reps, Epoch: int64(ev), State: state, MigratingTo: mig}
+		pl := &Placement{Leader: leader, Replicas: reps, Epoch: int64(ev), State: state, MigratingTo: mig}
+		if withGrants {
+			gn, err := binary.ReadUvarint(r)
+			if err != nil {
+				return nil, err
+			}
+			if gn > 255 {
+				return nil, fmt.Errorf("table: too many seat grants %d", gn)
+			}
+			if gn > 0 {
+				pl.SeatGrant = make(map[string]string, gn)
+			}
+			for j := uint64(0); j < gn; j++ {
+				ni, err := r.ReadByte()
+				if err != nil {
+					return nil, err
+				}
+				name, err := node(ni)
+				if err != nil {
+					return nil, err
+				}
+				kc, err := r.ReadByte()
+				if err != nil {
+					return nil, err
+				}
+				switch kc {
+				case seatGrantRingCode:
+					pl.SeatGrant[name] = SeatGrantRing
+				case seatGrantFactorCode:
+					pl.SeatGrant[name] = SeatGrantFactor
+				default:
+					return nil, fmt.Errorf("table: bad seat grant code %d", kc)
+				}
+			}
+		}
+		t.Slots[int32(slot)] = pl
+	}
+	if withGrants {
+		pn, err := binary.ReadUvarint(r)
+		if err != nil {
+			return nil, err
+		}
+		if pn > 1<<20 {
+			return nil, fmt.Errorf("table: too many planned members %d", pn)
+		}
+		planned := make([]string, 0, pn)
+		for j := uint64(0); j < pn; j++ {
+			mi, err := r.ReadByte()
+			if err != nil {
+				return nil, err
+			}
+			name, err := node(mi)
+			if err != nil {
+				return nil, err
+			}
+			planned = append(planned, name)
+		}
+		t.PlanMembers = planned
 	}
 	return t, nil
 }
+
+// Seat-grant codes on the wire (v5).
+const (
+	seatGrantRingCode   = byte(0)
+	seatGrantFactorCode = byte(1)
+)
 
 func readStr(r *bytes.Reader) (string, error) {
 	l, err := binary.ReadUvarint(r)

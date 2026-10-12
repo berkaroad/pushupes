@@ -350,7 +350,7 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60_000_000_000) // 60s
 	defer cancel()
-	if err := s.Engine.StartMigration(ctx, int32(slot), req.ToNode); err != nil {
+	if err := s.Engine.MigrateSlot(ctx, int32(slot), req.ToNode); err != nil {
 		if refuseNotController(w, err) {
 			return
 		}

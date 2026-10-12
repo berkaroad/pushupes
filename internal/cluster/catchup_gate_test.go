@@ -28,14 +28,15 @@ import (
 // must be locatable through its aggregate's directory, or nothing can read it
 // while its LEO still counts it.
 //
-// The migration catch-up gate compares LEOs (rule 2 territory) and so cannot see
-// a rule-3 gap. The fence's pushFrames is where such a gap can be created: it
-// ships from the target's self-reported LEO, so an aggregate whose records sit
-// above that LEO arrives at a version the target does not continue, lands in the
-// WAL, and is not adopted by the directory.
+// A migration target can be in exactly that state: its LEO (which counts seqs)
+// has caught up while one aggregate's stream is short, so every records-per-LEO
+// comparison passes. The COMMIT GATE is what refuses such a copy — it compares
+// the two directories (aggregate/version/resolvable counts), and a divergence at
+// the same log end offset is the one case fetching can never repair, so the gate
+// reports it and the hand-over drops the copy (rebalanceRound, MigrateSlot)
+// instead of moving leadership onto records the new leader cannot serve.
 //
-// This test drives the gate itself with such a target and records whether it
-// passes.
+// This test builds that copy and pins the gate's verdict on it.
 func TestCatchUpGateAcceptsInvisibleRecords(t *testing.T) {
 	// --- source: a slot with the aggregate pushed to a high seq by a partner.
 	srcStore, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
@@ -128,25 +129,40 @@ func TestCatchUpGateAcceptsInvisibleRecords(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// The fence's actual work: the source brings the target up to the frozen LEO.
-	// This must go through pushFencedTail, not pushFrames directly — the
-	// consistency check and the rebuild live there, and calling pushFrames
-	// bypasses exactly the guard this test exists to verify.
-	tgtLEO := tgtStore.LastSeqOf(slot)
+	// Two verdicts, in the order a hand-over meets them. First the copy is
+	// BEHIND (its log end offset still trails the source's): nothing failed,
+	// the fetch path has work left, so the gate waits. Reading the peers goes
+	// through the peer plane (empty srcAddr = this node's own copy).
+	ready, diverged, err := src.handoverReady(ctx, slot, "node-1", "node-2")
+	if err != nil {
+		t.Fatalf("handoverReady (behind): %v", err)
+	}
+	if ready || diverged {
+		t.Fatalf("a copy that is still behind must make the gate WAIT (ready=%v diverged=%v)", ready, diverged)
+	}
+	t.Logf("gate while behind: srcLEO=%d tgtLEO=%d -> wait", srcLEO, tgtStore.LastSeqOf(slot))
+
+	// Let the copy reach the source's log end offset, the way the fetch path
+	// and the fence's tail push do. The records counted by that LEO are on the
+	// target's disk; its DIRECTORY is short, which is the part an LEO-only
+	// comparison cannot see.
 	if err := src.pushFencedTail(ctx, slot, srcLEO); err != nil {
 		t.Fatalf("pushFencedTail: %v", err)
 	}
-
-	// What the gate observes: the target's LEO now equals the source's.
-	nowLEO := tgtStore.LastSeqOf(slot)
-	if nowLEO != srcLEO {
-		t.Fatalf("target LEO %d, want %d (the fence should have brought it level)", nowLEO, srcLEO)
+	if got := tgtStore.LastSeqOf(slot); got != srcLEO {
+		t.Fatalf("target LEO %d, want %d (the tail push should level it)", got, srcLEO)
 	}
-	t.Logf("gate inputs: srcLEO=%d tgtLEO=%d -> tgtLEO >= srcLEO is %v (gate would PASS)",
-		srcLEO, nowLEO, nowLEO >= srcLEO)
-	_ = tgtLEO
+	ready, diverged, err = src.handoverReady(ctx, slot, "node-1", "node-2")
+	if err != nil {
+		t.Fatalf("handoverReady (level): %v", err)
+	}
+	if ready || !diverged {
+		t.Fatalf("a short directory AT the source's log end offset must be reported DIVERGED (ready=%v diverged=%v): "+
+			"fetching cannot repair it, so the hand-over drops the copy and it pulls again from empty", ready, diverged)
+	}
 
-	// What a reader observes for the pushed aggregate.
+	// The observable cause: the records are on the target's disk while its
+	// directory does not serve them.
 	srcTail, err := srcStore.TailVersionOf(agg, 0)
 	if err != nil {
 		t.Fatalf("source tail: %v", err)
@@ -159,81 +175,9 @@ func TestCatchUpGateAcceptsInvisibleRecords(t *testing.T) {
 	if err != nil {
 		t.Fatalf("target read: %v", err)
 	}
-	t.Logf("source tail=%d | target tail=%d records=%d", srcTail, tgtTail, len(tgtRecs))
-
-	// The gap: records are on the target's disk but the directory does not serve
-	// them, while the LEO the gate compares has already counted them.
-	_, _, payload, err := tgtStore.ReadSlotBytes(slot, uint64(tgtLEO+4), uint64(tgtLEO+5), 1<<20)
-	if err == nil && len(payload) > 0 {
-		m, _, derr := data.DecodeRecordMeta(payload)
-		if derr == nil {
-			t.Logf("target seq %d on disk: agg=%s version=%d (invisible: tail says %d)",
-				tgtLEO+4, m.AggregateID, m.Version, tgtTail)
-		}
-	}
-
-	if tgtTail != srcTail {
-		t.Errorf("rule 3 violated and the catch-up gate cannot see it: target tail %d != source tail %d "+
-			"while the gate compares LEOs (%d >= %d passes), so a migration would commit with records "+
-			"the new leader cannot serve", tgtTail, srcTail, nowLEO, srcLEO)
-	}
-}
-
-// The companion negative control: when the target genuinely holds the aggregate,
-// the same push brings its tail level with the source's. Without this, the test
-// above could pass by the push simply never working.
-func TestCatchUpGateSeesCompleteTarget(t *testing.T) {
-	srcStore, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer srcStore.Close()
-	src := NewEngine(nil, srcStore, "node-1", nil)
-
-	tgtStore, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tgtStore.Close()
-	tgt := NewEngine(nil, tgtStore, "node-2", nil)
-
-	agg := "gate-ok"
-	slot := srcStore.SlotOf(agg)
-	rec := func(v uint32) *data.EventRecord {
-		return &data.EventRecord{
-			AggregateID: agg, Version: v,
-			CommandID: agg + "-c" + strconv.Itoa(int(v)),
-			Events:    []data.Event{{Type: "E", Body: []byte("x")}},
-		}
-	}
-	for v := uint32(1); v <= 5; v++ {
-		if _, err := srcStore.Append(rec(v)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Target holds the first three, so the push delivers a CONTIGUOUS tail.
-	for v := uint32(1); v <= 3; v++ {
-		if err := tgtStore.AppendAtSeq(slot, uint64(v), rec(v)); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	tgtAddr := newPeerHarness(t, tgt)
-	src.registerPeerForTest(t, "node-2", tgtAddr)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	srcLEO := srcStore.LastSeqOf(slot)
-	if err := src.pushFrames(ctx, tgtAddr, slot, tgtStore.LastSeqOf(slot)+1, srcLEO); err != nil {
-		t.Fatalf("pushFrames: %v", err)
-	}
-
-	srcTail, _ := srcStore.TailVersionOf(agg, 0)
-	tgtTail, err := tgtStore.TailVersionOf(agg, 0)
-	if err != nil {
-		t.Fatalf("target tail: %v", err)
-	}
-	if tgtTail != srcTail {
-		t.Errorf("contiguous push left target tail %d != source tail %d", tgtTail, srcTail)
+	t.Logf("source tail=%d | target tail=%d records=%d (same LEO, different directory)",
+		srcTail, tgtTail, len(tgtRecs))
+	if tgtTail >= srcTail {
+		t.Fatalf("test setup: the target's directory should be short of the source's (target tail %d, source tail %d)", tgtTail, srcTail)
 	}
 }

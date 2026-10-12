@@ -28,8 +28,6 @@ const (
 	PeerService_SlotLeo_FullMethodName           = "/pushupes.v1.PeerService/SlotLeo"
 	PeerService_FenceSlot_FullMethodName         = "/pushupes.v1.PeerService/FenceSlot"
 	PeerService_SlotLeader_FullMethodName        = "/pushupes.v1.PeerService/SlotLeader"
-	PeerService_PushSegments_FullMethodName      = "/pushupes.v1.PeerService/PushSegments"
-	PeerService_TriggerSnapshot_FullMethodName   = "/pushupes.v1.PeerService/TriggerSnapshot"
 	PeerService_DropSlot_FullMethodName          = "/pushupes.v1.PeerService/DropSlot"
 	PeerService_ReportUnreachable_FullMethodName = "/pushupes.v1.PeerService/ReportUnreachable"
 	PeerService_SlotLeos_FullMethodName          = "/pushupes.v1.PeerService/SlotLeos"
@@ -44,7 +42,7 @@ const (
 // as the Raft transport (the peer port): the connection demux routes the
 // HTTP/2 preface (first byte 'P') here and every other first byte to
 // Raft. All node-to-node communication — replication fetch, LEO progress,
-// migration forwarding/segments/snapshot, liveness probing and address
+// commit-fence forwarding, liveness probing and address
 // registration — rides this one gRPC surface; the admin port is
 // management-only.
 type PeerServiceClient interface {
@@ -86,13 +84,6 @@ type PeerServiceClient interface {
 	// back to the source: an infinite MOVED/ASK ping-pong for the length of the
 	// follower apply lag (clients with a small redirect budget fail).
 	SlotLeader(ctx context.Context, in *SlotLeaderRequest, opts ...grpc.CallOption) (*SlotLeaderResponse, error)
-	// PushSegments streams sealed WAL segments of a slot into the importing
-	// node (migration snapshot step) in bounded messages — the source never
-	// holds a whole segment in memory.
-	PushSegments(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushSegmentsRequest, PushSegmentsResponse], error)
-	// TriggerSnapshot asks this node, as migration source, to push its
-	// sealed segments of a slot to the target.
-	TriggerSnapshot(ctx context.Context, in *TriggerSnapshotRequest, opts ...grpc.CallOption) (*TriggerSnapshotResponse, error)
 	// DropSlot discards this node's local copy of one slot and reopens it empty.
 	// Used by the migration fence when a target's streams are inconsistent with
 	// its LEO (DESIGN.md §1.1 rule 3): the increment that would repair it cannot
@@ -218,29 +209,6 @@ func (c *peerServiceClient) SlotLeader(ctx context.Context, in *SlotLeaderReques
 	return out, nil
 }
 
-func (c *peerServiceClient) PushSegments(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushSegmentsRequest, PushSegmentsResponse], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PeerService_ServiceDesc.Streams[0], PeerService_PushSegments_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[PushSegmentsRequest, PushSegmentsResponse]{ClientStream: stream}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type PeerService_PushSegmentsClient = grpc.ClientStreamingClient[PushSegmentsRequest, PushSegmentsResponse]
-
-func (c *peerServiceClient) TriggerSnapshot(ctx context.Context, in *TriggerSnapshotRequest, opts ...grpc.CallOption) (*TriggerSnapshotResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(TriggerSnapshotResponse)
-	err := c.cc.Invoke(ctx, PeerService_TriggerSnapshot_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *peerServiceClient) DropSlot(ctx context.Context, in *DropSlotRequest, opts ...grpc.CallOption) (*DropSlotResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DropSlotResponse)
@@ -289,7 +257,7 @@ func (c *peerServiceClient) SlotSizes(ctx context.Context, in *SlotSizesRequest,
 // as the Raft transport (the peer port): the connection demux routes the
 // HTTP/2 preface (first byte 'P') here and every other first byte to
 // Raft. All node-to-node communication — replication fetch, LEO progress,
-// migration forwarding/segments/snapshot, liveness probing and address
+// commit-fence forwarding, liveness probing and address
 // registration — rides this one gRPC surface; the admin port is
 // management-only.
 type PeerServiceServer interface {
@@ -331,13 +299,6 @@ type PeerServiceServer interface {
 	// back to the source: an infinite MOVED/ASK ping-pong for the length of the
 	// follower apply lag (clients with a small redirect budget fail).
 	SlotLeader(context.Context, *SlotLeaderRequest) (*SlotLeaderResponse, error)
-	// PushSegments streams sealed WAL segments of a slot into the importing
-	// node (migration snapshot step) in bounded messages — the source never
-	// holds a whole segment in memory.
-	PushSegments(grpc.ClientStreamingServer[PushSegmentsRequest, PushSegmentsResponse]) error
-	// TriggerSnapshot asks this node, as migration source, to push its
-	// sealed segments of a slot to the target.
-	TriggerSnapshot(context.Context, *TriggerSnapshotRequest) (*TriggerSnapshotResponse, error)
 	// DropSlot discards this node's local copy of one slot and reopens it empty.
 	// Used by the migration fence when a target's streams are inconsistent with
 	// its LEO (DESIGN.md §1.1 rule 3): the increment that would repair it cannot
@@ -399,12 +360,6 @@ func (UnimplementedPeerServiceServer) FenceSlot(context.Context, *FenceSlotReque
 }
 func (UnimplementedPeerServiceServer) SlotLeader(context.Context, *SlotLeaderRequest) (*SlotLeaderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SlotLeader not implemented")
-}
-func (UnimplementedPeerServiceServer) PushSegments(grpc.ClientStreamingServer[PushSegmentsRequest, PushSegmentsResponse]) error {
-	return status.Error(codes.Unimplemented, "method PushSegments not implemented")
-}
-func (UnimplementedPeerServiceServer) TriggerSnapshot(context.Context, *TriggerSnapshotRequest) (*TriggerSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method TriggerSnapshot not implemented")
 }
 func (UnimplementedPeerServiceServer) DropSlot(context.Context, *DropSlotRequest) (*DropSlotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DropSlot not implemented")
@@ -601,31 +556,6 @@ func _PeerService_SlotLeader_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PeerService_PushSegments_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(PeerServiceServer).PushSegments(&grpc.GenericServerStream[PushSegmentsRequest, PushSegmentsResponse]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type PeerService_PushSegmentsServer = grpc.ClientStreamingServer[PushSegmentsRequest, PushSegmentsResponse]
-
-func _PeerService_TriggerSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(TriggerSnapshotRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(PeerServiceServer).TriggerSnapshot(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: PeerService_TriggerSnapshot_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).TriggerSnapshot(ctx, req.(*TriggerSnapshotRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _PeerService_DropSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DropSlotRequest)
 	if err := dec(in); err != nil {
@@ -742,10 +672,6 @@ var PeerService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _PeerService_SlotLeader_Handler,
 		},
 		{
-			MethodName: "TriggerSnapshot",
-			Handler:    _PeerService_TriggerSnapshot_Handler,
-		},
-		{
 			MethodName: "DropSlot",
 			Handler:    _PeerService_DropSlot_Handler,
 		},
@@ -762,12 +688,6 @@ var PeerService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _PeerService_SlotSizes_Handler,
 		},
 	},
-	Streams: []grpc.StreamDesc{
-		{
-			StreamName:    "PushSegments",
-			Handler:       _PeerService_PushSegments_Handler,
-			ClientStreams: true,
-		},
-	},
+	Streams:  []grpc.StreamDesc{},
 	Metadata: "pushupes/v1/peer.proto",
 }

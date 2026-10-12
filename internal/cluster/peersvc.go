@@ -187,9 +187,18 @@ func (s *peerServer) Replicate(_ context.Context, req *pushupesv1.ReplicateReque
 
 func (s *peerServer) SlotLeo(_ context.Context, req *pushupesv1.SlotLeoRequest) (*pushupesv1.SlotLeoResponse, error) {
 	leo, aggregates, versions, resolvable := s.e.HandleSlotLeo(req.Slot)
-	return &pushupesv1.SlotLeoResponse{
+	resp := &pushupesv1.SlotLeoResponse{
 		Leo: leo, Aggregates: aggregates, Versions: versions, Resolvable: resolvable,
-	}, nil
+	}
+	if req.Flush {
+		// The fence's durability probe: make the tail durable before answering.
+		dur, err := s.e.HandleSlotFlush(req.Slot)
+		if err != nil {
+			return nil, err
+		}
+		resp.DurableLeo = dur
+	}
+	return resp, nil
 }
 
 func (s *peerServer) FenceSlot(ctx context.Context, req *pushupesv1.FenceSlotRequest) (*pushupesv1.FenceSlotResponse, error) {
@@ -205,20 +214,6 @@ func (s *peerServer) FenceSlot(ctx context.Context, req *pushupesv1.FenceSlotReq
 func (s *peerServer) SlotLeader(_ context.Context, req *pushupesv1.SlotLeaderRequest) (*pushupesv1.SlotLeaderResponse, error) {
 	leader, epoch := s.e.HandleSlotLeader(req.Slot)
 	return &pushupesv1.SlotLeaderResponse{Leader: leader, Epoch: epoch}, nil
-}
-
-func (s *peerServer) PushSegments(stream pushupesv1.PeerService_PushSegmentsServer) error {
-	if err := s.e.writeSegments(stream); err != nil {
-		return err
-	}
-	return stream.SendAndClose(&pushupesv1.PushSegmentsResponse{})
-}
-
-func (s *peerServer) TriggerSnapshot(ctx context.Context, req *pushupesv1.TriggerSnapshotRequest) (*pushupesv1.TriggerSnapshotResponse, error) {
-	if err := s.e.HandleSnapshotCommand(ctx, req.Slot, req.ToNode); err != nil {
-		return nil, err
-	}
-	return &pushupesv1.TriggerSnapshotResponse{}, nil
 }
 
 // DropSlot discards this node's local copy of a slot. The migration fence calls
@@ -435,25 +430,6 @@ func (e *Engine) peerSlotLeader(ctx context.Context, addr string, slot int32) (s
 		return "", 0, err
 	}
 	return resp.Leader, resp.Epoch, nil
-}
-
-// peerOpenPush starts a PushSegments client stream to addr. The caller
-// sends the bounded chunks and closes with CloseAndRecv.
-func (e *Engine) peerOpenPush(ctx context.Context, addr string) (pushupesv1.PeerService_PushSegmentsClient, error) {
-	c, err := e.peerRPC(addr)
-	if err != nil {
-		return nil, err
-	}
-	return c.PushSegments(ctx)
-}
-
-func (e *Engine) peerTriggerSnapshot(ctx context.Context, addr string, slot int32, toNode string) error {
-	c, err := e.peerRPC(addr)
-	if err != nil {
-		return err
-	}
-	_, err = c.TriggerSnapshot(ctx, &pushupesv1.TriggerSnapshotRequest{Slot: slot, ToNode: toNode})
-	return err
 }
 
 func (e *Engine) peerPing(ctx context.Context, addr string) error {

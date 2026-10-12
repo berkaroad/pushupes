@@ -32,7 +32,7 @@ import (
 // fork of the log ("diverged on replay") that the follower fetch loop cannot
 // heal and that silently drops an acknowledged write.
 //
-// The gap is the commit window: awaitCaughtUp samples the target's LEO and the
+// The gap is the commit window: the commit gate samples the target's LEO and the
 // leader move is submitted afterwards. Writes accepted in between are not
 // guaranteed to have reached the target, so the moved-to leader can start
 // writing at seqs the source already used for other records.
@@ -64,6 +64,10 @@ const (
 	// caught up" (the best-effort mirror and the fetch loop keep the target
 	// within a few ms) and returns almost immediately; this is the fallback.
 	fenceCatchUpTimeout = 3 * time.Second
+	// fenceDurableTimeout bounds the target's flush. The fence holds the slot's
+	// writes for its duration, so a target that cannot get the tail on disk
+	// fails the hand-over (release + backoff) rather than wedging the slot.
+	fenceDurableTimeout = 3 * time.Second
 	// fenceMaxHold is the source-side watchdog: a fence is force-released
 	// after this long even if no controller action ever arrives, so a crashed
 	// controller cannot block a slot's writes forever.
@@ -397,7 +401,7 @@ func (e *Engine) pushFencedTail(ctx context.Context, slot int32, leo uint64) err
 	if addr == "" {
 		return fmt.Errorf("fence: no address for migration target %s", to)
 	}
-	if err := e.ensureTargetConsistent(ctx, slot, addr, to); err != nil {
+	if err := e.verifyTargetHoldsSource(ctx, slot, addr, to); err != nil {
 		return err
 	}
 	deadline := time.Now().Add(fenceCatchUpTimeout)
@@ -407,13 +411,45 @@ func (e *Engine) pushFencedTail(ctx context.Context, slot int32, leo uint64) err
 			return err
 		}
 		if tgtLEO >= leo {
-			return nil
+			// Held, not yet durable: the leadership may only move once the
+			// frozen tail is ON DISK at the target (see confirmTargetDurable).
+			return e.confirmTargetDurable(ctx, addr, slot, leo, to)
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("fence: target %s LEO %d < frozen source LEO %d (catch-up timeout)", to, tgtLEO, leo)
 		}
 		if err := e.pushFrames(ctx, addr, slot, tgtLEO+1, leo); err != nil {
 			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// confirmTargetDurable requires the target to hold the frozen tail durably
+// before the leader move commits. A committed move is terminal and the source
+// stops being recoverable once it leaves the replica set, so on a single-copy
+// layout the last acknowledged records would otherwise live only in the
+// target's page cache: a target that then died would lose writes the cluster
+// acknowledged. It flushes, re-asks, and gives up (failing the hand-over) on the
+// bound — the retention on the source's copy is what covers the retry.
+func (e *Engine) confirmTargetDurable(ctx context.Context, addr string, slot int32, leo uint64, to string) error {
+	deadline := time.Now().Add(fenceDurableTimeout)
+	var last uint64
+	for {
+		dur, err := e.peerDurableLEO(ctx, addr, slot)
+		if err != nil {
+			return err
+		}
+		last = dur
+		if dur >= leo {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("fence: target %s durable LEO %d < frozen source LEO %d (flush timeout)", to, last, leo)
 		}
 		select {
 		case <-ctx.Done():
