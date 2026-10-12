@@ -10,6 +10,7 @@
 #   scripts/cluster.sh status    查看各节点 Raft 角色、Leader 槽数、迁移中槽数
 #   scripts/cluster.sh join N    运行时扩一个节点：先拉起 node-N（-join 指向现有成员），再 POST 到 controller 加成员
 #   scripts/cluster.sh remove N  运行时摘掉 node-N（只允许离线节点：进程在跑会先停，等探活标离线后再 DELETE 到 controller；槽主自动迁到存活副本，副本集按新成员数重排为因子个席位）
+#   scripts/cluster.sh admit N [learner]  把 node-N 准入目录（数据面节点：不投票、只承载槽副本；默认 role=learner）
 #   scripts/cluster.sh members   列出当前 raft 成员（GET /admin/cluster/nodes）
 #   scripts/cluster.sh smoke     端到端冒烟：MOVED 重定向 → v1/v2 写入 → 幂等 exists → 版本冲突 fail/1001 → 回读
 #   scripts/cluster.sh slotcheck 副本一致性体检：逐槽比较 leader 与各副本摘要（有发散副本时退出码 1）
@@ -21,6 +22,11 @@
 # 脚本可用环境变量覆盖：
 #   REPLICAS=3             节点数：冷启动时是要拉起的全部节点，start 在集群
 #                          已经存在时只拉起缺的，并把它们 -join 进现有集群
+#   ROLE_<n>=voter|learner|both
+#                          节点 n 的角色（默认 both）。控制面/数据面分离的用法：
+#                          ROLE_1..3=voter 起三个纯控制节点，再用 `join 4`（先
+#                          admit 再启动）挂 ROLE_4=learner 的数据面节点；数据面
+#                          节点的槽表由控制面分发，不参与选举
 #   HOST=127.0.0.1         绑定与广播地址
 #   ADMIN_BASE=8091         节点 i 的 admin 管理端口（HTTP admin + pprof）= ADMIN_BASE + i - 1
 #   PEER_BASE=8391         节点 i 的 peer 端口（Raft + peer gRPC，全部节点间通讯）= PEER_BASE + i - 1
@@ -176,6 +182,11 @@ start_node() {
   peers="$(peers_csv)"
   : > "$dir/node.log"
   local extra=()
+  # 每个节点的角色可由 ROLE_<n> 指定（voter/learner/both，默认 both = 现行形态）。
+  # 控制面节点用 ROLE_1=voter 之类注入；数据面进程接线前 learner 只能停在目录里。
+  local role_var="ROLE_$n"
+  local node_role="${!role_var:-both}"
+  extra+=(-role "$node_role")
   # 运行时加入的节点（join N）不是初始成员：它用 -peers 当种子、用 -join
   # 指向现有成员报名。start_node 只负责拉起进程，成员变更由 cmd_join 提交。
   if [[ -n "${JOIN_TARGET:-}" ]]; then
@@ -232,6 +243,23 @@ wait_ready() {
           local rf; rf="$(json_field "$body" replica_factor)"
           info "集群就绪：slot 规划 $planned 槽（每槽 ${rf:-?} 副本，按副本策略 × 成员数推导）"
           return 0
+        fi
+        # 纯控制面（每个已注册成员都是 voter）就绪时槽表就是 0 条：承载池为空，控制器
+        # 按设计不规划，写入由控制面明确拒绝。没有这一支，角色分离的拓扑每次 start 都
+        # 会白等一个 READY_TIMEOUT 再报「未就绪」。
+        if [[ "${state,,}" == "leader" && "$planned" == "0" ]]; then
+          # 数据面成员 = 已自报 client 地址、且角色不是 voter 的目录条目（与布局池
+          # 同一口径）。`grep -c` 计 0 时退出码是 1，别让它决定分支。
+          local members hosting=0
+          members="$(curl -s --max-time 2 "$(base_url 1)/admin/cluster/nodes" 2>/dev/null \
+            | grep -o '{"id":"node-[0-9]*"[^}]*}' | grep '"client_addr":"http')" || members=""
+          if [[ -n "$members" ]]; then
+            hosting="$(printf '%s\n' "$members" | grep -vc '"role":"voter"')" || hosting=0
+          fi
+          if [[ "$hosting" == "0" ]]; then
+            info "集群就绪：纯控制面（目录里没有数据面成员），槽表 0 条；等数据面节点注册后自动规划"
+            return 0
+          fi
         fi
       done
     fi
@@ -347,22 +375,56 @@ controller_admin() {
 
 # cmd_join N：运行时扩一个节点。先拉起进程（-join 指向现有成员），等它
 # 自己报名进 raft 配置，再等它出现在成员表里。
+# node_n_role N：节点 N 的角色（ROLE_<n>，默认 both）。
+node_n_role() {
+  local role_var="ROLE_$1"
+  printf '%s' "${!role_var:-both}"
+}
+
+# cmd_admit N [role]：把 node-N 准入复制目录。数据面节点（role=learner）的准入
+# 是一条目录命令，不碰 raft 配置 —— 它不投票。控制面只接受「目录里已有」的节点
+# 自报地址（OpRegister 不新增成员），所以准入必须先于进程启动。
+cmd_admit() {
+  local n="${1:-}" role="${2:-learner}" resp
+  [[ -n "$n" && "$n" =~ ^[0-9]+$ ]] || die "用法: $0 admit <节点序号> [learner]"
+  resp="$(curl -s --max-time 5 -X POST "$(base_url 1)/admin/cluster/nodes" \
+    -d "{\"id\":\"node-$n\",\"peer_addr\":\"$HOST:$(peer_port "$n")\",\"role\":\"$role\"}")" \
+    || die "准入 node-$n 失败（controller 是否在跑？）"
+  info "node-$n 准入：$resp"
+}
+
 cmd_join() {
   local n="${1:-}"
   [[ -n "$n" && "$n" =~ ^[0-9]+$ ]] || die "用法: $0 join <节点序号>"
   build_binary
+  local node_role="$(node_n_role "$n")"
   if node_pid_alive "$n"; then
     info "node-$n 已在运行，跳过启动"
   else
     rm -f "$(pid_file "$n")"
-    # 报名入口：指向 node-1 的 peer 端口（启动时至少 node-1 已在跑）。
-    JOIN_TARGET="$HOST:$(peer_port 1)" start_node "$n"
+    if [[ "$node_role" == "learner" ]]; then
+      # 数据面节点：先准入（目录命令），再启动。它不报名 raft（不投票），
+      # 槽表由控制面经 WatchLayout 分发；自己的 admin/client 地址由注册心跳公告。
+      cmd_admit "$n" learner
+      start_node "$n"
+    else
+      # 报名入口：指向 node-1 的 peer 端口（启动时至少 node-1 已在跑）。
+      JOIN_TARGET="$HOST:$(peer_port 1)" start_node "$n"
+    fi
   fi
   local deadline=$((SECONDS + READY_TIMEOUT))
   while (( SECONDS < deadline )); do
     local members
     members="$(curl -s --max-time 3 "$(base_url 1)/admin/cluster/nodes" 2>/dev/null)" || members=""
-    if printf '%s' "$members" | grep -q "\"id\":\"node-$n\""; then
+    if [[ "$node_role" == "learner" ]]; then
+      # 数据面节点的判定是「它自报了 client 地址」：准入只是目录里多一条，
+      # 进程起来并注册之后才真的能收数据。
+      if printf '%s' "$members" | grep -o "{\"id\":\"node-$n\"[^}]*}" | grep -q '\"client_addr\":\"http'; then
+        info "node-$n 已作为数据面节点上线（不投票；槽表由控制面分发）"
+        cmd_members
+        return 0
+      fi
+    elif printf '%s' "$members" | grep -q "\"id\":\"node-$n\""; then
       info "node-$n 已加入 raft 配置（成员变更自动 replan 槽表）"
       cmd_members
       return 0
@@ -446,7 +508,10 @@ cmd_members() {
 # 进来的节点在 status/smoke/slotcheck 里凭空消失。
 cluster_node_indexes() {
   local extra=""
+  # 只收「已自报 client 地址」的成员：没有 client 地址的条目（刚准入、进程还没起的
+  # learner）不该被算出一个并不存在的 client 端口——按端口推算的前提是那个进程在跑。
   extra="$(curl -s --max-time 3 "$(base_url 1)/admin/cluster/nodes" 2>/dev/null \
+    | grep -o '{"id":"node-[0-9]*"[^}]*}' | grep '"client_addr":"http' \
     | grep -o '"id":"node-[0-9]*"' | grep -o '[0-9]*')" || extra=""
   printf '%s\n' $(seq 1 "$REPLICAS") $extra | sort -n -u
 }
@@ -461,9 +526,16 @@ cmd_status() {
       continue
     fi
     state="$(json_field "$body" state)"
-    leaders="$(printf '%s' "$body" | grep -o "\"leader\":\"node-$i\"" | wc -l | tr -d ' ')"
+    # 只数槽表里的 leader：raft 段的 "leader" 字段在 leader 自身会回填自己的
+    # id，直接全串 grep 会让 raft leader 凭空多出 1 个槽——纯控制节点（不持槽）
+    # 上这个偏差最刺眼，会把「0 个槽」显示成 1。
+    leaders="$(printf '%s' "$body" | sed 's/.*"slots"://' | grep -o "\"leader\":\"node-$i\"" | wc -l | tr -d ' ')"
     migrating="$(printf '%s' "$body" | grep -o '"state":"migrating_' | wc -l | tr -d ' ')"
-    info "  node-$i: raft=${state} leader槽=${leaders} 迁移中槽=${migrating} admin=$(admin_port "$i") client=$(client_port "$i")"
+    # status 的 peers 是 map[string]Peer：取 node-$i 那条里的 role（没有 role
+    # 字段的旧公告按 both 显示）。
+    local role
+    role="$(printf '%s' "$body" | grep -o "\"node-$i\":{[^}]*}" | grep -o '\"role\":\"[a-z]*\"' | head -1 | sed 's/.*:\"//; s/\"//')"
+    info "  node-$i: raft=${state} role=${role:-both} leader槽=${leaders} 迁移中槽=${migrating} admin=$(admin_port "$i") client=$(client_port "$i")"
   done
 }
 
@@ -538,6 +610,7 @@ case "${1:-}" in
   start)   cmd_start ;;
   stop)    cmd_stop ;;
   status)  cmd_status ;;
+  admit)   shift; cmd_admit "$@" ;;
   join)    shift; cmd_join "$@" ;;
   remove)  shift; cmd_remove "$@" ;;
   members) cmd_members ;;

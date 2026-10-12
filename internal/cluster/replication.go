@@ -48,13 +48,26 @@ type epochHW struct {
 // watermark per slot. Event data never enters Raft — it is replicated by
 // a dedicated seq-based fetch protocol.
 type Engine struct {
-	node    *Node
-	store   *storage.Store
-	table   *Table
-	tableMu sync.RWMutex
-	logger  *slog.Logger
-	peers   *peerClient // cached PeerService connections, keyed by peer addr
-	self    string
+	node  consensus
+	store *storage.Store
+	// hub is this node's data-plane feed (layoutfeed.go): the subscriptions
+	// that keep role=learner nodes in step with the replicated metadata. Built
+	// on first use because it reads the consensus timing off `node`, which is
+	// attached after construction.
+	hubOnce sync.Once
+	hub     *layoutHub
+
+	// planPoolSeen/planPoolWaited carry the settle gate across controller
+	// rounds (see poolSettled): the last data-plane pool observed while it was
+	// still changing, and how many rounds the plan has been deferred for it.
+	// Only the controller's own loop touches them.
+	planPoolSeen   []string
+	planPoolWaited int
+	table          *Table
+	tableMu        sync.RWMutex
+	logger         *slog.Logger
+	peers          *peerClient // cached PeerService connections, keyed by peer addr
+	self           string
 
 	// replication bookkeeping per slot, only meaningful on slot leaders
 	replMu sync.Mutex
@@ -121,6 +134,18 @@ type Engine struct {
 	own   atomic.Pointer[ownership]
 	// tableGen bumps with every applied table change (holds tableMu).
 	tableGen uint64
+
+	// owner fence (owner.go): pendingOwners is the set of slots whose local
+	// copy is unproven for the live table (leader service refused with
+	// fail/1007 until adopted, or until the copy is removed from disk by
+	// the operator); bornSet captures which slots
+	// had a WAL when the process started — the "predates this process"
+	// witness that separates an upgraded copy from bytes this generation
+	// produced.
+	ownerMu       sync.Mutex
+	pendingOwners map[int32]ownerReason
+	bornSet       map[int32]bool
+	ownerKick     chan struct{}
 
 	// migration commit fence: one preallocated write gate per slot (a writer
 	// must be able to register its in-flight append without racing the fence
@@ -515,7 +540,7 @@ var (
 
 // NewEngine wires the cluster to the local storage. The Raft node may be
 // attached later with SetNode (they reference each other).
-func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logger) *Engine {
+func NewEngine(node consensus, store *storage.Store, self string, logger *slog.Logger) *Engine {
 	e := &Engine{
 		node:  node,
 		store: store,
@@ -531,17 +556,19 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logge
 		// long-poll fetch round plus progress/replication/leo probes —
 		// gRPC multiplexes them over the single cached conn (the old HTTP
 		// transport needed a large idle-conn pool to avoid re-dial churn).
-		peers:       newPeerClient(),
-		repl:        map[int32]*slotRepl{},
-		sessions:    map[string]*fetchSession{},
-		sessKick:    make(chan struct{}, 1),
-		storageKick: make(chan struct{}, 1),
-		failStreak:  map[string]int{},
-		ledPrev:     map[int32]bool{},
-		fenceSet:    map[int32]bool{},
-		diverged:    map[int32]string{},
-		hwSeen:      map[int32]epochHW{},
-		migrating:   map[int32]struct{}{},
+		peers:         newPeerClient(),
+		repl:          map[int32]*slotRepl{},
+		sessions:      map[string]*fetchSession{},
+		sessKick:      make(chan struct{}, 1),
+		storageKick:   make(chan struct{}, 1),
+		failStreak:    map[string]int{},
+		ledPrev:       map[int32]bool{},
+		fenceSet:      map[int32]bool{},
+		diverged:      map[int32]string{},
+		pendingOwners: map[int32]ownerReason{},
+		ownerKick:     make(chan struct{}, 1),
+		hwSeen:        map[int32]epochHW{},
+		migrating:     map[int32]struct{}{},
 		// post-migration cleanup: the former source keeps its copy for this
 		// long once it sees the hand-over committed (-drop-after).
 		dropAfter: DefaultDropRetention,
@@ -567,6 +594,17 @@ func NewEngine(node *Node, store *storage.Store, self string, logger *slog.Logge
 	e.divergedConfirm = divergedConfirmWindow
 	e.fetchScratchPool.New = func() any { return &fetchScratch{} }
 	e.fences = make([]slotFence, store.SlotCount)
+	// The owner fence's birth witness (owner.go): which slots already hold a
+	// WAL. It MUST be taken here — the first moment the engine can exist
+	// alongside its store — because "predates this process" is exactly the
+	// line between an upgraded copy (unproven until adopted) and bytes this
+	// generation wrote under the live table (proven by construction).
+	e.bornSet = make(map[int32]bool)
+	for i := int32(0); i < store.SlotCount; i++ {
+		if store.HasWAL(i) {
+			e.bornSet[i] = true
+		}
+	}
 	if e.logger == nil {
 		l := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 		e.logger = l.With("component", "cluster")
@@ -633,6 +671,20 @@ func (e *Engine) SnapshotState() ([]byte, error) {
 	e.tableMu.RLock()
 	defer e.tableMu.RUnlock()
 	return e.table.EncodeTableBinary(), nil
+}
+
+// ResetState implements cluster.Applier: back to an empty table, as a node
+// that has been told to rebuild from nothing must be (see learnernode.go).
+// The slot count stays this node's own — the commands that follow carry the
+// cluster's actual layout.
+func (e *Engine) ResetState() error {
+	tbl := NewTableWithPolicy(e.store.SlotCount, DefaultReplicaPolicy)
+	e.tableMu.Lock()
+	e.table = tbl
+	e.tableGen++
+	e.tableMu.Unlock()
+	e.syncMigrationState()
+	return nil
 }
 
 // RestoreState implements cluster.Applier; accepts the binary snapshot form.
@@ -709,6 +761,9 @@ func (e *Engine) SlotOf(aggregateID string) int32 { return e.store.SlotOf(aggreg
 // was silently reused — a later hand-over's copy could be deleted the moment
 // the earlier window expired, i.e. "immediately".
 func (e *Engine) syncMigrationState() {
+	// Every table change re-decides the owner fence: a promotion must be
+	// judged (and stamped, or fenced) now, not at the next slow tick.
+	e.kickOwnerFence()
 	prev := e.replicaSnapshot()
 	fenced := e.fencedSlots()
 	fencedSet := make(map[int32]bool, len(fenced))
@@ -866,6 +921,30 @@ func (e *Engine) SubmitAppend(ctx context.Context, rec *data.EventRecord) (resp 
 	return e.submitAppendLocked(ctx, rec, slot)
 }
 
+// controlOnlyRefusal answers the append THIS node must not serve: a slot the
+// table does not assign and a node the directory knows as a pure control
+// plane. The classic cluster serves an unassigned slot locally (single-node
+// shape), but a voter's WAL growing a seq space no layout knows is exactly
+// the contamination the role split exists to keep off the control plane —
+// the plan simply has not run yet (no data-plane member registered).
+//
+// Returns nil when this node may serve the slot.
+func (e *Engine) controlOnlyRefusal(slot int32) *data.AppendResponse {
+	e.tableMu.RLock()
+	p, in := e.table.Peers[e.self]
+	pureControl := in && p.PureControl()
+	e.tableMu.RUnlock()
+	if !pureControl {
+		return nil
+	}
+	return &data.AppendResponse{
+		Status: data.StatusFail,
+		ErrID:  data.ErrIDNotLeader,
+		Err:    "cluster has no data-plane members; this node is control-plane only",
+		Slot:   slot,
+	}
+}
+
 // submitAppendLocked is the routing/execution half of SubmitAppend, run while
 // the slot's write-fence registration is held (so the fence drain accounts for
 // this append).
@@ -883,6 +962,9 @@ func (e *Engine) submitAppendLocked(ctx context.Context, rec *data.EventRecord, 
 	}
 	e.tableMu.RUnlock()
 	if !ok {
+		if refusal := e.controlOnlyRefusal(slot); refusal != nil {
+			return refusal, nil
+		}
 		// single-node / unassigned: serve locally
 		return e.localAppend(slot, rec)
 	}
@@ -974,7 +1056,7 @@ func (e *Engine) localAppend(slot int32, rec *data.EventRecord) (*data.AppendRes
 			return resp, err
 		}
 		if resp != nil && resp.Status == data.StatusFail &&
-			(resp.ErrID == data.ErrIDVersionConflict || resp.ErrID == data.ErrIDBadRequest) {
+			(resp.ErrID == data.ErrIDVersionConflict || resp.ErrID == data.ErrIDBadRequest || resp.ErrID == data.ErrIDSlotUnproven) {
 			// The token paid for a record that never landed on the leader's
 			// log (a business-rule fail): give it back. A watermark timeout
 			// (fail/1005) keeps its charge — the record IS durable above —
@@ -1017,6 +1099,19 @@ func (e *Engine) localAppendThrottled(slot int32, rec *data.EventRecord) (*data.
 // see SubmitBatch). The returned response for a success carries the assigned
 // seq; exists carries the stored record; fail carries the wire error.
 func (e *Engine) landLocalAppend(slot int32, rec *data.EventRecord) (*data.AppendResponse, error) {
+	// Owner fence (owner.go): a copy the table cannot vouch for stays out of
+	// service. Appending here would write into a seq space the client was
+	// never told about — the contamination the fence exists to refuse — so
+	// the fence exists to refuse — so the refusal answers before the WAL, and an operator resolves it
+	// explicitly (adopt, or remove the copy on disk).
+	if e.slotPending(slot) {
+		return &data.AppendResponse{
+			Status: data.StatusFail,
+			ErrID:  data.ErrIDSlotUnproven,
+			Err:    "SlotUnproven",
+			Slot:   slot,
+		}, nil
+	}
 	out, err := e.store.Append(rec)
 	if err != nil {
 		return nil, err
@@ -1096,6 +1191,15 @@ func (e *Engine) SubmitBatch(ctx context.Context, slot int32, recs []*data.Event
 
 	switch {
 	case !ok:
+		if refusal := e.controlOnlyRefusal(slot); refusal != nil {
+			// One answer per record (they are independent wire responses).
+			out := make([]*data.AppendResponse, len(recs))
+			for i := range out {
+				r := *refusal
+				out[i] = &r
+			}
+			return out, nil
+		}
 		// single-node / unassigned: serve locally
 		return e.batchLocal(ctx, slot, recs)
 	case pState == SlotMigratingOut && pLeader != e.self:
@@ -2121,7 +2225,15 @@ func (e *Engine) Leads(slot int32) bool {
 func (e *Engine) Self() string { return e.self }
 
 // SetNode attaches the Raft node (breaking the engine<->node cycle).
-func (e *Engine) SetNode(node *Node) { e.node = node }
+func (e *Engine) SetNode(node consensus) { e.node = node }
+
+// layoutFeed is this node's data-plane feed hub (layoutfeed.go), built on
+// first use: it reads the consensus timing and the node id off the Engine's
+// node, which is attached after construction.
+func (e *Engine) layoutFeed() *layoutHub {
+	e.hubOnce.Do(func() { e.hub = newLayoutHub(e) })
+	return e.hub
+}
 
 // SetBootPolicy records the -replica-policy seed for a brand-new cluster.
 // The controller applies it exactly once — on the table's first round, while
@@ -3544,6 +3656,13 @@ func (e *Engine) readAdmission(slot int32) (bound uint64, leader string, leaderA
 	epoch, held := p.Epoch, replicaListHas(p.Replicas, e.self)
 	e.tableMu.RUnlock()
 	if leader == e.self {
+		if e.slotPending(slot) {
+			// Fenced leader (owner.go): the local copy answers empty until
+			// an operator adopts it or discards it — reading unproven
+			// events while their seq space is disputed is half the hazard
+			// the fence kills.
+			return 0, leader, leaderAddr, ""
+		}
 		return nilBounded, leader, leaderAddr, "" // the leader owns its log
 	}
 	if !held {
@@ -3658,6 +3777,53 @@ func (e *Engine) applyHwLedger(leader string, slots []int32, values []uint64) {
 const livenessFailThreshold = 3
 
 // RunController reconciles cluster state; only the Raft leader executes it.
+// planSettleMaxRounds bounds how long the layout waits for the data-plane pool
+// to stop changing. Two deferred rounds is one cold start's worth of
+// registration and one straggler's worth of patience; a membership that keeps
+// moving gets laid out anyway rather than not at all.
+const planSettleMaxRounds = 2
+
+// poolSettled reports whether the layout may be planned under this pool in this
+// round, carrying the settle state across rounds.
+//
+// The data-plane pool is assembled by REGISTRATION, and a cold start registers
+// its members over a fraction of a second — so a round that plans the moment
+// the FIRST member announces plans for a cluster that has not finished showing
+// up. That is what a classic both-shape cold start looked like before this
+// gate: the first plan ran under one member (factor 1 — every slot on whichever
+// node announced first), the second member's arrival then re-planned all 1680
+// replica sets at factor 2, and the cluster spent its first seconds
+// single-copy with a full re-seat right after. The plan now waits one round for
+// the pool to repeat itself; the cost is one reconcile interval on a cold
+// start, the gain is a first layout that is already the intended shape.
+//
+// It defers only while the pool differs from the one the last plan ran under
+// (planned): a steady cluster, or one whose plan already matches its members,
+// never waits. planSettleMaxRounds bounds the wait so a pool that keeps moving
+// is still planned under.
+func (e *Engine) poolSettled(pool, planned []string) bool {
+	if sameMembers(pool, planned) {
+		e.planPoolSeen, e.planPoolWaited = nil, 0
+		return true
+	}
+	if sameMembers(pool, e.planPoolSeen) {
+		// Unchanged since the previous round: this is the pool to lay out.
+		e.planPoolSeen, e.planPoolWaited = nil, 0
+		return true
+	}
+	if e.planPoolWaited >= planSettleMaxRounds {
+		e.loggerf("layout: the data-plane pool (%v) is still changing after %d deferred rounds; planning under it anyway",
+			pool, e.planPoolWaited)
+		e.planPoolSeen, e.planPoolWaited = nil, 0
+		return true
+	}
+	e.planPoolSeen = append([]string(nil), pool...)
+	e.planPoolWaited++
+	e.loggerf("layout: %d data-plane member(s) (%v) so far; waiting one round for the pool to settle before planning under it",
+		len(pool), pool)
+	return false
+}
+
 func (e *Engine) RunController(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -3695,15 +3861,23 @@ func (e *Engine) RunController(ctx context.Context) {
 			}
 			p := Peer{ID: id, PeerAddr: canonical}
 			if id == e.self {
-				p.AdminAddr, p.ClientAddr = e.node.cfg.AdminAddr, e.node.cfg.ClientAddr
+				p.AdminAddr, p.ClientAddr = e.node.Cfg().AdminAddr, e.node.Cfg().ClientAddr
+				p.Role = e.node.Cfg().Role
 			}
 			e.submit(&Command{Op: OpJoinNode, Peer: &p})
 		}
 		for id := range tbl.Peers {
-			if _, ok := raftAddrs[id]; !ok {
-				e.loggerf("peer %s is no longer a raft voter; removing it from the directory", id)
-				e.submit(&Command{Op: OpLeaveNode, NodeID: id})
+			if _, ok := raftAddrs[id]; ok {
+				continue
 			}
+			if p, in := tbl.Peers[id]; in && p.Role == RoleLearner {
+				// Learners are admitted through replicated commands and
+				// live in the directory only — the raft configuration never
+				// names them, and their absence from it is not a leave.
+				continue
+			}
+			e.loggerf("peer %s is no longer a raft voter; removing it from the directory", id)
+			e.submit(&Command{Op: OpLeaveNode, NodeID: id})
 		}
 		// 2) plan: first re-derive the table's replica factor from the
 		// replicated policy tier and the member count — ReplicaCountForPolicy
@@ -3734,19 +3908,34 @@ func (e *Engine) RunController(ctx context.Context) {
 				tbl = e.TableSnapshot()
 			}
 		}
-		if want := ReplicaCountForPolicy(tbl.Policy, len(tbl.Peers)); tbl.Replicas != want {
-			e.loggerf("replica factor: table has %d, policy %q with %d members wants %d — changing it",
-				tbl.Replicas, tbl.Policy, len(tbl.Peers), want)
-			if err := e.submit(&Command{Op: OpConfig, Replicas: want}); err == nil {
-				// Re-read: the probe below plans with the factor this round
-				// just wrote, instead of the one it replaced.
-				tbl = e.TableSnapshot()
+		// The layout waits for the pool to settle: planning under a pool that
+		// is still being assembled is what made a cold start lay out its first
+		// member alone and then re-seat everything (see poolSettled). The
+		// factor is written under the same gate, so the first plan never runs
+		// at a factor derived from a half-arrived pool.
+		pool := tbl.HostingIDs()
+		if e.poolSettled(pool, tbl.PlanMembers) {
+			if want := ReplicaCountForPolicy(tbl.Policy, len(pool)); tbl.Replicas != want {
+				e.loggerf("replica factor: table has %d, policy %q with %d data-plane members wants %d — changing it",
+					tbl.Replicas, tbl.Policy, len(pool), want)
+				if err := e.submit(&Command{Op: OpConfig, Replicas: want}); err == nil {
+					// Re-read: the probe below plans with the factor this
+					// round just wrote, instead of the one it replaced.
+					tbl = e.TableSnapshot()
+				}
 			}
-		}
-		if len(tbl.Slots) == 0 {
-			e.submit(&Command{Op: OpPlanSlots})
-		} else if probe := tbl.Clone(); probe.applyReplanSlots() {
-			e.submit(&Command{Op: OpReplanSlots})
+			if len(tbl.Slots) == 0 {
+				// No data-plane member yet (a pure control plane waiting for
+				// its first learner): submitting the plan would fail apply and
+				// re-commit every second — the idle-creep pattern again.
+				// Clients get the explicit "no data nodes" answer at the write
+				// path; the first hosting registration arms the plan.
+				if len(pool) > 0 {
+					e.submit(&Command{Op: OpPlanSlots})
+				}
+			} else if probe := tbl.Clone(); probe.applyReplanSlots() {
+				e.submit(&Command{Op: OpReplanSlots})
+			}
 		}
 		// 3) liveness sweep: probe peers over the peer plane; a peer that
 		// misses several consecutive probes is MARKED DOWN (leadership
@@ -3856,10 +4045,15 @@ func (e *Engine) loggerf(format string, args ...any) {
 // Start launches background loops (replica fetch + controller + leader
 // rebalance; the rebalancer exits at once when the knob is turned off).
 func (e *Engine) Start(ctx context.Context) {
+	// The feed hub runs everywhere (on a learner it can never acquire a
+	// subscriber, since the serving path redirects anything that is not the
+	// controller), and shares the consensus heartbeat interval.
+	go e.layoutFeed().run(ctx)
 	go e.replicaLoop(ctx)
 	go e.RunController(ctx)
 	go e.RunRebalancer(ctx)
 	go e.runStorageSampler(ctx)
+	go e.runOwnerFence(ctx)
 }
 
 // ---- cluster storage gauge -----------------------------------------------------

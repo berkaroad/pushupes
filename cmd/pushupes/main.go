@@ -92,6 +92,7 @@ func main() {
 		batchPar   = flag.Int("batch-slot-parallelism", envIntOr("PUSHUPES_BATCH_SLOT_PARALLELISM", grpcapi.DefaultBatchSlotParallelism),
 			"max slots one BatchAppend executes concurrently (different slots take independent fences and WALs; a wide batch spanning the ring lands at most this many concurrent WAL writers — env PUSHUPES_BATCH_SLOT_PARALLELISM)")
 		bootstrap     = flag.Bool("bootstrap", false, "write this cluster's initial configuration from this node. By default the node whose id leads -peers does that and every other configured node starts as a seed that offers itself through the running cluster (env PUSHUPES_BOOTSTRAP not read: this is a startup decision, not a tunable)")
+		role          = flag.String("role", envOr("PUSHUPES_ROLE", "both"), "this node's place in the cluster: voter (control plane — votes in the consensus group and hosts NO slot replicas), learner (data plane — receives the replicated layout from the control plane without voting) or both (the classic single-plane shape: votes and hosts; env PUSHUPES_ROLE)")
 		raftHeartbeat = flag.Duration("raft-heartbeat-timeout", envDurationOr("PUSHUPES_RAFT_HEARTBEAT_TIMEOUT", raft.DefaultHeartbeatTimeout),
 			"consensus heartbeat interval (env PUSHUPES_RAFT_HEARTBEAT_TIMEOUT). A leader whose heartbeats do not arrive in time is voted out, so on a host that can delay the consensus event loop raise this together with -raft-election-timeout")
 		raftElection = flag.Duration("raft-election-timeout", envDurationOr("PUSHUPES_RAFT_ELECTION_TIMEOUT", raft.DefaultElectionTimeout),
@@ -109,13 +110,17 @@ func main() {
 	base := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	logger := base.With("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *adoptTo, slotCount, *replicaPolicy, int64(segmentB), int64(grpcMaxMsg), *batchPar, *flushN, *flushD, *dropAfter, *fetchSettleD, *rebalanceInterval, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *role, *adoptTo, slotCount, *replicaPolicy, int64(segmentB), int64(grpcMaxMsg), *batchPar, *flushN, *flushD, *dropAfter, *fetchSettleD, *rebalanceInterval, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
 		logger.Error("pushupes exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr string, adoptInterval time.Duration, slotCount int, replicaPolicy string, segmentBytes, grpcMaxMsgBytes int64, batchParallelism int, flushN int64, flushD, dropAfter, fetchSettle, rebalanceInterval time.Duration, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, role string, adoptInterval time.Duration, slotCount int, replicaPolicy string, segmentBytes, grpcMaxMsgBytes int64, batchParallelism int, flushN int64, flushD, dropAfter, fetchSettle, rebalanceInterval time.Duration, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
+	nodeRole, err := cluster.NormalizeRole(role)
+	if err != nil {
+		return err
+	}
 	// Canonical form for every stored address: scheme required. A bare
 	// host:port gets the default "http://" prefix; an explicit protocol
 	// is honoured as passed. TCP-level uses (listen/dial) strip it again.
@@ -234,6 +239,7 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 		PeerAddr:         peerAddr,
 		AdminAddr:        adminAddr,
 		ClientAddr:       clientAddr,
+		Role:             nodeRole,
 		DataDir:          filepath.Join(dataDir, "cluster"),
 		Peers:            peers,
 		Seed:             seeding,
@@ -267,7 +273,11 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr st
 	// (see above) keeps offering itself through the configured members until
 	// the leader has added it. A node that is already a member — the author
 	// itself, or a joiner that has caught up — sends nothing.
-	if seeding {
+	if seeding && nodeRole != cluster.RoleLearner {
+		// A data-plane node never offers itself for membership: it is not a
+		// voter, and its admission is a directory command the operator posts
+		// (DESIGN §12.3). Running the joiner here would have it asking to be
+		// added to the Raft configuration it must never join.
 		go eng.NewJoiner(targets, adoptInterval).Run(ctx)
 	}
 

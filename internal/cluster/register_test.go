@@ -22,7 +22,7 @@ import (
 
 // commitIndexOf reads the Raft commit index a node reports in its stats
 // (the very number the console shows as "commit" in the cluster overview).
-func commitIndexOf(t *testing.T, n *Node) uint64 {
+func commitIndexOf(t *testing.T, n consensus) uint64 {
 	t.Helper()
 	raw, ok := n.Stats()["commit_index"]
 	if !ok {
@@ -99,5 +99,28 @@ func TestRegistrationChangeStillCommits(t *testing.T) {
 	}
 	if after := commitIndexOf(t, e.node); after != stable {
 		t.Fatalf("post-change heartbeat advanced commit index: %d -> %d", stable, after)
+	}
+}
+
+// TestPeerAddrForNodeUsesDirectory pins the relay lookup order: a member
+// admitted at runtime carries its peer address in the replicated directory
+// but NOT in the static -peers list, and a follower relaying a registration
+// must resolve it from the directory (before this, such a relay silently
+// returned "" and stranded registration heartbeats until a restart).
+func TestPeerAddrForNodeUsesDirectory(t *testing.T) {
+	e := newLeaderEngine(t)
+	join(t, e, "node-9", "127.0.0.1:9499")
+	if got := e.peerAddrForNode("node-9"); got != "127.0.0.1:9499" {
+		t.Fatalf("directory-only member resolved to %q, want its announced peer addr", got)
+	}
+	// Static fallback still answers for a configured peer the directory has
+	// not seeded yet (a bootstrapped node that never registered).
+	nd := e.node.(*Node)
+	nd.cfg.Peers = append(nd.cfg.Peers, Peer{ID: "node-8", PeerAddr: "127.0.0.1:9498"})
+	if got := e.peerAddrForNode("node-8"); got != "127.0.0.1:9498" {
+		t.Fatalf("static-list-only peer resolved to %q, want the configured addr", got)
+	}
+	if got := e.peerAddrForNode("node-7"); got != "" {
+		t.Fatalf("unknown peer resolved to %q, want no answer", got)
 	}
 }

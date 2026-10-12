@@ -113,7 +113,7 @@ func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushP
 	for i := int32(0); i < slotCount; i++ {
 		path := st.slotDir(i)
 		if fi, err := os.Stat(path); err == nil && fi.IsDir() {
-			if entries, err := os.ReadDir(path); err == nil && len(entries) > 0 {
+			if hasWALFiles(path) {
 				tasks = append(tasks, task{i, path})
 			}
 		}
@@ -157,12 +157,39 @@ func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushP
 	return st, nil
 }
 
+// hasWALFiles reports whether a slot directory holds segment files. Auxiliary
+// files (the owner.json provenance record; index sidecars) do not make a slot
+// a copy-with-data — a directory that holds only auxiliary files is treated
+// as absent, so opening it never materialises a WAL behind an operator's
+// careful "delete the segments, keep the evidence" edit.
+func hasWALFiles(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".wal") {
+			return true
+		}
+	}
+	return false
+}
+
 func (st *Store) slotDir(slot int32) string {
 	return filepath.Join(st.Dir, fmt.Sprintf("slot-%03d", slot))
 }
 
 // SlotDir exposes a slot's WAL directory.
 func (st *Store) SlotDir(slot int32) string { return st.slotDir(slot) }
+
+// HasWAL reports whether the slot directory holds segment files (the
+// provenance view: auxiliary files like owner.json do not count).
+func (st *Store) HasWAL(slot int32) bool {
+	if slot < 0 || slot >= st.SlotCount {
+		return false
+	}
+	return hasWALFiles(st.slotDir(slot))
+}
 
 // DropSlot closes and removes a slot's WAL (post-migration cleanup).
 func (st *Store) DropSlot(slotID int32) error {
@@ -191,8 +218,9 @@ func (st *Store) SlotPresent(slotID int32) bool {
 	if s := st.slots[slotID].Load(); s != nil {
 		return true
 	}
-	entries, err := os.ReadDir(st.slotDir(slotID))
-	return err == nil && len(entries) > 0
+	// The provenance view counts segments only: a directory holding just the
+	// owner.json record is not a copy with something to lose.
+	return hasWALFiles(st.slotDir(slotID))
 }
 
 // SlotDiskBytes is a slot's on-disk footprint: the sum of its segment files.

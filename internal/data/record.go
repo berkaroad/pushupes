@@ -469,7 +469,8 @@ const (
 	ErrIDSlotNotLocal    = client.ErrIDSlotNotLocal // MOVED
 	ErrIDMigrating       = client.ErrIDMigrating    // ASK
 	ErrIDNotLeader       = client.ErrIDNotLeader
-	ErrIDFlowControl     = client.ErrIDFlowControl // the node's flow control refused the append
+	ErrIDFlowControl     = client.ErrIDFlowControl  // the node's flow control refused the append
+	ErrIDSlotUnproven    = client.ErrIDSlotUnproven // local copy without a proven generation (owner fence)
 )
 
 var (

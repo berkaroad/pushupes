@@ -32,6 +32,7 @@ const (
 	PeerService_ReportUnreachable_FullMethodName = "/pushupes.v1.PeerService/ReportUnreachable"
 	PeerService_SlotLeos_FullMethodName          = "/pushupes.v1.PeerService/SlotLeos"
 	PeerService_SlotSizes_FullMethodName         = "/pushupes.v1.PeerService/SlotSizes"
+	PeerService_WatchLayout_FullMethodName       = "/pushupes.v1.PeerService/WatchLayout"
 )
 
 // PeerServiceClient is the client API for PeerService service.
@@ -109,6 +110,17 @@ type PeerServiceClient interface {
 	// (the copy the writes landed on), and only the holder of a copy can report
 	// its bytes. A slot this node does not hold answers 0.
 	SlotSizes(ctx context.Context, in *SlotSizesRequest, opts ...grpc.CallOption) (*SlotSizesResponse, error)
+	// WatchLayout is the data-plane node's feed: a node running with
+	// role=learner holds slot replicas but is not a voter (DESIGN §12), so it
+	// takes the replicated metadata from here instead of running a Raft group.
+	// Only the leader serves it (any voter answers with a REDIRECT frame naming
+	// the leader, and the caller re-dials). The server side streams the state
+	// machine's inputs — HELLO (leader, term, voter set, generation), ENTRY
+	// (committed command), COMMIT (progress) and SNAPSHOT (rebuild-from-here) —
+	// and closes the stream when the caller falls too far behind to keep in a
+	// bounded buffer: the caller reconnects, reports what it applied, and is
+	// either caught up incrementally or handed an image.
+	WatchLayout(ctx context.Context, in *WatchLayoutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LayoutFrame], error)
 }
 
 type peerServiceClient struct {
@@ -249,6 +261,25 @@ func (c *peerServiceClient) SlotSizes(ctx context.Context, in *SlotSizesRequest,
 	return out, nil
 }
 
+func (c *peerServiceClient) WatchLayout(ctx context.Context, in *WatchLayoutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LayoutFrame], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &PeerService_ServiceDesc.Streams[0], PeerService_WatchLayout_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchLayoutRequest, LayoutFrame]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PeerService_WatchLayoutClient = grpc.ServerStreamingClient[LayoutFrame]
+
 // PeerServiceServer is the server API for PeerService service.
 // All implementations must embed UnimplementedPeerServiceServer
 // for forward compatibility.
@@ -324,6 +355,17 @@ type PeerServiceServer interface {
 	// (the copy the writes landed on), and only the holder of a copy can report
 	// its bytes. A slot this node does not hold answers 0.
 	SlotSizes(context.Context, *SlotSizesRequest) (*SlotSizesResponse, error)
+	// WatchLayout is the data-plane node's feed: a node running with
+	// role=learner holds slot replicas but is not a voter (DESIGN §12), so it
+	// takes the replicated metadata from here instead of running a Raft group.
+	// Only the leader serves it (any voter answers with a REDIRECT frame naming
+	// the leader, and the caller re-dials). The server side streams the state
+	// machine's inputs — HELLO (leader, term, voter set, generation), ENTRY
+	// (committed command), COMMIT (progress) and SNAPSHOT (rebuild-from-here) —
+	// and closes the stream when the caller falls too far behind to keep in a
+	// bounded buffer: the caller reconnects, reports what it applied, and is
+	// either caught up incrementally or handed an image.
+	WatchLayout(*WatchLayoutRequest, grpc.ServerStreamingServer[LayoutFrame]) error
 	mustEmbedUnimplementedPeerServiceServer()
 }
 
@@ -372,6 +414,9 @@ func (UnimplementedPeerServiceServer) SlotLeos(context.Context, *SlotLeosRequest
 }
 func (UnimplementedPeerServiceServer) SlotSizes(context.Context, *SlotSizesRequest) (*SlotSizesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SlotSizes not implemented")
+}
+func (UnimplementedPeerServiceServer) WatchLayout(*WatchLayoutRequest, grpc.ServerStreamingServer[LayoutFrame]) error {
+	return status.Error(codes.Unimplemented, "method WatchLayout not implemented")
 }
 func (UnimplementedPeerServiceServer) mustEmbedUnimplementedPeerServiceServer() {}
 func (UnimplementedPeerServiceServer) testEmbeddedByValue()                     {}
@@ -628,6 +673,17 @@ func _PeerService_SlotSizes_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PeerService_WatchLayout_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchLayoutRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(PeerServiceServer).WatchLayout(m, &grpc.GenericServerStream[WatchLayoutRequest, LayoutFrame]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PeerService_WatchLayoutServer = grpc.ServerStreamingServer[LayoutFrame]
+
 // PeerService_ServiceDesc is the grpc.ServiceDesc for PeerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -688,6 +744,12 @@ var PeerService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _PeerService_SlotSizes_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "WatchLayout",
+			Handler:       _PeerService_WatchLayout_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "pushupes/v1/peer.proto",
 }

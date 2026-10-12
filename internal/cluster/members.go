@@ -65,12 +65,35 @@ var ErrOnlineMember = errors.New("cluster: node is online; only offline members 
 // the only one membership needs. Its admin and client addresses are NOT passed:
 // a member announces those itself through the ordinary registration protocol
 // once it is in the configuration.
-func (e *Engine) AddMember(ctx context.Context, id, peerAddr string) error {
+func (e *Engine) AddMember(ctx context.Context, id, peerAddr, role string) error {
 	if e.node == nil {
 		return &NotControllerError{}
 	}
 	if id == "" || peerAddr == "" {
 		return fmt.Errorf("%w: id and peer addr are required", ErrBadMember)
+	}
+	if role == RoleLearner {
+		// Learner admission is a replicated DIRECTORY command: the raft
+		// configuration never names a learner, and the layout pool takes it
+		// from the entry's role (see Table.HostingIDs). Idempotent on the
+		// directory: a re-admission of the same live entry is a no-op.
+		if p, ok := e.TableSnapshot().Peers[id]; ok && p.Role == RoleLearner {
+			return nil
+		}
+		if e.node.IsMember(id) {
+			return fmt.Errorf("%w: %s is already a raft voter; it cannot also be admitted as a learner", ErrBadMember, id)
+		}
+		if err := e.submit(&Command{Op: OpJoinNode, Peer: &Peer{
+			ID: id, PeerAddr: NormalizeAddr(peerAddr), Role: RoleLearner,
+		}}); err != nil {
+			if errors.Is(err, ErrNotLeader) {
+				cid, caddr := e.Controller()
+				return &NotControllerError{LeaderID: cid, AdminAddr: caddr}
+			}
+			return err
+		}
+		e.loggerf("learner %s admitted to the directory (peer addr %s); it registers its admin/client addresses itself", id, HostPort(NormalizeAddr(peerAddr)))
+		return nil
 	}
 	if e.node.IsMember(id) {
 		return nil // already a member: idempotent
@@ -108,10 +131,31 @@ func (e *Engine) RemoveMember(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("%w: id is required", ErrBadMember)
 	}
+	p, inDir := e.TableSnapshot().Peers[id]
 	if !e.node.IsMember(id) {
-		return nil // already gone: idempotent
+		if !inDir {
+			return nil // already gone: idempotent
+		}
+		if p.Role != RoleLearner {
+			return nil // in the directory only as an unseeded name: the voter sync owns it
+		}
+		// A learner revocation is a directory leave (no raft configuration
+		// change). The online guard is the same rule as for voters: a live
+		// learner holds seats the cluster is using.
+		if !p.Offline() {
+			return fmt.Errorf("%w: %s", ErrOnlineMember, id)
+		}
+		if err := e.submit(&Command{Op: OpLeaveNode, NodeID: id}); err != nil {
+			if errors.Is(err, ErrNotLeader) {
+				cid, caddr := e.Controller()
+				return &NotControllerError{LeaderID: cid, AdminAddr: caddr}
+			}
+			return err
+		}
+		e.loggerf("learner %s revoked from the directory; its seats re-plan to the remaining holders", id)
+		return nil
 	}
-	if p, ok := e.TableSnapshot().Peers[id]; ok && !p.Offline() {
+	if inDir && !p.Offline() {
 		return fmt.Errorf("%w: %s", ErrOnlineMember, id)
 	}
 	if err := e.node.RemoveMember(id, AddMemberTimeout); err != nil {
@@ -133,15 +177,32 @@ func (e *Engine) RemoveMember(ctx context.Context, id string) error {
 func (e *Engine) Members() []MemberView {
 	voters := e.node.Members()
 	tbl := e.TableSnapshot()
-	out := make([]MemberView, 0, len(voters))
+	out := make([]MemberView, 0, len(voters)+len(tbl.Peers))
+	seen := map[string]bool{}
 	for _, v := range voters {
-		mv := MemberView{ID: v.ID, PeerAddr: v.Addr}
+		mv := MemberView{ID: v.ID, PeerAddr: v.Addr, Role: RoleVoter}
 		if p, ok := tbl.Peers[v.ID]; ok {
 			mv.AdminAddr = p.AdminAddr
 			mv.ClientAddr = p.ClientAddr
 			mv.Down = p.Down
+			// The self-announced role wins (voter/both both mean "votes"):
+			// a both node reports both, not the bare voter the config
+			// implies for the raft axis alone.
+			if p.Role != "" {
+				mv.Role = p.Role
+			}
 		}
+		seen[v.ID] = true
 		out = append(out, mv)
+	}
+	// Learners live in the directory only — the raft configuration never
+	// names them, so the voter walk above cannot find them.
+	for id, p := range tbl.Peers {
+		if seen[id] || p.Role != RoleLearner {
+			continue
+		}
+		out = append(out, MemberView{ID: id, PeerAddr: p.PeerAddr,
+			AdminAddr: p.AdminAddr, ClientAddr: p.ClientAddr, Role: p.Role, Down: p.Down})
 	}
 	return out
 }
@@ -152,6 +213,7 @@ type MemberView struct {
 	PeerAddr   string `json:"peer_addr"`
 	AdminAddr  string `json:"admin_addr,omitempty"`
 	ClientAddr string `json:"client_addr,omitempty"`
+	Role       string `json:"role,omitempty"`
 	Down       bool   `json:"down,omitempty"`
 }
 
@@ -159,19 +221,24 @@ type MemberView struct {
 type Adoption struct {
 	ID       string
 	PeerAddr string
+	// Role is the shape to be admitted with: RoleLearner (data plane, no
+	// vote) or "" (voter — the classic every-node-votes admission).
+	Role string
 }
 
 // sendAdoption delivers an offer to a peer's peer-plane address; a non-leader
 // relays it onward. offerAddr is the JOINING node's peer address (what the
 // leader adds); targetAddr is the member being asked (which may be any node).
-func (e *Engine) sendAdoption(ctx context.Context, id, offerAddr, targetAddr string) error {
+func (e *Engine) sendAdoption(ctx context.Context, id, offerAddr, targetAddr, role string) error {
 	cctx, cancel := context.WithTimeout(ctx, registerRPCTimeout)
 	defer cancel()
 	c, err := e.peerRPC(targetAddr)
 	if err != nil {
 		return err
 	}
-	_, err = c.Adopt(cctx, &pushupesv1.AdoptRequest{Id: id, PeerAddr: HostPort(NormalizeAddr(offerAddr))})
+	_, err = c.Adopt(cctx, &pushupesv1.AdoptRequest{
+		Id: id, PeerAddr: HostPort(NormalizeAddr(offerAddr)), Role: role,
+	})
 	return err
 }
 
@@ -210,7 +277,7 @@ func (e *Engine) NewJoiner(targets []string, interval time.Duration) *Joiner {
 	return &Joiner{
 		e:        e,
 		targets:  cleaned,
-		selfAddr: HostPort(NormalizeAddr(e.node.cfg.PeerAddr)),
+		selfAddr: HostPort(NormalizeAddr(e.node.Cfg().PeerAddr)),
 		interval: interval,
 	}
 }
@@ -229,7 +296,7 @@ func (j *Joiner) Run(ctx context.Context) {
 			return
 		}
 		target := j.targets[i%len(j.targets)]
-		if err := j.e.sendAdoption(ctx, j.e.self, j.selfAddr, target); err != nil {
+		if err := j.e.sendAdoption(ctx, j.e.self, j.selfAddr, target, j.e.node.Cfg().Role); err != nil {
 			j.e.loggerf("join offer to %s failed: %v", target, err)
 		}
 		select {
@@ -249,6 +316,11 @@ func (e *Engine) acceptAdoption(ctx context.Context, ad *Adoption) error {
 		return fmt.Errorf("adopt: no raft node")
 	}
 	if e.node.IsLeader() {
+		if ad.Role == RoleLearner {
+			// Self-admission of a data-plane node: same directory command
+			// the admin endpoint posts (AddMember keeps one admission path).
+			return e.AddMember(ctx, ad.ID, ad.PeerAddr, RoleLearner)
+		}
 		if e.node.IsMember(ad.ID) {
 			return nil
 		}
@@ -259,7 +331,7 @@ func (e *Engine) acceptAdoption(ctx context.Context, ad *Adoption) error {
 		return nil
 	}
 	if addr := e.leaderPeerAddr(); addr != "" {
-		return e.sendAdoption(ctx, ad.ID, ad.PeerAddr, addr)
+		return e.sendAdoption(ctx, ad.ID, ad.PeerAddr, addr, ad.Role)
 	}
 	return fmt.Errorf("adopt: leader unknown yet")
 }

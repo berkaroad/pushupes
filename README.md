@@ -211,6 +211,7 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 | flag | env | 默认 | 说明 |
 |---|---|---|---|
 | `-node` | `PUSHUPES_NODE` | `node-1` | 节点 id |
+| `-role` | `PUSHUPES_ROLE` | `both` | 节点角色：`voter`=控制面（参与选举、**不承载槽副本**）、`learner`=数据面（不投票，从控制面接收布局分发）、`both`=经典单面形态（既投票又承载副本）。角色由节点自报进复制目录，布局池只认非 voter 成员；非法值启动即报错。`learner` 的槽表由控制面经 `WatchLayout` 流分发（DESIGN §12.4），它不建共识组、不提交、也不报名成为投票者 |
 | `-peer` | `PUSHUPES_PEER` | `http://127.0.0.1:8391` | peer 面：Raft + PeerService gRPC（全部节点间流量，运维只需配这个端口） |
 | `-admin` | `PUSHUPES_ADMIN` | `http://127.0.0.1:8091` | admin 面：HTTP 管理 API + pprof |
 | `-client` | `PUSHUPES_CLIENT` | `http://127.0.0.1:8591` | client 面：gRPC 事件读写唯一入口 |
@@ -251,14 +252,18 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 错误 ID：`1001` 版本冲突（附 current_version）、`1002` 参数非法、
 `1003` MOVED、`1004` ASK、`1005` 本节点非 controller（admin 写命令专用，
 响应附 `controller` 与 `controller_admin_addr`）、`1006` 本节点流控拒绝
-（见「节点级流控」；经 `pkg/client` 写入时该码被库吸收为回压，调用方看不到它）。
+（见「节点级流控」；经 `pkg/client` 写入时该码被库吸收为回压，调用方看不到它）、
+`1007` 本地副本来源未证实（owner 围栏拦下该槽：leader 拒写、本地读答空，直到
+运维经 `/admin/slots/pending/adopt` 采纳、或删除槽目录，见 DESIGN §3.1）。
 
 admin 面 HTTP（仅管理）：`GET /admin/cluster/status`、`GET /admin/writes`、
 `GET /admin/slots/{slot}/describe`、`GET /admin/slots/{slot}/streams`、
 `POST /admin/slots/{slot}/migrate`、`POST /admin/slots/{slot}/remove-replica`、
 `POST /admin/cluster/plan`、`POST /admin/cluster/replica-policy`、
 `POST/GET/DELETE /admin/flow-control`（节点本地：收到请求的节点就是被设置/查询/
-恢复的节点）、`GET /healthz`、`/debug/pprof/`。
+恢复的节点）、`GET /admin/slots/pending`、`POST /admin/slots/pending/adopt`
+（owner 围栏：查看被拦副本并采纳「属于当前世代」，同样节点本地；丢弃走运维
+手工删除槽目录，见 DESIGN §3.1）、`GET /healthz`、`/debug/pprof/`。
 **控制器专属写命令（migrate/remove-replica/plan/replica-policy）必须直接发到 Raft leader 的
 admin 地址**，follower 一律拒绝（425 + 1005），不做转发。
 

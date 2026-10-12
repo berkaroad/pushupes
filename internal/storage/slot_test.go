@@ -17,6 +17,7 @@ package storage
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/berkaroad/pushupes/internal/data"
@@ -296,5 +297,49 @@ func TestBadRequests(t *testing.T) {
 	}
 	if out.Status != data.StatusFail || out.ErrID != data.ErrIDBadRequest {
 		t.Fatalf("empty events should fail 1002: %+v", out)
+	}
+}
+
+// TestAuxOnlyDirIsNotACopy pins the provenance view of "has data": a slot
+// directory holding only auxiliary files (the owner.json record an operator
+// may have left behind as evidence) is NOT a copy. Opening it must not
+// materialise a WAL, SlotPresent/HasWAL must answer false, and the fence's
+// "predates this process" witness stays honest.
+func TestAuxOnlyDirIsNotACopy(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStore(dir, 4, DefaultSegmentBytes, FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Append(mkRec("aux-1", 1, "aux-c1")); err != nil {
+		t.Fatal(err)
+	}
+	walSlot := st.SlotOf("aux-1")
+	if err := st.DropSlot(walSlot); err != nil {
+		t.Fatal(err)
+	}
+	// Re-seed as an auxiliary-only directory: file present, no segments.
+	slotDir := st.SlotDir(walSlot)
+	if err := os.MkdirAll(slotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(slotDir, "owner.json"), []byte(`{"topology":"t","leader":"n","epoch":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	st2, err := OpenStore(dir, 4, DefaultSegmentBytes, FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	if st2.HasWAL(walSlot) {
+		t.Fatal("an owner.json-only directory reads as a copy with a WAL")
+	}
+	if st2.SlotPresent(walSlot) {
+		t.Fatal("an owner.json-only directory reads as a present copy")
+	}
+	if _, err := os.ReadDir(slotDir); err != nil {
+		t.Fatal(err)
 	}
 }

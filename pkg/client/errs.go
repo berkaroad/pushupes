@@ -24,4 +24,8 @@ const (
 	ErrIDMigrating       = 1004 // ASK
 	ErrIDNotLeader       = 1005
 	ErrIDFlowControl     = 1006 // the node's flow control refused the append
+	ErrIDSlotUnproven    = 1007 // this node holds slot data its owner record cannot
+	// place in the current cluster generation; the leader refuses to serve
+	// the slot (writes would mix seq spaces) until an operator adopts the
+	// copy or removes it from disk (see DESIGN §3.1 owner fence).
 )

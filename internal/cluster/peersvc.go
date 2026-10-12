@@ -97,7 +97,7 @@ func (s *peerServer) ReportUnreachable(_ context.Context, req *pushupesv1.Report
 }
 
 func (s *peerServer) Register(_ context.Context, req *pushupesv1.RegisterRequest) (*pushupesv1.RegisterResponse, error) {
-	reg := &Registration{ID: req.Id, AdminAddr: req.AdminAddr, ClientAddr: req.ClientAddr}
+	reg := &Registration{ID: req.Id, AdminAddr: req.AdminAddr, ClientAddr: req.ClientAddr, Role: req.GetRole()}
 	if err := s.e.acceptRegistration(reg); err != nil {
 		return nil, err
 	}
@@ -105,7 +105,7 @@ func (s *peerServer) Register(_ context.Context, req *pushupesv1.RegisterRequest
 }
 
 func (s *peerServer) Adopt(ctx context.Context, req *pushupesv1.AdoptRequest) (*pushupesv1.AdoptResponse, error) {
-	if err := s.e.acceptAdoption(ctx, &Adoption{ID: req.Id, PeerAddr: req.PeerAddr}); err != nil {
+	if err := s.e.acceptAdoption(ctx, &Adoption{ID: req.Id, PeerAddr: req.PeerAddr, Role: req.GetRole()}); err != nil {
 		return nil, err
 	}
 	return &pushupesv1.AdoptResponse{}, nil
@@ -490,6 +490,49 @@ func (s *peerServer) SlotSizes(_ context.Context, req *pushupesv1.SlotSizesReque
 		resp.Bytes[i] = uint64(s.e.SlotSize(slot))
 	}
 	return resp, nil
+}
+
+// WatchLayout is the data-plane node's feed (DESIGN §12, layoutfeed.go): the
+// caller runs no Raft group and takes the replicated metadata from here. Only
+// the controller serves frames — any other voter answers a redirect frame
+// naming where to go — and the stream ends when the caller falls too far
+// behind to keep in a bounded buffer, which is the caller's cue to reconnect
+// and re-sync from its applied index.
+func (s *peerServer) WatchLayout(req *pushupesv1.WatchLayoutRequest, stream grpc.ServerStreamingServer[pushupesv1.LayoutFrame]) error {
+	if req.GetLearnerId() == "" {
+		return fmt.Errorf("cluster: WatchLayout needs a learner id")
+	}
+	return s.e.layoutFeed().serve(stream.Context(), layoutRequest{
+		LearnerID: req.GetLearnerId(),
+		FromIndex: req.GetFromIndex(),
+		FromTerm:  req.GetFromTerm(),
+		Topology:  req.GetTopology(),
+	}, func(f *layoutFrame) error { return stream.Send(toPBFrame(f)) })
+}
+
+// toPBFrame puts one feed step on the wire. kind/entry_kind are carried as
+// numbers so the two sides can grow without a shared enum.
+func toPBFrame(f *layoutFrame) *pushupesv1.LayoutFrame {
+	out := &pushupesv1.LayoutFrame{
+		Kind:           f.Kind,
+		Index:          f.Index,
+		Term:           f.Term,
+		Data:           f.Data,
+		CommitIndex:    f.CommitIndex,
+		LeaderId:       f.LeaderID,
+		LeaderPeerAddr: f.LeaderPeer,
+		Topology:       f.Topology,
+		FirstIndex:     f.FirstIndex,
+		EntryKind:      uint32(f.EntryKind),
+		Reason:         f.Reason,
+	}
+	if len(f.Voters) > 0 {
+		out.Voters = make([]*pushupesv1.LayoutVoter, 0, len(f.Voters))
+		for _, v := range f.Voters {
+			out.Voters = append(out.Voters, &pushupesv1.LayoutVoter{Id: v.ID, Addr: v.Addr})
+		}
+	}
+	return out
 }
 
 // peerSlotSizes asks a peer for the on-disk bytes of the given slots.

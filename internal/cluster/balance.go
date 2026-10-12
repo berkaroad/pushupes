@@ -441,11 +441,20 @@ func (e *Engine) reclaimRound(ctx context.Context) int {
 	if len(tbl.Peers) < 2 || !layoutSettled(tbl) {
 		return 0
 	}
-	planned := PlanSlots(tbl.PeerIDs(), tbl.SlotCount, tbl.Replicas)
+	planned := PlanSlots(tbl.HostingIDs(), tbl.SlotCount, tbl.Replicas)
 	now := time.Now()
 	var cands []reclaimCandidate
 	for s, p := range tbl.Slots {
-		drop := surplusSeatForReplan(p, tbl.Replicas, planned[s].Replicas)
+		want := planned[s]
+		if want == nil {
+			// No hosting member plans this slot: the pool is empty (every
+			// member is control-plane only). Nothing comes off — a dropped
+			// seat must be redundant against the seats that STAY, and with no
+			// hosting member there is no such seat. The bytes outlive the
+			// layout; the slot is re-seated when a data-plane node arrives.
+			continue
+		}
+		drop := surplusSeatForReplan(p, tbl.Replicas, want.Replicas)
 		if drop == "" {
 			continue
 		}

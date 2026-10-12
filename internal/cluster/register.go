@@ -50,6 +50,9 @@ type Registration struct {
 	ID         string
 	AdminAddr  string
 	ClientAddr string
+	// Role is the node's self-announcement of its place in the cluster
+	// ("" = both). The node's own -role flag is the only authority on it.
+	Role string
 }
 
 func (r *Registration) validate() error {
@@ -69,7 +72,7 @@ func (e *Engine) sendRegistration(ctx context.Context, peerAddr string, reg *Reg
 		return err
 	}
 	_, err = c.Register(cctx, &pushupesv1.RegisterRequest{
-		Id: reg.ID, AdminAddr: reg.AdminAddr, ClientAddr: reg.ClientAddr,
+		Id: reg.ID, AdminAddr: reg.AdminAddr, ClientAddr: reg.ClientAddr, Role: reg.Role,
 	})
 	return err
 }
@@ -92,7 +95,7 @@ func (e *Engine) acceptRegistration(reg *Registration) error {
 			return nil
 		}
 		return e.submit(&Command{Op: OpRegister, Peer: &Peer{
-			ID: reg.ID, AdminAddr: reg.AdminAddr, ClientAddr: reg.ClientAddr,
+			ID: reg.ID, AdminAddr: reg.AdminAddr, ClientAddr: reg.ClientAddr, Role: reg.Role,
 		}})
 	}
 	if addr := e.leaderPeerAddr(); addr != "" {
@@ -111,20 +114,36 @@ func (e *Engine) registrationMatches(reg *Registration) bool {
 		return false
 	}
 	p, ok := tbl.Peers[reg.ID]
-	return ok && p.AdminAddr == reg.AdminAddr && p.ClientAddr == reg.ClientAddr
+	if !ok || p.AdminAddr != reg.AdminAddr || p.ClientAddr != reg.ClientAddr {
+		return false
+	}
+	// An announcement that carries no role never disagrees: the recorded
+	// role (from any earlier announcement) already says everything a
+	// role-less peer could.
+	return reg.Role == "" || p.Role == reg.Role
 }
 
 // leaderPeerAddr maps the Raft leader id onto its peer address — the one
 // address every node knows statically for every configured peer.
 func (e *Engine) leaderPeerAddr() string {
-	id := e.node.raft.LeaderID()
+	id := e.node.LeaderID()
 	if id == "" {
 		return ""
 	}
 	if id == e.self {
-		return e.node.cfg.PeerAddr
+		return e.node.Cfg().PeerAddr
 	}
-	for _, p := range e.node.cfg.Peers {
+	return e.peerAddrForNode(id)
+}
+
+// peerAddrForNode resolves a node id to its peer-plane address: the
+// replicated directory first (it carries members admitted at runtime, which
+// the static -peers list cannot know), the static list as fallback.
+func (e *Engine) peerAddrForNode(id string) string {
+	if p, ok := e.TableSnapshot().Peers[id]; ok && p.PeerAddr != "" {
+		return p.PeerAddr
+	}
+	for _, p := range e.node.Cfg().Peers {
 		if p.ID == id {
 			return p.PeerAddr
 		}
@@ -143,11 +162,12 @@ type RegisterAnnouncer struct {
 func (e *Engine) NewRegisterAnnouncer() *RegisterAnnouncer {
 	reg := Registration{
 		ID:         e.self,
-		AdminAddr:  e.node.cfg.AdminAddr,
-		ClientAddr: e.node.cfg.ClientAddr,
+		AdminAddr:  e.node.Cfg().AdminAddr,
+		ClientAddr: e.node.Cfg().ClientAddr,
+		Role:       e.node.Cfg().Role,
 	}
-	targets := make([]string, 0, len(e.node.cfg.Peers)+1)
-	for _, p := range e.node.cfg.Peers {
+	targets := make([]string, 0, len(e.node.Cfg().Peers)+1)
+	for _, p := range e.node.Cfg().Peers {
 		if p.PeerAddr != "" && p.ID != e.self {
 			targets = append(targets, p.PeerAddr)
 		}
@@ -180,7 +200,8 @@ func (a *RegisterAnnouncer) Run(ctx context.Context) {
 func (a *RegisterAnnouncer) done() bool {
 	tbl := a.e.TableSnapshot()
 	p, ok := tbl.Peers[a.reg.ID]
-	return ok && p.AdminAddr == a.reg.AdminAddr && p.ClientAddr == a.reg.ClientAddr
+	return ok && p.AdminAddr == a.reg.AdminAddr && p.ClientAddr == a.reg.ClientAddr &&
+		(a.reg.Role == "" || p.Role == a.reg.Role)
 }
 
 func (a *RegisterAnnouncer) announceOnce(ctx context.Context) {

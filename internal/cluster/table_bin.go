@@ -40,11 +40,17 @@ import (
 
 const (
 	tableMagic = "PTAB"
-	// v5 appends, after the slots, the member directory the layout was planned
-	// under and — per slot — why each seat exists (ring = load, factor =
-	// redundancy). The fetch round ranks a node's catch-up by that label, so it
-	// has to survive a snapshot. v4 is the same file without them.
-	tableVer = byte(5)
+	// tableVer (v6) adds the self-announced node role to every directory
+	// entry: the layout pool (voters host no slots) must survive a snapshot
+	// or the restored table would spread seats onto the control plane until
+	// re-registration lands.
+	tableVer = byte(6)
+	// tableVerGrant is the v5 form: it appends, after the slots, the member
+	// directory the layout was planned under and — per slot — why each seat
+	// exists (ring = load, factor = redundancy). The fetch round ranks a
+	// node's catch-up by that label, so it has to survive a snapshot.
+	// v4 is the same file without the grants.
+	tableVerGrant = byte(5)
 	// tableVerNoGrant is the v4 form: the replica policy tier in the header,
 	// and no seat grants.
 	tableVerNoGrant = byte(4)
@@ -171,6 +177,9 @@ func (t *Table) EncodeTableBinary() []byte {
 		} else {
 			body.WriteByte(0)
 		}
+		// Role (v6): who may carry slots. "" (both) is a length-zero
+		// string — the pre-role reading of every old entry.
+		putStr(&body, p.Role)
 	}
 	n = binary.PutUvarint(tmp[:], uint64(len(names)))
 	body.Write(tmp[:n])
@@ -249,11 +258,11 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return nil, fmt.Errorf("table: short header: %w", err)
 	}
-	if string(hdr[0:4]) != tableMagic || (hdr[4] != tableVer && hdr[4] != tableVerNoGrant && hdr[4] != tableVerPolicy) {
+	if string(hdr[0:4]) != tableMagic || (hdr[4] != tableVer && hdr[4] != tableVerNoGrant && hdr[4] != tableVerPolicy && hdr[4] != tableVerGrant) {
 		return nil, fmt.Errorf("table: bad snapshot magic/version")
 	}
 	policyInHeader := hdr[4] != tableVerPolicy // v4 and later carry the tier in the header
-	withGrants := hdr[4] == tableVer           // v5 carries the seat grants
+	withGrants := hdr[4] >= tableVerGrant      // v5 and later carry the seat grants
 	var tmp4 [4]byte
 	readU32 := func() (uint32, error) {
 		if _, err := io.ReadFull(r, tmp4[:]); err != nil {
@@ -311,7 +320,14 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 		if _, err := io.ReadFull(r, db[:]); err != nil {
 			return nil, err
 		}
-		t.Peers[id] = Peer{ID: id, PeerAddr: peerAddr, AdminAddr: adminAddr, ClientAddr: clientAddr, Down: db[0] == 1}
+		role := ""
+		if hdr[4] >= tableVer {
+			// Role (v6): one len-prefixed string per entry.
+			if role, err = readStr(r); err != nil {
+				return nil, err
+			}
+		}
+		t.Peers[id] = Peer{ID: id, PeerAddr: peerAddr, AdminAddr: adminAddr, ClientAddr: clientAddr, Role: role, Down: db[0] == 1}
 	}
 	nameN, err := binary.ReadUvarint(r)
 	if err != nil {

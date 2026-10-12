@@ -75,6 +75,53 @@ service PeerService {
   // (the copy the writes landed on), and only the holder of a copy can report
   // its bytes. A slot this node does not hold answers 0.
   rpc SlotSizes(SlotSizesRequest) returns (SlotSizesResponse);
+  // WatchLayout is the data-plane node's feed: a node running with
+  // role=learner holds slot replicas but is not a voter (DESIGN §12), so it
+  // takes the replicated metadata from here instead of running a Raft group.
+  // Only the leader serves it (any voter answers with a REDIRECT frame naming
+  // the leader, and the caller re-dials). The server side streams the state
+  // machine's inputs — HELLO (leader, term, voter set, generation), ENTRY
+  // (committed command), COMMIT (progress) and SNAPSHOT (rebuild-from-here) —
+  // and closes the stream when the caller falls too far behind to keep in a
+  // bounded buffer: the caller reconnects, reports what it applied, and is
+  // either caught up incrementally or handed an image.
+  rpc WatchLayout(WatchLayoutRequest) returns (stream LayoutFrame);
+}
+
+// WatchLayoutRequest names the caller and the point it resumes from.
+message WatchLayoutRequest {
+  string learner_id = 1;
+  // from_index/from_term are the last point the caller APPLIED (0 when it has
+  // nothing). The pair is checked against the log: a mismatch means the
+  // caller's history is not this group's and it gets an image instead.
+  uint64 from_index = 2;
+  uint64 from_term = 3;
+  // topology is the cluster generation the caller's local bytes belong to
+  // (see internal/cluster/owner.go): the leader reports its own id, and a
+  // differing value is how a node that kept its slot data across a rebuilt
+  // consensus state learns that its copies need re-proving.
+  string topology = 4;
+}
+
+// LayoutFrame is one step of the feed. kind selects which fields carry.
+message LayoutFrame {
+  uint32 kind = 1;
+  uint64 index = 2;   // ENTRY/SNAPSHOT: the index this frame puts the caller at
+  uint64 term = 3;    // ENTRY/SNAPSHOT: that index's term
+  bytes data = 4;     // ENTRY: command payload; SNAPSHOT: state-machine image
+  uint64 commit_index = 5;  // COMMIT: the leader's commit index
+  string leader_id = 6;     // HELLO/REDIRECT
+  string leader_peer_addr = 7;  // HELLO/REDIRECT: where to re-dial
+  string topology = 8;   // HELLO: the leader's cluster generation id
+  repeated LayoutVoter voters = 9;  // HELLO: the voter set (Members/PeerAddrs)
+  uint64 first_index = 10;  // HELLO: lowest index the leader can still serve
+  uint32 entry_kind = 11;   // ENTRY: Raft entry kind (command/noop/conf)
+  string reason = 12;    // HELLO/REDIRECT: why this frame (operator-facing)
+}
+
+message LayoutVoter {
+  string id = 1;
+  string addr = 2;
 }
 
 message PingRequest {}
@@ -109,6 +156,8 @@ message RegisterRequest {
   string id = 1;
   string admin_addr = 2;  // management HTTP base (scheme carried)
   string client_addr = 3; // client-facing gRPC base (scheme carried)
+  string role = 4;        // self-announced place in the cluster: voter /
+                          // learner / both ("" = both, the classic shape)
 }
 message RegisterResponse {}
 
@@ -118,6 +167,8 @@ message RegisterResponse {}
 message AdoptRequest {
   string id = 1;
   string peer_addr = 2;
+  string role = 3; // the role to be admitted with ("" = voter, the
+                   // classic every-node-votes shape)
 }
 message AdoptResponse {}
 

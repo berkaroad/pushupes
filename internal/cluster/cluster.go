@@ -54,6 +54,39 @@ type Applier interface {
 	SnapshotState() ([]byte, error)
 	// RestoreState replaces the replicated state from a snapshot.
 	RestoreState(data []byte) error
+	// ResetState drops the replicated state back to "nothing has been
+	// decided yet". A data-plane node is told to do this when the control
+	// plane it follows cannot place the point it resume from (index 0 with no
+	// image to install): replaying a log onto a state it does not belong to
+	// would leave the two silently divergent, so the state goes first.
+	ResetState() error
+}
+
+// Node roles (-role): who votes in the consensus group and who may host
+// slot replicas. The two axes are deliberately separate:
+//
+//   - voter:   control-plane member — votes and is elected; hosts NO slots,
+//     so its raft timings never share a machine with a data-plane load.
+//   - learner: data-plane member — receives the replicated layout over the
+//     control plane's distribution stream; never votes, never elects.
+//   - both:    the classic single-plane shape (every node votes and hosts)
+//     and the default, so a cluster that never names a role behaves exactly
+//     as it always did.
+const (
+	RoleVoter   = "voter"
+	RoleLearner = "learner"
+	RoleBoth    = "both"
+)
+
+// NormalizeRole validates a role name ("" means the default, both).
+func NormalizeRole(role string) (string, error) {
+	switch role {
+	case "", RoleBoth:
+		return RoleBoth, nil
+	case RoleVoter, RoleLearner:
+		return role, nil
+	}
+	return "", fmt.Errorf("cluster: unknown role %q (want voter, learner or both)", role)
 }
 
 // Peer is a cluster member. AdminAddr serves inter-node replication and
@@ -64,13 +97,46 @@ type Peer struct {
 	PeerAddr   string `json:"peer_addr"`
 	AdminAddr  string `json:"admin_addr"`
 	ClientAddr string `json:"client_addr"`
+	// Role is the node's self-announced place in the cluster (see the role
+	// constants above): announced like the admin/client addresses — the node
+	// knows its own -role flag, nobody else can answer for it.
+	Role string `json:"role,omitempty"`
 	// Down is the controller's liveness verdict, replicated through Raft:
 	// the peer failed its consecutive peer-plane probes. The directory entry
-	// KEEPS its announced addresses (unlike leave_node, which deletes it),
-	// so a failed node stays visible — flagged 离线 in the console — instead
-	// of flickering between "removed" and "re-seeded without addresses".
+	// KEEPS its announced addresses (unlike leave_node, which deletes it), so
+	// a failed node stays visible — flagged 离线 in the console — instead of
+	// flickering between "removed" and "re-seeded without addresses".
 	Down bool `json:"down,omitempty"`
 }
+
+// Hosts reports whether a directory entry may carry slot replicas. Two
+// conditions, both about the node having said what it is and where to reach
+// it:
+//
+//   - it is not a pure control node (a voter hosts nothing, by role);
+//   - it has announced a client address. An entry that has never registered is
+//     a static -peers seed or a directory entry the controller derived from the
+//     Raft configuration — a node clients cannot route to, and one the
+//     controller would seat, hand leadership to and then watch stall. Planning
+//     onto it also opened a real hole in a control/data split: on a cold start
+//     every static peer was pool-eligible before its role announcement landed,
+//     so a cluster of pure voters planned slots onto itself (observed live:
+//     three voters each leading 840 slots on a fresh cluster, layout
+//     unrecoverable without replaying history). Registration closes both,
+//     because OpRegister carries the addresses and the role in one command —
+//     the entry joins the pool on the plan after it.
+//
+// Note what is deliberately NOT a condition: Down. A failed node keeps its
+// seats (its copies are what a failover hands leadership to); "can this node
+// be a target right now" is a different question, answered by Offline.
+func (p Peer) Hosts() bool { return p.Role != RoleVoter && p.ClientAddr != "" }
+
+// PureControl reports whether the directory says this node is control-plane
+// only — the one case where an unassigned slot must not be served locally
+// (see Engine.controlOnlyRefusal). Unlike Hosts it does NOT treat "unknown" as
+// not hosting: an entry with no role is a node that has not announced yet, and
+// refusing its writes would turn "the plan is one round away" into an error.
+func (p Peer) PureControl() bool { return p.Role == RoleVoter }
 
 // Offline is the cluster-wide "clients cannot reach this node" rule: no
 // announced client address (not registered yet) or a live-marked-down peer.
@@ -84,8 +150,13 @@ type Config struct {
 	PeerAddr   string
 	AdminAddr  string
 	ClientAddr string
-	DataDir    string
-	Peers      []Peer
+	// Role is this node's place in the cluster (RoleVoter / RoleLearner /
+	// RoleBoth; "" means both). It lands in the peer directory through the
+	// registration announcement and decides whether the layout may place
+	// slots here (see Peer.Hosts).
+	Role    string
+	DataDir string
+	Peers   []Peer
 	// Seed marks Peers as a bootstrap seed rather than an authoritative
 	// membership: a node that does not author the cluster's configuration
 	// (a runtime joiner, or any configured node other than the one leading
@@ -135,12 +206,25 @@ func (c *Config) withDefaults() {
 
 // Node is a running Raft node owning the slot-table state machine.
 type Node struct {
-	cfg      Config
+	cfg Config
+	// raft is the control-plane engine: a Raft group this node votes in.
+	// learner is the data-plane engine: no group at all, the replicated
+	// metadata arriving over the controller's feed (learnernode.go). Exactly
+	// one of them is set — see NewNode.
 	raft     *raft.Node
+	learner  *learnerNode
 	fsm      *FSM
 	mux      *peerMux
 	stopOnce sync.Once
 	logger   *slog.Logger
+	// topology identifies THIS node's consensus history generation: a random
+	// id written once into the data dir and kept for the dir's lifetime. It
+	// fences the owner provenance record (owner.go): a copy stamped under one
+	// topology and found after the dir was rebuilt carries a different id,
+	// so the node refuses to lead it rather than writing into a stale seq
+	// space. It never needs to agree across nodes — every node compares its
+	// own record against its own dir.
+	topology string
 }
 
 // NewNode starts (or recovers) a Raft node. The second return value is the
@@ -154,7 +238,6 @@ func NewNode(cfg Config, applier Applier, logger *slog.Logger) (*Node, net.Liste
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, nil, err
 	}
-
 	advertise, err := net.ResolveTCPAddr("tcp", HostPort(cfg.PeerAddr))
 	if err != nil {
 		return nil, nil, fmt.Errorf("cluster: resolve peer addr %q: %w", cfg.PeerAddr, err)
@@ -168,6 +251,30 @@ func NewNode(cfg Config, applier Applier, logger *slog.Logger) (*Node, net.Liste
 	// handshake magic 0x9E — see peer_mux.go).
 	mux, err := newPeerMux(HostPort(cfg.PeerAddr), advertise)
 	if err != nil {
+		return nil, nil, err
+	}
+
+	if cfg.Role == RoleLearner {
+		// Data-plane node (DESIGN §12): it serves slot replicas and the
+		// inter-node PeerService plane, and takes the replicated metadata from
+		// the controller's feed. There is no Raft group, so there is no
+		// consensus dir either — which is why the generation id it fences its
+		// own copies with comes from the control plane rather than from a file
+		// here (see learnernode.go).
+		ln, err := newLearnerNode(cfg, applier, logger)
+		if err != nil {
+			mux.Close()
+			return nil, nil, err
+		}
+		logger.Info("data-plane node: layout arrives from the control plane",
+			"role", cfg.Role, "seeds", len(cfg.Peers))
+		ln.start()
+		return &Node{cfg: cfg, learner: ln, mux: mux, logger: logger}, mux.GRPCListener(), nil
+	}
+
+	topo, err := loadOrInitTopology(cfg.DataDir)
+	if err != nil {
+		mux.Close()
 		return nil, nil, err
 	}
 
@@ -200,7 +307,7 @@ func NewNode(cfg Config, applier Applier, logger *slog.Logger) (*Node, net.Liste
 		"election", cfg.ElectionTimeout,
 		"ratio", float64(cfg.ElectionTimeout)/float64(cfg.HeartbeatTimeout))
 
-	return &Node{cfg: cfg, raft: rn, fsm: fsm, mux: mux, logger: logger}, mux.GRPCListener(), nil
+	return &Node{cfg: cfg, raft: rn, fsm: fsm, mux: mux, logger: logger, topology: topo}, mux.GRPCListener(), nil
 }
 
 // raftVoters projects the configured peer directory onto the consensus
@@ -221,8 +328,14 @@ func (a raftLogAdapter) Infof(f string, args ...any)  { a.l.Info(fmt.Sprintf(f, 
 func (a raftLogAdapter) Warnf(f string, args ...any)  { a.l.Warn(fmt.Sprintf(f, args...)) }
 func (a raftLogAdapter) Errorf(f string, args ...any) { a.l.Error(fmt.Sprintf(f, args...)) }
 
-// Apply submits a command through Raft and returns the applied result.
+// Apply submits a command through Raft and returns the applied result. A
+// data-plane node never submits: it answers ErrNotLeader, the same answer a
+// follower gives, so every leader-only path in the Engine takes its
+// non-controller branch.
 func (n *Node) Apply(cmd []byte) ([]byte, error) {
+	if n.learner != nil {
+		return nil, ErrNotLeader
+	}
 	res, err := n.raft.Apply(cmd, n.cfg.ApplyTimeout)
 	if err != nil {
 		if errors.Is(err, raft.ErrNotLeader) {
@@ -241,17 +354,84 @@ func (n *Node) Apply(cmd []byte) ([]byte, error) {
 }
 
 // IsLeader reports whether this node holds the Raft leadership (controller).
-func (n *Node) IsLeader() bool { return n.raft.IsLeader() }
+// A data-plane node is never the controller.
+func (n *Node) IsLeader() bool {
+	if n.learner != nil {
+		return false
+	}
+	return n.raft.IsLeader()
+}
+
+// Cfg returns the node's configuration (addresses and join seeds) — the
+// Engine reads its own plane addresses and the seed list through it, so a
+// learner implementation can answer the same shape without a Raft group.
+func (n *Node) Cfg() Config { return n.cfg }
+
+// TopologyID is the consensus generation this node's replicated metadata
+// belongs to (see owner.go). A voter reads its own dir — the dir IS its
+// consensus history; a data-plane node took the id from the control plane it
+// follows, because its dir holds slot data and no history of its own.
+func (n *Node) TopologyID() string {
+	if n.learner != nil {
+		return n.learner.TopologyID()
+	}
+	return n.topology
+}
+
+// consensus is the cluster layer's seam to the replicated-metadata engine.
+// raftNode (the *Node above) implements it with a Raft group; the learner
+// implementation (role=learner, see learner.go) answers the same surface
+// from the control plane's distribution stream — the Engine's behavior (a
+// leader-only submit, directory sync, membership views) never branches on
+// the difference: it only observes IsLeader()==false and reads the same
+// replicated table its raft siblings apply.
+type consensus interface {
+	Apply(cmd []byte) ([]byte, error)
+	IsLeader() bool
+	LeaderID() string
+	LeaderPeerAddr() string
+	PeerAddrs() map[string]string
+	Members() []raft.Voter
+	IsMember(id string) bool
+	Stats() map[string]any
+	AddMember(id, addr string, timeout time.Duration) error
+	RemoveMember(id string, timeout time.Duration) error
+	Cfg() Config
+	TopologyID() string
+	WaitForLeader(timeout time.Duration) (string, error)
+	// LayoutSlice answers a data-plane node asking for the replicated
+	// metadata from a given point (raft.LayoutSlice): entries to continue
+	// with, or an image to rebuild from. It is a control-plane primitive —
+	// only a voter has a log to slice — so a learner answers an error and the
+	// feed is served by whoever holds the controller (layoutfeed.go).
+	LayoutSlice(from, fromTerm uint64, max int) (raft.LayoutSlice, error)
+	Close() error
+}
+
+var _ consensus = (*Node)(nil)
 
 // LeaderID returns the Raft leader (controller) node id — the id the slot
 // table and the peer directory are keyed by.
-func (n *Node) LeaderID() string { return n.raft.LeaderID() }
+func (n *Node) LeaderID() string {
+	if n.learner != nil {
+		return n.learner.LeaderID()
+	}
+	return n.raft.LeaderID()
+}
 
 // LeaderPeerAddr returns the leader's peer-plane address ("" when unknown).
-func (n *Node) LeaderPeerAddr() string { return n.raft.LeaderAddr() }
+func (n *Node) LeaderPeerAddr() string {
+	if n.learner != nil {
+		return n.learner.LeaderPeerAddr()
+	}
+	return n.raft.LeaderAddr()
+}
 
 // WaitForLeader blocks until a leader is known.
 func (n *Node) WaitForLeader(timeout time.Duration) (string, error) {
+	if n.learner != nil {
+		return n.learner.WaitForLeader(timeout)
+	}
 	return n.raft.WaitForLeader(timeout)
 }
 
@@ -269,6 +449,9 @@ func (n *Node) Peers() []string {
 // static voter set — the authoritative source of the only address every node
 // learns statically about every other node.
 func (n *Node) PeerAddrs() map[string]string {
+	if n.learner != nil {
+		return n.learner.PeerAddrs()
+	}
 	vs := n.raft.Voters()
 	out := make(map[string]string, len(vs))
 	for _, v := range vs {
@@ -287,6 +470,9 @@ func (n *Node) PeerAddrs() map[string]string {
 // what the node is actually running with — next to the flag they passed, not
 // buried in a startup log line.
 func (n *Node) Stats() map[string]any {
+	if n.learner != nil {
+		return n.learner.Stats()
+	}
 	st := n.raft.Stats()
 	heartbeat, election := n.cfg.HeartbeatTimeout, n.cfg.ElectionTimeout
 	if heartbeat <= 0 {
@@ -301,29 +487,63 @@ func (n *Node) Stats() map[string]any {
 }
 
 // IsMember reports whether id is in the current cluster membership.
-func (n *Node) IsMember(id string) bool { return n.raft.IsMember(id) }
+func (n *Node) IsMember(id string) bool {
+	if n.learner != nil {
+		return n.learner.IsMember(id)
+	}
+	return n.raft.IsMember(id)
+}
 
 // Members returns the current membership (id + consensus address).
-func (n *Node) Members() []raft.Voter { return n.raft.Members() }
+func (n *Node) Members() []raft.Voter {
+	if n.learner != nil {
+		return n.learner.Members()
+	}
+	return n.raft.Members()
+}
 
 // AddMember adds a node to the cluster membership at runtime (leader only).
 func (n *Node) AddMember(id, addr string, timeout time.Duration) error {
+	if n.learner != nil {
+		return n.learner.AddMember(id, addr, timeout)
+	}
 	return n.raft.AddMember(id, addr, timeout)
 }
 
 // RemoveMember drops a node from the cluster membership at runtime (leader only).
 func (n *Node) RemoveMember(id string, timeout time.Duration) error {
+	if n.learner != nil {
+		return n.learner.RemoveMember(id, timeout)
+	}
 	return n.raft.RemoveMember(id, timeout)
 }
 
 // Voters reports whether id currently counts towards quorum.
-func (n *Node) IsVoter(id string) bool { return n.raft.IsVoter(id) }
+func (n *Node) IsVoter(id string) bool {
+	if n.learner != nil {
+		return n.learner.IsMember(id)
+	}
+	return n.raft.IsVoter(id)
+}
+
+// LayoutSlice serves the data-plane feed (layoutfeed.go). A learner has no log
+// to slice and answers an error, which keeps a misdirected caller loud.
+func (n *Node) LayoutSlice(from, fromTerm uint64, max int) (raft.LayoutSlice, error) {
+	if n.learner != nil {
+		return n.learner.LayoutSlice(from, fromTerm, max)
+	}
+	return n.raft.LayoutSlice(from, fromTerm, max)
+}
 
 // Close shuts the node down.
 func (n *Node) Close() error {
 	var err error
 	n.stopOnce.Do(func() {
-		if cerr := n.raft.Close(); cerr != nil {
+		if n.learner != nil {
+			if cerr := n.learner.Close(); cerr != nil {
+				err = cerr
+			}
+		} else if cerr := n.raft.Close(); cerr != nil {
 			err = cerr
 		}
 		if n.mux != nil {

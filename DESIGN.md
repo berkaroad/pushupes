@@ -98,6 +98,7 @@ seq 升序重放同一批记录，把计数器重建到 LEO。
 | 1004 | ERR_MIGRATING | 槽位迁移中（ASK 语义，附目标节点） |
 | 1005 | ERR_NOT_LEADER | 本节点非该槽 leader（附 leader 地址） |
 | 1006 | ERR_FLOW_CONTROL | 本节点流控拒绝（message 固定 `FlowControl`；令牌桶取空时写入不落 WAL 直接失败，见 §6.2） |
+| 1007 | ERR_SLOT_UNPROVEN | 本地副本来源未证实（owner 围栏：leader 拒写、本地读答空，直到运维采纳或丢弃，见 §3.1） |
 
 并发控制：锁粒度 = slot。同一槽串行写（保证 seq/version 原子推进），
 不同槽并行。1680 槽 = 最多 1680 条并行写路径。
@@ -178,6 +179,38 @@ Body: Record*，每条记录：
   `fsync_new_bytes_avg/max` 与它覆盖的段文件大小
   `fsync_file_size_avg/max`（后者才是服务时间量级的解释）。这台设备上
   4K+fdatasync 的参照：盘空闲时 p50 ≈ 2ms、邻租户打满时 ≈ 7ms。
+
+### 3.1 owner 围栏（本地副本的来源证明）
+
+两份数据、两条恢复路径互不依赖（槽 WAL 只认自己目录，共识状态只认自己的
+日志/快照），危险只在两者错配时出现：**共识状态丢失或被替换、槽文件还在**
+——重建后的表把槽规划给一个盘上已有旧 seq 空间的节点，旧事件与新事件就会
+混进同一个槽。围栏给每个槽目录配一份证据文件 `slot-xxx/owner.json`，内容
+是「写下它时，表把这个槽指给谁、哪个任期、我扮演什么席位」，外加本节点的
+世代号：
+
+- **世代号**（`<data>/cluster/topology`）：共识目录首启时生成、随目录共存
+  亡。清空/替换共识 ⇒ 新世代 ⇒ 所有旧记录自动不匹配，这是围栏的主判据。
+- **出生见证**：进程启动瞬间扫描一遍哪些槽目录带 WAL。「本进程生命周期内
+  出现的副本」（首写、迁移推送、fetch 补齐）天然属于当前世代，直接盖记录；
+  「出生就在盘上、又没有匹配记录」的副本才是来历不明，等待运维裁决。
+- **判定**（leader 席位才会被围栏；冗余副本的读由同步证明门控，写由复制协议
+  对账）：记录匹配 ⇒ 盖新记录（表变化后刷新，比较后写，稳态零文件 IO）；
+  记录缺失/世代不符/任期倒退 ⇒ 该槽 PENDING——leader 拒写 `fail/1007`
+  （不落 WAL，与 1006 同级的前置拒绝）、本地读答空。围栏只拒绝，从不删除：
+  证据留在盘上等运维决定。
+- **运维裁决**（节点本地接口，不经 Raft、不转发，与 §6.2 流控同形）：
+  `GET /admin/slots/pending` 查看本节点被围的槽与原因；
+  `POST /admin/slots/pending/adopt` 采纳（「这份数据属于当前世代」的显式
+  确认；请求体 `{}` 或空=全部被围槽——升级到这个特性后的首启全量采纳就走
+  这条，`{"slots":[3,5]}`=只点名槽，非 pending 的槽一律回 in skipped、绝不
+  顺手采纳）。丢弃没有接口：删除一份集群仍在引用的副本会造成来源分裂
+  （幸存副本随时可能带着旧 seq 空间复活），所以运维按传统方式删除磁盘目录
+  `slot-xxx/`，下一拍围栏见 WAL 已不在自然解除裁决。手动删除 owner.json
+  表达的是「这份副本来历不明」（重新进 pending），不是丢弃。
+- **席位记录防「借位转正」**：来历不明的出生副本在席位阶段不盖章，晋升为
+  leader 的那一刻按 leader 规则重新判定，未证实的副本不能靠持有只读席位
+  洗白来源。
 
 ## 4. 高可用（复制设计）
 
@@ -583,6 +616,8 @@ GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（�
 GET  /admin/writes                             # 每槽 durable 计数 + 每槽落盘字节 write_bytes（与计数同下标，两快照作差得 msg/s 与字节/s）+ 槽内总字节/事件流数量 + 本节点待清理副本 + 本节点流控（flow_control = 生效配置视图 {tokens, period_ms, configured}；flow_control_hits = 每槽累计流控拒绝数——桶是节点的、计数归槽——与计数同下标；前端轮询）
 GET  /admin/stats[?worst=N]                    # 三个「等在哪里」自视合一：flush = 待刷记录数/最老未刷记录年龄/刷盘队列长度与在飞数/fsync 排队等待与 syscall 服务时间分位/每次新覆盖字节与覆盖的段文件大小；repl = `hw < LEO` 的槽数与最老等待时长（?worst=N 列出最久的槽）/每副本上报新鲜度与 LEO 落后/fetch 轮次与「按数据唤醒 vs 按等待预算到期」计数；ack = 每条写入的确认链路四段耗时（栅栏+路由 / 本地 WAL 落地 / 等 ISR 高水位 / 整调用）与结果、失败原因分布、正在等待的调用数、水位落后条数（?worst=N 列出等得最久的槽）
 GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本+最新记录 unix_time，仅内存索引，不读 WAL）
+GET  /admin/slots/pending                      # 本节点被 owner 围栏拦下的槽（slot/原因/表与记录的 leader-epoch-世代；节点本地）
+POST /admin/slots/pending/adopt                # 采纳被围副本（节点本地，见 §3.1；{}=全部 pending 槽，{"slots":[...]}=点名且仅限 pending，非 pending 回 skipped）
 POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移（控制器专属，必须发到 Raft leader 的 admin 地址）
 POST /admin/slots/{slot}/remove-replica {node} # 回收副本集里的一个成员（控制器专属，同上）
 POST /admin/cluster/plan                       # 触发重新规划（控制器专属，同上）
@@ -1428,3 +1463,102 @@ Wait(lsn)            → 阻塞到自己的 LSN 落盘
   几 KB）。
 - WAL 写失败的极端情况下，已挂起的 follower ack 靠 RPC 超时回收（写失败即节点
   不可用，不做额外降级）。
+
+## 12. 控制面与数据面的角色分离（voter / learner / both）
+
+> 状态：**角色轴、准入、布局口径已实现并验收**；数据面节点（learner）自身的
+> 布局分发流见 §12.4（已接线）。
+
+### 12.1 三个角色
+
+节点用 `-role`（env `PUSHUPES_ROLE`，默认 `both`）声明自己的位置：
+
+| 角色 | 投票（Raft） | 承载槽副本 | 用途 |
+|---|---|---|---|
+| `voter` | 是 | **否** | 控制面：选举域与数据面负载彻底分开，压测/高写入不再干扰心跳 |
+| `learner` | 否 | 是 | 数据面：只从控制面接收布局，不参与 quorum（见 §12.4） |
+| `both` | 是 | 是 | 经典单面形态，也是默认值——不声明角色 = 行为与历史一致 |
+
+角色是**节点自报**的：与 admin/client 地址同一条注册公告（`RegisterRequest.role`）
+写进复制目录的 `peers[].role`，而不是由控制面代为假定——只有节点自己知道它的
+`-role`。因此目录里的角色也随快照持久化（表编码 v6，v5 及更早文件按空值 = both 读入）。
+
+### 12.2 布局口径
+
+- `Table.HostingIDs()` 是唯一的布局池：目录里 `role != voter` 的成员（空值算 both）。
+  `plan_slots`/`replan_slots`、副本因子推导（`ReplicaCountForPolicy` 的成员数）
+  与 `OnlinePeerIDs()` 的候选集全部只认这个池。
+- 纯控制节点因此**不持有任何席位**，也不出现在故障转移/再平衡的目标集里。
+- **计划等池稳定一拍**：池是按注册逐个长出来的，所以「第一个成员一注册就规划」会
+  规划一个还没到齐的集群——经典 both 冷启动曾经如此：首个 plan 落在最先注册的那一
+  个成员上（factor 1、1680 槽全在它身上），第二个成员注册后再把 1680 个副本集全部
+  重排（factor 2），之后领导权还要按再均衡节奏慢慢挪。现在计划只在「池与上一轮观察
+  相同」或「已推迟满两轮」时才提交（`Engine.poolSettled`），代价是冷启动晚一个对账
+  周期，换来的是第一个布局就是目标形状：实测 3 节点 both 冷启动在 t=3.0s 一次性以
+  factor 2 / 560-560-560 落地，不再出现 factor 1 窗口，也没有随后的席位重排波。
+- 池为空（集群只有 voter）时：不提交 plan（避免失败条目每秒重提交把 commit
+  推高），槽表保持零条目；客户端在该节点写入得到显式拒绝
+  `fail/1005` + `"cluster has no data-plane members; this node is control-plane only"`
+  （单条 `SubmitAppend` 与 client 面批量 `SubmitBatch` 两条入口都拦，见
+  `controlOnlyRefusal`）。第一个数据面成员自报后，控制器自动补 plan。
+
+### 12.3 准入与撤销
+
+- 加数据面节点：`POST /admin/cluster/nodes {"id":..,"peer_addr":..,"role":"learner"}`
+  ——提交一条**目录命令**（`join_node` + role），不改 raft 配置：learner 不进投票集，
+  其席位由 replan 铺开；节点进程随后自报地址与角色。
+- 加投票成员：同接口省略 `role`（或 `voter`/`both`）——走原有两阶段（learner 追平后
+  晋升），语义不变。
+- 撤销：`DELETE /admin/cluster/nodes/{id}` 对 learner 提交目录 `leave_node`，对 voter
+  仍是 raft 配置变更；两者都只允许撤销**已下线**的成员（在线成员持有的席位正在被
+  集群使用）。
+- 控制器对账的目录同步因此是双源：投票集来自 raft 配置（`PeerAddrs`），learner 来自
+  目录条目本身——反向清理只删「既不是 voter、角色也不是 learner」的条目。
+
+### 12.4 数据面节点的状态分发
+
+> 状态：**已实现并验收**（3 voter + 2 learner 端到端，见 §12.5）。
+
+数据面节点不投票、不持有日志，它的槽表来自控制面的 `WatchLayout` 服务端流：
+
+- **服务端（leader）**：每个 learner 一条订阅，由共识心跳的同一 tick 驱动（不是
+  第二个调度器）。帧分五种：`HELLO`（leader id/地址、term、投票集、本集群世代、
+  日志下限）、`ENTRY`（一条**已提交**命令，带 index/term/entry kind）、`COMMIT`
+  （推进水位）、`SNAPSHOT`（整份状态 + 落点）、`REDIRECT`（非 leader 只给方向，
+  不给静默流）。每订阅一个有界缓冲（256 帧）：塞满即**掐流**，learner 重连后
+  报告自己应用到哪、由 `LayoutSlice` 决定续传还是给镜像——「卡住的数据节点不占
+  控制面内存」是设计目标，不是容错细节。
+- **共识层原语**：`raft.Node.LayoutSlice(from, fromTerm, max)` 是唯一的读取面，
+  判据与 AppendEntries 同源——term 不符、请求点已被压缩、调用方超前于本组 commit，
+  三者任一即回答镜像（镜像取自快照文件，与给落后 voter 装快照是同一份字节）。
+- **客户端（learner）**：严格按 index 应用（重复即跳过——命令都是确定性的集合型
+  变更；空洞即断流重连），状态与位点一起落盘（`layout-feed.json` + 状态字节；
+  位点没有配得上的状态就不是恢复点，落盘时状态在前、位点在后）。应用失败或缓存
+  不可用即作废恢复点、以 index 0 请求整份重建。世代不符时清空状态机重来——这正是
+  「带旧槽数据加入新集群」的入口。
+
+learner 的槽表与投票节点的是同一份复制状态，因此路由、取副本、迁移、owner 围栏
+全部复用同一套 Engine 代码；它唯一与投票节点不同的地方是「表从 socket 来而不是从
+日志来」，以及 `Apply` 恒回 `ErrNotLeader`（它不提交）。它也不跑 joiner：数据面
+节点绝不能报名成为投票者。
+
+### 12.5 端到端验收口径
+
+实测（3 个 `voter` + 2 个 `learner`，独立运行目录与端口）：
+
+- 纯控制面就绪后槽表 **0 条**、三个投票节点 **0 席位**；挂上数据面后 1680 槽全在
+  数据面（factor 2），`smoke` 通过、`slotcheck` 1680 槽 0 发散。
+- 数据面节点的共识目录只有 `layout-feed.json` 与状态缓存（无 wal/无 snapshot）：
+  它确实不跑共识组。数据面重启走 `resumed from cached state at index=N` 增量续传。
+- **杀掉 2/3 voter 无配额时，数据面写入仍然成功**——写路径不依赖控制面，这是解耦
+  的意义所在；控制面自身的写入则按预期失败。
+- 降级（保留数据面数据、整体重建控制面共识状态）：数据面带旧数据挂上新集群后本地
+  副本全部 `pending`（原因=世代不符），采纳前写入得到 `fail/1007 SlotUnproven`，
+  采纳后 `smoke` 通过、`slotcheck` 0 发散。这条链路已脚本化为
+  `scripts/degrade-check.sh`（用法同 cluster.sh 的环境变量，另需 `YES=1` 确认删除
+  控制面共识目录）：它自己做完全部 8 步并断言每一步，退出码即结论。注意围栏判的是
+  「以领导者身份服务」的副本，因此一个在本世代不领槽的数据节点报 0 条 pending 是
+  正确行为（它的旧副本归抓取/发散检测管）。
+- 关再均衡（`PUSHUPES_REBALANCE_INTERVAL=0`）下的同一套验收也通过：经典 3 节点
+  both 冷启动即 560-560-560（factor 2），拆分形态 840-840，冒烟与 slotcheck 首跑
+  即绿——需要「无在途领导权移交」的稳定窗口时用这个姿势。

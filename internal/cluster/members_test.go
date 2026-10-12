@@ -61,7 +61,7 @@ func TestEngineAddRemoveMember(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	if err := fEng.AddMember(ctx, "node-4", "127.0.0.1:9999"); err == nil {
+	if err := fEng.AddMember(ctx, "node-4", "127.0.0.1:9999", RoleBoth); err == nil {
 		t.Fatal("AddMember on a follower must be refused")
 	} else if _, ok := err.(*NotControllerError); !ok {
 		t.Fatalf("AddMember on a follower returned %T (%v), want *NotControllerError", err, err)
@@ -71,7 +71,7 @@ func TestEngineAddRemoveMember(t *testing.T) {
 	// it (the node itself is not run here: the change must still commit — the
 	// cluster keeps a quorum without it).
 	added := testListenerAddr(t)
-	if err := leEng.AddMember(ctx, "node-4", added); err != nil {
+	if err := leEng.AddMember(ctx, "node-4", added, RoleBoth); err != nil {
 		t.Fatalf("AddMember: %v", err)
 	}
 
@@ -96,7 +96,7 @@ func TestEngineAddRemoveMember(t *testing.T) {
 	}
 
 	// Idempotent re-add.
-	if err := leEng.AddMember(ctx, "node-4", added); err != nil {
+	if err := leEng.AddMember(ctx, "node-4", added, RoleBoth); err != nil {
 		t.Fatalf("repeat AddMember must be a no-op: %v", err)
 	}
 
@@ -143,15 +143,15 @@ func TestAddMemberRejectsBadInput(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := leEng.AddMember(ctx, "", "127.0.0.1:1"); err == nil {
+	if err := leEng.AddMember(ctx, "", "127.0.0.1:1", RoleBoth); err == nil {
 		t.Fatal("AddMember without an id must be refused")
 	}
-	if err := leEng.AddMember(ctx, "node-9", ""); err == nil {
+	if err := leEng.AddMember(ctx, "node-9", "", RoleBoth); err == nil {
 		t.Fatal("AddMember without a peer address must be refused")
 	}
 	// An address that already belongs to a member under another id is a
 	// misconfigured joining node, not a new member.
-	if err := leEng.AddMember(ctx, "node-9", c.peerOf(leader).PeerAddr); err == nil {
+	if err := leEng.AddMember(ctx, "node-9", c.peerOf(leader).PeerAddr, RoleBoth); err == nil {
 		t.Fatal("AddMember reusing a member's address must be refused")
 	}
 	// A single-voter cluster cannot remove its last member.
@@ -177,7 +177,7 @@ func TestRemoveMemberOnlyOffline(t *testing.T) {
 	// A voter outside the three: added through the ordinary membership path
 	// (a real listener so the change commits without it).
 	added := testListenerAddr(t)
-	if err := leEng.AddMember(ctx, "node-4", added); err != nil {
+	if err := leEng.AddMember(ctx, "node-4", added, RoleBoth); err != nil {
 		t.Fatalf("AddMember: %v", err)
 	}
 	// The directory learns it with a full registration (join sets all three

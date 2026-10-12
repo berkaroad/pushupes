@@ -189,9 +189,27 @@ func (t *Table) PeerIDs() []string {
 	return ids
 }
 
+// HostingIDs is the layout pool: directory members that may carry slot
+// replicas (role != voter). plan_slots/replan_slots spread over THIS set
+// and the policy's factor derives from its size: the control plane's voters
+// keep their machine to themselves — a raft timing must never share a host
+// with a data-plane load, which is the point of splitting the planes.
+// Empty-role entries count as hosting (both): the default is the classic
+// single-plane shape.
+func (t *Table) HostingIDs() []string {
+	ids := make([]string, 0, len(t.Peers))
+	for id, p := range t.Peers {
+		if p.Hosts() {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 // OnlinePeerIDs lists the peers the cluster may put leadership ON: members
 // that are not Offline (self-announced a client address AND not marked down
-// by the controller's liveness sweep). This is the single authoritative
+// by the controller's liveness sweep) and may host slots. This is the single authoritative
 // "which nodes can serve clients right now" set: the rebalancer ring and the
 // failover leader pick anchor on it, so they can never hand a slot to a node
 // clients cannot reach. (plan_slots/replan_slots spread over the FULL
@@ -201,7 +219,7 @@ func (t *Table) PeerIDs() []string {
 func (t *Table) OnlinePeerIDs() []string {
 	ids := make([]string, 0, len(t.Peers))
 	for id, p := range t.Peers {
-		if !p.Offline() {
+		if !p.Offline() && p.Hosts() {
 			ids = append(ids, id)
 		}
 	}
@@ -285,7 +303,7 @@ func (t *Table) layoutStale() bool {
 			return true
 		}
 	}
-	nodes := t.PeerIDs()
+	nodes := t.HostingIDs()
 	if len(nodes) == 0 {
 		return false
 	}
@@ -362,7 +380,7 @@ func (t *Table) layoutStale() bool {
 // epoch, which is the leader change's fence.
 // Non-stable slots belong to a migration in flight and are never touched.
 func (t *Table) applyReplanSlots() bool {
-	nodes := t.PeerIDs()
+	nodes := t.HostingIDs()
 	if len(nodes) == 0 {
 		return false
 	}
@@ -632,7 +650,7 @@ func (t *Table) Apply(c *Command) error {
 		// The factor follows the tier immediately, clamped to the members the
 		// directory holds; the layout itself converges on the next replan (the
 		// same factor-change path a membership change drives, see DESIGN §4).
-		t.Replicas = ReplicaCountForPolicy(policy, len(t.Peers))
+		t.Replicas = ReplicaCountForPolicy(policy, len(t.HostingIDs()))
 	case OpJoinNode:
 		if c.Peer == nil || c.Peer.ID == "" {
 			return fmt.Errorf("join_node: missing peer")
@@ -651,6 +669,12 @@ func (t *Table) Apply(c *Command) error {
 			return fmt.Errorf("register: unknown peer %s", c.Peer.ID)
 		}
 		p.AdminAddr, p.ClientAddr = c.Peer.AdminAddr, c.Peer.ClientAddr
+		if c.Peer.Role != "" {
+			// A pre-role replayed announcement leaves the recorded role
+			// alone; an announcement carrying one updates it (the node's
+			// own -role flag is the authority on its role).
+			p.Role = c.Peer.Role
+		}
 		t.Peers[c.Peer.ID] = p
 	case OpLeaveNode:
 		// Purge the node from the directory AND from every placement that
@@ -726,9 +750,9 @@ func (t *Table) Apply(c *Command) error {
 		// time loses leadership anyway (mark_down moved it, the ring gate
 		// keeps it off the leaders until it returns). The ACTIVE set is the
 		// rebalancer's and the failover pick's domain, not the layout's.
-		nodes := t.PeerIDs()
+		nodes := t.HostingIDs()
 		if len(nodes) == 0 {
-			return fmt.Errorf("plan_slots: no members")
+			return fmt.Errorf("plan_slots: no data-plane members (every directory entry is a voter)")
 		}
 		t.Slots = PlanSlots(nodes, t.SlotCount, t.Replicas)
 		for _, p := range t.Slots {
@@ -760,8 +784,8 @@ func (t *Table) Apply(c *Command) error {
 		// member KEEPS its replica seats (that is how its copy is still home
 		// when it returns); the sets are derived from the full directory for
 		// the same reason the plan uses it above.
-		if len(t.PeerIDs()) == 0 {
-			return fmt.Errorf("replan_slots: no members")
+		if len(t.HostingIDs()) == 0 {
+			return fmt.Errorf("replan_slots: no data-plane members")
 		}
 		t.applyReplanSlots()
 	case OpLeaderMove:

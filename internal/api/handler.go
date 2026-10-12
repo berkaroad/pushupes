@@ -59,6 +59,8 @@ func New(eng *cluster.Engine, store *storage.Store) *Server {
 	s.mux.HandleFunc("GET /admin/writes", s.handleWrites)
 	s.mux.HandleFunc("GET /admin/stats", s.handleStats)
 	s.mux.HandleFunc("GET /admin/slots/{slot}/describe", s.handleSlotDescribe)
+	s.mux.HandleFunc("GET /admin/slots/pending", s.handlePendingSlots)
+	s.mux.HandleFunc("POST /admin/slots/pending/adopt", s.handleAdoptPending)
 	s.mux.HandleFunc("GET /admin/slots/{slot}/streams", s.handleSlotStreams)
 	s.mux.HandleFunc("POST /admin/slots/{slot}/migrate", s.handleMigrate)
 	s.mux.HandleFunc("POST /admin/slots/{slot}/remove-replica", s.handleRemoveReplica)
@@ -524,14 +526,23 @@ func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID       string `json:"id"`
 		PeerAddr string `json:"peer_addr"`
+		// Role admits the member with: "learner" (data plane, no vote — a
+		// replicated directory entry) or voter/both/"" (the raft-configuration
+		// admission, the classic shape).
+		Role string `json:"role"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" || req.PeerAddr == "" {
 		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "id and peer_addr required")
 		return
 	}
+	role, err := cluster.NormalizeRole(req.Role)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, err.Error())
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), cluster.AddMemberTimeout+5_000_000_000)
 	defer cancel()
-	if err := s.Engine.AddMember(ctx, req.ID, req.PeerAddr); err != nil {
+	if err := s.Engine.AddMember(ctx, req.ID, req.PeerAddr, role); err != nil {
 		if refuseNotController(w, err) {
 			return
 		}
@@ -583,6 +594,41 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---- helpers ---------------------------------------------------------------------
+
+// ---- owner fence (node-local; see cluster/owner.go) ----
+//
+// These endpoints act on THIS node's local copies — no Raft command, no
+// redirect, nothing replicated, in the same shape handleSetFlowControl uses
+// for the other node-local knob. A fenced (pending) slot refuses writes with
+// fail/1007 and answers reads empty until an operator adopts the copy
+// ("this WAL belongs to this generation") or removes the slot directory on
+// disk (the fence re-reads the ground truth each round and lifts the verdict
+// by itself).
+
+func (s *Server) handlePendingSlots(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"node": s.Engine.Self(), "slots": s.Engine.PendingSlots()})
+}
+
+// handleAdoptPending stamps the fenced copies of THIS node and puts them
+// back in service. Body is optional: {} (or no body) adopts every pending
+// slot — the one-time upgrade action; {"slots":[3,5]} adopts exactly those
+// slots, and any that are not currently pending comes back in skipped.
+// Discarding a copy is not an endpoint: an operator removes the slot
+// directory on disk and the next fence round clears the verdict itself
+// (see DESIGN §3.1).
+func (s *Server) handleAdoptPending(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Slots []int32 `json:"slots"`
+	}
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "bad body (want {} or {\"slots\":[...]})")
+			return
+		}
+	}
+	adopted, skipped := s.Engine.AdoptPending(req.Slots)
+	writeJSON(w, http.StatusOK, map[string]any{"adopted": adopted, "skipped": skipped})
+}
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	// Marshal to a buffer FIRST: a body we cannot encode must surface as a
