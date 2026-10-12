@@ -234,6 +234,15 @@ type Engine struct {
 	hwWait       time.Duration
 	dropGen      uint64
 	pendingDrops map[int32]pendingDrop
+	// dropWake nudges this node's single drop sweeper — ONE timer per node
+	// instead of one per queued slot (a factor decrease queues thousands of
+	// copies at once). dropSweeper records that the goroutine is running.
+	dropWake    chan struct{}
+	dropSweeper bool
+	// dropSweeperN counts how many sweeper goroutines this node has armed. There
+	// is deliberately ONE per node; tests pin that arming many schedules at once
+	// still starts exactly one.
+	dropSweeperN int
 	replicaOf    map[int32]bool
 
 	// The slots THIS controller is driving through StartMigration right now.

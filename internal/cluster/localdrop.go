@@ -42,6 +42,13 @@ import (
 //     membership change) is what made the console grey out a node that still
 //     held a required copy.
 //
+// The countdown itself is ONE sweeper per node, not one timer per queued slot:
+// a factor decrease leaves thousands of copies surplus at once, and a goroutine
+// plus a timer for each of them is a load the node never needed. The sweeper
+// sleeps until the EARLIEST queued deadline (woken when a schedule is armed or
+// cancelled) and then drops everything that is due, so a schedule still fires at
+// its own deadline, to the millisecond, exactly as the per-slot timers did.
+//
 // While a countdown runs, the schedule is published (PendingDrop/PendingDrops)
 // so the admin plane can say which of a slot's copies is queued to be dropped
 // and when. It ends when the timer fires, when the copy is actually dropped, or
@@ -151,30 +158,101 @@ func (e *Engine) startDropCountdown(slot int32) {
 	gen := e.dropGen
 	d := e.dropAfter
 	e.pendingDrops[slot] = pendingDrop{deadline: time.Now().Add(d), gen: gen}
+	e.wakeDropSweeperLocked()
 	e.dropMu.Unlock()
-	go e.dropAfterRetention(slot, gen, d)
 }
 
-// dropAfterRetention waits out the retention window and then drops this node's
-// local copy of the slot — unless the schedule was superseded or cancelled in
-// the meantime, or the table has put this node back on the slot, in which case
-// the data is kept (that is what the retention is for) and the schedule is
-// called off.
-func (e *Engine) dropAfterRetention(slot int32, gen uint64, delay time.Duration) {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	<-timer.C
+// wakeDropSweeperLocked arms the node's single drop sweeper (once) and nudges it
+// to re-read the queue, because the schedule just added — or the one just
+// cancelled — may hold a deadline earlier than the one it is sleeping for. The
+// nudge is a one-slot channel: a pending wake already covers every reason.
+func (e *Engine) wakeDropSweeperLocked() {
+	if e.dropWake == nil {
+		e.dropWake = make(chan struct{}, 1)
+	}
+	if !e.dropSweeper {
+		e.dropSweeper = true
+		e.dropSweeperN++
+		go e.runDropSweeper()
+	}
+	select {
+	case e.dropWake <- struct{}{}:
+	default:
+	}
+}
 
+// runDropSweeper is the node's ONLY retention timer. It sleeps until the earliest
+// queued deadline and drops what is due, then repeats; with nothing queued it
+// parks until a schedule is armed. A schedule therefore fires at its own
+// deadline rather than on a fixed tick, which keeps the retention exact for any
+// configured window.
+func (e *Engine) runDropSweeper() {
+	for {
+		e.dropMu.Lock()
+		var next time.Time
+		for _, p := range e.pendingDrops {
+			if next.IsZero() || p.deadline.Before(next) {
+				next = p.deadline
+			}
+		}
+		wake := e.dropWake
+		e.dropMu.Unlock()
+
+		if next.IsZero() {
+			<-wake // nothing queued: wait for a schedule to be armed
+			continue
+		}
+		if d := time.Until(next); d > 0 {
+			timer := time.NewTimer(d)
+			select {
+			case <-timer.C:
+			case <-wake:
+				// A schedule was armed or cancelled: recompute instead of
+				// sleeping out a deadline that may no longer be the earliest.
+				timer.Stop()
+				continue
+			}
+		}
+		e.dropDueCopies()
+	}
+}
+
+// dropDueCopies drops every queued copy whose retention window has elapsed. The
+// table is the authority at fire time, exactly as it was for the per-slot timer:
+// a copy this node owes the slot again (it leads it, or it is back in the set)
+// is kept and its schedule is called off.
+func (e *Engine) dropDueCopies() {
+	now := time.Now()
+	type dueDrop struct {
+		slot int32
+		gen  uint64
+	}
+	var due []dueDrop
+	e.dropMu.Lock()
+	for slot, p := range e.pendingDrops {
+		if now.Before(p.deadline) {
+			continue
+		}
+		delete(e.pendingDrops, slot)
+		due = append(due, dueDrop{slot: slot, gen: p.gen})
+	}
+	e.dropMu.Unlock()
+	for _, d := range due {
+		e.dropRetainedCopy(d.slot, d.gen)
+	}
+}
+
+// dropRetainedCopy drops one copy whose window elapsed, unless a newer hand-over
+// re-armed the slot in the meantime (the schedule belongs to ONE hand-over: the
+// newer window owns the data now) or the table has put this node back on the
+// slot. Both re-checks are the same ones the per-slot timer made when it woke.
+func (e *Engine) dropRetainedCopy(slot int32, gen uint64) {
 	e.dropMu.Lock()
 	cur, ok := e.pendingDrops[slot]
-	current := ok && cur.gen == gen
 	e.dropMu.Unlock()
-	if !current {
-		return // superseded by a newer hand-over, or cancelled: not this timer's copy
+	if ok && cur.gen != gen {
+		return // superseded by a newer hand-over: not this schedule's copy
 	}
-
-	// The table is the authority at fire time. A copy this node still owes the
-	// slot (it leads it again, or it is back in the replica set) is kept.
 	if !e.copyIsSurplus(slot) {
 		e.forgetPendingDrop(slot, gen)
 		return
@@ -221,7 +299,11 @@ func (e *Engine) onSlot(slot int32) bool {
 // any more (the node is on the slot again), or nothing was queued at all.
 func (e *Engine) cancelPendingDrop(slot int32) {
 	e.dropMu.Lock()
+	_, had := e.pendingDrops[slot]
 	delete(e.pendingDrops, slot)
+	if had {
+		e.wakeDropSweeperLocked() // the earliest deadline may have moved out
+	}
 	e.dropMu.Unlock()
 }
 
@@ -249,17 +331,16 @@ func (e *Engine) pendingSlotIDs() []int32 {
 	return out
 }
 
-// pendingDropLocked reads one entry, dropping it once its deadline is behind
-// us: at that point the retention window is over and nothing is queued any
-// more, whatever the cleanup itself ended up doing. Expiring lazily keeps the
-// map bounded without a sweeper.
+// pendingDropLocked reads one entry for the admin plane. An entry whose deadline
+// is behind us reports "nothing queued" (the window is over whatever the cleanup
+// is doing) but is NOT deleted here: the node's sweeper owns that transition, and
+// a reader stealing the entry would leave the copy on disk forever.
 func (e *Engine) pendingDropLocked(slot int32, now time.Time) (time.Time, bool) {
 	p, ok := e.pendingDrops[slot]
 	if !ok {
 		return time.Time{}, false
 	}
 	if !now.Before(p.deadline) {
-		delete(e.pendingDrops, slot)
 		return time.Time{}, false
 	}
 	return p.deadline, true
@@ -282,7 +363,8 @@ func (e *Engine) PendingDrop(slot int32) (time.Time, bool) {
 // PendingDrops lists this node's queued cleanups as a per-slot array aligned
 // with the slot index — 0 means "nothing queued", otherwise the unix second at
 // which the local copy is due to be dropped. Same shape as the other per-slot
-// gauges the console polls.
+// gauges the console polls: the cleanup queue is shown per (slot, node), so the
+// console can mark the replica whose copy is on its way out.
 func (e *Engine) PendingDrops() []int64 {
 	out := make([]int64, e.store.SlotCount)
 	now := time.Now()

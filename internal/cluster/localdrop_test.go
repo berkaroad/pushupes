@@ -95,6 +95,112 @@ func dirGone(dir string) bool {
 	return os.IsNotExist(err)
 }
 
+// replicaSlotsOf lists the slots this node replicates WITHOUT leading them: the
+// copies that become surplus the moment the node leaves the set.
+func replicaSlotsOf(t *testing.T, e *Engine, self string, want int) []int32 {
+	t.Helper()
+	var out []int32
+	for s := int32(0); s < e.store.SlotCount && len(out) < want; s++ {
+		p := e.TableSnapshot().Slots[s]
+		if p.Leader == self || !replicaListHas(p.Replicas, self) {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// TestDropSweeperDropsEveryQueuedCopyInOneWake pins the single sweeper: a factor
+// decrease leaves thousands of copies surplus at once, and ONE node timer — not
+// one per queued copy — has to take them all out. Every queue armed here shares
+// (about) one deadline, so a sweeper that handled a single copy per wake would
+// leave the rest behind.
+func TestDropSweeperDropsEveryQueuedCopyInOneWake(t *testing.T) {
+	e, st := dropSetup(t, "node-2")
+	const rt = 300 * time.Millisecond
+	e.SetDropRetention(rt)
+
+	targets := replicaSlotsOf(t, e, "node-2", 6)
+	if len(targets) < 3 {
+		t.Fatalf("test setup: only %d slots replicate on node-2", len(targets))
+	}
+	dirs := make([]string, 0, len(targets))
+	for _, s := range targets {
+		dirs = append(dirs, fillSlot(t, e, st, s))
+	}
+	if _, ok := e.PendingDrop(targets[0]); ok {
+		t.Fatal("nothing is surplus while this node is still a replica of the slot")
+	}
+	if e.dropSweeperN != 0 {
+		t.Fatalf("no schedule has been armed, yet %d sweepers exist", e.dropSweeperN)
+	}
+
+	// One command takes the node out of every set — the shape a factor
+	// decrease produces on the whole table.
+	applyCmd(t, e, &Command{Op: OpSlotRemoveReplica, Slots: targets, NodeID: "node-2"})
+	for _, s := range targets {
+		if _, ok := e.PendingDrop(s); !ok {
+			t.Fatalf("slot %d: leaving the set must queue its copy", s)
+		}
+	}
+	if e.dropSweeperN != 1 {
+		t.Fatalf("%d slots armed %d sweepers, want exactly 1 per node", len(targets), e.dropSweeperN)
+	}
+
+	armed := time.Now()
+	waitFor(t, 3*time.Second, func() bool {
+		for _, d := range dirs {
+			if !dirGone(d) {
+				return false
+			}
+		}
+		return true
+	}, "every queued copy to be dropped")
+	// One shared deadline, one wake: the copies may not trickle out.
+	if el := time.Since(armed); el > rt+time.Second {
+		t.Fatalf("copies armed together took %s past a %s window: the sweep is not one wake", el, rt)
+	}
+	for _, s := range targets {
+		if _, ok := e.PendingDrop(s); ok {
+			t.Fatalf("slot %d: the schedule must be cleared once its drop ran", s)
+		}
+	}
+	if e.dropSweeperN != 1 {
+		t.Fatalf("sweepers after the sweep = %d, want 1", e.dropSweeperN)
+	}
+}
+
+// TestDropSweeperRecomputesForAnEarlierWindow pins the sweeper's wake: a long
+// window is armed first and the sweeper sleeps out to it, then a much shorter one
+// is armed. The short copy must go at ITS deadline — which means the arming has
+// to nudge the sweeper into recomputing the earliest deadline instead of leaving
+// it asleep until the long window expires.
+func TestDropSweeperRecomputesForAnEarlierWindow(t *testing.T) {
+	e, st := dropSetup(t, "node-2")
+	slots := replicaSlotsOf(t, e, "node-2", 2)
+	if len(slots) < 2 {
+		t.Fatalf("test setup: need two replicated slots, got %d", len(slots))
+	}
+	slow, fast := slots[0], slots[1]
+
+	e.SetDropRetention(30 * time.Second)
+	slowDir := fillSlot(t, e, st, slow)
+	applyCmd(t, e, &Command{Op: OpSlotRemoveReplica, Slots: []int32{slow}, NodeID: "node-2"})
+
+	e.SetDropRetention(200 * time.Millisecond)
+	fastDir := fillSlot(t, e, st, fast)
+	applyCmd(t, e, &Command{Op: OpSlotRemoveReplica, Slots: []int32{fast}, NodeID: "node-2"})
+
+	waitFor(t, 3*time.Second, func() bool { return dirGone(fastDir) },
+		"the short-window copy to be dropped at its own deadline")
+	if dirGone(slowDir) {
+		t.Fatal("the long-window copy lost its own deadline and was dropped early")
+	}
+	if _, ok := e.PendingDrop(slow); !ok {
+		t.Fatal("the long-window schedule must still be queued")
+	}
+}
+
 // TestOutOfSetHandoverArmsOnlyWhenTheSourceLeavesTheSet walks the state a real
 // migration to an out-of-set target produces on the FORMER SOURCE: the target
 // is admitted, the leader moves, and only the post-commit reclaim takes this
