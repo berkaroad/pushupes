@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -76,6 +77,16 @@ const (
 	// the round interval instead (a node that led 560 slots returns in 560
 	// rounds, and a factor decrease reclaims one surplus seat per round).
 	rebalanceCommitsPerRound = 1
+	// reclaimBudget bounds one reclaim sweep. The sweep retires every surplus
+	// seat it can inside the budget and the next round continues, so a factor
+	// decrease on a large table converges in a round or two instead of one seat
+	// per round (1680 slots at one seat per interval is about an hour). It must
+	// stay under the round interval so a sweep cannot run back to back with the
+	// next round.
+	reclaimBudget = 1 * time.Second
+	// reclaimProbeConcurrency bounds the copy checks in flight in one sweep. Each
+	// probe is a peer round trip, so the sweep must not open one per surplus seat.
+	reclaimProbeConcurrency = 16
 )
 
 // SetRebalanceConfig wires the -rebalance-interval knob. An interval <= 0
@@ -110,9 +121,9 @@ func (e *Engine) RunRebalancer(ctx context.Context) {
 		e.rebalanceRound(ctx, rebalanceCommitsPerRound)
 		// Surplus-seat reclaim: the other half of a re-layout. A re-layout only
 		// ADDS seats (Table.applyReplanSlots), so a set left oversized by a
-		// factor change converges here — one seat per round, and only once the
-		// copies that stay are in sync (see reclaimRound).
-		e.reclaimRound(ctx, rebalanceCommitsPerRound)
+		// factor change converges here, in one budgeted sweep per round and only
+		// once the copies that stay are in sync (see reclaimRound).
+		e.reclaimRound(ctx)
 	}
 }
 
@@ -380,71 +391,167 @@ func recordAttempt(m *map[int32]rebalanceAttempt, slot int32, from, to string, n
 //   - a seat whose kept peers are unreachable, or diverged rather than merely
 //     behind, is skipped with backoff: it will either heal or wait for the
 //     operator (the hand-over path owns repairing a diverged copy).
-func (e *Engine) reclaimRound(ctx context.Context, limit int) int {
-	if limit <= 0 {
-		return 0
+//
+// reclaimCandidate is one surplus seat a sweep may retire: the slot, the seat to
+// drop, and the placement the decision was made from.
+type reclaimCandidate struct {
+	slot      int32
+	drop      string
+	placement *Placement
+}
+
+// probeParked reports whether a probe of this candidate would touch a peer that
+// already failed one this round. It mirrors keptCopiesInSync's peer set exactly:
+// the leader plus the seats that stay.
+func probeParked(parked map[string]bool, p *Placement, drop string) bool {
+	if parked[p.Leader] {
+		return true
 	}
+	for _, r := range p.Replicas {
+		if r != drop && parked[r] {
+			return true
+		}
+	}
+	return false
+}
+
+// reclaimRound retires the surplus replica seats a re-layout left behind: a
+// re-layout only ADDS seats (Table.applyReplanSlots), so a set left oversized by
+// a factor change converges here. One call sweeps every surplus slot it can
+// within reclaimBudget rather than one seat per round, with three guards so the
+// sweep cannot turn into a stall:
+//
+//   - a deadline (reclaimBudget): the round stops on time and the next one
+//     continues where it left off;
+//   - a per-peer circuit breaker: a peer that fails a probe is parked for the
+//     rest of the round, so one unreachable node costs one timeout instead of
+//     one per seat it holds — the failure mode a serial one-seat-per-round loop
+//     was accidentally protected from;
+//   - a bounded probe pool plus one table command per node: the copy checks run
+//     reclaimProbeConcurrency at a time, and the removals for one seat travel in
+//     a single command (OpSlotRemoveReplica carries a slot list), so a
+//     1680-seat reclaim costs a handful of Raft entries, not thousands.
+//
+// The safety rule is unchanged: a seat only comes off once every seat that STAYS
+// holds a copy equivalent to the leader's (keptCopiesInSync), so the dropped
+// seat is redundant by construction. The layout must be settled — a live
+// hand-over owns the placement rules and the sweep yields to it.
+func (e *Engine) reclaimRound(ctx context.Context) int {
 	tbl := e.TableSnapshot()
 	if len(tbl.Peers) < 2 || !layoutSettled(tbl) {
 		return 0
 	}
 	planned := PlanSlots(tbl.PeerIDs(), tbl.SlotCount, tbl.Replicas)
-	slots := make([]int32, 0, 8)
+	now := time.Now()
+	var cands []reclaimCandidate
 	for s, p := range tbl.Slots {
-		if surplusSeatForReplan(p, tbl.Replicas, planned[s].Replicas) != "" {
-			slots = append(slots, s)
-		}
-	}
-	if len(slots) == 0 {
-		return 0
-	}
-	sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
-	done := 0
-	for _, s := range slots {
-		if done >= limit || ctx.Err() != nil {
-			break
-		}
-		// Re-read the placement: the round's plan came from a snapshot and a
-		// hand-over or a migration may have moved this slot since.
-		cur, ok := e.TableSnapshot().Slots[s]
-		if !ok {
-			continue
-		}
-		drop := surplusSeatForReplan(cur, tbl.Replicas, planned[s].Replicas)
+		drop := surplusSeatForReplan(p, tbl.Replicas, planned[s].Replicas)
 		if drop == "" {
 			continue
 		}
 		if e.migrationInFlight(s) {
 			continue // a handover is building a copy of this slot: its seat is not surplus
 		}
-		if !e.seatRetryReady(s, drop, time.Now()) {
+		if !e.seatRetryReady(s, drop, now) {
 			continue
 		}
-		inSync, behind, err := e.keptCopiesInSync(ctx, s, cur, drop)
+		cands = append(cands, reclaimCandidate{slot: s, drop: drop, placement: p})
+	}
+	if len(cands) == 0 {
+		return 0
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i].slot < cands[j].slot })
+
+	// Phase 1: prove the surplus redundant, in a bounded pool.
+	deadline := time.Now().Add(reclaimBudget)
+	redundant := make([]bool, len(cands))
+	var (
+		mu   sync.Mutex
+		down = map[string]bool{} // peers parked for the rest of this round
+		wg   sync.WaitGroup
+		sem  = make(chan struct{}, reclaimProbeConcurrency)
+	)
+	for i := range cands {
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			break // out of budget: the next round takes the rest
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(i int, c reclaimCandidate) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			mu.Lock()
+			parked := probeParked(down, c.placement, c.drop)
+			mu.Unlock()
+			if parked {
+				return // a peer this probe needs is unreachable this round
+			}
+			inSync, behind, err := e.keptCopiesInSync(ctx, c.slot, c.placement, c.drop)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil:
+				// Park exactly the peers the probe touched — the leader and the
+				// copies that stay. The seat's own node is deliberately NOT parked:
+				// another candidate may still be able to drop a seat from it this
+				// round, and removing a seat needs no contact with the node.
+				down[c.placement.Leader] = true
+				for _, r := range c.placement.Replicas {
+					if r != c.drop {
+						down[r] = true
+					}
+				}
+				e.loggerf("surplus seat reclaim: probe of slot %d failed: %v (peers parked for this round)", c.slot, err)
+			case behind:
+				// the seats that stay are still fetching: the surplus is not redundant yet
+			case !inSync:
+				// A kept copy reports the leader's LEO with a different directory.
+				// Fetching cannot repair that (the rebalancer's repair path owns it
+				// when it hands this slot's leadership over), and probing it again
+				// every round buys nothing: back off.
+				e.recordSeatAttempt(c.slot, c.drop, time.Now())
+				e.logger.Warn("surplus seat kept: a copy that stays has the leader's LEO but a different directory",
+					"slot", c.slot, "seat", c.drop, "op", "seat_reclaim")
+			default:
+				redundant[i] = true
+			}
+		}(i, cands[i])
+	}
+	wg.Wait()
+
+	// Phase 2: one removal command per seat, carrying every redundant slot.
+	bySeat := map[string][]int32{}
+	for i, c := range cands {
+		if redundant[i] {
+			bySeat[c.drop] = append(bySeat[c.drop], c.slot)
+		}
+	}
+	seats := make([]string, 0, len(bySeat))
+	for n := range bySeat {
+		seats = append(seats, n)
+	}
+	sort.Strings(seats)
+	done := 0
+	for _, n := range seats {
+		if ctx.Err() != nil {
+			break
+		}
+		slots := bySeat[n]
+		sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
+		removed, err := e.RemoveReplicaBatch(ctx, n, slots)
 		if err != nil {
-			continue // peer-plane error: it will either heal or be caught next round
-		}
-		if behind {
-			continue // the copies that stay are still fetching: the surplus is not redundant yet
-		}
-		if !inSync {
-			// A kept copy reports the leader's LEO with a different directory.
-			// Fetching cannot repair that (the rebalancer's repair path owns it
-			// when it hands this slot's leadership over), and probing it again
-			// every round buys nothing: back off.
-			e.recordSeatAttempt(s, drop, time.Now())
-			e.logger.Warn("surplus seat kept: a copy that stays has the leader's LEO but a different directory",
-				"slot", s, "seat", drop, "op", "seat_reclaim")
+			for _, s := range slots {
+				e.recordSeatAttempt(s, n, time.Now())
+			}
+			e.loggerf("surplus seat reclaim: dropping %s from %d slots failed: %v (retried with backoff)", n, len(slots), err)
 			continue
 		}
-		if err := e.RemoveReplica(ctx, s, drop); err != nil {
-			e.recordSeatAttempt(s, drop, time.Now())
-			e.loggerf("surplus seat reclaim: dropping %s from slot %d failed: %v (retried with backoff)", drop, s, err)
-			continue
+		if removed == 0 {
+			continue // every slot in the batch stopped qualifying
 		}
-		e.logger.Info("surplus replica reclaimed: the set is back at the factor",
-			"slot", s, "seat", drop, "factor", tbl.Replicas, "op", OpSlotRemoveReplica)
-		done++
+		e.logger.Info("surplus replicas reclaimed: the sets are back at the factor",
+			"seat", n, "slots", removed, "factor", tbl.Replicas, "op", OpSlotRemoveReplica)
+		done += removed
 	}
 	return done
 }

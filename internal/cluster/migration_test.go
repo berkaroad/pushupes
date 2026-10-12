@@ -166,7 +166,7 @@ func TestReclaimYieldsToAnInFlightHandover(t *testing.T) {
 
 	// Baseline: a surplus seat the plan does not prescribe is reclaimed.
 	grow()
-	if n := src.reclaimRound(ctx, 1); n != 1 {
+	if n := src.reclaimRound(ctx); n != 1 {
 		t.Fatalf("reclaim dropped %d seats, want 1", n)
 	}
 	if p, _ := src.TableSnapshot().Slots[0]; replicaSetHas(p.Replicas, "node-3") {
@@ -176,7 +176,7 @@ func TestReclaimYieldsToAnInFlightHandover(t *testing.T) {
 	// With a hand-over in flight the same seat is off limits.
 	grow()
 	src.markMigrationInFlight(0)
-	if n := src.reclaimRound(ctx, 1); n != 0 {
+	if n := src.reclaimRound(ctx); n != 0 {
 		t.Fatalf("reclaim dropped %d seats during a hand-over, want 0", n)
 	}
 	if p, _ := src.TableSnapshot().Slots[0]; !replicaSetHas(p.Replicas, "node-3") {
@@ -185,7 +185,7 @@ func TestReclaimYieldsToAnInFlightHandover(t *testing.T) {
 
 	// Once the hand-over is over the seat is surplus again.
 	src.clearMigrationInFlight(0)
-	if n := src.reclaimRound(ctx, 1); n != 1 {
+	if n := src.reclaimRound(ctx); n != 1 {
 		t.Fatalf("reclaim dropped %d seats after the hand-over, want 1", n)
 	}
 	if p, _ := src.TableSnapshot().Slots[0]; replicaSetHas(p.Replicas, "node-3") {

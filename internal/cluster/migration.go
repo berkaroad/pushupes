@@ -414,6 +414,51 @@ func (e *Engine) RemoveReplica(ctx context.Context, slot int32, node string) err
 	return nil
 }
 
+// RemoveReplicaBatch reclaims one member from several slots in ONE table
+// command (OpSlotRemoveReplica carries a slot list). The per-slot checks are
+// RemoveReplica's; a slot that no longer qualifies is skipped and left out of
+// the command, so one stale placement cannot hold back the rest of the batch,
+// and only the slots actually submitted are reported.
+func (e *Engine) RemoveReplicaBatch(ctx context.Context, node string, slots []int32) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	// Controller-only, like RemoveReplica: a follower refuses with a
+	// *NotControllerError naming the controller.
+	if err := e.controllerGuard(); err != nil {
+		return 0, err
+	}
+	tbl := e.TableSnapshot()
+	if _, ok := tbl.Peers[node]; !ok {
+		return 0, fmt.Errorf("unknown node %q", node)
+	}
+	keep := make([]int32, 0, len(slots))
+	for _, slot := range slots {
+		p, ok := tbl.Slots[slot]
+		if !ok || p.State != SlotStable || p.Leader == node || len(p.Replicas) <= 1 {
+			continue // unassigned, mid-handover, the leader, or the last copy
+		}
+		inSet := false
+		for _, r := range p.Replicas {
+			if r == node {
+				inSet = true
+				break
+			}
+		}
+		if !inSet {
+			continue
+		}
+		keep = append(keep, slot)
+	}
+	if len(keep) == 0 {
+		return 0, nil
+	}
+	if err := e.submit(&Command{Op: OpSlotRemoveReplica, Slots: keep, NodeID: node}); err != nil {
+		return 0, fmt.Errorf("remove replicas: %w", err)
+	}
+	return len(keep), nil
+}
+
 // verifyTargetHoldsSource is the fence's last guard before the leader move.
 //
 // Completeness is the COMMIT GATE's job, not the fence's: the gate proved the

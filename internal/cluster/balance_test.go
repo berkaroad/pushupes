@@ -770,7 +770,7 @@ func TestFactorOneGrowthConvergesEndToEnd(t *testing.T) {
 			t.Fatalf("slot %d: replicas %v at factor 1, want the single copy on the ring leader %s", s, p.Replicas, p.Leader)
 		}
 	}
-	if done := neu.reclaimRound(ctx, 8); done != 0 {
+	if done := neu.reclaimRound(ctx); done != 0 {
 		t.Fatalf("the committed hand-overs left no surplus seat, got %d reclaims", done)
 	}
 	if left := PlanLeaderRebalance(tbl); len(left) != 0 {
@@ -819,6 +819,179 @@ func TestSurplusSeatForReplan(t *testing.T) {
 	p = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-4", "node-1", "node-3"}, State: SlotStable}
 	if got := surplusSeatForReplan(p, 2, plan); got != "node-1" {
 		t.Fatalf("surplus seat = %q, want the sorted first of the extras (node-1)", got)
+	}
+}
+
+// reclaimHarness builds a 4-node table (factor 2) on real stores and a real peer
+// plane, with every member registered. It returns the controller engine, the
+// engines and stores by id, and the peer addresses.
+func reclaimHarness(t *testing.T) (*Engine, map[string]*Engine, map[string]*storage.Store, map[string]string) {
+	t.Helper()
+	ids := []string{"node-1", "node-2", "node-3", "node-4"}
+	engines := map[string]*Engine{}
+	stores := map[string]*storage.Store{}
+	addrs := map[string]string{}
+	for _, id := range ids {
+		st, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
+		if err != nil {
+			t.Fatalf("open store %s: %v", id, err)
+		}
+		t.Cleanup(func() { st.Close() })
+		engines[id], stores[id] = NewEngine(nil, st, id, nil), st
+	}
+	ctr := engines["node-1"]
+	ctr.node = newTestRaftNode(t, ctr)
+	for _, id := range ids {
+		addrs[id] = newPeerHarness(t, engines[id])
+	}
+	for _, id := range ids {
+		e := engines[id]
+		for _, p := range ids {
+			applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: p, PeerAddr: addrs[p]}})
+			applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: p, AdminAddr: addrs[p], ClientAddr: addrs[p]}})
+		}
+		applyCmd(t, e, &Command{Op: OpConfig, Replicas: 2})
+		applyCmd(t, e, &Command{Op: OpPlanSlots})
+	}
+	return ctr, engines, stores, addrs
+}
+
+// syncRingPair appends the same record to every seat the plan keeps for the slot,
+// which is what makes a surplus seat redundant (keptCopiesInSync compares each
+// kept seat against the leader's directory).
+func syncRingPair(t *testing.T, ctr *Engine, stores map[string]*storage.Store, slot int32) {
+	t.Helper()
+	agg := aggInSlot(t, ctr, slot)
+	for _, r := range ctr.TableSnapshot().Slots[slot].Replicas {
+		if _, err := stores[r].Append(makeRecord(agg, 1, agg+"-1")); err != nil {
+			t.Fatalf("append to %s: %v", r, err)
+		}
+	}
+}
+
+// TestReclaimSweepsEverySurplusSeatInOneRound pins the sweep: ONE round retires
+// every surplus seat it can prove redundant, instead of one seat per round. That
+// is the case that matters — shrinking the factor on a large table used to take
+// one seat per round interval (1680 slots is about an hour).
+func TestReclaimSweepsEverySurplusSeatInOneRound(t *testing.T) {
+	ctr, _, stores, _ := reclaimHarness(t)
+	slots := []int32{0, 1, 2, 3, 4, 5}
+	extras := map[int32]string{}
+	for _, s := range slots {
+		syncRingPair(t, ctr, stores, s)
+		// The surplus seat must be a node the plan does NOT keep for this slot:
+		// adding a node that is already in the pair is a no-op and would leave
+		// nothing to reclaim.
+		extra := ""
+		cur := ctr.TableSnapshot().Slots[s]
+		for _, cand := range []string{"node-2", "node-3", "node-4"} {
+			if !replicaListHas(cur.Replicas, cand) {
+				extra = cand
+				break
+			}
+		}
+		if extra == "" {
+			t.Fatalf("slot %d: no free node for the surplus seat: %v", s, cur.Replicas)
+		}
+		extras[s] = extra
+		applyCmd(t, ctr, &Command{Op: OpSlotAddReplica, Slots: []int32{s}, NodeID: extra})
+		if p := ctr.TableSnapshot().Slots[s]; !replicaListHas(p.Replicas, extra) {
+			t.Fatalf("slot %d: the extra seat was not added: %v", s, p.Replicas)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if done := ctr.reclaimRound(ctx); done != len(slots) {
+		t.Fatalf("one sweep must retire every redundant surplus seat: want %d, got %d", len(slots), done)
+	}
+	for _, s := range slots {
+		if p := ctr.TableSnapshot().Slots[s]; replicaListHas(p.Replicas, extras[s]) {
+			t.Fatalf("slot %d kept its surplus seat %s: %v", s, extras[s], p.Replicas)
+		}
+		if p := ctr.TableSnapshot().Slots[s]; len(p.Replicas) != 2 {
+			t.Fatalf("slot %d is not back at the factor: %v", s, p.Replicas)
+		}
+	}
+	// The removals travel one command per seat, not one per slot: the whole sweep
+	// costs a handful of Raft entries instead of one per reclaimed slot.
+	if done := ctr.reclaimRound(ctx); done != 0 {
+		t.Fatalf("a settled layout must not reclaim anything, got %d", done)
+	}
+}
+
+// TestReclaimParksAnUnreachablePeerButStillRetiresTheRest pins the circuit
+// breaker: a probe that fails parks the peers it touched for the rest of the
+// round, while the seats that CAN be proven redundant still come off in the same
+// round. One unreachable node must cost the round the probe, not the sweep.
+func TestReclaimParksAnUnreachablePeerButStillRetiresTheRest(t *testing.T) {
+	ctr, _, stores, _ := reclaimHarness(t)
+	tbl := ctr.TableSnapshot()
+
+	// Pick a slot whose probe has to reach node-4, and one whose probe does not.
+	// The probe touches the leader and the seats that stay.
+	var probesDead, probeBlind int32 = -1, -1
+	for s := int32(0); s < tbl.SlotCount; s++ {
+		p := tbl.Slots[s]
+		touches := p.Leader == "node-4"
+		for _, r := range p.Replicas {
+			if r == "node-4" && r != p.Leader {
+				touches = true
+			}
+		}
+		if touches && probesDead < 0 {
+			probesDead = s
+		}
+		if !touches && probeBlind < 0 {
+			probeBlind = s
+		}
+	}
+	if probesDead < 0 || probeBlind < 0 {
+		t.Fatalf("the ring plan does not offer both shapes (dead=%d blind=%d)", probesDead, probeBlind)
+	}
+
+	// node-4 answers no probe: unregister its peer address.
+	applyCmd(t, ctr, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-4", PeerAddr: ""}})
+
+	// Both slots carry a surplus seat that is redundant on its own terms: the
+	// seats that stay hold the same data.
+	syncRingPair(t, ctr, stores, probeBlind)
+	blindExtra := "node-3"
+	if replicaListHas(ctr.TableSnapshot().Slots[probeBlind].Replicas, blindExtra) {
+		blindExtra = "node-2"
+	}
+	if replicaListHas(ctr.TableSnapshot().Slots[probeBlind].Replicas, blindExtra) {
+		t.Skip("no third node free for the redundant seat")
+	}
+	applyCmd(t, ctr, &Command{Op: OpSlotAddReplica, Slots: []int32{probeBlind}, NodeID: blindExtra})
+
+	// The failing slot's surplus seat: node-4 itself is a replica of its pair in
+	// half the plan, so give it a surplus from a node that is NOT node-4 and let
+	// the PROBE fail instead (node-4 is in the kept or leader position).
+	syncRingPair(t, ctr, stores, probesDead)
+	deadExtra := ""
+	for _, cand := range []string{"node-2", "node-3"} {
+		if !replicaListHas(ctr.TableSnapshot().Slots[probesDead].Replicas, cand) {
+			deadExtra = cand
+			break
+		}
+	}
+	if deadExtra == "" {
+		t.Skip("no third node free for the surplus seat of the failing slot")
+	}
+	applyCmd(t, ctr, &Command{Op: OpSlotAddReplica, Slots: []int32{probesDead}, NodeID: deadExtra})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	done := ctr.reclaimRound(ctx)
+
+	if p := ctr.TableSnapshot().Slots[probeBlind]; replicaListHas(p.Replicas, blindExtra) {
+		t.Fatalf("the seat that could be proven redundant must come off in the same round as a failing probe: %v", p.Replicas)
+	}
+	if p := ctr.TableSnapshot().Slots[probesDead]; !replicaListHas(p.Replicas, deadExtra) {
+		t.Fatalf("the seat whose probe failed must stay: %v", p.Replicas)
+	}
+	if done != 1 {
+		t.Fatalf("want exactly the one provable seat reclaimed, got %d", done)
 	}
 }
 
@@ -891,7 +1064,7 @@ func TestReclaimRoundDropsSurplusSeat(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if done := ctr.reclaimRound(ctx, 8); done != 1 {
+	if done := ctr.reclaimRound(ctx); done != 1 {
 		t.Fatalf("one surplus is redundant and one is not: want 1 reclaim, got %d", done)
 	}
 	if p := ctr.TableSnapshot().Slots[0]; replicaListHas(p.Replicas, "node-3") {
@@ -907,14 +1080,14 @@ func TestReclaimRoundDropsSurplusSeat(t *testing.T) {
 	// The fresh seat catches up (the ordinary fetch loop does this): the surplus
 	// is redundant now and the next round takes it off.
 	appendOne(stores["node-1"], agg2)
-	if done := ctr.reclaimRound(ctx, 8); done != 1 {
+	if done := ctr.reclaimRound(ctx); done != 1 {
 		t.Fatalf("the caught-up pair makes the surplus redundant: want 1 reclaim, got %d", done)
 	}
 	if p := ctr.TableSnapshot().Slots[2]; replicaListHas(p.Replicas, "node-2") {
 		t.Fatalf("slot 2's surplus seat must be reclaimed once its replacement is in sync: %v", p.Replicas)
 	}
 	// Nothing left to reclaim.
-	if done := ctr.reclaimRound(ctx, 8); done != 0 {
+	if done := ctr.reclaimRound(ctx); done != 0 {
 		t.Fatalf("a settled layout must not reclaim anything, got %d", done)
 	}
 }
