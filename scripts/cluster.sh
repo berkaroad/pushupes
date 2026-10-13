@@ -161,7 +161,7 @@ build_binary() {
     [[ -w "${GOCACHE:-/nonexistent}" ]] || export GOCACHE=/root/.cache/go-build
     mkdir -p "$GOTMPDIR" "$GOPATH" "$GOCACHE" 2>/dev/null || true
     export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
-    (cd "$ROOT" && go build -o bin/pushupes ./cmd/pushupes && go build -o bin/grpccheck ./cmd/grpccheck && go build -o bin/slotcheck ./cmd/slotcheck) || die "编译失败"
+    (cd "$ROOT" && CGO_ENABLED=0 go build -o bin/pushupes ./cmd/pushupes && CGO_ENABLED=0 go build -o bin/grpccheck ./cmd/grpccheck && CGO_ENABLED=0 go build -o bin/slotcheck ./cmd/slotcheck) || die "编译失败"
   fi
 }
 

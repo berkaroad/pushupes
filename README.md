@@ -136,7 +136,7 @@ tag 与设置入口、每节点底部「写入速度（数量/大小）」双轴
 要求 Go 1.26+：
 
 ```bash
-go build -o bin/pushupes ./cmd/pushupes
+CGO_ENABLED=0 go build -o bin/pushupes ./cmd/pushupes   # 纯 Go 静态链接，不依赖 glibc
 go build ./... && go vet ./... && go test ./... -count=1   # 全量门禁
 ```
 
