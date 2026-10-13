@@ -28,6 +28,20 @@ func populatePeers(t *testing.T, tbl *Table, ids []string) {
 	}
 }
 
+// fixtureFactor is the fixtures' explicit factor curve, NOT a policy tier:
+// these table-level tests never run the controller, so they drive OpConfig
+// with the numbers they name. The curve rises with membership (3 members ->
+// 2, 5 -> 3, 7 -> 4) because the tests were written against a factor that
+// grows as members arrive — the shape the high tier now has in its own way
+// (factor = the pool size) — without every fixture slot replicating onto
+// every node.
+func fixtureFactor(members int) int {
+	if members < 1 {
+		return 1
+	}
+	return (members-1)/2 + 1
+}
+
 // TestReplicaFactorRaisesExistingTable pins the mechanism the controller drives
 // once the derived factor grows: lift Table.Replicas (OpConfig) and only then
 // top every slot's replica set up to it (OpReplanSlots). A table whose factor
@@ -86,7 +100,7 @@ func TestReplicaFactorRaisesExistingTable(t *testing.T) {
 // later, against real copies (reclaimRound, TestReclaimRoundDropsSurplusSeat).
 func TestMemberRemovalReDerivesReplicaSets(t *testing.T) {
 	members := []string{"node-1", "node-2", "node-3", "node-4", "node-5", "node-6", "node-7"}
-	tbl := NewTable(1680, ReplicaCountForMembers(len(members)))
+	tbl := NewTable(1680, fixtureFactor(len(members)))
 	populatePeers(t, tbl, members)
 	tbl.Slots = PlanSlots(members, tbl.SlotCount, tbl.Replicas)
 	if tbl.Replicas != 4 {
@@ -105,7 +119,7 @@ func TestMemberRemovalReDerivesReplicaSets(t *testing.T) {
 		}
 	}
 	// The controller re-derives the factor from the member count first.
-	if err := tbl.Apply(&Command{Op: OpConfig, Replicas: ReplicaCountForMembers(len(tbl.Peers))}); err != nil {
+	if err := tbl.Apply(&Command{Op: OpConfig, Replicas: fixtureFactor(len(tbl.Peers))}); err != nil {
 		t.Fatalf("apply config: %v", err)
 	}
 	if tbl.Replicas != 3 {
@@ -478,63 +492,27 @@ func TestLayoutStaleIgnoresMembersBeyondThePlan(t *testing.T) {
 	}
 }
 
-// TestReplicaCountFollowsFaultTolerance pins the high tier's derivation: one
-// more copy than the failures the Raft group survives. These numbers are the
-// specification for ReplicaPolicyHigh (the other tiers fix the factor at 1/2,
-// clamped to the member count — see TestReplicaCountForPolicy):
-//
-//	1 voter  -> 0+1 = 1
-//	3 voters -> 1+1 = 2
-//	5 voters -> 2+1 = 3
-//	7 voters -> 3+1 = 4
-//
-// Even counts use the same floor((N-1)/2) arithmetic (2->1, 4->2, 6->3): a
-// 4-voter group survives one failure exactly like a 3-voter group.
-func TestReplicaCountFollowsFaultTolerance(t *testing.T) {
-	cases := []struct{ members, want int }{
-		{0, 1}, // no members enumerated yet: never below one copy
-		{1, 1},
-		{2, 1},
-		{3, 2},
-		{4, 2},
-		{5, 3},
-		{6, 3},
-		{7, 4},
-		{8, 4},
-		{9, 5},
-	}
-	for _, c := range cases {
-		got := ReplicaCountForMembers(c.members)
-		if got != c.want {
-			t.Errorf("ReplicaCountForMembers(%d) = %d, want %d", c.members, got, c.want)
-		}
-		if c.members > 0 && got > c.members {
-			t.Errorf("%d members must never plan more replicas (%d) than members", c.members, got)
-		}
-	}
-}
-
 // TestEvenMemberCountSeatsTheNewMemberAndHoldsTheFactor pins the rule after the
-// trigger change: the derived copy count still only moves on the ODD member
-// counts (4 voters survive one failure exactly like 3, so the 4th member leaves
-// the factor at 2), but the member itself is seated like any other — the layout
-// has left it out, which arms the re-layout (layoutStale's second shape). It
-// used to carry no seat and no slot until the next odd count, with its slots'
-// ring leader unable to become a replica.
+// trigger change: a factor that does NOT move when a member arrives still has
+// to seat that member — the layout has left it out, which arms the re-layout
+// (layoutStale's second shape). Here the fixture factor holds at 2 across the
+// 4th member, then the 5th raises it to 3. It used to carry no seat and no
+// slot until the next odd count, with its slots' ring leader unable to become
+// a replica.
 func TestEvenMemberCountSeatsTheNewMemberAndHoldsTheFactor(t *testing.T) {
 	nodes := []string{"node-1", "node-2", "node-3"}
-	tbl := NewTable(16, ReplicaCountForMembers(len(nodes)))
+	tbl := NewTable(16, fixtureFactor(len(nodes)))
 	populatePeers(t, tbl, nodes)
 	tbl.Slots = PlanSlots(nodes, tbl.SlotCount, tbl.Replicas)
 
-	// The 4th member: the derived count stays 2 (4 voters survive one failure,
-	// exactly like 3), so the controller's OpConfig writes the same value — and
-	// the new member holds no seat, which must arm the replan.
+	// The 4th member: the fixture factor stays 2, so the controller's OpConfig
+	// writes the same value — and the new member holds no seat, which must
+	// arm the replan.
 	populatePeers(t, tbl, []string{"node-4"})
-	if want := ReplicaCountForMembers(4); want != 2 {
-		t.Fatalf("ReplicaCountForMembers(4) = %d, want 2", want)
+	if want := fixtureFactor(4); want != 2 {
+		t.Fatalf("fixtureFactor(4) = %d, want 2", want)
 	}
-	if err := tbl.Apply(&Command{Op: OpConfig, Replicas: ReplicaCountForMembers(4)}); err != nil {
+	if err := tbl.Apply(&Command{Op: OpConfig, Replicas: fixtureFactor(4)}); err != nil {
 		t.Fatalf("apply config: %v", err)
 	}
 	if tbl.Replicas != 2 {
@@ -582,13 +560,13 @@ func TestEvenMemberCountSeatsTheNewMemberAndHoldsTheFactor(t *testing.T) {
 		t.Fatal("a table whose sets already cover the ring must not plan a further replan")
 	}
 
-	// The 5th member moves the derived count to 3, and now both new members
+	// The 5th member moves the fixture factor to 3, and now both new members
 	// enter the layout (the ring window over five members).
 	populatePeers(t, tbl, []string{"node-5"})
-	if want := ReplicaCountForMembers(5); want != 3 {
-		t.Fatalf("ReplicaCountForMembers(5) = %d, want 3", want)
+	if want := fixtureFactor(5); want != 3 {
+		t.Fatalf("fixtureFactor(5) = %d, want 3", want)
 	}
-	if err := tbl.Apply(&Command{Op: OpConfig, Replicas: ReplicaCountForMembers(5)}); err != nil {
+	if err := tbl.Apply(&Command{Op: OpConfig, Replicas: fixtureFactor(5)}); err != nil {
 		t.Fatalf("apply config: %v", err)
 	}
 	if err := tbl.Apply(&Command{Op: OpReplanSlots}); err != nil {
@@ -736,7 +714,7 @@ func TestMediumGrowthSeatsTheNewMember(t *testing.T) {
 // each time.
 func TestReplicaFactorGrowsWithMembership(t *testing.T) {
 	ids := []string{"node-1"}
-	tbl := NewTable(16, ReplicaCountForMembers(len(ids)))
+	tbl := NewTable(16, fixtureFactor(len(ids)))
 	populatePeers(t, tbl, ids)
 	tbl.Slots = PlanSlots(ids, tbl.SlotCount, tbl.Replicas)
 
@@ -750,9 +728,9 @@ func TestReplicaFactorGrowsWithMembership(t *testing.T) {
 	}
 	for _, s := range steps {
 		populatePeers(t, tbl, s.nodes) // the members that are in the cluster now
-		want := ReplicaCountForMembers(len(s.nodes))
+		want := fixtureFactor(len(s.nodes))
 		if want != s.want {
-			t.Fatalf("ReplicaCountForMembers(%d) = %d, want %d", len(s.nodes), want, s.want)
+			t.Fatalf("fixtureFactor(%d) = %d, want %d", len(s.nodes), want, s.want)
 		}
 		if err := tbl.Apply(&Command{Op: OpConfig, Replicas: want}); err != nil {
 			t.Fatalf("apply config: %v", err)

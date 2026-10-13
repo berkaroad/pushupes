@@ -22,21 +22,18 @@ import "fmt"
 // startup flag only seeds a brand-new cluster, and the admin endpoint is the
 // entry point for every later change.
 //
-// ReplicaPolicyLow     — factor 1: one copy per slot.
-// ReplicaPolicyMedium  — factor 2: a leader plus one replica (the default).
-// ReplicaPolicyHigh    — fault tolerance + 1: the Raft group survives
+// The member count a tier derives against is the DATA-PLANE pool — the
+// directory members that host slots (Table.HostingIDs) — not the whole
+// directory: a control-only member holds no seat and no copy, so counting it
+// into the factor would ask every slot for replicas that cannot exist.
 //
-//	                       floor((N-1)/2) failures and every slot keeps exactly
-//	                       one more copy than that, so the data outlives the
-//	                       same failures the consensus group outlives:
-//
-//		1 voter  -> 0 + 1 = 1 replica
-//		3 voters -> 1 + 1 = 2 replicas
-//		5 voters -> 2 + 1 = 3
-//		7 voters -> 3 + 1 = 4
-//
-// Even member counts land on the same count as the odd count below them
-// (4 voters -> 2, 6 -> 3) — the same floor((N-1)/2) arithmetic.
+//	ReplicaPolicyLow     — factor 1: one copy per slot.
+//	ReplicaPolicyMedium  — factor 2: a leader plus one replica (the default).
+//	ReplicaPolicyHigh    — one copy on EVERY data-plane node: the factor is
+//	                       the pool's own size, so every slot keeps a full
+//	                       copy on every member that can hold data — the
+//	                       strongest durability tier, at the price of every
+//	                       data node storing every byte.
 type ReplicaPolicy string
 
 const (
@@ -70,25 +67,13 @@ func NormalizeReplicaPolicy(s string) (ReplicaPolicy, error) {
 	return ReplicaPolicy(s), nil
 }
 
-// ReplicaCountForMembers is the high tier: the per-slot replica count derived
-// from the Raft cluster's own fault tolerance — a group of N voters survives
-// floor((N-1)/2) failures, and every slot keeps one more copy than that.
-// It is what ReplicaCountForPolicy computes for ReplicaPolicyHigh; the even
-// member counts reuse the odd count's arithmetic (2->1, 4->2, 6->3).
-func ReplicaCountForMembers(members int) int {
-	if members < 1 {
-		return 1
-	}
-	return (members-1)/2 + 1
-}
-
-// ReplicaCountForPolicy is the policy's per-slot replica factor for a cluster
-// of `members` members: low is always one copy, medium is always two, high
-// follows the cluster's fault tolerance (ReplicaCountForMembers). The result
-// is clamped to the member count — a factor larger than the cluster has nodes
-// would ask slots for replicas that cannot exist (a 1-member cluster on the
-// medium default plans one copy, not two). An unrecognised policy value falls
-// back to the medium derivation, same as the default.
+// ReplicaCountForPolicy is the policy's per-slot replica factor for a data
+// plane of `members` hosting members (Table.HostingIDs): low is always one
+// copy, medium is always two, high is the pool itself — every data node holds
+// every slot. The result is clamped to the member count — a factor larger
+// than the pool would ask slots for replicas that cannot exist (a 1-member
+// data plane on the medium tier plans one copy, not two). An unrecognised
+// policy value falls back to the medium derivation, same as the seed path.
 func ReplicaCountForPolicy(policy ReplicaPolicy, members int) int {
 	if members < 1 {
 		members = 1
@@ -98,7 +83,7 @@ func ReplicaCountForPolicy(policy ReplicaPolicy, members int) int {
 	case ReplicaPolicyLow:
 		want = 1
 	case ReplicaPolicyHigh:
-		want = ReplicaCountForMembers(members)
+		want = members // every data-plane node holds every slot
 	default: // medium (and any unknown value, which the table cannot hold anyway)
 		want = 2
 	}

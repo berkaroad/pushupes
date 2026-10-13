@@ -244,11 +244,12 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 		"slots":      tbl.Slots,
 		"slot_count": tbl.SlotCount,
 		// replica_factor is the per-slot copy count in force, derived by the
-		// controller from the cluster's replica policy tier and the member
-		// count (cluster.ReplicaCountForPolicy). replica_policy is that tier
-		// (low/medium/high) — the value stored in the replicated table, which
-		// the admin endpoint (POST /admin/cluster/replica-policy) sets and the
-		// startup flag only seeds. These are where an operator reads both back.
+		// controller from the cluster's replica policy tier and the data-plane
+		// member count (cluster.ReplicaCountForPolicy). replica_policy is that
+		// tier (low/medium/high) — the value stored in the replicated table,
+		// which the admin endpoint (POST /admin/cluster/replica-policy) sets
+		// and the startup flag only seeds. These are where an operator reads
+		// both back.
 		"replica_factor":        tbl.Replicas,
 		"replica_policy":        string(tbl.Policy),
 		"controller":            leaderID,
@@ -416,11 +417,11 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 // (low / medium / high) — the knob behind the per-slot replica factor. The
 // tier lives in the replicated slot table, so this is one controller-only
 // Raft command: it takes effect on every node and survives restarts. The
-// factor the tier implies is derived from the member count (clamped to it),
-// and the controller converges the replica sets on the next round — the same
-// factor-change path a membership change drives. The startup -replica-policy
-// flag only seeds a brand-new cluster; this endpoint is the entry point for
-// every change after that.
+// factor the tier implies is derived from the data-plane member count
+// (clamped to it), and the controller converges the replica sets on the next
+// round — the same factor-change path a membership change drives. The startup
+// -replica-policy flag only seeds a brand-new cluster; this endpoint is the
+// entry point for every change after that.
 //
 //	POST /admin/cluster/replica-policy  {"policy":"high"}
 func (s *Server) handleSetReplicaPolicy(w http.ResponseWriter, r *http.Request) {

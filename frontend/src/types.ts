@@ -3,6 +3,12 @@ export interface Peer {
   peer_addr: string
   admin_addr: string
   client_addr: string
+  // The node's self-announced plane: 'voter' (control only, hosts nothing),
+  // 'learner' (data plane), 'both'/'' (classic single-plane). The replica
+  // factor derives from the members that HOST (role != 'voter' with an
+  // announced client_addr — the backend's Table.HostingIDs pool), not from
+  // the whole directory.
+  role?: string
   // The controller's replicated liveness verdict: consecutive peer-plane
   // probes failed. The directory entry (addresses included) survives a
   // down-mark — only leadership moves off it — so the console can show the
@@ -34,8 +40,9 @@ export interface ClusterStatus {
   slot_count: number
   replicas?: number
   // replica_factor is the per-slot copy count in force; replica_policy is the
-  // tier behind it (low/medium/high). The factor is derived from the policy
-  // and the member count by the controller; the policy is set through
+  // tier behind it (low = 1 copy, medium = 2 — the default —, high = one copy
+  // on every data-plane node). The factor is derived from the policy and the
+  // data-plane member count by the controller; the policy is set through
   // POST /admin/cluster/replica-policy (the startup flag only seeds a new
   // cluster), so this is the live cluster-wide value every node reads back.
   replica_factor?: number

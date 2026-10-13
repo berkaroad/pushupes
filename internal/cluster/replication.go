@@ -2243,12 +2243,12 @@ func (e *Engine) layoutFeed() *layoutHub {
 func (e *Engine) SetBootPolicy(p ReplicaPolicy) { e.bootPolicy = p }
 
 // SetReplicaPolicy is the cluster's policy entry point: it changes the
-// replica strategy tier — low (one copy per slot), medium (two), high (the
-// cluster's fault tolerance plus one). The tier lives in the replicated slot
-// table, so the change is one Raft command: it takes effect on every node
+// replica strategy tier — low (one copy per slot), medium (two, the default),
+// high (one copy on every data-plane node). The tier lives in the replicated
+// slot table, so the change is one Raft command: it takes effect on every node
 // and survives restarts. The factor the tier implies is derived at apply
-// time from the member count (clamped to it), and the controller's next
-// round converges the replica sets on the new factor — the same
+// time from the data-plane member count (clamped to it), and the controller's
+// next round converges the replica sets on the new factor — the same
 // factor-change path a membership change drives (DESIGN §4). Submitting the
 // tier the table already holds is a no-op. It returns the live tier and the
 // factor in force.
@@ -3880,12 +3880,12 @@ func (e *Engine) RunController(ctx context.Context) {
 			e.submit(&Command{Op: OpLeaveNode, NodeID: id})
 		}
 		// 2) plan: first re-derive the table's replica factor from the
-		// replicated policy tier and the member count — ReplicaCountForPolicy
+		// replicated policy tier and the data-plane pool — ReplicaCountForPolicy
 		// reads Table.Policy (the tier the admin endpoint sets, seeded at
 		// bootstrap by the flag), so low/medium hold the factor steady against
-		// membership and only high follows the fault tolerance. A grown cluster
-		// on high carries more copies of every slot; a policy change moves the
-		// factor on any tier. Then full-replan only
+		// membership and only high follows the pool itself: every data node
+		// holds every slot. A grown cluster on high carries one more full copy
+		// of the data on every new member. Then full-replan only
 		// when nothing is assigned; otherwise converge the layout — fill gaps
 		// left by member joins and re-derive replica sets left stale by a
 		// factor change (OpReplanSlots' own function, run on a clone: a replan

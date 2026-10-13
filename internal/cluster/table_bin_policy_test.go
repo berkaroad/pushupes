@@ -22,10 +22,11 @@ import (
 )
 
 // A live cluster's snapshot directory holds v3 tables: they predate the policy
-// tier, and their factor was the fault-tolerance derivation — restoring one
-// must say "high" (so the controller re-derives the factor the snapshot
-// already holds and the table converges with no churn), keep the factor and
-// the layout exactly, and stay readable forever.
+// tier, and their factor was the old fault-tolerance derivation — on the
+// classic 3-member cluster that landed on two copies, the medium tier's
+// number, so restoring one must say "medium" (the controller re-derives the
+// factor the snapshot already holds and the table converges with no churn),
+// keep the factor and the layout exactly, and stay readable forever.
 
 func TestTableBinaryDecodesV3Snapshots(t *testing.T) {
 	// Hand-build a minimal v3 payload: header + empty directory + one slot.
@@ -78,8 +79,8 @@ func TestTableBinaryDecodesV3Snapshots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a v3 snapshot must stay readable: %v", err)
 	}
-	if tbl.Policy != ReplicaPolicyHigh {
-		t.Errorf("v3 factor was the fault-tolerance derivation: restored policy = %q, want high", tbl.Policy)
+	if tbl.Policy != ReplicaPolicyMedium {
+		t.Errorf("v3 factor was the old fault-tolerance derivation, which the classic 3-member cluster landed on 2 = medium: restored policy = %q, want medium", tbl.Policy)
 	}
 	if tbl.Replicas != 2 || tbl.SlotCount != 2 {
 		t.Errorf("v3 fields changed: factor %d, slot count %d", tbl.Replicas, tbl.SlotCount)
@@ -88,17 +89,17 @@ func TestTableBinaryDecodesV3Snapshots(t *testing.T) {
 		t.Fatalf("v3 layout did not survive: %+v", tbl.Slots)
 	}
 	// The restored table must be immediately stable under the controller's
-	// derive-and-reconcile rule: high over one member is one copy, but the
+	// derive-and-reconcile rule: medium over one member is one copy, but the
 	// snapshot's factor (2) is what the LAYOUT was planned with, and the
 	// controller only touches the table when policy+members disagree — here
-	// the seed/derive step keeps high and converges the sets on the next
+	// the seed/derive step keeps medium and converges the sets on the next
 	// replan, exactly like a membership shrink. What matters for compat is
 	// the round trip through the v4 encoder afterwards.
 	out, err := DecodeTableBinary(tbl.EncodeTableBinary())
 	if err != nil {
 		t.Fatalf("v3 -> v4 re-encode broke: %v", err)
 	}
-	if out.Policy != ReplicaPolicyHigh || out.Replicas != 2 {
+	if out.Policy != ReplicaPolicyMedium || out.Replicas != 2 {
 		t.Fatalf("policy/factor lost across the upgrade: %q/%d", out.Policy, out.Replicas)
 	}
 }

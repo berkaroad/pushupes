@@ -54,10 +54,11 @@ const (
 	// tableVerNoGrant is the v4 form: the replica policy tier in the header,
 	// and no seat grants.
 	tableVerNoGrant = byte(4)
-	// tableVerPolicy is the v3 form: it predates the policy tier, and its
-	// factor was the fault-tolerance derivation — the high tier says exactly
-	// that, so a v3 snapshot restores as high and the controller re-derives
-	// the same factor the table already carries.
+	// tableVerPolicy is the v3 form: it predates the policy tier. Its factor
+	// was the old fault-tolerance derivation, which on the classic 3-member
+	// cluster landed on two copies — the medium tier's number — so a v3
+	// snapshot restores as medium and the controller re-derives the same
+	// factor the table already carries.
 	tableVerPolicy = byte(3)
 	noNode         = byte(255)
 )
@@ -278,10 +279,14 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 	if err != nil {
 		return nil, err
 	}
-	// v3 snapshots carry no tier: their factor was the fault-tolerance
-	// derivation itself, so the restored table says high and the controller
-	// re-derives the factor the snapshot already holds.
-	policy := ReplicaPolicyHigh
+	// v3 snapshots carry no tier: their factor was the old fault-tolerance
+	// derivation, which on the classic 3-member cluster landed on two copies
+	// — the medium tier's number. Tag the restored table medium and keep the
+	// recorded factor; the controller re-derives on its next round like it
+	// does for any table. (high no longer means "derived from the member
+	// count's floor half", it means "a copy on every data node", and that
+	// would silently inflate a restored v3 cluster.)
+	policy := ReplicaPolicyMedium
 	if policyInHeader {
 		policyStr, err := readStr(r)
 		if err != nil {

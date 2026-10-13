@@ -68,7 +68,7 @@ function startNode(i) {
     '-admin', `127.0.0.1:${port(i)}`, '-peer', `127.0.0.1:${8390 + i}`, '-client', `127.0.0.1:${8590 + i}`,
     '-data', './data',
     '-peers', 'node-1=http://127.0.0.1:8391,node-2=http://127.0.0.1:8392,node-3=http://127.0.0.1:8393',
-    // 每槽副本数不是配置项：3 个成员推导出 2 份（ReplicaCountForMembers）。
+    // 每槽副本数由槽表里的策略档位推导（medium=2 份为默认；high=每个数据节点一份全量）。
     '-segment-bytes', '256MiB',
   ]
   if (i === 1) args.push('-bootstrap')

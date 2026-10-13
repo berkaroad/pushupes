@@ -376,15 +376,14 @@ Body: Record*，每条记录：
   两件事共用同一个 cadence 与让路门禁，且各自每轮推进一次提交。
 - **默认拓扑**：`slot_count=1680`（固定）。每槽副本数由**副本策略**（replica
   policy）分档决定，策略值存放在 Raft 复制的槽表里、全集群一份：
-  `low` = 1 份、`medium` = 2 份（默认）、`high` = 容错节点数 + 1，即
-  `ReplicaCountForMembers(N) = floor((N-1)/2) + 1`——「共识组能扛住几次
-  故障，数据就多留一份」（1 节点 0+1=1、3 节点 1+1=2、5 节点 2+1=3、7 节点 3+1=4；
-  偶数成员同式：2→1、4→2、6→3）。任何一档的因子都按成员数钳制（因子不会超过
-  集群节点数：1 成员集群上的 medium 落为 1 份）。控制器每轮按「表里的策略 ×
-  当前成员数」重算并写进槽表（`OpConfig`），策略一变或成员数一变就把因子对齐；
+  `low` = 1 份、`medium` = 2 份（**默认**）、`high` = 每个数据节点各存一份全量，
+  即因子等于布局池的大小（`Table.HostingIDs()`，§12.2）——最强的持久性档位，
+  代价是每个数据节点存全部字节。任何一档的因子都按数据节点数钳制（因子不会超过
+  池大小：1 个数据节点的集群上的 medium 落为 1 份）。控制器每轮按「表里的策略 ×
+  当前数据节点数」重算并写进槽表（`OpConfig`），策略一变或承载池一变就把因子对齐；
   副本集按环 `slot % N` 起、向前取该数量个节点。
   策略的修改入口是 admin 接口 `POST /admin/cluster/replica-policy`（控制器专属
-  的 Raft 命令 `OpSetPolicy`，命令只带档位、副本数在应用时按成员数推导，保持
+  的 Raft 命令 `OpSetPolicy`，命令只带档位、副本数在应用时按数据节点数推导，保持
   所有节点状态机确定性），控制台集群页的「副本策略」卡片配了编辑态（修改 →
   草稿 → 保存确认 → 提交）；启动参数 `-replica-policy`（env
   `PUSHUPES_REPLICA_POLICY`，默认 medium）只为新集群种下初始值——控制器仅在
@@ -851,10 +850,10 @@ slot_count      = 1680         # 固定不可配置（105 的倍数，见 §7.2�
 segment_bytes   = 268435456    # 默认 256MiB；须为 64MiB 的整数倍，最小 64MiB、最大 2GiB
                               # -segment-bytes / PUSHUPES_SEGMENT_BYTES 可写字节数或带单位
                               # （256MiB / 1GiB / 268435456）
-replica_policy  = medium       # 副本策略：low=每槽 1 份 / medium=2 份 / high=容错节点数+1
+replica_policy  = medium       # 副本策略：low=每槽 1 份 / medium=2 份（默认）/ high=每个数据节点一份全量
                               # -replica-policy / PUSHUPES_REPLICA_POLICY 只为新集群种初始值；
                               # 策略存在复制的槽表里，之后的修改走 POST /admin/cluster/replica-policy
-replica_count   = 2
+replica_count   = 2                # = ReplicaCountForPolicy(策略, 数据节点数)，控制器每轮重推
 election_mode   = leader       # preferred leader 自动回切
 flush.policy    = 每 1000 条或 5s（可关闭为纯页缓存）
                               # -flush-messages / PUSHUPES_FLUSH_MESSAGES（每 N 条）、
@@ -1486,8 +1485,8 @@ Wait(lsn)            → 阻塞到自己的 LSN 落盘
 ### 12.2 布局口径
 
 - `Table.HostingIDs()` 是唯一的布局池：目录里 `role != voter` 的成员（空值算 both）。
-  `plan_slots`/`replan_slots`、副本因子推导（`ReplicaCountForPolicy` 的成员数）
-  与 `OnlinePeerIDs()` 的候选集全部只认这个池。
+  `plan_slots`/`replan_slots`、副本因子推导（`ReplicaCountForPolicy` 取的就是
+  这个池的大小）与 `OnlinePeerIDs()` 的候选集全部只认这个池。
 - 纯控制节点因此**不持有任何席位**，也不出现在故障转移/再平衡的目标集里。
 - **计划等池稳定一拍**：池是按注册逐个长出来的，所以「第一个成员一注册就规划」会
   规划一个还没到齐的集群——经典 both 冷启动曾经如此：首个 plan 落在最先注册的那一

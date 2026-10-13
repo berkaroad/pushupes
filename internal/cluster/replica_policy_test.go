@@ -18,8 +18,8 @@ import "testing"
 
 // TestReplicaCountForPolicy pins the three tiers. low and medium are fixed
 // factors, clamped to whatever members exist (a cluster cannot hold more
-// copies of a slot than it has nodes); high is the fault-tolerance derivation
-// — one more copy than the failures the Raft group survives.
+// copies of a slot than it has nodes); high IS the data plane: every hosting
+// member holds every slot.
 func TestReplicaCountForPolicy(t *testing.T) {
 	cases := []struct {
 		policy  ReplicaPolicy
@@ -35,13 +35,11 @@ func TestReplicaCountForPolicy(t *testing.T) {
 		{ReplicaPolicyMedium, 7, 2},
 		{ReplicaPolicyHigh, 0, 1}, // no members enumerated yet: never below one copy
 		{ReplicaPolicyHigh, 1, 1},
-		{ReplicaPolicyHigh, 2, 1},
-		{ReplicaPolicyHigh, 3, 2},
-		{ReplicaPolicyHigh, 4, 2},
-		{ReplicaPolicyHigh, 5, 3},
-		{ReplicaPolicyHigh, 6, 3},
-		{ReplicaPolicyHigh, 7, 4},
-		{ReplicaPolicyHigh, 9, 5},
+		{ReplicaPolicyHigh, 2, 2},
+		{ReplicaPolicyHigh, 3, 3},
+		{ReplicaPolicyHigh, 5, 5},
+		{ReplicaPolicyHigh, 7, 7},
+		{ReplicaPolicyHigh, 9, 9},
 	}
 	for _, c := range cases {
 		got := ReplicaCountForPolicy(c.policy, c.members)
@@ -73,7 +71,7 @@ func TestSetPolicyCommandAppliesTierAndFactor(t *testing.T) {
 	}{
 		{"low", 1, false},
 		{"medium", 2, false},
-		{"high", ReplicaCountForMembers(len(members)), false},
+		{"high", len(members), false}, // high: every data-plane node holds every slot
 		{"bogus", 0, true},
 	} {
 		err := tbl.Apply(&Command{Op: OpSetPolicy, Policy: c.policy})
@@ -98,23 +96,24 @@ func TestSetPolicyCommandAppliesTierAndFactor(t *testing.T) {
 // TestPolicyChangeReLaysReplicaSets is the regression for the operator's knob:
 // a tier change moves the factor, and the controller's existing factor-change
 // path — OpConfig + replan to fill a raised factor, then seat reclaim for a
-// lowered one — converges the layout. Medium -> high (2 -> 3 copies over five
-// members) must add the ring's seats to every slot; high -> low (3 -> 1) must
-// leave surplus seats for reclaimRound to take off, never drop one in the
-// replan itself.
+// lowered one — converges the layout. Medium -> high (2 -> 5 copies over five
+// members: high seats every member on every slot) must add the ring's remaining
+// seats to every slot; high -> medium (5 -> 2) must leave surplus seats for
+// reclaimRound to take off, never drop one in the replan itself.
 func TestPolicyChangeReLaysReplicaSets(t *testing.T) {
 	members := []string{"node-1", "node-2", "node-3", "node-4", "node-5"}
 	tbl := NewTable(16, 2) // the medium layout over five members
 	populatePeers(t, tbl, members)
 	tbl.Slots = PlanSlots(members, tbl.SlotCount, tbl.Replicas)
 
-	// medium -> high: the factor rises 2 -> 3, and the replan adds the third
-	// ring seat to every stable slot.
+	// medium -> high: the factor rises 2 -> 5 (every data-plane node holds
+	// every slot), and the replan adds the remaining ring seats to every
+	// stable slot.
 	if err := tbl.Apply(&Command{Op: OpSetPolicy, Policy: "high"}); err != nil {
 		t.Fatalf("set policy: %v", err)
 	}
-	if tbl.Replicas != 3 {
-		t.Fatalf("five members on high must want three copies, got %d", tbl.Replicas)
+	if tbl.Replicas != 5 {
+		t.Fatalf("five members on high must want five copies, got %d", tbl.Replicas)
 	}
 	if !tbl.layoutStale() {
 		t.Fatal("a factor change must leave the layout stale until the replan")
@@ -123,17 +122,17 @@ func TestPolicyChangeReLaysReplicaSets(t *testing.T) {
 		t.Fatalf("replan: %v", err)
 	}
 	for s, p := range tbl.Slots {
-		if len(p.Replicas) < 3 {
-			t.Fatalf("slot %d has %d replicas after the replan, want 3: %v", s, len(p.Replicas), p.Replicas)
+		if len(p.Replicas) < 5 {
+			t.Fatalf("slot %d has %d replicas after the replan, want 5: %v", s, len(p.Replicas), p.Replicas)
 		}
-		for i := 0; i < 3; i++ {
+		for i := 0; i < 5; i++ {
 			if on := members[(int(s)+i)%len(members)]; !replicaListHas(p.Replicas, on) {
 				t.Fatalf("slot %d does not hold the ring's seat %s: %v", s, on, p.Replicas)
 			}
 		}
 	}
 
-	// high -> medium: the factor drops 3 -> 2. The replan never DROPS a seat
+	// high -> medium: the factor drops 5 -> 2. The replan never DROPS a seat
 	// (the copies a stale set holds are what has been replicating the slot;
 	// the surplus comes off later via reclaimRound), so a settled-to-3 set
 	// stays where it is and the round must not burn a Raft entry on it.

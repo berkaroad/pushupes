@@ -282,9 +282,11 @@ export default function ClusterPage() {
   const [policyDraft, setPolicyDraft] = useState<ReplicaPolicy>('medium')
   const [policySaving, setPolicySaving] = useState(false)
 
-  const replicaFactorFor = (policy: ReplicaPolicy, members: number) => {
-    const n = Math.max(members, 1)
-    const want = policy === 'low' ? 1 : policy === 'high' ? Math.floor((n - 1) / 2) + 1 : 2
+  // 推导口径与后端 cluster.ReplicaCountForPolicy 一致：low=1 份、medium=2 份、
+  // high=每个数据节点一份全量（因子就是数据节点数），并按数据节点数钳制。
+  const replicaFactorFor = (policy: ReplicaPolicy, dataNodes: number) => {
+    const n = Math.max(dataNodes, 1)
+    const want = policy === 'low' ? 1 : policy === 'high' ? n : 2
     return Math.min(want, n)
   }
 
@@ -303,9 +305,13 @@ export default function ClusterPage() {
   const savePolicy = () => {
     const st = statusRef.current
     const cur = (st?.replica_policy ?? 'medium') as ReplicaPolicy
-    const members = st ? Object.keys(st.peers).length : 0
-    const from = st?.replica_factor ?? replicaFactorFor(cur, members)
-    const to = replicaFactorFor(policyDraft, members)
+    // 因子按数据面池推导（后端 Table.HostingIDs）：纯控制节点不承载副本，
+    // 不进这个数。
+    const dataNodes = st
+      ? Object.values(st.peers).filter((p) => p.role !== 'voter' && p.client_addr).length
+      : 0
+    const from = st?.replica_factor ?? replicaFactorFor(cur, dataNodes)
+    const to = replicaFactorFor(policyDraft, dataNodes)
     if (policyDraft === cur && to === from) {
       // Nothing to confirm: the draft matches the live tier. Close the edit
       // state instead of burning a no-op round trip.
@@ -320,7 +326,7 @@ export default function ClusterPage() {
       content: (
         <div>
           <Typography.Paragraph style={{ marginBottom: 8 }}>
-            {REPLICA_POLICY_LABELS[policyDraft]}。当前 {members} 个成员，{trend}。
+            {REPLICA_POLICY_LABELS[policyDraft]}。当前 {dataNodes} 个数据节点，{trend}。
           </Typography.Paragraph>
           <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
             策略写入 Raft 复制的槽表，全集群即时生效并持久保留；扩容副本不会搬运 leader，
@@ -469,6 +475,9 @@ export default function ClusterPage() {
   const slots = Object.values(status.slots)
   const migrating = slots.filter((s) => s.state !== 'stable').length
   const peers = Object.values(status.peers)
+  // 数据面池规模——副本因子就是按这个数推导的（后端 Table.HostingIDs 口径：
+  // 非纯控制、且已自报 client 地址的成员）。
+  const dataNodes = peers.filter((p) => p.role !== 'voter' && p.client_addr).length
   const online = peers.filter(isOnlinePeer).length
   // The cluster storage sample: every slot counted once, at its leader. A node
   // that does not serve the field yet (or has not sampled) renders '-'.
@@ -527,8 +536,8 @@ export default function ClusterPage() {
               />
             </Space>
             <Typography.Text type="secondary">
-              副本因子按「策略 × 当前成员数（{peers.length}）」推导：low 每槽 1 份、medium 每槽 2 份、
-              high 为容错节点数 + 1；保存前不会改动集群。
+              副本因子按「策略 × 数据节点数（{dataNodes}）」推导：low 每槽 1 份、medium 每槽 2 份（默认）、
+              high 每个数据节点一份全量；保存前不会改动集群。
             </Typography.Text>
             <Space>
               <Button type="primary" loading={policySaving} onClick={savePolicy}>保存</Button>
@@ -543,7 +552,7 @@ export default function ClusterPage() {
             </Space>
             <Typography.Text type="secondary">
               策略写入 Raft 复制的槽表，全集群生效并持久保留；启动参数 -replica-policy 只用于新集群的初始值，
-              之后的修改都从这里提交。因子由策略与成员数推导（当前 {peers.length} 个成员），控制器每轮把副本集收敛到该因子。
+              之后的修改都从这里提交。因子由策略与数据节点数推导（当前 {dataNodes} 个数据节点），控制器每轮把副本集收敛到该因子。
             </Typography.Text>
           </Space>
         )}

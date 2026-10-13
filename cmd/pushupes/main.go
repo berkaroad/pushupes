@@ -70,7 +70,7 @@ func main() {
 		// (POST /admin/cluster/replica-policy) is the entry point for every
 		// change. See DESIGN §4.
 		replicaPolicy = flag.String("replica-policy", envOr("PUSHUPES_REPLICA_POLICY", string(cluster.DefaultReplicaPolicy)),
-			"replica policy tier for a NEW cluster: low (1 copy per slot), medium (2), high (fault tolerance + 1); applied on the table's first plan only — an existing cluster keeps the policy the admin endpoint last set (env PUSHUPES_REPLICA_POLICY)")
+			"replica policy tier for a NEW cluster: low (1 copy per slot), medium (2, the default), high (one copy per data-plane node); applied on the table's first plan only — an existing cluster keeps the policy the admin endpoint last set (env PUSHUPES_REPLICA_POLICY)")
 		segmentB = byteSize(envByteSizeOr("PUSHUPES_SEGMENT_BYTES", storage.DefaultSegmentBytes))
 		flushN   = flag.Int64("flush-messages", envInt64Or("PUSHUPES_FLUSH_MESSAGES", 1000), "fsync every N records (0 disables) (env PUSHUPES_FLUSH_MESSAGES)")
 		flushD   = flag.Duration("flush-interval", envDurationOr("PUSHUPES_FLUSH_INTERVAL", 5*time.Second), "fsync every interval (0 disables) (env PUSHUPES_FLUSH_INTERVAL)")

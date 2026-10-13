@@ -103,31 +103,41 @@ func TestLayoutSliceServesTheSnapshottedState(t *testing.T) {
 			t.Fatalf("apply: %v", err)
 		}
 	}
-	// Wait for the snapshot to land and the log to compact under it.
+	// Wait until an image worth asserting on EXISTS. This harness's very first
+	// snapshot is legitimately EMPTY: the boot entries (noop + configuration)
+	// are applied before any command reaches the state machine, and with a
+	// threshold of 1 that zero-command image can land first. LayoutSlice's
+	// contract is "the image matches the log's snapshot file" — an empty image
+	// is a legal answer ("rebuild from nothing") — so what the test must wait
+	// for is a snapshot point that carries at least one command, not just any
+	// floor move. (The two earlier reds of this test were both this race
+	// observed from different sides: first a remembered-index comparison, then
+	// len(Data) checked against the empty boot image.)
+	var (
+		floor uint64
+		sl    LayoutSlice
+	)
 	deadline := time.Now().Add(10 * time.Second)
-	landed := false
-	for time.Now().Before(deadline) {
-		if s, _, _ := n.log.Snapshot(); s > 0 && n.log.FirstIndex() > 1 {
-			landed = true
+	for {
+		s, _, _ := n.log.Snapshot()
+		cand, err := n.LayoutSlice(0, 0, 64)
+		if err != nil {
+			t.Fatalf("LayoutSlice: %v", err)
+		}
+		if s > 0 && n.log.FirstIndex() > 1 && cand.Snapshot != nil && len(cand.Snapshot.Data) > 0 {
+			floor, sl = s, cand
 			break
 		}
+		if time.Now().After(deadline) {
+			t.Skip("no command-bearing snapshot landed; the compaction path needs more entries on this platform")
+		}
 		time.Sleep(20 * time.Millisecond)
-	}
-	if !landed {
-		t.Skip("no snapshot landed; the compaction path needs more entries on this platform")
 	}
 
 	// The image is read from the snapshot FILE, so what it must match is the
 	// file, not the index this test happened to observe: with a threshold of 1
 	// every later apply writes a new one, and under a loaded suite that lands
-	// between two reads of this test (the first version of this test compared
-	// against a remembered index and failed exactly that way, once, in the full
-	// parallel run).
-	floor, _, _ := n.log.Snapshot()
-	sl, err := n.LayoutSlice(0, 0, 64)
-	if err != nil {
-		t.Fatalf("LayoutSlice: %v", err)
-	}
+	// between two reads of this test.
 	if sl.Snapshot == nil {
 		t.Fatalf("a compacted log must answer a fresh caller with an image (first index %d)", sl.FirstIndex)
 	}
