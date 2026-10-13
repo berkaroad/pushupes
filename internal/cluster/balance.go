@@ -74,13 +74,13 @@ const (
 	// executes: exactly one. A commit's fence freezes one slot's writes, so a
 	// strictly serial commit loop keeps the frozen-slot count at one and the
 	// write-latency noise bounded to a single slot; convergence is paced by
-	// the round interval instead (a node that led 560 slots returns in 560
+	// the round interval instead (a node that led 2048 slots returns in 2048
 	// rounds, and a factor decrease reclaims one surplus seat per round).
 	rebalanceCommitsPerRound = 1
 	// reclaimBudget bounds one reclaim sweep. The sweep retires every surplus
 	// seat it can inside the budget and the next round continues, so a factor
 	// decrease on a large table converges in a round or two instead of one seat
-	// per round (1680 slots at one seat per interval is about an hour). It must
+	// per round (4096 slots at one seat per interval is about two hours). It must
 	// stay under the round interval so a sweep cannot run back to back with the
 	// next round.
 	reclaimBudget = 1 * time.Second
@@ -430,7 +430,7 @@ func probeParked(parked map[string]bool, p *Placement, drop string) bool {
 //   - a bounded probe pool plus one table command per node: the copy checks run
 //     reclaimProbeConcurrency at a time, and the removals for one seat travel in
 //     a single command (OpSlotRemoveReplica carries a slot list), so a
-//     1680-seat reclaim costs a handful of Raft entries, not thousands.
+//     4096-seat reclaim costs a handful of Raft entries, not thousands.
 //
 // The safety rule is unchanged: a seat only comes off once every seat that STAYS
 // holds a copy equivalent to the leader's (keptCopiesInSync), so the dropped

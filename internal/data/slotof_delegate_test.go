@@ -34,7 +34,7 @@ func TestSlotOfDelegatesToClient(t *testing.T) {
 			}
 		}
 	}
-	if DefaultSlotCount != 1680 {
+	if DefaultSlotCount != 4096 {
 		t.Fatalf("DefaultSlotCount drifted: %d", DefaultSlotCount)
 	}
 }

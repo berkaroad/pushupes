@@ -30,15 +30,17 @@ func TestSlotOfGolden(t *testing.T) {
 		cnt  int
 		want int32
 	}{
-		{"", 1680, 1083},
-		{"a", 1680, 136},
+		{"", 4096, 2203},
+		{"a", 4096, 248},
+		{"agg-1", 4096, 607},
+		{"bench-0", 4096, 3594},
+		{"bench-99", 4096, 3898},
+		{"seed-7-3", 4096, 2118},
+		{"grpc-smoke-x", 4096, 176},
+		{"世界", 4096, 2865},
+		// a non-power-of-two count exercises the uint64 modulo
 		{"agg-1", 1680, 223},
 		{"bench-0", 1680, 1322},
-		{"bench-99", 1680, 522},
-		{"seed-7-3", 1680, 614},
-		{"grpc-smoke-x", 1680, 1232},
-		{"世界", 1680, 625},
-		// a non-power-of-two count exercises the uint64 modulo
 		{"agg-1", 8, 7},
 		{"bench-0", 8, 2},
 		{"", 8, 3},

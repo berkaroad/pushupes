@@ -75,7 +75,7 @@ func TestSlotDiskBytesCoversLoadedAndColdCopies(t *testing.T) {
 	}
 	// A slot with no directory at all has no footprint — and asking for a size
 	// must not create one (the gauge is read on a timer, it cannot be the thing
-	// that materialises 1680 slot directories).
+	// that materialises 4096 slot directories).
 	if err := os.RemoveAll(st.SlotDir(absent)); err != nil {
 		t.Fatal(err)
 	}

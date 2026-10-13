@@ -436,18 +436,19 @@ type ByteRange struct {
 // ---- Slot routing ----------------------------------------------------------
 
 // DefaultSlotCount is the fixed number of slots in the cluster (configurable).
-// 1680 = 105 * 16 is sized for a joint 3/5/7-node deployment: with a multiple of
-// lcm(3,5,7) the leader of an aggregate is a pure function of hash%N, so 3, 5
-// and 7 node clusters all distribute their leaders evenly and changing the slot
-// count later cannot move an aggregate to another node. It is also far above
-// the expected node count: cheap slot metadata, fine-grained placement and
-// migration units.
+// 4096 = 2^12 is sized for the split data plane: at the target ceiling of 1024
+// data nodes every node still holds 4 slots, so placement and migration stay
+// granular at full scale. Data-node counts are even, and every power of two up
+// to 1024 divides 4096 exactly — those topologies give each node the same slot
+// count (ring placement keeps any other N within one slot of the mean). It is
+// also far above the expected node count: cheap slot metadata, fine-grained
+// placement and migration units.
 //
 // This is server-side cluster state. The client contract (pkg/client) carries
 // the routing ALGORITHM — the one thing a client must compute identically —
 // while the slot count reaches clients through PrefetchRoutes, so it can
 // change without stranding any client build.
-const DefaultSlotCount = 1680
+const DefaultSlotCount = 4096
 
 // SlotOf routes an aggregate ID to its slot. The algorithm lives in
 // pkg/client (see that package's doc): the client computes the same slot the
