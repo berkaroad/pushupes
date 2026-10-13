@@ -100,9 +100,10 @@ func main() {
 	// One ReadTails for the whole list instead of a per-aggregate ReadStream
 	// probe chain: the per-aggregate form cost O(aggregates x log(tail)) RPCs
 	// and grew with the data already on disk (measured 5.5s at 58k existing
-	// records across 1000 aggregates). The server groups the request by slot
-	// and forwards one grouped RPC per node it does not hold, so the client
-	// side stays a single call.
+	// records across 1000 aggregates). The library groups the list by the
+	// cached routing table and drives one sub-call per holding node,
+	// following per-entry MOVED itself, so the call site stays a single
+	// call.
 	//
 	// This phase is NOT part of the write window, and it is timed separately
 	// so the reported throughput stays a write-phase number.
@@ -114,11 +115,13 @@ func main() {
 		cancel()
 		if err != nil {
 			fmt.Printf("warn: read tails: %v (tails left at 0)\n", err)
-		} else if len(resp.Versions) != len(aggIDs) {
-			fmt.Printf("warn: read tails: got %d versions for %d aggregates\n",
-				len(resp.Versions), len(aggIDs))
+		} else if len(resp.Results) != len(aggIDs) {
+			fmt.Printf("warn: read tails: got %d results for %d aggregates\n",
+				len(resp.Results), len(aggIDs))
 		} else {
-			copy(lastVers, resp.Versions)
+			for i, r := range resp.Results {
+				lastVers[i] = r.Version
+			}
 		}
 	}
 	var resumeSum uint64

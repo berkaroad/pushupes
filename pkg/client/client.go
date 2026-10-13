@@ -41,7 +41,7 @@ type Config struct {
 // maintained by PrefetchRoutes (seeded at New, refreshed on a timer,
 // patched per MOVED/ASK in between), one long-lived gRPC connection per
 // node address shared by every call, per-record redirect self-heal on
-// the write path, and flow-control backpressure: a node that answers 1006
+// the write and read paths, and flow-control backpressure: a node that answers 1006
 // gets its refused records re-sent every FlowBackoff (default 100ms) while
 // a per-node gate stays closed, pausing every later write to that node
 // until one re-send comes back un-throttled. Business rules (idempotency,
@@ -495,55 +495,243 @@ func (c *Client) sendGroup(ctx context.Context, attempt int, addr string,
 	return next, lastErr
 }
 
+// ---- single-key reads: redirect-following ------------------------------
+//
+// Reads are served by the node that holds the slot's leadership (or a
+// replica whose sync with the current epoch is proven); every other node
+// answers MOVED in-band. The library follows that redirect with the same
+// self-heal the write path uses — patch the slot's routing row from the
+// answer, retry, count the redirect. A stale routing row therefore costs
+// one extra round trip, never a wrong answer and never a server-to-server
+// hop.
+
+// readWithRedirect drives one single-key read call through the cached
+// table: send, follow MOVED/ASK (patch + retry), rotate the row onto the
+// next entry node on transport failure — Config.Attempts rounds, then the
+// last error surfaces.
+func readWithRedirect[T any](c *Client, ctx context.Context, aggID string,
+	call func(addr string) (*T, uint32, string, error)) (*T, error) {
+
+	slot := c.slotOf(aggID)
+	var lastErr error
+	for attempt := 0; attempt < c.cfg.Attempts; attempt++ {
+		addr := c.routeFor(slot, int(c.rr.Add(1)-1))
+		resp, errID, node, err := call(addr)
+		if err != nil {
+			// transport failure: a rotation is a guess, not a redirect
+			// the cluster told us — the Redirects() counter stays out of it.
+			lastErr = err
+			c.routes.patch(slot, c.routes.entries[(int(c.rr.Load())+attempt+1)%len(c.routes.entries)])
+			continue
+		}
+		switch errID {
+		case ErrIDSlotNotLocal, ErrIDMigrating:
+			if node != "" {
+				c.routes.patch(slot, hostPort(node))
+			}
+			c.redirects.Add(1)
+			lastErr = nil
+		default:
+			return resp, nil
+		}
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("client: read %q not served after %d attempts: %w", aggID, c.cfg.Attempts, lastErr)
+	}
+	return nil, fmt.Errorf("client: read %q still redirected after %d attempts", aggID, c.cfg.Attempts)
+}
+
 // ReadStream reads a version range of one aggregate stream (from_version
 // 0 = from the head, limit 0 = all). The call goes to the slot leader as
-// the cached table sees it; a stale row costs one server-side proxy hop,
-// not a wrong answer — reads on a node that holds neither slot nor
-// replica are forwarded to the leader by the cluster itself.
+// the cached table sees it; a MOVED answer patches the row and retries
+// (see readWithRedirect).
 func (c *Client) ReadStream(ctx context.Context, aggID string,
 	fromVersion uint32, limit uint64) (*pushupesv1.ReadStreamResponse, error) {
 
-	addr := c.routeFor(c.slotOf(aggID), int(c.rr.Add(1)-1))
-	cctx, cancel := c.callCtx(ctx)
-	defer cancel()
-	return c.event(addr).ReadStream(cctx, &pushupesv1.ReadStreamRequest{
-		AggregateId: aggID, FromVersion: fromVersion, Limit: limit,
+	return readWithRedirect(c, ctx, aggID, func(addr string) (*pushupesv1.ReadStreamResponse, uint32, string, error) {
+		cctx, cancel := c.callCtx(ctx)
+		defer cancel()
+		resp, err := c.event(addr).ReadStream(cctx, &pushupesv1.ReadStreamRequest{
+			AggregateId: aggID, FromVersion: fromVersion, Limit: limit,
+		})
+		if err != nil {
+			return nil, 0, "", err
+		}
+		return resp, resp.GetErrId(), resp.GetNode(), nil
 	})
 }
 
-// ReadTails asks the latest version of many aggregates in one call, in
-// request order (0 = the aggregate has no visible records). The whole
-// list goes to one entry node, which groups by slot internally and
-// forwards one grouped RPC per destination it does not hold — the bulk
-// form of "does version k exist" for a resume scan.
+// ReadTailsFanout caps how many destinations one ReadTails round drives
+// concurrently — the client-side twin of the server's
+// -batch-slot-parallelism cap on BatchAppend: a resume scan over a large
+// id list fans out to one sub-call per holding node, and the cap keeps a
+// wide batch from opening them all at once.
+const ReadTailsFanout = 16
+
+// ReadTails asks the latest version of many aggregates, in request order
+// (version 0 with err_id 0 = the aggregate has no records visible within
+// the answering node's bound). The list is grouped by the cached routing
+// table and each destination gets ONE sub-call — the fan-out that used to
+// live on the server now lives here, with the same per-entry redirect
+// self-heal as BatchAppend: a MOVED result patches that slot's row and
+// re-sends just that entry (up to Config.Attempts rounds; a transport
+// failure rotates the rows onto the next entry nodes instead). The answer
+// is one result per requested aggregate in request order, echoing each
+// aggregate_id; an entry that is still redirected or unanswered when the
+// rounds run out fails the call whole — a tail scan that silently reports
+// 0 for a slice of its ids is the wrong answer, not a partial one.
 func (c *Client) ReadTails(ctx context.Context, aggIDs []string) (*pushupesv1.ReadTailsResponse, error) {
-	addr := c.routes.entries[int(c.rr.Add(1)-1)%len(c.routes.entries)]
-	cctx, cancel := c.callCtx(ctx)
-	defer cancel()
-	return c.event(addr).ReadTails(cctx, &pushupesv1.ReadTailsRequest{AggregateIds: aggIDs})
+	out := &pushupesv1.ReadTailsResponse{Results: make([]*pushupesv1.ReadTailsResult, len(aggIDs))}
+	if len(aggIDs) == 0 {
+		return out, nil
+	}
+	pending := make([]int, len(aggIDs))
+	for i := range pending {
+		pending[i] = i
+	}
+	var lastErr error
+	for attempt := 0; attempt < c.cfg.Attempts && len(pending) > 0; attempt++ {
+		next, err := c.readTailsRound(ctx, attempt, pending, aggIDs, out)
+		lastErr = err
+		pending = next
+	}
+	if len(pending) > 0 {
+		return nil, fmt.Errorf("client: read tails: %d of %d aggregates still redirected or unanswered after %d rounds: %w",
+			len(pending), len(aggIDs), c.cfg.Attempts, lastErr)
+	}
+	return out, nil
+}
+
+// readTailsRound drives one fan-out round: group the pending entries by
+// their cached leader, one sub-call per destination (bounded
+// concurrency), and merge the answers. It returns the entry indices that
+// still need a round — redirected entries (their rows patched from the
+// answer first) and entries behind a failed or misaligned destination
+// (their rows rotated, the BatchAppend convention) — plus the last
+// transport error, informational.
+func (c *Client) readTailsRound(ctx context.Context, attempt int, idxs []int,
+	aggIDs []string, out *pushupesv1.ReadTailsResponse) ([]int, error) {
+
+	type group struct {
+		addr string
+		idx  []int
+		ids  []string
+	}
+	byAddr := map[string]*group{}
+	var order []*group
+	for _, i := range idxs {
+		slot := c.slotOf(aggIDs[i])
+		addr := c.routeFor(slot, int(c.rr.Add(1)-1))
+		g := byAddr[addr]
+		if g == nil {
+			g = &group{addr: addr}
+			byAddr[addr] = g
+			order = append(order, g)
+		}
+		g.idx = append(g.idx, i)
+		g.ids = append(g.ids, aggIDs[i])
+	}
+
+	// Groups run concurrently, each writing only its own entries' slots in
+	// out and its own requeue list; the merge is lock-free by construction.
+	type gres struct {
+		g       *group
+		results []*pushupesv1.ReadTailsResult
+		err     error
+	}
+	sem := make(chan struct{}, ReadTailsFanout)
+	done := make(chan gres, len(order))
+	for _, g := range order {
+		sem <- struct{}{}
+		go func(g *group) {
+			defer func() { <-sem }()
+			cctx, cancel := c.callCtx(ctx)
+			defer cancel()
+			resp, err := c.event(g.addr).ReadTails(cctx, &pushupesv1.ReadTailsRequest{AggregateIds: g.ids})
+			done <- gres{g: g, results: resp.GetResults(), err: err}
+		}(g)
+	}
+
+	var next []int
+	var lastErr error
+	for range order {
+		r := <-done
+		if r.err != nil {
+			lastErr = r.err
+			for _, i := range r.g.idx {
+				c.routes.patch(c.slotOf(aggIDs[i]), c.routes.entries[(int(c.rr.Load())+attempt+1)%len(c.routes.entries)])
+				next = append(next, i)
+			}
+			continue
+		}
+		if len(r.results) != len(r.g.ids) {
+			lastErr = fmt.Errorf("client: read tails: %s answered %d results for %d ids", r.g.addr, len(r.results), len(r.g.ids))
+			for _, i := range r.g.idx {
+				c.routes.patch(c.slotOf(aggIDs[i]), c.routes.entries[(int(c.rr.Load())+attempt+1)%len(c.routes.entries)])
+				next = append(next, i)
+			}
+			continue
+		}
+		for k, res := range r.results {
+			i := r.g.idx[k]
+			// the protocol echoes aggregate_id per result; an echo
+			// mismatch means the answer does not line up with the request.
+			if res.GetAggregateId() != aggIDs[i] {
+				lastErr = fmt.Errorf("client: read tails: result echo mismatch from %s at %d: %q", r.g.addr, k, res.GetAggregateId())
+				for _, j := range r.g.idx {
+					c.routes.patch(c.slotOf(aggIDs[j]), c.routes.entries[(int(c.rr.Load())+attempt+1)%len(c.routes.entries)])
+					next = append(next, j)
+				}
+				break
+			}
+			switch res.GetErrId() {
+			case ErrIDSlotNotLocal, ErrIDMigrating:
+				if res.GetNode() != "" {
+					c.routes.patch(c.slotOf(aggIDs[i]), hostPort(res.GetNode()))
+				}
+				c.redirects.Add(1)
+				next = append(next, i)
+			default:
+				out.Results[i] = res
+			}
+		}
+	}
+	return next, lastErr
 }
 
 // ReadByCommand looks one record up by command_id (idempotency probe).
+// Redirect-following as in ReadStream.
 func (c *Client) ReadByCommand(ctx context.Context, aggID, commandID string) (*pushupesv1.ReadByCommandResponse, error) {
-	addr := c.routeFor(c.slotOf(aggID), int(c.rr.Add(1)-1))
-	cctx, cancel := c.callCtx(ctx)
-	defer cancel()
-	return c.event(addr).ReadByCommand(cctx, &pushupesv1.ReadByCommandRequest{
-		AggregateId: aggID, CommandId: commandID,
+	return readWithRedirect(c, ctx, aggID, func(addr string) (*pushupesv1.ReadByCommandResponse, uint32, string, error) {
+		cctx, cancel := c.callCtx(ctx)
+		defer cancel()
+		resp, err := c.event(addr).ReadByCommand(cctx, &pushupesv1.ReadByCommandRequest{
+			AggregateId: aggID, CommandId: commandID,
+		})
+		if err != nil {
+			return nil, 0, "", err
+		}
+		return resp, resp.GetErrId(), resp.GetNode(), nil
 	})
 }
 
 // ReadVersionByTime reports the highest version whose record has unix_time
 // at or before the given time (0 = none visible) — the anchor for a
-// point-in-time replay that continues with ReadStream.
+// point-in-time replay that continues with ReadStream. Redirect-following
+// as in ReadStream.
 func (c *Client) ReadVersionByTime(ctx context.Context, aggID string,
 	unixTime int64) (*pushupesv1.ReadVersionByTimeResponse, error) {
 
-	addr := c.routeFor(c.slotOf(aggID), int(c.rr.Add(1)-1))
-	cctx, cancel := c.callCtx(ctx)
-	defer cancel()
-	return c.event(addr).ReadVersionByTime(cctx, &pushupesv1.ReadVersionByTimeRequest{
-		AggregateId: aggID, UnixTime: unixTime,
+	return readWithRedirect(c, ctx, aggID, func(addr string) (*pushupesv1.ReadVersionByTimeResponse, uint32, string, error) {
+		cctx, cancel := c.callCtx(ctx)
+		defer cancel()
+		resp, err := c.event(addr).ReadVersionByTime(cctx, &pushupesv1.ReadVersionByTimeRequest{
+			AggregateId: aggID, UnixTime: unixTime,
+		})
+		if err != nil {
+			return nil, 0, "", err
+		}
+		return resp, resp.GetErrId(), resp.GetNode(), nil
 	})
 }
 

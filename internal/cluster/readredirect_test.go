@@ -24,7 +24,7 @@ import (
 )
 
 // LocalRead decides, on every read RPC, whether this node serves a slot
-// locally or forwards it to the slot leader — and with what visibility
+// locally or redirects the client to the slot leader — and with what visibility
 // ceiling when it serves. The contract:
 //
 //   - the slot LEADER serves locally, unbounded (own durable LEO): a leader
@@ -37,9 +37,9 @@ import (
 //     been confirmed yet — serving the log tail would leak unacked records
 //     the store's 0-means-unbounded convention cannot express as a ceiling);
 //   - an unproven copy (new seat, lagging, or one whose proof predates a
-//     failover: the epoch key invalidates it) and any NON-HOLDER forward.
+//     failover: the epoch key invalidates it) and any NON-HOLDER redirect.
 //
-// These tests pin the answer table itself; the forwarding it prevents is a
+// These tests pin the answer table itself; the relay it prevents is a
 // silently short read of acknowledged data.
 func TestLocalReadMatchesTableSemantics(t *testing.T) {
 	e, _ := newTestEngine(t, "node-1")
@@ -53,39 +53,39 @@ func TestLocalReadMatchesTableSemantics(t *testing.T) {
 		t.Fatal("test setup: no placements")
 	}
 
-	locals, forwards := 0, 0
+	locals, redirects := 0, 0
 	for slot, p := range tbl.Slots {
-		_, _, proxy, _ := e.LocalRead(slot)
+		_, _, redirect, _ := e.LocalRead(slot)
 		switch {
 		case p.Leader == e.self:
-			if proxy != "" {
-				t.Fatalf("slot %d: leader must serve locally, got proxy %q", slot, proxy)
+			if redirect != "" {
+				t.Fatalf("slot %d: leader must serve locally, got redirect %q", slot, redirect)
 			}
 			locals++
 		case replicaListHas(p.Replicas, e.self):
-			// No ledger sample yet: unproven sync — forward.
-			if proxy != tbl.Peers[p.Leader].ClientAddr {
-				t.Fatalf("slot %d: unsynced replica must forward to the leader client addr %q, got %q",
-					slot, tbl.Peers[p.Leader].ClientAddr, proxy)
+			// No ledger sample yet: unproven sync — redirect.
+			if redirect != tbl.Peers[p.Leader].ClientAddr {
+				t.Fatalf("slot %d: unsynced replica must redirect to the leader client addr %q, got %q",
+					slot, tbl.Peers[p.Leader].ClientAddr, redirect)
 			}
-			forwards++
+			redirects++
 		default:
-			if proxy != tbl.Peers[p.Leader].ClientAddr {
-				t.Fatalf("slot %d: non-holder must forward to %q, got %q", slot, tbl.Peers[p.Leader].ClientAddr, proxy)
+			if redirect != tbl.Peers[p.Leader].ClientAddr {
+				t.Fatalf("slot %d: non-holder must redirect to %q, got %q", slot, tbl.Peers[p.Leader].ClientAddr, redirect)
 			}
-			forwards++
+			redirects++
 		}
 	}
-	if locals == 0 || forwards == 0 {
-		t.Fatalf("fixture must exercise both branches (locals=%d forwards=%d)", locals, forwards)
+	if locals == 0 || redirects == 0 {
+		t.Fatalf("fixture must exercise both branches (locals=%d redirects=%d)", locals, redirects)
 	}
 
 	// An unassigned slot answers locally (empty), never a panic or a bogus
-	// forward.
+	// redirect.
 	for s := int32(0); s < 8192; s++ {
 		if _, ok := tbl.Slots[s]; !ok {
-			if _, _, proxy, _ := e.LocalRead(s); proxy != "" {
-				t.Errorf("unassigned slot %d: got proxy %q, want local empty", s, proxy)
+			if _, _, redirect, _ := e.LocalRead(s); redirect != "" {
+				t.Errorf("unassigned slot %d: got redirect %q, want local empty", s, redirect)
 			}
 			break
 		}
@@ -114,17 +114,17 @@ func TestLocalReadReplicaShapes(t *testing.T) {
 	}
 	wantLeaderAddr := tbl.Peers[tbl.Slots[replicated].Leader].ClientAddr
 
-	// Shape 1: unsynced (no sample) — forward.
-	if _, _, proxy, _ := e.LocalRead(replicated); proxy != wantLeaderAddr {
-		t.Fatalf("unsynced replica: proxy=%q, want %q", proxy, wantLeaderAddr)
+	// Shape 1: unsynced (no sample) — redirect.
+	if _, _, redirect, _ := e.LocalRead(replicated); redirect != wantLeaderAddr {
+		t.Fatalf("unsynced replica: redirect=%q, want %q", redirect, wantLeaderAddr)
 	}
 
 	// Shape 2: sampled at zero — admitted but empty (NOT unbounded: the
 	// store reads a 0 ceiling as "whole log", which would leak).
 	e.NoteHwLedger(replicated, 0)
-	upto, serveEmpty, proxy, _ := e.LocalRead(replicated)
-	if proxy != "" || !serveEmpty || upto != 0 {
-		t.Fatalf("zero-watermark replica: upto=%d empty=%v proxy=%q, want 0/true/\"\"", upto, serveEmpty, proxy)
+	upto, serveEmpty, redirect, _ := e.LocalRead(replicated)
+	if redirect != "" || !serveEmpty || upto != 0 {
+		t.Fatalf("zero-watermark replica: upto=%d empty=%v redirect=%q, want 0/true/\"\"", upto, serveEmpty, redirect)
 	}
 
 	// Shape 3: synced at LEO with records on disk — local, ceiling = the
@@ -157,16 +157,16 @@ func TestLocalReadReplicaShapes(t *testing.T) {
 		t.Fatalf("test setup: append did not land on slot %d (leo=%d)", replicated, leo)
 	}
 	e.NoteHwLedger(replicated, leo)
-	upto, serveEmpty, proxy, _ = e.LocalRead(replicated)
-	if proxy != "" || serveEmpty || upto != leo {
-		t.Fatalf("synced replica: upto=%d empty=%v proxy=%q, want %d/false/local", upto, serveEmpty, proxy, leo)
+	upto, serveEmpty, redirect, _ = e.LocalRead(replicated)
+	if redirect != "" || serveEmpty || upto != leo {
+		t.Fatalf("synced replica: upto=%d empty=%v redirect=%q, want %d/false/local", upto, serveEmpty, redirect, leo)
 	}
 
 	// An LEO that has not reached the sample yet stays unproven: a sample of
 	// leo+5 cannot exist before those records land, so drive it directly.
 	e.NoteHwLedger(replicated, leo+5)
-	if _, _, proxy, _ := e.LocalRead(replicated); proxy != wantLeaderAddr {
-		t.Fatalf("LEO below the sampled watermark must forward, got proxy %q", proxy)
+	if _, _, redirect, _ := e.LocalRead(replicated); redirect != wantLeaderAddr {
+		t.Fatalf("LEO below the sampled watermark must redirect, got redirect %q", redirect)
 	}
 
 	// Epoch invalidation: the sample was taken under the OLD leader. A
@@ -184,13 +184,13 @@ func TestLocalReadReplicaShapes(t *testing.T) {
 		t.Skip("test setup: no third seat in the slot's replica set")
 	}
 	applyCmd(t, e, &Command{Op: OpLeaderMove, Slots: []int32{replicated}, NewLeader: other})
-	if _, _, proxy, _ := e.LocalRead(replicated); proxy == "" {
+	if _, _, redirect, _ := e.LocalRead(replicated); redirect == "" {
 		t.Fatal("stale-epoch sample admitted a local read after a failover: epoch key is broken")
 	}
 	// The round under the NEW leader re-proves it: reads land locally again.
 	e.NoteHwLedger(replicated, st.LastSeqOf(replicated))
-	if _, _, proxy, _ := e.LocalRead(replicated); proxy != "" {
-		t.Fatalf("post-failover sample must admit the local read, proxy=%q", proxy)
+	if _, _, redirect, _ := e.LocalRead(replicated); redirect != "" {
+		t.Fatalf("post-failover sample must admit the local read, redirect=%q", redirect)
 	}
 }
 
@@ -275,9 +275,9 @@ func TestHwLedgerRoundTrip(t *testing.T) {
 	applyCmd(t, fe, &Command{Op: OpConfig, Replicas: 2})
 	applyCmd(t, fe, &Command{Op: OpPlanSlots})
 	fe.applyHwLedger("node-1", []int32{slot}, []uint64{uint64(hw)})
-	upto, _, proxy, _ := fe.LocalRead(slot)
-	if proxy != "" || upto != uint64(hw) {
-		t.Fatalf("follower after ledger seed: upto=%d proxy=%q, want %d/local", upto, proxy, hw)
+	upto, _, redirect, _ := fe.LocalRead(slot)
+	if redirect != "" || upto != uint64(hw) {
+		t.Fatalf("follower after ledger seed: upto=%d redirect=%q, want %d/local", upto, redirect, hw)
 	}
 	// A ledger answered by a node the follower's table does NOT see as the
 	// slot's leader is ignored (a split-brain or stale session must not
@@ -297,7 +297,7 @@ func TestHwLedgerRoundTrip(t *testing.T) {
 		t.Fatalf("fixture: slot %d leader is %q", slot, leader)
 	}
 	fe2.applyHwLedger("node-ghost", []int32{slot}, []uint64{uint64(hw)})
-	if _, _, proxy, _ := fe2.LocalRead(slot); proxy == "" {
+	if _, _, redirect, _ := fe2.LocalRead(slot); redirect == "" {
 		t.Fatal("a ledger from a non-leader admitted the local read")
 	}
 }
@@ -331,7 +331,7 @@ func TestLeaderReplicaReportsPlacement(t *testing.T) {
 			t.Fatalf("slot %d: addr %q, want the leader's client addr %q", slot, addr, want)
 		}
 		// local must mean "leads OR replicates" — ownership, not admission:
-		// a replica may hold the slot and still forward reads until its
+		// a replica may hold the slot and still redirect reads until its
 		// sync is proven (see TestLocalReadReplicaShapes).
 		wantLocal := p.Leader == e.self || replicaListHas(p.Replicas, e.self)
 		if local != wantLocal {
@@ -340,7 +340,7 @@ func TestLeaderReplicaReportsPlacement(t *testing.T) {
 		}
 	}
 
-	// An unassigned slot: found=false, and no address to forward to.
+	// An unassigned slot: found=false, and no address to redirect to.
 	for s := int32(0); s < 8192; s++ {
 		if _, ok := tbl.Slots[s]; !ok {
 			leader, addr, local, found := e.LeaderReplica(s)
@@ -354,7 +354,7 @@ func TestLeaderReplicaReportsPlacement(t *testing.T) {
 }
 
 // A slot led by a peer this node does not replicate: local=false and the
-// returned address is the leader's, which is what a forward needs.
+// returned address is the leader's, which is what a redirect needs.
 func TestLeaderReplicaRemoteSlot(t *testing.T) {
 	st, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
 	if err != nil {
@@ -399,10 +399,10 @@ func TestLeaderReplicaRemoteSlot(t *testing.T) {
 	}
 }
 
-// The forward address must be the CLIENT-plane one: a reader dials it as a
+// The redirect address must be the CLIENT-plane one: a reader dials it as a
 // gRPC event client, so handing back the peer (raft) address would aim reads
 // at the raft listener. The read path now answers it through LocalRead.
-func TestLocalReadForwardsToClientPlane(t *testing.T) {
+func TestLocalReadRedirectsToClientPlane(t *testing.T) {
 	st, err := storage.OpenStore(t.TempDir(), 8, storage.DefaultSegmentBytes, storage.FlushPolicy{})
 	if err != nil {
 		t.Fatal(err)
@@ -446,8 +446,8 @@ func TestLocalReadForwardsToClientPlane(t *testing.T) {
 	if want == "" || want == tbl.Peers[leader].PeerAddr {
 		t.Fatalf("test setup: leader %s has no distinct client addr (%q)", leader, want)
 	}
-	if _, _, proxy, _ := e.LocalRead(target); proxy != want {
-		t.Errorf("LocalRead proxy addr = %q, want the client-plane address %q (peer addr is %q)",
-			proxy, want, tbl.Peers[leader].PeerAddr)
+	if _, _, redirect, _ := e.LocalRead(target); redirect != want {
+		t.Errorf("LocalRead redirect addr = %q, want the client-plane address %q (peer addr is %q)",
+			redirect, want, tbl.Peers[leader].PeerAddr)
 	}
 }

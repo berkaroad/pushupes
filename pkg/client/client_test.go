@@ -43,8 +43,13 @@ type fakeNode struct {
 	addrs     []string      // every node's addr (shared view)
 	leaders   map[int32]int // slot -> index into addrs
 	appendReq []*pushupesv1.BatchAppendRequest
+	readCalls int // ReadStream calls served, for routing assertions
 	// onAppend scripts the answer for the n-th recorded call; nil = all-success.
 	onAppend func(n int, req *pushupesv1.BatchAppendRequest) *pushupesv1.BatchAppendResponse
+	// onReadStream scripts the answer for the n-th read call, like
+	// onAppend on the write path — the read-side redirect self-heal tests
+	// answer through it.
+	onReadStream func(n int, req *pushupesv1.ReadStreamRequest) *pushupesv1.ReadStreamResponse
 }
 
 func (f *fakeNode) PrefetchRoutes(_ context.Context, _ *pushupesv1.PrefetchRoutesRequest) (*pushupesv1.PrefetchRoutesResponse, error) {
@@ -78,10 +83,40 @@ func (f *fakeNode) BatchAppend(_ context.Context, req *pushupesv1.BatchAppendReq
 	return out, nil
 }
 
+func (f *fakeNode) ReadStream(_ context.Context, req *pushupesv1.ReadStreamRequest) (*pushupesv1.ReadStreamResponse, error) {
+	f.mu.Lock()
+	f.readCalls++
+	n := f.readCalls
+	script := f.onReadStream
+	f.mu.Unlock()
+	if script != nil {
+		if resp := script(n, req); resp != nil {
+			return resp, nil
+		}
+	}
+	return &pushupesv1.ReadStreamResponse{Records: []*pushupesv1.Record{
+		{AggregateId: req.AggregateId, Version: req.FromVersion}}}, nil
+}
+
+// ReadTails mirrors the real server's admission: this fake answers only for
+// slots it leads (version = id length, a deterministic stand-in), and
+// redirects every other entry in-band with the leader's node — exactly the
+// per-entry MOVED the library now has to group, patch and re-send.
 func (f *fakeNode) ReadTails(_ context.Context, req *pushupesv1.ReadTailsRequest) (*pushupesv1.ReadTailsResponse, error) {
+	f.mu.Lock()
+	leaders := f.leaders
+	f.mu.Unlock()
 	out := &pushupesv1.ReadTailsResponse{}
 	for _, id := range req.AggregateIds {
-		out.Versions = append(out.Versions, uint32(len(id))) // deterministic: version = id length
+		res := &pushupesv1.ReadTailsResult{AggregateId: id}
+		if slot := SlotOf(id, 8); leaders[slot] != f.idx {
+			res.ErrId = ErrIDSlotNotLocal
+			res.Slot = slot
+			res.Node = f.addrs[leaders[slot]]
+		} else {
+			res.Version = uint32(len(id)) // deterministic: version = id length
+		}
+		out.Results = append(out.Results, res)
 	}
 	return out, nil
 }
@@ -587,14 +622,25 @@ func TestClientReadPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tails.Versions) != 3 {
-		t.Fatalf("tails order mismatch: %+v", tails.Versions)
+	if len(tails.Results) != 3 {
+		t.Fatalf("tails order mismatch: %+v", tails.Results)
 	}
-	// "a" routes to node 0 (slot 0), so a leader-targeted call exists;
-	// ReadTails may land on either node (entry round-robin) — the fake
-	// answers with id lengths, so verify the answer content instead.
-	if tails.Versions[0] != 1 || tails.Versions[1] != 5 || tails.Versions[2] != 1 {
-		t.Fatalf("tails versions: %+v", tails.Versions)
+	// The library groups the list by its cached table and drives one
+	// sub-call per holding node — every entry is answered AT its leader
+	// (the fake answers id lengths), in request order, echoing each id,
+	// with no redirect round needed at all.
+	want := []struct {
+		id string
+		v  uint32
+	}{{"a", 1}, {"agg-1", 5}, {"x", 1}}
+	for i, w := range want {
+		r := tails.Results[i]
+		if r.AggregateId != w.id || r.ErrId != 0 || r.Version != w.v {
+			t.Fatalf("tails entry %d = %+v, want {id %s version %d}", i, r, w.id, w.v)
+		}
+	}
+	if c.Redirects() != 0 {
+		t.Fatalf("routed tails needed %d redirects, want 0", c.Redirects())
 	}
 	_ = nodes
 
@@ -605,6 +651,107 @@ func TestClientReadPaths(t *testing.T) {
 	if !bc.Found || bc.Record.CommandId != "cmd-x" {
 		t.Fatalf("ReadByCommand: %+v", bc)
 	}
+}
+
+// TestClientReadRedirectFollow pins the single-key read MOVED self-heal:
+// the node the call lands on deflects the first attempt with err 1003
+// naming another node (an epoch flip caught mid-call — reads are never
+// relayed server to server). The library patches that slot's row from the
+// answer and retries where the cluster said, handing the caller the
+// eventual answer; the 1003 never reaches the caller, the redirect is
+// counted.
+func TestClientReadRedirectFollow(t *testing.T) {
+	nodes, addrs := fakeCluster(t, 2)
+	c, err := New([]string{addrs[0]}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// "a" routes to node 0; node 0 points its FIRST read at node 1, which
+	// then answers the retry normally.
+	nodes[0].onReadStream = func(n int, req *pushupesv1.ReadStreamRequest) *pushupesv1.ReadStreamResponse {
+		if n == 1 {
+			return &pushupesv1.ReadStreamResponse{
+				ErrId: ErrIDSlotNotLocal, Slot: SlotOf("a", 8), Node: addrs[1],
+			}
+		}
+		return nil
+	}
+	rs, err := c.ReadStream(context.Background(), "a", 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rs.ErrId != 0 || len(rs.Records) != 1 || rs.Records[0].AggregateId != "a" {
+		t.Fatalf("read did not self-heal: %+v", rs)
+	}
+	if nodes[0].readCalls != 1 || nodes[1].readCalls != 1 {
+		t.Fatalf("retry did not land on the named node: node-0 %d calls, node-1 %d",
+			nodes[0].readCalls, nodes[1].readCalls)
+	}
+	if c.Redirects() != 1 {
+		t.Fatalf("Redirects = %d, want 1", c.Redirects())
+	}
+}
+
+// TestClientReadRedirectExhausted: a cluster that deflects every attempt
+// fails the call with an error, not a silently empty stream — the caller
+// must be able to tell "no records" from "never got an answer".
+func TestClientReadRedirectExhausted(t *testing.T) {
+	nodes, addrs := fakeCluster(t, 2)
+	c, err := New([]string{addrs[0]}, &Config{Attempts: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for _, f := range nodes {
+		other := addrs[1-f.idx]
+		f.onReadStream = func(_ int, _ *pushupesv1.ReadStreamRequest) *pushupesv1.ReadStreamResponse {
+			return &pushupesv1.ReadStreamResponse{ErrId: ErrIDSlotNotLocal, Node: other}
+		}
+	}
+	if _, err := c.ReadStream(context.Background(), "a", 1, 0); err == nil {
+		t.Fatal("an exhausted redirect loop must answer an error, not a response")
+	}
+}
+
+// TestClientReadTailsPerEntryRedirect gives one entry's cached row a bad
+// name: that entry alone is re-sent after the per-entry MOVED patches its
+// row — the rest of the list keeps its answer from the same round, and the
+// merged reply stays request-ordered.
+func TestClientReadTailsPerEntryRedirect(t *testing.T) {
+	nodes, addrs := fakeCluster(t, 2)
+	c, err := New([]string{addrs[0]}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// The table fetched at New says node 1 leads slot 7 ("agg-1"); both
+	// fakes now claim node 0 instead, so node 1 answers that entry with a
+	// MOVED and the retry at node 0 answers the version.
+	for _, f := range nodes {
+		f.mu.Lock()
+		f.leaders[7] = 0
+		f.mu.Unlock()
+	}
+	tails, err := c.ReadTails(context.Background(), []string{"agg-1", "a"})
+	if err != nil {
+		t.Fatalf("per-entry redirect must self-heal: %v", err)
+	}
+	if len(tails.Results) != 2 {
+		t.Fatalf("tails order mismatch: %+v", tails.Results)
+	}
+	if r := tails.Results[0]; r.AggregateId != "agg-1" || r.ErrId != 0 || r.Version != 5 {
+		t.Fatalf("redirected entry: %+v", r)
+	}
+	if r := tails.Results[1]; r.AggregateId != "a" || r.ErrId != 0 || r.Version != 1 {
+		t.Fatalf("un-redirected entry: %+v", r)
+	}
+	if c.Redirects() != 1 {
+		t.Fatalf("Redirects = %d, want 1", c.Redirects())
+	}
+	_ = addrs
 }
 
 // TestClientConnsAreShared pins the reuse contract: BatchAppend, a read,

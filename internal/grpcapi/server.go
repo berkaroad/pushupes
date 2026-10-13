@@ -30,7 +30,6 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	"github.com/berkaroad/pushupes/internal/cluster"
@@ -57,11 +56,6 @@ type Server struct {
 	// batchParallelism caps how many slots one BatchAppend executes
 	// concurrently (see BatchAppend).
 	batchParallelism int
-
-	// leaders pools EventService clients for cross-node read proxies
-	// (this node holds neither the slot nor a replica of it).
-	mu      sync.Mutex
-	leaders map[string]pushupesv1.EventServiceClient
 }
 
 // DefaultBatchSlotParallelism is the concurrent-slot cap one BatchAppend
@@ -73,9 +67,9 @@ const DefaultBatchSlotParallelism = 100
 // not tune the knob pass 0). selfClientAddr is this node's client-plane
 // address (scheme-free "host:port"), used by PrefetchRoutes' fallback.
 func NewServer(eng *cluster.Engine, store *storage.Store, logger *slog.Logger, batchParallelism int, selfClientAddr string) *Server {
-	// A nil logger must not panic a handler half-way through: the read path
-	// logs (and continues) on a proxy failure, and a panic there replaces a
-	// "proxy dial failed" warning with a crash that hides the real reason.
+	// A nil logger must not panic a handler half-way through: startup
+	// validation here keeps the field safe for any handler that grows a
+	// log line later.
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
 	}
@@ -85,29 +79,12 @@ func NewServer(eng *cluster.Engine, store *storage.Store, logger *slog.Logger, b
 	return &Server{engine: eng, store: store, logger: logger,
 		selfClientAddr:   cluster.HostPort(selfClientAddr),
 		batchParallelism: batchParallelism,
-		leaders:          map[string]pushupesv1.EventServiceClient{}}
+	}
 }
 
 // Register adds the service to a grpc.Server.
 func (s *Server) Register(g *grpc.Server) {
 	pushupesv1.RegisterEventServiceServer(g, s)
-}
-
-// leaderClient dials (lazily, keep-alive) the leader's gRPC data plane.
-func (s *Server) leaderClient(addr string) (pushupesv1.EventServiceClient, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if c, ok := s.leaders[addr]; ok {
-		return c, nil
-	}
-	// routing-table addresses carry a scheme; gRPC dials plain host:port
-	conn, err := grpc.NewClient(cluster.HostPort(addr), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, err
-	}
-	c := pushupesv1.NewEventServiceClient(conn)
-	s.leaders[addr] = c
-	return c, nil
 }
 
 // ---- Write ------------------------------------------------------------------
@@ -377,6 +354,15 @@ func (s *Server) fail(errID int, msg string, currentVersion uint32, slot int32, 
 
 // ---- ReadStream ---------------------------------------------------------------
 
+// Reads redirect in-band exactly like writes: the node that can serve a
+// slot — its leader, or a replica whose sync with the current epoch is
+// proven — answers; every other node hands back err_id 1003 (MOVED) with
+// the authoritative slot and the leader's client-plane node, and the
+// client refreshes its routing row and retries. Nothing is relayed server
+// to server: at data-plane scale the relay would double every read's
+// handler cost and open one pooled connection per (entry, leader) pair
+// the cluster never needs.
+
 func (s *Server) ReadStream(ctx context.Context, req *pushupesv1.ReadStreamRequest) (*pushupesv1.ReadStreamResponse, error) {
 	if req.AggregateId == "" {
 		return nil, status.Error(codes.InvalidArgument, "aggregate_id required")
@@ -387,21 +373,18 @@ func (s *Server) ReadStream(ctx context.Context, req *pushupesv1.ReadStreamReque
 	}
 	slot := s.store.SlotOf(req.AggregateId)
 
-	// Read admission: forward when this node cannot be trusted to answer
+	// Read admission: redirect when this node cannot be trusted to answer
 	// locally (a non-holder, or a replica whose sync with the slot's current
 	// leader is not yet proven); serve locally when it can — the leader up to
 	// its own LEO, a synced replica up to the watermark it synced at, and a
 	// synced-but-nothing-confirmed replica the empty answer. See
-	// Engine.LocalRead for the rule and its reasoning.
-	uptoSeq, serveEmpty, proxy, _ := s.engine.LocalRead(slot)
-	if proxy != "" {
-		client, err := s.leaderClient(proxy)
-		if err != nil {
-			return nil, status.Errorf(codes.Unavailable, "read proxy dial: %v", err)
-		}
-		return client.ReadStream(ctx, &pushupesv1.ReadStreamRequest{
-			AggregateId: req.AggregateId, FromVersion: from, Limit: req.Limit,
-		})
+	// Engine.LocalRead for the rule and its reasoning. A node that cannot
+	// serve answers the redirect itself — MOVED, no relay.
+	uptoSeq, serveEmpty, redirect, _ := s.engine.LocalRead(slot)
+	if redirect != "" {
+		return &pushupesv1.ReadStreamResponse{
+			ErrId: uint32(data.ErrIDSlotNotLocal), Slot: slot, Node: redirect,
+		}, nil
 	}
 	var (
 		recs []*data.EventRecord
@@ -434,114 +417,68 @@ func (s *Server) ReadStream(ctx context.Context, req *pushupesv1.ReadStreamReque
 
 // ReadTails answers the latest version of many aggregates in one call: the bulk
 // form of "what is this stream's tail", which a resume scan needs per stream.
+// The answer shape is BatchAppend's: one result per requested aggregate, in
+// request order, each echoing its aggregate_id and carrying its own outcome —
+// a version when this node serves that slot, or that slot's own MOVED
+// redirect. Routing and redirecting are PER ENTRY, so one call never lets an
+// unreachable destination zero-fill another aggregate's answer; the fan-out
+// (group by leader, re-send redirected entries after patching) lives in the
+// client library.
 //
-// Two things keep it from being N single probes wearing a trench coat:
+// Two things keep the local half cheap:
 //
 //  1. The ownership decision is made ONCE PER SLOT, not once per aggregate:
 //     routing is per slot, so one lookup per slot covers every aggregate that
-//     shares it (LeaderReplica, a single table-lock read).
-//  2. Aggregates this node can serve locally are answered in one storage pass;
-//     only the ones it holds neither slot nor replica for are forwarded, and
-//     those are grouped by destination so each peer gets ONE RPC carrying all
-//     of its aggregates.
+//     shares it (a single table-lock read per distinct slot).
+//  2. Aggregates this node can serve locally are answered in one storage
+//     pass per entry, each bounded by that slot's admission ceiling.
 //
-// The visibility bound is ReadStream's: a node answering locally reports what
-// its own durable LEO covers. Server-side we never bound by the replication
-// watermark, because this node is a replica for every slot it can answer from
-// and a stale watermark would silently under-report.
+// The visibility bound is ReadStream's: a leader reports what its own durable
+// LEO covers, a proven replica what its synced watermark covers, and an
+// unproven holder redirects rather than guesses.
 func (s *Server) ReadTails(ctx context.Context, req *pushupesv1.ReadTailsRequest) (*pushupesv1.ReadTailsResponse, error) {
-	out := &pushupesv1.ReadTailsResponse{Versions: make([]uint32, len(req.AggregateIds))}
+	out := &pushupesv1.ReadTailsResponse{Results: make([]*pushupesv1.ReadTailsResult, len(req.AggregateIds))}
 	if len(req.AggregateIds) == 0 {
 		return out, nil
 	}
 
-	// Group by slot first: the slot decides routing, so every aggregate that
-	// shares a slot shares a destination.
-	bySlot := map[int32][]int{}
-	slots := make([]int32, 0, len(req.AggregateIds))
+	// One admission lookup per distinct slot, then fill each entry from it.
+	type verdict struct {
+		serve      bool
+		bound      uint64 // local visibility ceiling (0 = the leader's own LEO)
+		serveEmpty bool
+		redirect      string
+		slot       int32
+	}
+	seen := map[int32]*verdict{}
+
 	for i, id := range req.AggregateIds {
+		res := &pushupesv1.ReadTailsResult{AggregateId: id}
+		out.Results[i] = res
 		if id == "" {
-			continue // answered with 0
+			continue // answered with version 0, same as before
 		}
 		slot := s.store.SlotOf(id)
-		if _, ok := bySlot[slot]; !ok {
-			slots = append(slots, slot)
+		v := seen[slot]
+		if v == nil {
+			uptoSeq, serveEmpty, redirect, _ := s.engine.LocalRead(slot)
+			v = &verdict{serve: redirect == "", bound: uptoSeq, serveEmpty: serveEmpty, redirect: redirect, slot: slot}
+			seen[slot] = v
 		}
-		bySlot[slot] = append(bySlot[slot], i)
-	}
-
-	// One ownership lookup per slot, and a peer grouping so each destination
-	// gets a single forwarded RPC.
-	type fwdBatch struct {
-		idx  []int // positions in req.AggregateIds
-		ids  []string
-		addr string
-	}
-	fwd := map[string]*fwdBatch{}
-	var fwdOrder []string
-	var localIdx []int
-	localBound := map[int32]uint64{} // slot -> visibility ceiling (admission)
-
-	for _, slot := range slots {
-		idx := bySlot[slot]
-		uptoSeq, serveEmpty, proxy, _ := s.engine.LocalRead(slot)
-		if proxy == "" {
-			if serveEmpty {
-				continue // admitted but nothing confirmed: every version 0
-			}
-			localBound[slot] = uptoSeq
-			localIdx = append(localIdx, idx...)
+		if !v.serve {
+			res.ErrId = uint32(data.ErrIDSlotNotLocal)
+			res.Slot = v.slot
+			res.Node = v.redirect
 			continue
-		} else {
-			b := fwd[proxy]
-			if b == nil {
-				b = &fwdBatch{addr: proxy}
-				fwd[proxy] = b
-				fwdOrder = append(fwdOrder, proxy)
-			}
-			for _, i := range idx {
-				b.idx = append(b.idx, i)
-				b.ids = append(b.ids, req.AggregateIds[i])
-			}
 		}
-	}
-
-	// Local answers: one slot lookup per aggregate inside the store, but no
-	// routing clone and no extra RPC. A synced replica bounds by its synced
-	// watermark (the same ceiling ReadStream carries on this node); the
-	// leader path passes its own durable LEO (bounded=false).
-	for _, i := range localIdx {
-		v, err := s.store.TailVersionOf(req.AggregateIds[i], localBound[s.store.SlotOf(req.AggregateIds[i])])
+		if v.serveEmpty {
+			continue // admitted but nothing confirmed: version 0
+		}
+		version, err := s.store.TailVersionOf(id, v.bound)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "read tails: %v", err)
 		}
-		out.Versions[i] = v
-	}
-
-	// Forwarded answers: one RPC per destination, carrying all of its
-	// aggregates. A failed destination leaves its slots at 0 (the caller's
-	// contract: 0 means "nothing visible here"), matching the per-aggregate
-	// probe which also answered 0 on a transport error.
-	for _, addr := range fwdOrder {
-		b := fwd[addr]
-		client, err := s.leaderClient(addr)
-		if err != nil {
-			s.logger.Warn("read tails: proxy dial failed; reporting 0 for its aggregates", "addr", addr, "error", err)
-			continue
-		}
-		sub, err := client.ReadTails(ctx, &pushupesv1.ReadTailsRequest{AggregateIds: b.ids})
-		if err != nil {
-			s.logger.Warn("read tails: proxy call failed; reporting 0 for its aggregates", "addr", addr, "error", err)
-			continue
-		}
-		if len(sub.Versions) != len(b.ids) {
-			s.logger.Warn("read tails: proxy returned a mismatched length; reporting 0 for its aggregates",
-				"addr", addr, "want", len(b.ids), "got", len(sub.Versions))
-			continue
-		}
-		for n, i := range b.idx {
-			out.Versions[i] = sub.Versions[n]
-		}
+		res.Version = version
 	}
 	return out, nil
 }
@@ -553,15 +490,11 @@ func (s *Server) ReadByCommand(ctx context.Context, req *pushupesv1.ReadByComman
 		return nil, status.Error(codes.InvalidArgument, "aggregate_id and command_id required")
 	}
 	slot := s.store.SlotOf(req.AggregateId)
-	uptoSeq, serveEmpty, proxy, _ := s.engine.LocalRead(slot)
-	if proxy != "" {
-		client, err := s.leaderClient(proxy)
-		if err != nil {
-			return nil, status.Errorf(codes.Unavailable, "read proxy dial: %v", err)
-		}
-		return client.ReadByCommand(ctx, &pushupesv1.ReadByCommandRequest{
-			AggregateId: req.AggregateId, CommandId: req.CommandId,
-		})
+	uptoSeq, serveEmpty, redirect, _ := s.engine.LocalRead(slot)
+	if redirect != "" {
+		return &pushupesv1.ReadByCommandResponse{
+			ErrId: uint32(data.ErrIDSlotNotLocal), Slot: slot, Node: redirect,
+		}, nil
 	}
 	var (
 		rec *data.EventRecord
@@ -598,23 +531,19 @@ func (s *Server) ReadByCommand(ctx context.Context, req *pushupesv1.ReadByComman
 // history from that version with ReadStream.
 //
 // Routing and visibility are ReadStream's: a node holding neither the slot
-// nor a replica proxies to the slot leader's client plane, and a local answer
-// is bounded by the node's own durable LEO (never a watermark — the same
-// silent-short-read reasoning as ReadStream).
+// nor a proven-in-sync replica of it answers the MOVED redirect itself, and
+// a local answer is bounded by the node's own durable LEO (never a
+// watermark — the same silent-short-read reasoning as ReadStream).
 func (s *Server) ReadVersionByTime(ctx context.Context, req *pushupesv1.ReadVersionByTimeRequest) (*pushupesv1.ReadVersionByTimeResponse, error) {
 	if req.AggregateId == "" {
 		return nil, status.Error(codes.InvalidArgument, "aggregate_id required")
 	}
 	slot := s.store.SlotOf(req.AggregateId)
-	uptoSeq, serveEmpty, proxy, _ := s.engine.LocalRead(slot)
-	if proxy != "" {
-		client, err := s.leaderClient(proxy)
-		if err != nil {
-			return nil, status.Errorf(codes.Unavailable, "read proxy dial: %v", err)
-		}
-		return client.ReadVersionByTime(ctx, &pushupesv1.ReadVersionByTimeRequest{
-			AggregateId: req.AggregateId, UnixTime: req.UnixTime,
-		})
+	uptoSeq, serveEmpty, redirect, _ := s.engine.LocalRead(slot)
+	if redirect != "" {
+		return &pushupesv1.ReadVersionByTimeResponse{
+			ErrId: uint32(data.ErrIDSlotNotLocal), Slot: slot, Node: redirect,
+		}, nil
 	}
 	var err error
 	v := uint32(0)

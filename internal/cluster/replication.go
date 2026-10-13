@@ -180,12 +180,12 @@ type Engine struct {
 	// ledger). A replica serves a slot's reads locally only once its durable
 	// LEO reaches the bound — until then the slot's confirmed data may outrun
 	// this copy's log and a local read would be a short read, so the read
-	// proxies to the leader (see LocalRead). Samples are keyed by the
+	// redirects to the leader (see LocalRead). Samples are keyed by the
 	// placement EPOCH they were taken at: an epoch change (a failover, a
 	// migration commit) invalidates every sample taken under the old leader
 	// and forces re-sync against the new one. Reset on process start — a
 	// restarted replica re-proves its sync from the first ledger round, which
-	// costs a few seconds of leader-proxy reads and no correctness.
+	// costs a few seconds of redirect-and-retry reads and no correctness.
 	hwMu   sync.Mutex
 	hwSeen map[int32]epochHW
 
@@ -1007,7 +1007,7 @@ func (r *RedirectError) Error() string {
 }
 
 // clientAddr is the client-facing data-plane address of a peer: the
-// target MOVED/ASK redirects and cross-node read proxies point at.
+// target MOVED/ASK redirects and cross-node read redirects point at.
 func (e *Engine) clientAddr(nodeID string) string {
 	e.tableMu.RLock()
 	defer e.tableMu.RUnlock()
@@ -1468,7 +1468,7 @@ func (e *Engine) replicaCount(slot int32) int {
 // safe local read bound (see readAdmission). A seat outside the window is
 // NOT covered by the ack promise; its ledger sample gets clamped to the
 // leader's durable LEO — the only bound an unvouchable copy satisfies by
-// catching up in full — so it forwards until proven, never answers short.
+// catching up in full — so it redirects until proven, never answers short.
 // Caller holds replMu (peerDown nests tableMu; advanceHW parks in the same
 // order).
 func (e *Engine) seatVouchable(sr *slotRepl, node string) bool {
@@ -2888,7 +2888,7 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 		// own log — the short read of acknowledged data this fence exists to
 		// kill. For such a seat the sample is clamped to the leader's whole
 		// durable LEO, the only bound an unvouchable copy satisfies by
-		// catching up in full; until then admission forwards (or serves
+		// catching up in full; until then admission redirects (or serves
 		// empty) and never answers short.
 		e.replMu.Lock()
 		for _, s := range ledgerSlots {
@@ -3621,11 +3621,11 @@ func (e *Engine) LeaderReplica(slot int32) (leader, clientAddr string, local, fo
 	return leader, clientAddr, false, true
 }
 
-func (e *Engine) LocalRead(slot int32) (uptoSeq uint64, serveEmpty bool, proxy string, leader string) {
-	bound, leader, _, proxy := e.readAdmission(slot)
+func (e *Engine) LocalRead(slot int32) (uptoSeq uint64, serveEmpty bool, redirect string, leader string) {
+	bound, leader, _, redirect := e.readAdmission(slot)
 	switch {
-	case proxy != "":
-		return 0, false, proxy, leader // forward
+	case redirect != "":
+		return 0, false, redirect, leader // MOVED redirect
 	case bound == nilBounded:
 		return 0, false, "", leader // leader path / unassigned: unbounded local
 	case bound == 0:
@@ -3641,10 +3641,10 @@ func (e *Engine) LocalRead(slot int32) (uptoSeq uint64, serveEmpty bool, proxy s
 const nilBounded = ^uint64(0)
 
 // readAdmission resolves one slot's placement and replica-sync proof into
-// (bound, leader, leaderClientAddr, proxy) with bound=nilBounded when the
+// (bound, leader, leaderClientAddr, redirect) with bound=nilBounded when the
 // leader path applies. Unassigned slots answer locally (0 = unbounded) as
-// before — there is no leader to forward to.
-func (e *Engine) readAdmission(slot int32) (bound uint64, leader string, leaderAddr string, proxy string) {
+// before — there is no leader to redirect to.
+func (e *Engine) readAdmission(slot int32) (bound uint64, leader string, leaderAddr string, redirect string) {
 	e.tableMu.RLock()
 	p, found := e.table.Slots[slot]
 	if !found {
@@ -3666,16 +3666,16 @@ func (e *Engine) readAdmission(slot int32) (bound uint64, leader string, leaderA
 		return nilBounded, leader, leaderAddr, "" // the leader owns its log
 	}
 	if !held {
-		return 0, leader, leaderAddr, leaderAddr // a non-holder forwards, as ever
+		return 0, leader, leaderAddr, leaderAddr // a non-holder redirects, as ever
 	}
 	e.hwMu.Lock()
 	s, has := e.hwSeen[slot]
 	e.hwMu.Unlock()
 	// The PROOF is the sample itself: an unsampled replica (no ledger round
 	// has answered for it yet — a fresh boot, a new seat) is unproven and
-	// forwards even when its LEO is 0, because "0 records visible" and
+	// redirects even when its LEO is 0, because "0 records visible" and
 	// "nothing vouched yet" look identical in the log but not in safety:
-	// forwarding cannot answer short. A zero-HW SAMPLE is a different fact —
+	// a redirect cannot answer short. A zero-HW SAMPLE is a different fact —
 	// the leader vouched that nothing is confirmed — and admits a local read
 	// with an empty visibility answer (serveEmpty).
 	// The ceiling is the SAMPLE, never the replica's own LEO: the records
@@ -3703,7 +3703,7 @@ func (e *Engine) readAdmission(slot int32) (bound uint64, leader string, leaderA
 	if has && s.epoch == epoch && e.store.LastSeqOf(slot) >= s.hw {
 		return s.hw, leader, leaderAddr, "" // synced replica: local, ceiling = the synced HW
 	}
-	return 0, leader, leaderAddr, leaderAddr // not proven in sync: forward
+	return 0, leader, leaderAddr, leaderAddr // not proven in sync: MOVED redirect
 }
 
 // NoteHwLedger seeds one slot's read-admission bound directly, at this

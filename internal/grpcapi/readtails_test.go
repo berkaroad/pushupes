@@ -117,14 +117,21 @@ func TestReadTailsMatchesPerAggregateProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadTails: %v", err)
 	}
-	if len(resp.Versions) != len(ids) {
-		t.Fatalf("ReadTails returned %d versions for %d aggregates", len(resp.Versions), len(ids))
+	if len(resp.Results) != len(ids) {
+		t.Fatalf("ReadTails returned %d results for %d aggregates", len(resp.Results), len(ids))
 	}
 
 	// The reference: what the removed exponential+binary probe resolved to,
 	// i.e. the tail of the visible log, and independently the last_version a
 	// bounded ReadStream reports.
 	for i, sh := range shapes {
+		res := resp.Results[i]
+		if res.AggregateId != sh.agg {
+			t.Fatalf("ReadTails result %d echoes %q, want %q", i, res.AggregateId, sh.agg)
+		}
+		if res.ErrId != 0 {
+			t.Fatalf("ReadTails[%s] answered err_id %d, want a local version", sh.agg, res.ErrId)
+		}
 		wantTail, err := store.TailVersionOf(sh.agg, 0)
 		if err != nil {
 			t.Fatalf("reference tail %s: %v", sh.agg, err)
@@ -132,7 +139,7 @@ func TestReadTailsMatchesPerAggregateProbe(t *testing.T) {
 		if wantTail != uint32(sh.records) {
 			t.Fatalf("test setup: reference tail for %s is %d, want %d", sh.agg, wantTail, sh.records)
 		}
-		if got := resp.Versions[i]; got != wantTail {
+		if got := res.Version; got != wantTail {
 			t.Errorf("ReadTails[%s] = %d, want %d (the per-aggregate probe's answer)",
 				sh.agg, got, wantTail)
 		}
@@ -144,11 +151,14 @@ func TestReadTailsMatchesPerAggregateProbe(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadStream %s: %v", sh.agg, err)
 		}
+		if rs.ErrId != 0 {
+			t.Fatalf("ReadStream %s answered err_id %d, want a local answer", sh.agg, rs.ErrId)
+		}
 		wantLast := uint32(0)
 		if len(rs.Records) > 0 {
 			wantLast = rs.Records[len(rs.Records)-1].Version
 		}
-		if got := resp.Versions[i]; got != wantLast {
+		if got := res.Version; got != wantLast {
 			t.Errorf("ReadTails[%s] = %d but ReadStream ends at version %d",
 				sh.agg, got, wantLast)
 		}
@@ -162,8 +172,8 @@ func TestReadTailsMatchesPerAggregateProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadTails dup: %v", err)
 	}
-	if len(dup.Versions) != 3 || dup.Versions[0] != 37 || dup.Versions[1] != 0 || dup.Versions[2] != 37 {
-		t.Errorf("ReadTails with duplicates/absent = %v, want [37 0 37]", dup.Versions)
+	if len(dup.Results) != 3 || dup.Results[0].Version != 37 || dup.Results[1].Version != 0 || dup.Results[2].Version != 37 {
+		t.Errorf("ReadTails with duplicates/absent = %v, want [37 0 37]", tailVersionsOf(dup))
 	}
 
 	// An empty request is legal and answers nothing.
@@ -171,9 +181,18 @@ func TestReadTailsMatchesPerAggregateProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadTails empty: %v", err)
 	}
-	if len(empty.Versions) != 0 {
-		t.Errorf("ReadTails empty returned %d versions, want 0", len(empty.Versions))
+	if len(empty.Results) != 0 {
+		t.Errorf("ReadTails empty returned %d results, want 0", len(empty.Results))
 	}
+}
+
+// tailVersionsOf formats a ReadTails answer for failure output.
+func tailVersionsOf(resp *pushupesv1.ReadTailsResponse) []uint32 {
+	out := make([]uint32, len(resp.Results))
+	for i, r := range resp.Results {
+		out[i] = r.Version
+	}
+	return out
 }
 
 // A tail must never report versions the node cannot actually serve. A read is

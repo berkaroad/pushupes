@@ -53,6 +53,36 @@ func appendOne(ctx context.Context, addr string, req *pushupesv1.AppendRequest) 
 	return resp.Results[0].Response, nil
 }
 
+// readRedirected is the in-band redirect surface every read response carries.
+type readRedirected interface {
+	GetErrId() uint32
+	GetNode() string
+}
+
+// followRead issues one raw read from `from` and follows the in-band MOVED
+// chain (what pkg/client automates per call): a node that serves the slot
+// answers with err_id 0, every other node names the leader and the probe
+// retries there. grpccheck keeps this loop in raw stubs on purpose — it is
+// asserting the WIRE shape, not the library.
+func followRead[T readRedirected](ctx context.Context, from string, call func(addr string) (T, error)) (T, int) {
+	var zero T
+	addr := from
+	for hop := 0; hop <= 4; hop++ {
+		resp, err := call(addr)
+		check(err)
+		if resp.GetErrId() == 0 {
+			return resp, hop
+		}
+		if resp.GetErrId() != 1003 || resp.GetNode() == "" {
+			fatal("read@%s: err_id=%d node=%q, want a 1003 carrying the leader node",
+				addr, resp.GetErrId(), resp.GetNode())
+		}
+		addr = resp.GetNode()
+	}
+	fatal("read from %s: redirect loop never answered", from)
+	return zero, 0
+}
+
 func main() {
 	flag.Parse()
 	addrs := splitList(*clientAddrs)
@@ -110,18 +140,22 @@ func main() {
 	}
 	fmt.Printf("version skip -> FAIL 1001 current_version=2 ok\n")
 
-	// 3) wait for replication, then read on every node (leader, replica, proxy)
+	// 3) wait for replication, then read on every node: the leader and
+	// proven-sync replicas answer locally, every other node MOVEDs — the
+	// probe follows the chain and asserts the eventual answer plus that
+	// the redirect itself is the wire shape (err_id 1003 + leader node).
 	time.Sleep(3 * time.Second)
 	for _, a := range addrs {
-		rr, err := cli(a).ReadStream(ctx, &pushupesv1.ReadStreamRequest{AggregateId: agg})
-		check(err)
+		rr, hops := followRead(ctx, a, func(addr string) (*pushupesv1.ReadStreamResponse, error) {
+			return cli(addr).ReadStream(ctx, &pushupesv1.ReadStreamRequest{AggregateId: agg})
+		})
 		if len(rr.Records) != 2 || rr.LastVersion != 2 {
 			fatal("read@%s: %d records last=%d", a, len(rr.Records), rr.LastVersion)
 		}
 		if rr.Records[1].Events[0].Body[2] != 0xff || string(rr.Records[0].Events[0].Body) != `{"g":"世界"}` {
 			fatal("read@%s: body bytes mangled", a)
 		}
-		fmt.Printf("read@%s: 2 records, binary body verbatim ok\n", a)
+		fmt.Printf("read@%s: 2 records (answered after %d redirect(s)), binary body verbatim ok\n", a, hops)
 	}
 
 	// 4) idempotent replay -> EXISTS
@@ -134,19 +168,20 @@ func main() {
 	}
 	fmt.Printf("idempotent replay -> EXISTS with stored record ok\n")
 
-	// 5) by-command
-	bc, err := cli(addrs[0]).ReadByCommand(ctx, &pushupesv1.ReadByCommandRequest{AggregateId: agg, CommandId: "s-1"})
-	check(err)
+	// 5) by-command (followed from the first entry, like every read)
+	bc, _ := followRead(ctx, addrs[0], func(addr string) (*pushupesv1.ReadByCommandResponse, error) {
+		return cli(addr).ReadByCommand(ctx, &pushupesv1.ReadByCommandRequest{AggregateId: agg, CommandId: "s-1"})
+	})
 	if !bc.Found || bc.Record.Version != 1 || bc.Record.Seq == 0 {
 		fatal("by-command: %+v", bc)
 	}
 	fmt.Printf("by-command found v1 (seq=%d) ok\n", bc.Record.Seq)
 
 	// 6) point-in-time version anchor (ReadVersionByTime, on every node so
-	// the proxy path is covered too): v1/v2 carry explicit stamps, so the
-	// anchor for "before v2's time" is exactly 1, and past-the-clock is the
-	// full tail 2. The time stream hashes to its own slot, so its appends
-	// follow MOVED to that slot's leader like step 1 does.
+	// the redirect chain is covered too): v1/v2 carry explicit stamps, so
+	// the anchor for "before v2's time" is exactly 1, and past-the-clock is
+	// the full tail 2. The time stream hashes to its own slot, so its
+	// appends follow MOVED to that slot's leader like step 1 does.
 	const t1, t2 = int64(1600000001), int64(1600000002)
 	tagg := agg + "-t"
 	tTarget := target
@@ -180,24 +215,27 @@ func main() {
 	}
 	time.Sleep(2 * time.Second) // let the replica see the time stream
 	for _, a := range addrs {
-		vb, err := cli(a).ReadVersionByTime(ctx, &pushupesv1.ReadVersionByTimeRequest{
-			AggregateId: tagg, UnixTime: t1, // at-or-before v1's stamp -> exactly 1
+		vb, _ := followRead(ctx, a, func(addr string) (*pushupesv1.ReadVersionByTimeResponse, error) {
+			return cli(addr).ReadVersionByTime(ctx, &pushupesv1.ReadVersionByTimeRequest{
+				AggregateId: tagg, UnixTime: t1, // at-or-before v1's stamp -> exactly 1
+			})
 		})
-		check(err)
 		if vb.Version != 1 {
 			fatal("version-by-time@%s at=%d: want 1 got %d", a, t1, vb.Version)
 		}
-		vb2, err := cli(a).ReadVersionByTime(ctx, &pushupesv1.ReadVersionByTimeRequest{
-			AggregateId: tagg, UnixTime: t2,
+		vb2, _ := followRead(ctx, a, func(addr string) (*pushupesv1.ReadVersionByTimeResponse, error) {
+			return cli(addr).ReadVersionByTime(ctx, &pushupesv1.ReadVersionByTimeRequest{
+				AggregateId: tagg, UnixTime: t2,
+			})
 		})
-		check(err)
 		if vb2.Version != 2 {
 			fatal("version-by-time@%s at=%d: want 2 got %d", a, t2, vb2.Version)
 		}
-		vb0, err := cli(a).ReadVersionByTime(ctx, &pushupesv1.ReadVersionByTimeRequest{
-			AggregateId: tagg, UnixTime: t1 - 1, // before the first stamp -> 0
+		vb0, _ := followRead(ctx, a, func(addr string) (*pushupesv1.ReadVersionByTimeResponse, error) {
+			return cli(addr).ReadVersionByTime(ctx, &pushupesv1.ReadVersionByTimeRequest{
+				AggregateId: tagg, UnixTime: t1 - 1, // before the first stamp -> 0
+			})
 		})
-		check(err)
 		if vb0.Version != 0 {
 			fatal("version-by-time@%s at=%d: want 0 got %d", a, t1-1, vb0.Version)
 		}

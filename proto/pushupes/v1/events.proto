@@ -131,6 +131,15 @@ message ReadStreamResponse {
   repeated Record records = 1;
   uint32 next_version = 2;
   uint32 last_version = 3;
+  // Reads redirect like writes: a node that can neither serve the slot
+  // (its leader, or a replica whose sync with the current epoch is proven)
+  // nor answer it locally fails the read in-band — err_id 1003 (MOVED)
+  // with the authoritative slot and the leader's client-plane node, and
+  // no records. err_id 0 means this node answered. Clients refresh their
+  // routing row from the answer and retry (pkg/client does this per call).
+  uint32 err_id = 4;
+  int32 slot = 5;
+  string node = 6; // redirect target "host:port" when err_id is 1003
 }
 
 // ReadTailsRequest asks for the latest version of each listed aggregate.
@@ -138,17 +147,28 @@ message ReadTailsRequest {
   repeated string aggregate_ids = 1;
 }
 
-// ReadTailsResponse answers with one version per requested aggregate, in the
-// SAME ORDER as the request: versions[i] is the tail of aggregate_ids[i], and
-// 0 means that aggregate has no records in the slot the answering node holds.
-//
-// This is the bulk form of "does version k exist" probing: a resume scan needs
-// one number per aggregate, and one RPC per aggregate made the scan cost grow
-// with the number of streams. The bound is the same one ReadStream applies —
-// the answering node's own durable LEO (never a stale former-leader
-// watermark), same as ReadStream.
+// ReadTailsResult is one aggregate's tail outcome: version when the answering
+// node serves that slot (err_id 0), or a redirect — err_id 1003 (MOVED) plus
+// the authoritative slot and the leader's client-plane node, version 0.
+message ReadTailsResult {
+  string aggregate_id = 1; // echo, like BatchAppendResult
+  uint32 version = 2;
+  uint32 err_id = 3;
+  int32 slot = 4;
+  string node = 5;
+}
+
+// ReadTailsResponse answers one result per requested aggregate, in the SAME
+// ORDER as ReadTailsRequest.aggregate_ids, each echoing its aggregate_id
+// (the BatchAppend protocol shape). This node only answers versions for the
+// slots it can serve — its leaders and its proven-in-sync replicas; every
+// other aggregate comes back as a per-entry 1003 with the leader's node.
+// There is no server-side forwarding: the fan-out lives with the client,
+// which groups by its own routing table (pkg/client ReadTails does this,
+// mirroring BatchAppend's redirect re-send). A 0 version with err_id 0
+// means the aggregate has no records within this node's visibility bound.
 message ReadTailsResponse {
-  repeated uint32 versions = 1;
+  repeated ReadTailsResult results = 1;
 }
 
 message ReadByCommandRequest {
@@ -159,6 +179,11 @@ message ReadByCommandRequest {
 message ReadByCommandResponse {
   bool found = 1;
   Record record = 2;
+  // Redirect in-band, exactly as ReadStreamResponse: err_id 1003 + slot +
+  // the leader's client-plane node when this node cannot serve the slot.
+  uint32 err_id = 3;
+  int32 slot = 4;
+  string node = 5;
 }
 
 // ReadVersionByTimeRequest asks for the point-in-time version anchor of one
@@ -172,4 +197,9 @@ message ReadVersionByTimeRequest {
 
 message ReadVersionByTimeResponse {
   uint32 version = 1; // 0 = no record visible at or before the time
+  // Redirect in-band, exactly as ReadStreamResponse: err_id 1003 + slot +
+  // the leader's client-plane node when this node cannot serve the slot.
+  uint32 err_id = 2;
+  int32 slot = 3;
+  string node = 4;
 }

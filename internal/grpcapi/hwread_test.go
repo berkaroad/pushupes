@@ -205,8 +205,8 @@ func TestSteppedDownReplicaForwardsUntilReProven(t *testing.T) {
 		appendV(v)
 	}
 	eng.NoteHwLedger(slot, 3)
-	if _, _, proxy, _ := eng.LocalRead(slot); proxy != "" {
-		t.Fatalf("test setup: synced replica at epoch %d should read locally, proxy=%q", tbl.Slots[slot].Epoch, proxy)
+	if _, _, redirect, _ := eng.LocalRead(slot); redirect != "" {
+		t.Fatalf("test setup: synced replica at epoch %d should read locally, redirect=%q", tbl.Slots[slot].Epoch, redirect)
 	}
 
 	// node-1 steps down: the table hands the slot to the follower and node-1
@@ -229,7 +229,7 @@ func TestSteppedDownReplicaForwardsUntilReProven(t *testing.T) {
 	}
 	// The stale proof must NOT admit: forwarding beats serving a log the new
 	// leader cannot vouch for.
-	if _, _, proxy, _ := eng.LocalRead(slot); proxy == "" {
+	if _, _, redirect, _ := eng.LocalRead(slot); redirect == "" {
 		t.Fatal("stale-epoch proof admitted a local read after the step-down")
 	}
 
@@ -334,9 +334,9 @@ func TestZeroWatermarkReplicaShowsNothing(t *testing.T) {
 	}
 
 	eng.NoteHwLedger(repSlot, 0)
-	upto, serveEmpty, proxy, _ := eng.LocalRead(repSlot)
-	if proxy != "" || !serveEmpty || upto != 0 {
-		t.Fatalf("zero-watermark replica: upto=%d serveEmpty=%v proxy=%q, want 0/true/local", upto, serveEmpty, proxy)
+	upto, serveEmpty, redirect, _ := eng.LocalRead(repSlot)
+	if redirect != "" || !serveEmpty || upto != 0 {
+		t.Fatalf("zero-watermark replica: upto=%d serveEmpty=%v redirect=%q, want 0/true/local", upto, serveEmpty, redirect)
 	}
 	// The gRPC answer is the empty stream shape, not an error and not the log.
 	cli := serveEngine(t, eng, store)
