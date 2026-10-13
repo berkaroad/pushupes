@@ -14,6 +14,36 @@ leader→follower 专用拉取协议**（ISR + 高水位语义），两条链路
 Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分配表 / epoch / 集群成员
 ```
 
+## 集群拓扑
+
+以 **3 个控制节点 + 2 个数据节点** 为例（medium 副本策略：每槽 2 份，
+两个数据节点互为对方的副本）：
+
+```
+客户端（CQRS 框架）
+  │ gRPC EventService（client 面 85xx）：读写都直连槽 leader
+  │ 收 MOVED(1003)/ASK(1004) → 刷新本地 slot→node 路由缓存后重试
+  ▼
+控制面 · 3 个控制节点（role=voter）—— Raft 法定数 2/3
+  ctrl-1 ◀──Raft 日志复制──▶ ctrl-2 ◀──Raft 日志复制──▶ ctrl-3
+  只复制元数据：槽位分配表 slot→{leader, replicas[], epoch}、集群成员、副本策略
+  voter 不承载事件数据；controller 在控制面上：每 1s 探活，
+  某节点连续 3 次失败 → 从其 ISR 副本重选该节点名下所有槽的 leader（epoch+1）
+  │ WatchLayout：把槽位分配表分发到各数据节点（peer 面 83xx）
+  │ 探活 / 新节点报名（peer 面 83xx）
+  ▼
+数据面 · 2 个数据节点（role=learner）—— 承载槽副本：append-only WAL + 派生索引
+  data-1：leader 槽 0–2047 ┃ 副本 槽 2048–4095
+  data-2：leader 槽 2048–4095 ┃ 副本 槽 0–2047
+  data-1 ◀──MFetch 长轮询拉取（peer 面 83xx，与 Raft 同端口族）──▶ data-2
+  follower 按 leader 分组批量拉增量，应答是裸 WAL 字节、原样落盘，
+  批量回报 LEO，leader 推进 HW = ISR 内最小 LEO；
+  写入等到高水位覆盖该条记录才回 success（单节点宕机不丢已确认写入）
+```
+
+三条链路各走各的面：共识与数据复制都走 peer 面，事件读写只走 client 面，
+运维与观察（含管理控制台）走 admin 面（80xx）。
+
 ## 功能特性
 
 ### 数据模型与写入协议
@@ -29,9 +59,10 @@ Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分
 
 ### 存储
 
-- 固定 **1680 个哈希槽**（`mix64(FNV-1a(aggregate_id)) % 1680`）。槽数不可配置，
-  取 105 的倍数是为了让「聚合落在哪个节点」不随槽数调整而改变（推导见
-  DESIGN.md §7.2）。
+- 固定 **4096 个哈希槽**（`mix64(FNV-1a(aggregate_id)) % 4096`）。槽数不可配置，
+  `4096 = 2^12` 按「最多 1024 个数据节点、每节点至少 4 槽」估算；数据节点数取
+  偶数，2 的幂次节点数（2~1024）都整除 4096、每节点槽主数完全相同，其余偶数
+  按环布局摊到相差不超过 1（推导见 DESIGN.md §7.2）。
 - 每槽一条 **append-only WAL**，默认按 256MiB 分段（可配 64MiB~2GiB，须为 64MiB
   的整数倍）。**段文件名即 baseSeq**，整段可独立滚动、拷贝、删除，因此槽级
   热迁移走复制协议按 seq 追平（见「槽位热迁移」）。
@@ -63,8 +94,9 @@ Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分
 - 故障切换：controller 每 1s 探活，某节点连续 3 次失败即判定失联 → 从其 ISR
   副本中为该节点名下所有槽重选 leader（epoch+1，经 Raft 提交），客户端收
   MOVED 重定向；原 leader 恢复后自动回切（`election_mode=leader`）。
-- 读语义只暴露 `seq ≤ HW` 的记录（防脏读回滚）；非本地槽的读由服务端向
-  leader 代理转发。
+- 读语义只暴露 `seq ≤ HW` 的记录（防脏读回滚）；非本地槽的读由服务端就地
+  答 1003（MOVED）+ 槽 + leader 的 client 地址，客户端库跟随重定向重试
+  ——与写同一套机制，服务端从不中继读流量。
 
 ### 槽位热迁移（副本构建三阶段，不停写）
 
@@ -149,7 +181,8 @@ cd frontend && npm install && npm run build
 ### 一键起 3 节点集群（推荐）
 
 ```bash
-scripts/cluster.sh start     # 编译 + 拉起 3 节点，等待选主与槽规划收敛
+REPLICAS=5 VOTERS=3 scripts/cluster.sh start   # 一条命令建整簇：3 控制节点 + 2 数据节点
+scripts/cluster.sh restart   # 裸跑即可：节点数、每节点角色、端口都读自 $RUN_DIR/cluster.env
 scripts/cluster.sh status    # 各节点 Raft 角色、leader 槽数、迁移中槽数
 scripts/cluster.sh smoke     # 端到端冒烟：MOVED → v1/v2 写入 → 幂等 exists
                              #           → 版本冲突 fail/1001 → 回读
@@ -164,13 +197,17 @@ scripts/cluster.sh clean     # stop 并删除运行目录（含数据，慎用�
 
 每个节点占用三个端口，按节点序号依次递增（node-i = BASE + i − 1）；数据、日志、
 pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可用环境变量覆盖：
-`REPLICAS`（节点数）、`HOST`、`ADMIN_BASE`、`PEER_BASE`、`CLIENT_BASE`、
-`SEGMENT_BYTES`、`RUN_DIR`、`READY_TIMEOUT`、`BUILD`。每槽副本数由副本策略分档
-（`PUSHUPES_REPLICA_POLICY`=low/medium/high，默认 medium：1/2/每个数据节点一份
-全量）：该值只为新集群种初始值，策略存放在 Raft 复制的槽表里，之后改档位走
-`POST /admin/cluster/replica-policy`（控制台集群页的「副本策略」卡片即可操作）。
-扩节点两种做法等价：`REPLICAS=<新总数> cluster.sh start`（集群已存在时，缺的节点
-自动报名加入）或逐个 `cluster.sh join N`。
+`REPLICAS`（节点数）、`VOTERS`（控制面节点数：node-1..VOTERS=voter，其余=learner；
+也可用 `ROLE_<n>=voter|learner` 逐个点名）、`HOST`、`ADMIN_BASE`、`PEER_BASE`、
+`CLIENT_BASE`、`SEGMENT_BYTES`、`RUN_DIR`、`READY_TIMEOUT`、`BUILD`。`start`/`join`
+会把生效形态（节点数、每节点角色、端口）写进 `$RUN_DIR/cluster.env`，之后裸跑
+`restart`/`stop`/`status`/`smoke` 都按它执行，命令行显式传的变量仍优先；运行目录里
+只有节点目录而没有 `cluster.env`（老目录）时脚本按最大 `node-N` 推断节点数并提示补传
+角色。每槽副本数由副本策略分档（`PUSHUPES_REPLICA_POLICY`=low/medium/high，默认
+medium：1/2/每个数据节点一份全量）：该值只为新集群种初始值，策略存放在 Raft 复制的
+槽表里，之后改档位走 `POST /admin/cluster/replica-policy`（控制台集群页的「副本策略」
+卡片即可操作）。扩节点两种做法等价：`REPLICAS=<新总数> cluster.sh start`（集群已存在
+时，缺的节点自动报名加入）或逐个 `cluster.sh join N`。
 
 集群配置只由**一个**节点写下（`-peers` 里 id 最小的那个，或用 `-bootstrap` 指定的
 那个）；其余配置了 `-peers` 的节点一律以「种子」身份启动、向这些成员报名加入，自己
@@ -230,7 +267,7 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 | `-drop-after` | `PUSHUPES_DROP_AFTER` | 30s | 迁移后前源副本保留期；0=默认，负数启动即报错，不可关闭 |
 | `-rebalance-interval` | `PUSHUPES_REBALANCE_INTERVAL` | 2s | controller 每隔多久检查一次 leader 布局并执行回切（节点宕机恢复后把槽 leader 迁回环上预期节点）；**每轮只提交一次**（提交严格串行，任一时刻只有一个槽在交接栅栏上），所以收敛时间由这个间隔决定；0=关闭，负数启动即报错 |
 | `-grpc-max-msg-size` | `PUSHUPES_GRPC_MAX_MSG_SIZE` | 4MiB | client 面 gRPC 消息上限（recv/send 同值）；`BatchAppend` 单批要装进它，可写 `16MiB` 等带单位形式（env 同样接受）；≤0 启动即报错 |
-| `-batch-slot-parallelism` | `PUSHUPES_BATCH_SLOT_PARALLELISM` | 100 | `BatchAppend` 一批最多同时执行几个槽（异槽并行、同槽串行；铺满 1680 槽的宽批也不会瞬间压上等量并发 WAL 写者）；≤0 启动即报错 |
+| `-batch-slot-parallelism` | `PUSHUPES_BATCH_SLOT_PARALLELISM` | 100 | `BatchAppend` 一批最多同时执行几个槽（异槽并行、同槽串行；铺满 4096 槽的宽批也不会瞬间压上等量并发 WAL 写者）；≤0 启动即报错 |
 | `-raft-heartbeat-timeout` | `PUSHUPES_RAFT_HEARTBEAT_TIMEOUT` | 100ms | 共识心跳间隔。leader 的心跳没按时到达就会被投票换掉，所以宿主机可能拖住共识事件循环时要与 `-raft-election-timeout` 一起放大 |
 | `-raft-election-timeout` | `PUSHUPES_RAFT_ELECTION_TIMEOUT` | 500ms | follower 多久收不到心跳就发起选举。必须 ≥ 2× 心跳，否则一次迟到的心跳就会掀掉 leader（启动即报错）；与心跳是一对比例，一起放大而不是只收窄其中一个 |
 | `-raft-flush-interval` | `PUSHUPES_RAFT_FLUSH_INTERVAL` | 200µs | 共识 WAL 组提交窗口：窗口内到达的追加共用一次 fsync |
@@ -249,14 +286,23 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
   同槽串行、异槽并行（并发上限 `-batch-slot-parallelism`，默认 100）。单批
   必须装进 client 面 gRPC 消息上限（`-grpc-max-msg-size`，默认 4MiB）。
 - `EventService/ReadStream`：按聚合读取事件流（≤HW 语义）。
+- `EventService/ReadTails`：一次查询多个聚合的最新版本（resume 扫描用）。
+  服务端逐条应答：本地可服务的槽给版本，其余给该条自己的 1003 + `node`；
+  `pkg/client` 按本地路由表分组扇出、逐条修补重发。
+- `EventService/ReadVersionByTime`：按聚合 + 时间取「时间点及之前」的最大
+  版本锚点，再用 ReadStream 回放。
 - `EventService/ReadByCommand`：按 `command_id` 查询已写入的记录。
+  以上读接口与写一样走 MOVED 重定向（应答带 `err_id`/`slot`/`node`），
+  非本地槽不再由服务端代理转发；`pkg/client` 对调用方透明地跟随。
 
 错误 ID：`1001` 版本冲突（附 current_version）、`1002` 参数非法、
 `1003` MOVED、`1004` ASK、`1005` 本节点非 controller（admin 写命令专用，
 响应附 `controller` 与 `controller_admin_addr`）、`1006` 本节点流控拒绝
 （见「节点级流控」；经 `pkg/client` 写入时该码被库吸收为回压，调用方看不到它）、
 `1007` 本地副本来源未证实（owner 围栏拦下该槽：leader 拒写、本地读答空，直到
-运维经 `/admin/slots/pending/adopt` 采纳、或删除槽目录，见 DESIGN §3.1）。
+运维经 `/admin/slots/pending/adopt` 采纳、或删除槽目录，见 DESIGN §3.1）。世代号
+是复制状态里的集群级值（`GET /admin/cluster/status` 的 `topology`，每个节点报同一个），
+只有真正重建共识状态才会换世代；普通重启、raft 换主都不影响副本来源的证明。
 
 admin 面 HTTP（仅管理）：`GET /admin/cluster/status`、`GET /admin/writes`、
 `GET /admin/slots/{slot}/describe`、`GET /admin/slots/{slot}/streams`、
