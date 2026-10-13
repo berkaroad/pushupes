@@ -57,7 +57,12 @@ assert('slots route renders', renderRoute('/slots', 'light').length > 0)
 // so it works outside the browser too).
 const api = await vite.ssrLoadModule('/src/api.ts')
 assert('fetchSlotStreams exposed', typeof api.fetchSlotStreams === 'function')
-assert('addClusterNode exposed', typeof api.addClusterNode === 'function')
+// addClusterNode / removeClusterNode were the console's membership clients;
+// membership is CLI-only now (POST / DELETE /admin/cluster/nodes, documented
+// in DESIGN.md), so BOTH are gone — the page cannot re-wire an add or remove
+// button to a live call without failing these.
+assert('addClusterNode client is gone', api.addClusterNode === undefined)
+assert('removeClusterNode client is gone', api.removeClusterNode === undefined)
 try {
   const probes = await api.fetchSlotStreams('http://127.0.0.1:9591', 4058)
   assert('live slot streams answer', typeof probes.loaded === 'boolean' && Array.isArray(probes.streams))
@@ -97,17 +102,39 @@ assert('policy edit holds a draft state', pageSrc.includes('policyDraft'))
 assert('the Raft-state card is gone', !pageSrc.includes('Raft 状态'))
 assert('storage card reads storage_bytes', pageSrc.includes('storage_bytes'))
 assert('storage card flags a lower bound', pageSrc.includes('storage_bytes_complete'))
-// The stat row's slot card merges the old 迁移中槽位 into 槽位（迁移中 / 总数）
-// ("1 / 1680"), and the cluster-wide durable write rate rides on its own row
-// as TWO cards — 写入速度（数量） ("100 msg/s") and 写入速度（大小）
-// ("100 KiB/s") — never crammed into one value. The rate is summed at each
-// slot's leader from the same light /admin/writes poll the slots page uses.
-// These pin the wiring: the merged title, the removed separate card, the two
-// card titles, and the counter-sum helper that keeps the leader-only
-// accounting (replicas and both migration ends would double count).
-assert('slot card merges migrating into the total', pageSrc.includes('槽位（迁移中 / 总数）'))
-assert('the separate migrating-slot card is gone', !pageSrc.includes('"迁移中槽位"'))
-assert('the old slot-total title is gone', !pageSrc.includes('"槽位总数"'))
+// The stat row's slot card merged the old 迁移中槽位 into 槽位（迁移中 / 总数）
+// ("1 / 1680") — that card is now the 存储数量 card: the records stored
+// cluster-wide, the durable writes counter summed at each slot's LEADER from
+// the same /admin/writes poll the write-speed cards use ('-' until a complete
+// sample lands). The two write-speed cards stay on their own row.
+assert('storage-count card replaced the slot card',
+  pageSrc.includes('"存储数量"') && !pageSrc.includes('槽位（迁移中 / 总数）')
+  && !pageSrc.includes('"迁移中槽位"') && !pageSrc.includes('"槽位总数"'))
+// The node cards say 控制节点 / 数据节点 — the （在线 / 总数） suffix is gone,
+// the value line ("2 / 3") carries the counts.
+assert('control and data node cards by plane',
+  pageSrc.includes('"控制节点"') && pageSrc.includes('"数据节点"')
+  && !pageSrc.includes('（在线 / 总数）'))
+assert('the two cards count voters and learners',
+  pageSrc.includes('role === "voter"') && pageSrc.includes('role === "learner"'))
+assert('the summary row is four span-6 cards', (pageSrc.match(/span: 6/g) ?? []).length === 4)
+// The node directory splits into two blocks: 控制节点 on top (voters as
+// plain cards — no chart, no flow control — three per row, the answering
+// node keeps 当前 here) and 数据节点 below (learners as full cards, two per
+// row, no 当前). The merged 节点 title is gone.
+assert('the plain node block is gone', !pageSrc.includes('title: "节点"'))
+assert('the node blocks carry the split grids',
+  (pageSrc.match(/span: 8/g) ?? []).length === 1 && (pageSrc.match(/span: 12/g) ?? []).length === 3
+  && pageSrc.includes('plain'))
+assert('当前 rides the control block only',
+  (pageSrc.match(/current: p\.id === status\.node/g) ?? []).length === 1)
+// Membership is CLI-only in BOTH directions: no add button, no add modal, no
+// 移除 button anywhere on the cluster page — the console reads the fleet, the
+// operator changes it.
+assert('the console offers no membership UI',
+  !pageSrc.includes('添加节点') && !pageSrc.includes('移除')
+  && !pageSrc.includes('doAdd') && !pageSrc.includes('setAdding')
+  && !pageSrc.includes('askRemove') && !pageSrc.includes('removingId'))
 assert('write-speed is two cards, not one',
   pageSrc.includes('写入速度（数量）') && pageSrc.includes('写入速度（大小）')
   && !pageSrc.includes('写入速度（数量 / 大小）'))
@@ -336,6 +363,22 @@ assert('a marked-down peer with announced addresses is still tagged 离线',
   downCard.includes('离线') && downCard.includes('http://h:8593') && !/border-style:dashed/.test(downCard))
 const onlineCard = pc({ peer: { id: 'node-1', peer_addr: 'http://h:8391', admin_addr: 'http://h:8091', client_addr: 'http://h:8591' }, current: true, slots: 561 })
 assert('an online peer renders no 离线 tag', !onlineCard.includes('离线') && onlineCard.includes('当前') && !/border-style:dashed/.test(onlineCard))
+// The control-plane (plain) card shape: flow-control tag and button gone,
+// rate chart gone, action row gone; identity/offline/当前 intact. The data
+// card keeps the 流控 face and the chart. NEVER a 移除 button: membership is
+// CLI-only, and no PeerCard prop can bring it back.
+const plainPeer = { id: 'node-9', peer_addr: 'http://h:8399', admin_addr: 'http://h:8099', client_addr: 'http://h:8599' }
+const plainCard = pc({ peer: plainPeer, current: true, slots: 0, plain: true, flowControlConfigured: true })
+const fullCard = pc({ peer: plainPeer, slots: 3, flowControlConfigured: true, onFlowControl: () => {} })
+assert('no peer card ever renders 移除', !plainCard.includes('移除') && !fullCard.includes('移除') && !fullCard.includes('ant-btn-dangerous'))
+assert('a plain card renders no 流控 face', !plainCard.includes('流控') && !plainCard.includes('anticon-control'))
+assert('a plain card renders no rate chart',
+  !plainCard.includes('evts/sec') && !plainCard.includes('polyline') && !plainCard.includes('采集中'))
+assert('a plain card renders no slots tag', !plainCard.includes(' slots'))
+assert('a plain card still marks the answering node', plainCard.includes('当前'))
+assert('the data card keeps the 流控 face and the chart',
+  fullCard.includes('流控') && fullCard.includes('采集中'))
+assert('a card without the current prop renders no 当前 tag', !fullCard.includes('当前'))
 
 // The node-card dual-axis chart: two polylines (msg/s left axis primary,
 // KiB/s right axis orange) over one time axis, and the sampling hint below

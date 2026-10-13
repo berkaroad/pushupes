@@ -20,26 +20,24 @@ export function isOnlinePeer(p: Pick<Peer, 'client_addr' | 'down'>): boolean {
 // answers "governed" versus "actively throttling". Both flags come from the
 // per-node /admin/writes poll the page already runs.
 //
-// The footer row inside the card body carries the two node actions the
-// console offers: 流控 (open this node's flow-control modal) and 移除.
-// 移除 appears only when onRemove is passed — which the page does only for
-// offline members other than this one — so the console's own rule matches
-// the backend's (Engine.RemoveMember refuses an online member) before a
-// click can produce a 400. 流控 is node-local and harmless to open on any
-// live node, so it appears whenever onFlowControl is passed. The row is
-// rendered for EVERY card at a fixed height (the small-button 24px line):
-// cards keep an invisible placeholder per absent button, so all cards in
-// the grid stay the same height whether or not they carry actions.
-export function PeerCard({ peer, current, slots, onRemove, removing, flowControlConfigured, flowControlFiring, onFlowControl, ratePoints }: {
+// The footer row inside the card body carries the one node action the
+// console offers: 流控 (open this node's flow-control modal). Membership
+// actions live on the operator's command line (POST / DELETE
+// /admin/cluster/nodes, see DESIGN.md), never on a card. 流控 is node-local
+// and harmless to open on any live node, so it appears whenever
+// onFlowControl is passed; the row is rendered at a fixed height (the
+// small-button 24px line) with an invisible placeholder per absent button,
+// so all data cards in the grid stay the same height. A plain (control-
+// plane) card has neither action, so it renders no row at all.
+export function PeerCard({ peer, current, slots, flowControlConfigured, flowControlFiring, onFlowControl, ratePoints, plain }: {
   peer: Peer
-  current: boolean
+  current?: boolean
   slots: number
-  onRemove?: (id: string) => void
-  removing?: boolean
   flowControlConfigured?: boolean
   flowControlFiring?: boolean
   onFlowControl?: (id: string) => void
   ratePoints?: NodeRatePoint[]
+  plain?: boolean
 }) {
   const online = isOnlinePeer(peer)
   // Every card — online or offline — is the same solid bordered card: the
@@ -47,28 +45,30 @@ export function PeerCard({ peer, current, slots, onRemove, removing, flowControl
   // read as a different (broken) frame style instead of a state.
   return (
     <Card size="small"
-      title={<Space>{peer.id}{current ? <Tag color="blue">当前</Tag> : null}{online ? null : <Tag color="red">离线</Tag>}{flowControlConfigured ? <Tag color="orange" className={flowControlFiring ? 'flow-blink' : undefined}>流控</Tag> : null}</Space>}
-      extra={<Tag>{slots} slots</Tag>}>
+      title={<Space>{peer.id}{current ? <Tag color="blue">当前</Tag> : null}{online ? null : <Tag color="red">离线</Tag>}{!plain && flowControlConfigured ? <Tag color="orange" className={flowControlFiring ? 'flow-blink' : undefined}>流控</Tag> : null}</Space>}
+      extra={plain ? null : <Tag>{slots} slots</Tag>}>
       <Descriptions column={1} size="small">
         <Descriptions.Item label="Admin">{peer.admin_addr || '-'}</Descriptions.Item>
         <Descriptions.Item label="Client">{peer.client_addr || '-'}</Descriptions.Item>
         <Descriptions.Item label="Peer">{peer.peer_addr || '-'}</Descriptions.Item>
       </Descriptions>
-      <div style={{ marginTop: 12, height: 24, display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-        {onFlowControl
-          ? <Button size="small" icon={<ControlOutlined />} onClick={() => onFlowControl(peer.id)}>流控</Button>
-          : <span style={{ visibility: 'hidden' }} aria-hidden><Button size="small">流控</Button></span>}
-        {onRemove
-          ? <Button danger size="small" loading={removing} onClick={() => onRemove(peer.id)}>移除</Button>
-          : <span style={{ visibility: 'hidden' }} aria-hidden><Button danger size="small">移除</Button></span>}
-      </div>
+      {!plain && (
+        <div style={{ marginTop: 12, height: 24, display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+          {onFlowControl
+            ? <Button size="small" icon={<ControlOutlined />} onClick={() => onFlowControl(peer.id)}>流控</Button>
+            : <span style={{ visibility: 'hidden' }} aria-hidden><Button size="small">流控</Button></span>}
+        </div>
+      )}
       {/* The node's own write-rate history (msg/s + KiB/s, dual axis): what
           this node lands as a LEADER, the same face flow control governs.
           The card chart is the per-node mirror of the cluster write-speed
-          cards above — fed by the page's existing 2s writes poll. */}
-      <div style={{ marginTop: 12 }}>
-        <NodeRateChart points={ratePoints ?? []} />
-      </div>
+          cards above — fed by the page's existing 2s writes poll. A plain
+          (control-plane) card never leads writes, so it carries no chart. */}
+      {!plain && (
+        <div style={{ marginTop: 12 }}>
+          <NodeRateChart points={ratePoints ?? []} />
+        </div>
+      )}
     </Card>
   )
 }

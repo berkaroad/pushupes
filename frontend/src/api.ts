@@ -288,46 +288,6 @@ export async function withController<T>(
   throw new Error('控制器不可用，请重试')
 }
 
-// addClusterNode adds a node to the running Raft membership, addressed to the
-// controller: like every membership change it is controller-only (a follower
-// refuses with err_id 1005, nothing is forwarded). Only the new node's PEER
-// (consensus) address is sent — the node announces its own admin/client
-// addresses through the ordinary registration once it joins. The backend
-// waits for the configuration change to commit (AddMemberTimeout = 30s), so
-// the request budget is that plus margin.
-export async function addClusterNode(
-  id: string, peerAddr: string, status: ClusterStatus | null = null,
-): Promise<void> {
-  await withController(
-    (addr) => axios.post(
-      `${normalizeAdminBase(addr)}/admin/cluster/nodes`,
-      { id, peer_addr: peerAddr },
-      { timeout: 40000 },
-    ),
-    status,
-  )
-}
-
-// removeClusterNode drops a node from the running Raft membership, addressed to
-// the controller: like every membership change it is controller-only (a
-// follower refuses with err_id 1005, nothing is forwarded). Only an OFFLINE
-// member can be removed — the backend refuses a node the peer directory still
-// marks reachable with a 400 whose message names it, and the console guards
-// the same rule before sending (see ClusterPage). The backend waits for the
-// configuration change to commit (AddMemberTimeout = 30s), so the request
-// budget is that plus margin.
-export async function removeClusterNode(
-  id: string, status: ClusterStatus | null = null,
-): Promise<void> {
-  await withController(
-    (addr) => axios.delete(
-      `${normalizeAdminBase(addr)}/admin/cluster/nodes/${encodeURIComponent(id)}`,
-      { timeout: 40000 },
-    ),
-    status,
-  )
-}
-
 // migrateSlot starts a hot migration, addressed to the controller: it is a
 // controller-only command and the console's /api proxy may well be fronting a
 // follower. Pass the cached status table (no extra request) or let it fetch.

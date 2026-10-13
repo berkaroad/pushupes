@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, App, Button, Card, Col, Form, Input, InputNumber, Modal, Row, Select, Space, Statistic, Switch, Typography } from 'antd'
-import { EditOutlined, PlusOutlined } from '@ant-design/icons'
+import { EditOutlined } from '@ant-design/icons'
 import type { ClusterStatus, FlowControlDetail, NodeWrites } from '../types'
 import { humanBytes, humanBytesPerSec } from '../format'
-import { addClusterNode, clearFlowControl, ensureLeader, fetchFlowControl, fetchNodeWrites, removeClusterNode, setReplicaPolicy, setFlowControl, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
+import { clearFlowControl, ensureLeader, fetchFlowControl, fetchNodeWrites, setReplicaPolicy, setFlowControl, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
 import { PeerCard, isOnlinePeer } from '../PeerCard'
 import type { NodeRatePoint } from '../NodeRateChart'
 
@@ -46,23 +46,14 @@ export default function ClusterPage() {
   const [err, setErr] = useState<string | null>(null)
   const [auto, setAuto] = useState(true)
 
-  // The add-node modal. Membership changes are controller-only, so the submit
-  // goes through addClusterNode (which resolves the leader from the CURRENT
-  // status snapshot and retries once if it moved) — statusRef keeps the newest
-  // table for that, the same pattern the slots page uses for migrations.
-  const [adding, setAdding] = useState(false)
-  const [addBusy, setAddBusy] = useState(false)
-  const [aForm] = Form.useForm<{ id: string; peer_addr: string }>()
+  // Membership changes — adds AND removals — are operator CLI actions
+  // (POST / DELETE /admin/cluster/nodes, see DESIGN.md): the console
+  // deliberately offers no membership buttons. statusRef keeps the newest
+  // table for the policy command the console DOES own, the same pattern the
+  // slots page uses for migrations.
   const statusRef = useRef<ClusterStatus | null>(null)
 
-  // The remove-node action. The confirm modal names the target; removal is
-  // offline-only on BOTH sides: the button reaches the page only for offline
-  // peers (PeerCard gets onRemove only when !isOnlinePeer), and the backend
-  // re-checks the replicated table (Engine.RemoveMember refuses an online
-  // member with a 400) — a stale 5s snapshot must never be the only gate.
-  // removingId marks the in-flight target so only its card shows a spinner.
   const { modal, message } = App.useApp()
-  const [removingId, setRemovingId] = useState<string | null>(null)
 
   // Flow control (node-local). The card tag reads the config view the 2s
   // writes poll already carries per node (configured=true → 流控 tag); the
@@ -125,6 +116,12 @@ export default function ClusterPage() {
   // whose leaders were not all reporting) keeps the last known rate.
   const [writeRate, setWriteRate] = useState<{ msg: number; bytes: number } | null>(null)
   const lastSample = useRef<{ at: number; writes: number; bytes: number } | null>(null)
+
+  // 存储数量: the records stored cluster-wide, summed at each slot's LEADER
+  // (the same one-leader fold the rate uses — the leader's durable write
+  // counter IS the seq count of that copy, replicas would double count).
+  // The card shows '-' until the poll sees one complete sample.
+  const [storedRecords, setStoredRecords] = useState<number | null>(null)
 
   // The per-node card charts: same poll, same one-leader rule applied to
   // ONE node's led slots only (the card answers "what lands on this node
@@ -229,6 +226,9 @@ export default function ClusterPage() {
 
         const writes = leaderWriteTotals(st, perNode, 'writes')
         const bytes = leaderWriteTotals(st, perNode, 'write_bytes')
+        // The 存储数量 card rides this same leader-only sum: it updates on any
+        // complete writes sample, even while bytes is still incomplete.
+        if (writes !== null) setStoredRecords(writes)
         if (writes === null || bytes === null) return
         const prev = lastSample.current
         const now = Date.now()
@@ -250,24 +250,6 @@ export default function ClusterPage() {
     const firingTimers = flowFiringTimers.current
     return () => { stop = true; clearInterval(t); Object.values(firingTimers).forEach(clearTimeout) }
   }, [])
-
-  const doAdd = async () => {
-    const { id, peer_addr } = await aForm.validateFields()
-    setAddBusy(true)
-    try {
-      await addClusterNode(id.trim(), peer_addr.trim(), statusRef.current)
-      setAdding(false)
-      aForm.resetFields()
-      refresh()
-    } catch (e: any) {
-      // Keep the modal open on failure (a wrong address is fixed in place and
-      // retried); surface the backend's own message when it answers.
-      const msg = e?.response?.data?.error ?? e?.message ?? String(e)
-      setErr(`添加节点失败：${msg}`)
-    } finally {
-      setAddBusy(false)
-    }
-  }
 
   // The replica policy. The tier lives in the replicated slot table (the
   // startup flag only seeds a brand-new cluster), so this card is the
@@ -356,23 +338,6 @@ export default function ClusterPage() {
     })
   }
 
-  const askRemove = (id: string) => {
-    modal.confirm({
-      title: `确认移除节点 ${id}？`,
-      content: (
-        <div>
-          该操作把 <Typography.Text code>{id}</Typography.Text> 从 Raft
-          成员列表移除，仅离线节点允许。移除后控制器会把它的槽主迁到存活副本并自动补齐副本集；
-          节点进程本身不受影响，若之后重新拉起会再次自动报名入集群。
-        </div>
-      ),
-      okText: '移除',
-      okButtonProps: { danger: true },
-      cancelText: '取消',
-      onOk: () => doRemove(id),
-    })
-  }
-
   // openFlowControl opens the per-node modal prefilled from the node's own
   // GET /admin/flow-control: the poll's config view carries the numbers but
   // not the duration STRING the POST body round-trips, so one detail read
@@ -438,30 +403,6 @@ export default function ClusterPage() {
     }
   }
 
-  const doRemove = async (id: string) => {
-    // Guard the offline rule again at action time (from the freshest snapshot),
-    // not only at render time: auto-refresh may have raced a node back online
-    // between the paint and the click.
-    const peer = statusRef.current?.peers?.[id]
-    if (peer && isOnlinePeer(peer)) {
-      message.warning(`节点 ${id} 当前在线，只能移除离线节点`)
-      return
-    }
-    setRemovingId(id)
-    try {
-      await removeClusterNode(id, statusRef.current)
-      message.success(`节点 ${id} 已提交移除`)
-      refresh()
-    } catch (e: any) {
-      // The backend's own reason (still online / not the controller after two
-      // tries) is the actionable text; show it instead of a generic failure.
-      const msg = e?.response?.data?.error ?? e?.message ?? String(e)
-      message.error(`移除节点 ${id} 失败：${msg}`)
-    } finally {
-      setRemovingId(null)
-    }
-  }
-
   const leaderCount = useMemo(() => {
     if (!status) return {} as Record<string, number>
     const m: Record<string, number> = {}
@@ -472,13 +413,17 @@ export default function ClusterPage() {
   if (err && !status) return <Alert type="error" message="无法连接后端" description={err} />
   if (!status) return null
 
-  const slots = Object.values(status.slots)
-  const migrating = slots.filter((s) => s.state !== 'stable').length
   const peers = Object.values(status.peers)
   // 数据面池规模——副本因子就是按这个数推导的（后端 Table.HostingIDs 口径：
   // 非纯控制、且已自报 client 地址的成员）。
   const dataNodes = peers.filter((p) => p.role !== 'voter' && p.client_addr).length
-  const online = peers.filter(isOnlinePeer).length
+  // The summary row splits the fleet by plane: control nodes are the raft
+  // voters, data nodes the learners; each card counts online members with the
+  // cluster's own offline rule (isOnlinePeer).
+  const controlPeers = peers.filter((p) => p.role === 'voter')
+  const dataPeers = peers.filter((p) => p.role === 'learner')
+  const controlOnline = controlPeers.filter(isOnlinePeer).length
+  const dataOnline = dataPeers.filter(isOnlinePeer).length
   // The cluster storage sample: every slot counted once, at its leader. A node
   // that does not serve the field yet (or has not sampled) renders '-'.
   const storageBytes = status.storage_bytes
@@ -494,15 +439,16 @@ export default function ClusterPage() {
         <Switch checked={auto} onChange={setAuto} size="small" />
       </Space>
       {err ? <Alert type="warning" closable message={err} onClose={() => setErr(null)} /> : null}
-      {/* The summary row: three cards fill the 24-column grid (span 8 each).
+      {/* The summary row: four cards fill the 24-column grid (span 6 each).
           The two write-speed cards take a row of their own (span 12 each):
           count and size are read side by side, never crammed into one value. */}
       <Row gutter={16}>
-        <Col span={8}><Card><Statistic title="节点（在线 / 总数）" value={`${online} / ${peers.length}`}
-          valueStyle={online < peers.length ? { color: '#cf1322' } : undefined} /></Card></Col>
-        <Col span={8}><Card><Statistic title="槽位（迁移中 / 总数）" value={`${migrating} / ${status.slot_count}`}
-          valueStyle={migrating ? { color: '#faad14' } : undefined} /></Card></Col>
-        <Col span={8}><Card><Statistic title="存储大小"
+        <Col span={6}><Card><Statistic title="控制节点" value={`${controlOnline} / ${controlPeers.length}`}
+          valueStyle={controlOnline < controlPeers.length ? { color: '#cf1322' } : undefined} /></Card></Col>
+        <Col span={6}><Card><Statistic title="数据节点" value={`${dataOnline} / ${dataPeers.length}`}
+          valueStyle={dataOnline < dataPeers.length ? { color: '#cf1322' } : undefined} /></Card></Col>
+        <Col span={6}><Card><Statistic title="存储数量" value={storedRecords ?? '-'} /></Card></Col>
+        <Col span={6}><Card><Statistic title="存储大小"
           value={storageBytes === undefined ? '-' : humanBytes(storageBytes)}
           valueStyle={storageLowerBound ? { color: '#faad14' } : undefined}
           suffix={storageLowerBound ? '（下界）' : undefined} /></Card></Col>
@@ -557,26 +503,18 @@ export default function ClusterPage() {
           </Space>
         )}
       </Card>
-      <Card title="节点" extra={
-        <Button type="primary" size="small" icon={<PlusOutlined />} onClick={() => setAdding(true)}>
-          添加节点
-        </Button>
-      }>
-        {/* [16, 16]: the second value is the row gap — without it cards that
-            wrap onto a second line touch the row above edge to edge. */}
+      {/* The node directory split by plane. Control on top: voters get a row
+          of three PLAIN cards — no rate chart and no flow control (a voter
+          never leads writes; flow control is a data-plane face) — and the
+          answering node keeps its 当前 tag here, where it lives. Below it the
+          data plane: learners get two full cards per row, and 当前 is gone
+          from them (the answering node is a control member). Neither block
+          carries membership actions: add and remove are CLI operations. */}
+      <Card title="控制节点">
         <Row gutter={[16, 16]}>
-          {peers.map((p) => (
+          {controlPeers.map((p) => (
             <Col span={8} key={p.id}>
-              {/* 移除 only on offline cards, never on this answering node — the
-                  same offline rule the backend enforces, rendered before the
-                  click instead of failing inside it. */}
-              <PeerCard peer={p} current={p.id === status.node} slots={leaderCount[p.id] ?? 0}
-                onRemove={isOnlinePeer(p) || p.id === status.node ? undefined : askRemove}
-                removing={removingId === p.id}
-                flowControlConfigured={flowConfigured[p.id] ?? false}
-                flowControlFiring={!!flowFiring[p.id]}
-                ratePoints={nodeRates[p.id]}
-                onFlowControl={isOnlinePeer(p) ? openFlowControl : undefined} />
+              <PeerCard peer={p} current={p.id === status.node} slots={leaderCount[p.id] ?? 0} plain />
             </Col>
           ))}
         </Row>
@@ -585,21 +523,19 @@ export default function ClusterPage() {
           {status.raft.commit_index ? <> ｜ commit <Typography.Text code>{String(status.raft.commit_index)}</Typography.Text></> : null}
         </Typography.Text>
       </Card>
-      <Modal open={adding} onCancel={() => setAdding(false)} onOk={doAdd}
-        okText="添加" cancelText="取消" confirmLoading={addBusy}>
-        <Typography.Paragraph type="secondary" style={{ marginBottom: 12 }}>
-          将节点加入运行中的集群（提交给控制器）。只需填它的 Peer（Raft）地址；
-          新节点入集群后会自行上报 Admin / Client 地址。
-        </Typography.Paragraph>
-        <Form form={aForm} layout="vertical">
-          <Form.Item name="id" label="节点 ID" rules={[{ required: true, message: '请输入节点 ID' }]}>
-            <Input placeholder="如 node-4" />
-          </Form.Item>
-          <Form.Item name="peer_addr" label="Peer 地址" rules={[{ required: true, message: '请输入 Peer 地址' }]}>
-            <Input placeholder="如 10.0.0.4:8394" />
-          </Form.Item>
-        </Form>
-      </Modal>
+      <Card title="数据节点">
+        <Row gutter={[16, 16]}>
+          {dataPeers.map((p) => (
+            <Col span={12} key={p.id}>
+              <PeerCard peer={p} slots={leaderCount[p.id] ?? 0}
+                flowControlConfigured={flowConfigured[p.id] ?? false}
+                flowControlFiring={!!flowFiring[p.id]}
+                ratePoints={nodeRates[p.id]}
+                onFlowControl={isOnlinePeer(p) ? openFlowControl : undefined} />
+            </Col>
+          ))}
+        </Row>
+      </Card>
       {/* The per-node flow-control modal. Node-local: saving posts to the
           target node's own admin plane, never the controller. The body
           spells out what the numbers mean — ONE node-wide token bucket of
