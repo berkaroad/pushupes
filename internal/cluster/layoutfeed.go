@@ -223,9 +223,9 @@ func (h *layoutHub) serve(ctx context.Context, req layoutRequest, send func(*lay
 	// anything). The learner reaches the same conclusion on its own when it
 	// sees HELLO's generation (learnernode.go); enforcing it here means an old
 	// or misbehaving data node cannot poison its table either.
-	if req.Topology != "" && req.Topology != h.e.node.TopologyID() {
+	if req.Topology != "" && req.Topology != h.e.topologyID() {
 		h.e.loggerf("layout feed: %s resumes from generation %s but this cluster is %s; rebuilding it",
-			req.LearnerID, req.Topology, h.e.node.TopologyID())
+			req.LearnerID, req.Topology, h.e.topologyID())
 		req.FromIndex, req.FromTerm = 0, 0
 	}
 	s := h.attach(req)
@@ -237,7 +237,7 @@ func (h *layoutHub) serve(ctx context.Context, req layoutRequest, send func(*lay
 		Kind:       layoutHello,
 		LeaderID:   h.e.self,
 		LeaderPeer: h.e.node.Cfg().PeerAddr,
-		Topology:   h.e.node.TopologyID(),
+		Topology:   h.e.topologyID(),
 		Voters:     h.e.node.Members(),
 	}
 	if sl, err := h.e.node.LayoutSlice(s.cursor-1, s.term, 1); err == nil {
@@ -308,7 +308,7 @@ func (h *layoutHub) fill(s *layoutSub) error {
 	// The voter set and the generation ride the feed rather than the entry
 	// stream: a learner's own view of who votes is display material, and the
 	// generation is what tells a returning data node its copies need re-proving.
-	if voters, topo := h.e.node.Members(), h.e.node.TopologyID(); !sameVoters(voters, s.voters) || topo != s.topology {
+	if voters, topo := h.e.node.Members(), h.e.topologyID(); !sameVoters(voters, s.voters) || topo != s.topology {
 		f := &layoutFrame{
 			Kind:       layoutHello,
 			LeaderID:   h.e.self,

@@ -243,6 +243,11 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 		"peers":      tbl.Peers,
 		"slots":      tbl.Slots,
 		"slot_count": tbl.SlotCount,
+		// topology is the cluster's consensus generation, read from the
+		// replicated state (cluster.Table.Topology): the value a data node
+		// fences its copies against. Every node reports the same one — a
+		// divergence here is the thing to look at when a copy is fenced.
+		"topology": tbl.Topology,
 		// replica_factor is the per-slot copy count in force, derived by the
 		// controller from the cluster's replica policy tier and the data-plane
 		// member count (cluster.ReplicaCountForPolicy). replica_policy is that

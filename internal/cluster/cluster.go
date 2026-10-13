@@ -219,13 +219,17 @@ type Node struct {
 	mux      *peerMux
 	stopOnce sync.Once
 	logger   *slog.Logger
-	// topology identifies THIS node's consensus history generation: a random
-	// id written once into the data dir and kept for the dir's lifetime. It
-	// fences the owner provenance record (owner.go): a copy stamped under one
-	// topology and found after the dir was rebuilt carries a different id,
-	// so the node refuses to lead it rather than writing into a stale seq
-	// space. It never needs to agree across nodes — every node compares its
-	// own record against its own dir.
+	// topology is the id of the consensus dir THIS node bootstrapped with: a
+	// random id written once into the data dir and kept for the dir's
+	// lifetime. It fences the owner provenance record (owner.go) — a copy
+	// stamped under one generation and found after the dir was rebuilt
+	// carries a different id, so the node refuses to lead it rather than
+	// writing into a stale seq space. This per-dir id is a BOOTSTRAP SEED
+	// only: the generation a cluster actually fences against is the
+	// replicated one (Table.Topology), written by the first controller to
+	// find it empty. A per-node value could not serve that role — voters
+	// each carry a different id, and whoever leads changes on an ordinary
+	// restart.
 	topology string
 }
 

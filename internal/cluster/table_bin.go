@@ -40,11 +40,16 @@ import (
 
 const (
 	tableMagic = "PTAB"
-	// tableVer (v6) adds the self-announced node role to every directory
+	// tableVer (v7) adds the cluster's consensus generation to the header
+	// (Table.Topology): a node that joins from a snapshot has to learn it, or
+	// its owner fence would compare provenance records against nothing and
+	// fence every copy it inherits.
+	tableVer = byte(7)
+	// tableVerRole (v6) adds the self-announced node role to every directory
 	// entry: the layout pool (voters host no slots) must survive a snapshot
 	// or the restored table would spread seats onto the control plane until
 	// re-registration lands.
-	tableVer = byte(6)
+	tableVerRole = byte(6)
 	// tableVerGrant is the v5 form: it appends, after the slots, the member
 	// directory the layout was planned under and — per slot — why each seat
 	// exists (ring = load, factor = redundancy). The fetch round ranks a
@@ -160,6 +165,9 @@ func (t *Table) EncodeTableBinary() []byte {
 		policy = string(DefaultReplicaPolicy)
 	}
 	putStr(&body, policy)
+	// v7: the cluster's consensus generation, right after the header fields so
+	// the decoder can read it before the directory (see Table.Topology).
+	putStr(&body, t.Topology)
 
 	var tmp [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(tmp[:], uint64(len(peerIDs)))
@@ -259,9 +267,10 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return nil, fmt.Errorf("table: short header: %w", err)
 	}
-	if string(hdr[0:4]) != tableMagic || (hdr[4] != tableVer && hdr[4] != tableVerNoGrant && hdr[4] != tableVerPolicy && hdr[4] != tableVerGrant) {
+	if string(hdr[0:4]) != tableMagic || (hdr[4] != tableVer && hdr[4] != tableVerRole && hdr[4] != tableVerNoGrant && hdr[4] != tableVerPolicy && hdr[4] != tableVerGrant) {
 		return nil, fmt.Errorf("table: bad snapshot magic/version")
 	}
+	withTopology := hdr[4] >= tableVer         // v7 and later carry the generation in the header
 	policyInHeader := hdr[4] != tableVerPolicy // v4 and later carry the tier in the header
 	withGrants := hdr[4] >= tableVerGrant      // v5 and later carry the seat grants
 	var tmp4 [4]byte
@@ -299,6 +308,12 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 	}
 	t := NewTableWithPolicy(int32(slotCount), policy)
 	t.Replicas = int(replicas)
+	if withTopology {
+		// v7: the cluster's consensus generation (see Table.Topology).
+		if t.Topology, err = readStr(r); err != nil {
+			return nil, err
+		}
+	}
 	peerN, err := binary.ReadUvarint(r)
 	if err != nil {
 		return nil, err
@@ -326,7 +341,7 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 			return nil, err
 		}
 		role := ""
-		if hdr[4] >= tableVer {
+		if hdr[4] >= tableVerRole {
 			// Role (v6): one len-prefixed string per entry.
 			if role, err = readStr(r); err != nil {
 				return nil, err

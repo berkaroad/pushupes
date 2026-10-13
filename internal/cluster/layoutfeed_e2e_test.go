@@ -178,6 +178,7 @@ func tablesMatch(a, b *Table) bool { return tableDigest(a) == tableDigest(b) }
 // never decides).
 func tableDigest(t *Table) string {
 	var sb strings.Builder
+	fmt.Fprintf(&sb, "topology %s\n", t.Topology)
 	ids := make([]string, 0, len(t.Peers))
 	for id := range t.Peers {
 		ids = append(ids, id)

@@ -277,10 +277,24 @@ func (e *Engine) runOwnerFence(ctx context.Context) {
 	}
 }
 
-// topologyID names this node's consensus generation for the fence. A node
-// without a consensus Node (unit harnesses) gets one fixed stand-in: the id
-// only ever has to match its own previous records, never another node's.
+// topologyID names this cluster's consensus generation for the fence. The
+// authoritative value is the one in the replicated table (Table.Topology):
+// one id per consensus history, identical on every node, so a copy stamped
+// while one controller led stays proven when another one takes over. Before
+// that entry applies — the first rounds of a cold start, and unit harnesses
+// with no Node at all — the node's own bootstrap id stands in: it is exactly
+// the value the controller is about to submit.
 func (e *Engine) topologyID() string {
+	e.tableMu.RLock()
+	tbl := e.table
+	var id string
+	if tbl != nil {
+		id = tbl.Topology
+	}
+	e.tableMu.RUnlock()
+	if id != "" {
+		return id
+	}
 	if e.node != nil {
 		return e.node.TopologyID()
 	}

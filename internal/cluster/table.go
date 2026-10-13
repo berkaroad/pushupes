@@ -105,9 +105,19 @@ type Table struct {
 	// Policy is the cluster-wide replica strategy tier behind Replicas; the
 	// controller re-derives Replicas from it (clamped to the member count)
 	// every round, so the factor tracks both the policy and the membership.
-	Policy ReplicaPolicy        `json:"policy"`
-	Peers  map[string]Peer      `json:"peers"`
-	Slots  map[int32]*Placement `json:"slots"`
+	Policy ReplicaPolicy `json:"policy"`
+	// Topology is this cluster's consensus generation: one random id per
+	// consensus history, written into the replicated state by the first
+	// controller that finds it empty (OpSetTopology) and read from there by
+	// every node afterwards. The owner fence compares a data copy's
+	// provenance record against it (owner.go), and the layout feed carries it
+	// to the data plane, so the value has to be CLUSTER-wide: a per-node id
+	// would change when leadership moved between voters, and a plain restart
+	// would then declare every copy in the data plane a different generation
+	// and refuse to lead it until an operator adopted each node by hand.
+	Topology string               `json:"topology,omitempty"`
+	Peers    map[string]Peer      `json:"peers"`
+	Slots    map[int32]*Placement `json:"slots"`
 	// PlanMembers is the member directory the current layout was planned
 	// under. A replan that runs while it differs from the directory now grants
 	// RING seats (the ring just took the node on); one that runs under the same
@@ -161,6 +171,10 @@ func tableReplicaShortfall(t *Table) bool {
 func (t *Table) Clone() *Table {
 	out := NewTableWithPolicy(t.SlotCount, t.Policy)
 	out.Replicas = t.Replicas
+	// Topology: the cluster generation is part of the replicated state like
+	// any other field — a clone that dropped it would fence every copy the
+	// holder of the clone leads.
+	out.Topology = t.Topology
 	for k, v := range t.Peers {
 		out.Peers[k] = v
 	}
@@ -587,6 +601,12 @@ const (
 	// (reclaim a surplus copy, e.g. the former source of a committed
 	// migration). Non-leader only: dropping the leader would strand the slot.
 	OpSlotRemoveReplica = "slot_remove_replica"
+	// OpSetTopology records this cluster's consensus generation — one random
+	// id per consensus history (Table.Topology). The controller submits it
+	// once, before anything plans, so every later reader (the owner fence,
+	// the layout feed) reads one cluster-wide value instead of whichever
+	// voter happens to be leading.
+	OpSetTopology = "set_topology"
 )
 
 // Command is one replicated metadata mutation.
@@ -609,6 +629,8 @@ type Command struct {
 	// For OpConfig:
 	SlotCount int32 `json:"slot_count,omitempty"`
 	Replicas  int   `json:"replicas,omitempty"`
+	// For OpSetTopology: the consensus generation to record (Table.Topology).
+	Topology string `json:"topology,omitempty"`
 	// For OpSetPolicy: the tier name (low/medium/high).
 	Policy string `json:"policy,omitempty"`
 }
@@ -638,6 +660,15 @@ func (t *Table) Apply(c *Command) error {
 		}
 		if c.Replicas > 0 {
 			t.Replicas = c.Replicas
+		}
+	case OpSetTopology:
+		// First writer wins: a generation is decided once per consensus
+		// history. A later submit — a stale controller, or a node that
+		// booted with a fresh id of its own — must not overwrite it, or
+		// every copy in the data plane would be fenced against a value its
+		// provenance records cannot match.
+		if t.Topology == "" && c.Topology != "" {
+			t.Topology = c.Topology
 		}
 	case OpSetPolicy:
 		policy, err := NormalizeReplicaPolicy(c.Policy)

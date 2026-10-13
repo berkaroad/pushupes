@@ -306,3 +306,47 @@ func TestSeatGrantsLabelWhyTheSeatAppeared(t *testing.T) {
 		t.Fatal("test setup: no slot changed when the member joined")
 	}
 }
+
+// The generation a data copy is fenced against comes from the REPLICATED
+// state, not from whatever id the voter that happens to lead bootstrapped
+// with. Voters each write their own random id into their own consensus dir,
+// so a fence keyed on the current leader's id declared every copy a different
+// generation the moment leadership moved: a plain restart of a 3-voter
+// cluster left the whole data plane pending (writes failing err_id 1007)
+// until an operator adopted every node by hand.
+func TestClusterGenerationComesFromTheReplicatedState(t *testing.T) {
+	e, _ := newTestEngine(t, "node-1")
+
+	// A cold start — and the unit harnesses, which have no consensus Node at
+	// all — falls back to the node's own bootstrap id: exactly the value the
+	// controller is about to submit.
+	if got := e.topologyID(); got != "default" {
+		t.Fatalf("generation before the entry applies = %q, want the stand-in", got)
+	}
+
+	// The entry lands: from here every node reads the same value, whichever
+	// voter is leading.
+	applyCmd(t, e, &Command{Op: OpSetTopology, Topology: "gen-a"})
+	if got := e.topologyID(); got != "gen-a" {
+		t.Fatalf("generation = %q, want the replicated gen-a", got)
+	}
+	if got := e.TableSnapshot().Topology; got != "gen-a" {
+		t.Fatalf("table generation = %q, want gen-a", got)
+	}
+
+	// A second submit — a stale controller, or a voter that came back with a
+	// fresh id of its own — must not rotate it: that would re-fence every
+	// copy in the data plane.
+	applyCmd(t, e, &Command{Op: OpSetTopology, Topology: "gen-b"})
+	if got := e.topologyID(); got != "gen-a" {
+		t.Fatalf("generation = %q after a second submit, want gen-a (first writer wins)", got)
+	}
+
+	// Provenance records are stamped with it, so a copy written before a
+	// failover still matches the fence's value after it.
+	rec := desiredOwner(e.topologyID(), "node-1",
+		&Placement{Leader: "node-1", Replicas: []string{"node-1"}, Epoch: 1, State: SlotStable})
+	if rec.Topology != "gen-a" || !rec.Replica {
+		t.Fatalf("owner stamp = %+v, want the replicated generation and the seat", rec)
+	}
+}

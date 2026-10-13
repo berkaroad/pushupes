@@ -3895,6 +3895,20 @@ func (e *Engine) RunController(ctx context.Context) {
 		if len(tbl.Peers) == 0 {
 			continue
 		}
+		// The cluster generation goes into the replicated state before
+		// anything plans (Table.Topology): the id this node bootstrapped its
+		// consensus dir with becomes the value every node — and every data
+		// node's owner fence — reads from then on, so a later leadership
+		// move cannot re-fence the data plane. First writer wins at apply, so
+		// only a table without a generation submits at all.
+		if tbl.Topology == "" {
+			if id := e.topologyID(); id != "" {
+				e.loggerf("recording the cluster generation %s in the replicated state", id)
+				if err := e.submit(&Command{Op: OpSetTopology, Topology: id}); err == nil {
+					tbl = e.TableSnapshot()
+				}
+			}
+		}
 		// Seed first: the -replica-policy flag only touches a brand-new
 		// cluster — an empty table has never been planned and no OpSetPolicy
 		// can have reached it, so this is the one and only moment the startup

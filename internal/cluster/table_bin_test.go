@@ -15,6 +15,10 @@
 package cluster
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/binary"
+	"io"
 	"testing"
 )
 
@@ -68,6 +72,83 @@ func TestTableBinaryRoundTripsPlacementOutsideDirectory(t *testing.T) {
 				t.Fatalf("slot %d replica set changed: got %v want %v", s, got.Replicas, want.Replicas)
 			}
 		}
+	}
+}
+
+// The cluster generation (Table.Topology) rides the snapshot header: a node
+// that joins from one has to learn the value its copies will be fenced
+// against, and the fence runs before any entry of the next round applies.
+func TestSnapshotCarriesTheClusterGeneration(t *testing.T) {
+	tbl := NewTable(4, 2)
+	tbl.Topology = "gen-a"
+	tbl.Peers["node-2"] = Peer{Role: RoleLearner, ID: "node-2"}
+	tbl.Slots[0] = &Placement{Leader: "node-2", Replicas: []string{"node-2"}, Epoch: 1, State: SlotStable}
+	out, err := DecodeTableBinary(tbl.EncodeTableBinary())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Topology != "gen-a" {
+		t.Fatalf("generation across the round trip = %q, want gen-a", out.Topology)
+	}
+	if out.Slots[0].Leader != "node-2" || len(out.Peers) != 1 {
+		t.Fatalf("the generation field displaced the rest of the file: %+v", out)
+	}
+}
+
+// A snapshot written BEFORE the generation field must stay readable: the new
+// field is one len-prefixed string between the policy tier and the directory,
+// so a v6 blob is a v7 blob minus that string. Reading it back as v6 also
+// pins the two version gates (role, topology) that are easy to break by
+// bumping tableVer.
+func TestSnapshotFromBeforeTheGenerationFieldStillRestores(t *testing.T) {
+	tbl := NewTable(4, 2)
+	tbl.Topology = "gen-a"
+	tbl.Peers["node-2"] = Peer{Role: RoleLearner, ID: "node-2", PeerAddr: "127.0.0.1:8392"}
+	tbl.Slots[1] = &Placement{Leader: "node-2", Replicas: []string{"node-2"}, Epoch: 2, State: SlotStable}
+
+	raw := tbl.EncodeTableBinary()
+	zr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Header: magic(4) ver(1) slotCount(4) replicas(4) then the policy string.
+	off := 13
+	plen, n := binary.Uvarint(plain[off:])
+	if n <= 0 {
+		t.Fatal("policy length unreadable")
+	}
+	off += n + int(plen)
+	tlen, n := binary.Uvarint(plain[off:])
+	if n <= 0 || string(plain[off+n:off+n+int(tlen)]) != "gen-a" {
+		t.Fatalf("generation not where the format says: %d bytes at %d", tlen, off)
+	}
+	old := append([]byte{}, plain[:off]...)
+	old = append(old, plain[off+n+int(tlen):]...) // drop the generation string
+	old[4] = tableVerRole                         // ...and say v6
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(old); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	back, err := DecodeTableBinary(buf.Bytes())
+	if err != nil {
+		t.Fatalf("a pre-generation snapshot no longer decodes: %v", err)
+	}
+	if back.Topology != "" {
+		t.Fatalf("v6 blob claimed a generation %q", back.Topology)
+	}
+	if back.Peers["node-2"].Role != RoleLearner || back.Peers["node-2"].PeerAddr != "127.0.0.1:8392" {
+		t.Fatalf("v6 directory entry misread: %+v", back.Peers["node-2"])
+	}
+	if p := back.Slots[1]; p == nil || p.Leader != "node-2" || p.Epoch != 2 {
+		t.Fatalf("v6 placement misread: %+v", p)
 	}
 }
 
