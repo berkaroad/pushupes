@@ -24,7 +24,7 @@ import "testing"
 func TestLeaveNodeClearsMigratingTarget(t *testing.T) {
 	tbl := NewTable(2, 2)
 	for _, id := range []string{"node-1", "node-2", "node-3"} {
-		tbl.Peers[id] = Peer{ID: id, PeerAddr: "127.0.0.1:1"}
+		tbl.Peers[id] = Peer{Role: RoleLearner, ID: id, PeerAddr: "127.0.0.1:1"}
 	}
 	tbl.Slots[0] = &Placement{Leader: "node-1", Replicas: []string{"node-1", "node-3"}, Epoch: 1, State: SlotStable}
 	tbl.Slots[1] = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-3"}, Epoch: 1, State: SlotMigratingOut, MigratingTo: "node-3"}
@@ -59,7 +59,7 @@ func TestLeaveNodeClearsMigratingTarget(t *testing.T) {
 func TestPlacementMutationsRefuseNonMember(t *testing.T) {
 	tbl := NewTable(2, 2)
 	for _, id := range []string{"node-1", "node-2"} {
-		tbl.Peers[id] = Peer{ID: id}
+		tbl.Peers[id] = Peer{Role: RoleLearner, ID: id}
 	}
 	tbl.Slots[0] = &Placement{Leader: "node-1", Replicas: []string{"node-1", "node-2"}, Epoch: 1, State: SlotStable}
 

@@ -37,7 +37,7 @@ func TestAdminLeaderRedirect(t *testing.T) {
 		"node-3": "http://127.0.0.1:8093",
 	}
 	for id, addr := range admins {
-		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: id, PeerAddr: "peer-" + id, AdminAddr: addr, ClientAddr: addr}})
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: id, PeerAddr: "peer-" + id, AdminAddr: addr, ClientAddr: addr}})
 	}
 
 	stats := follower.Stats()

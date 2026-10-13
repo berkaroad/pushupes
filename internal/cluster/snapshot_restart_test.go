@@ -48,7 +48,7 @@ func TestRestartRestoresSnapshotWithNonMemberPlacement(t *testing.T) {
 	// the directory does not hold (in the real breakage: node-6, the leader
 	// of 238 slots).
 	for _, id := range []string{"node-1", "node-2", "node-3", "node-4", "node-5"} {
-		applyCmd(t, eng, &Command{Op: OpJoinNode, Peer: &Peer{ID: id, PeerAddr: "127.0.0.1:1", AdminAddr: "http://127.0.0.1:1", ClientAddr: "http://127.0.0.1:1"}})
+		applyCmd(t, eng, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: id, PeerAddr: "127.0.0.1:1", AdminAddr: "http://127.0.0.1:1", ClientAddr: "http://127.0.0.1:1"}})
 	}
 	applyCmd(t, eng, &Command{Op: OpConfig, Replicas: 3})
 	applyCmd(t, eng, &Command{Op: OpPlanSlots})

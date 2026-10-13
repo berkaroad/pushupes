@@ -47,7 +47,7 @@ func TestReadTailsMatchesPerAggregateProbe(t *testing.T) {
 	eng := cluster.NewEngine(nil, store, "node-1", nil)
 
 	for _, id := range []string{"node-1", "node-2", "node-3"} {
-		c := &cluster.Command{Op: cluster.OpJoinNode, Peer: &cluster.Peer{
+		c := &cluster.Command{Op: cluster.OpJoinNode, Peer: &cluster.Peer{Role: cluster.RoleLearner,
 			ID: id, PeerAddr: "127.0.0.1:1", AdminAddr: "127.0.0.1:1", ClientAddr: "127.0.0.1:1",
 		}}
 		if _, err := eng.ApplyCommand(c.Encode()); err != nil {

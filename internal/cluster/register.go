@@ -51,13 +51,17 @@ type Registration struct {
 	AdminAddr  string
 	ClientAddr string
 	// Role is the node's self-announcement of its place in the cluster
-	// ("" = both). The node's own -role flag is the only authority on it.
+	// (RoleVoter or RoleLearner, always stated). The node's own -role flag
+	// is the only authority on it.
 	Role string
 }
 
 func (r *Registration) validate() error {
 	if r.ID == "" || r.AdminAddr == "" || r.ClientAddr == "" {
 		return fmt.Errorf("register: incomplete announcement %+v", *r)
+	}
+	if _, err := NormalizeRole(r.Role); err != nil {
+		return err
 	}
 	return nil
 }
@@ -117,10 +121,7 @@ func (e *Engine) registrationMatches(reg *Registration) bool {
 	if !ok || p.AdminAddr != reg.AdminAddr || p.ClientAddr != reg.ClientAddr {
 		return false
 	}
-	// An announcement that carries no role never disagrees: the recorded
-	// role (from any earlier announcement) already says everything a
-	// role-less peer could.
-	return reg.Role == "" || p.Role == reg.Role
+	return p.Role == reg.Role
 }
 
 // leaderPeerAddr maps the Raft leader id onto its peer address — the one
@@ -201,7 +202,7 @@ func (a *RegisterAnnouncer) done() bool {
 	tbl := a.e.TableSnapshot()
 	p, ok := tbl.Peers[a.reg.ID]
 	return ok && p.AdminAddr == a.reg.AdminAddr && p.ClientAddr == a.reg.ClientAddr &&
-		(a.reg.Role == "" || p.Role == a.reg.Role)
+		p.Role == a.reg.Role
 }
 
 func (a *RegisterAnnouncer) announceOnce(ctx context.Context) {

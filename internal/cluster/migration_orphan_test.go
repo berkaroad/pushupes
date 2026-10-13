@@ -28,8 +28,8 @@ import (
 // what to abandon is a pure function, asserted here.
 func TestOrphanedMigrationsListsUnownedUnstableSlots(t *testing.T) {
 	tbl := NewTable(8, 2)
-	tbl.Peers["node-1"] = Peer{ID: "node-1"}
-	tbl.Peers["node-2"] = Peer{ID: "node-2"}
+	tbl.Peers["node-1"] = Peer{Role: RoleLearner, ID: "node-1"}
+	tbl.Peers["node-2"] = Peer{Role: RoleLearner, ID: "node-2"}
 	tbl.Slots[0] = &Placement{Leader: "node-1", Replicas: []string{"node-1", "node-2"}, State: SlotStable}
 	tbl.Slots[1] = &Placement{Leader: "node-1", Replicas: []string{"node-1", "node-2"}, State: SlotMigratingOut, MigratingTo: "node-2"}
 	tbl.Slots[2] = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-1"}, State: SlotImportingIn, MigratingTo: "node-2"}

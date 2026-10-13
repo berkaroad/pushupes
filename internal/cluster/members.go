@@ -72,6 +72,9 @@ func (e *Engine) AddMember(ctx context.Context, id, peerAddr, role string) error
 	if id == "" || peerAddr == "" {
 		return fmt.Errorf("%w: id and peer addr are required", ErrBadMember)
 	}
+	if role != RoleVoter && role != RoleLearner {
+		return fmt.Errorf("%w: role must be %s or %s", ErrBadMember, RoleVoter, RoleLearner)
+	}
 	if role == RoleLearner {
 		// Learner admission is a replicated DIRECTORY command: the raft
 		// configuration never names a learner, and the layout pool takes it
@@ -97,6 +100,9 @@ func (e *Engine) AddMember(ctx context.Context, id, peerAddr, role string) error
 	}
 	if e.node.IsMember(id) {
 		return nil // already a member: idempotent
+	}
+	if p, ok := e.TableSnapshot().Peers[id]; ok && p.Role == RoleLearner {
+		return fmt.Errorf("%w: %s is already a directory learner; it cannot also be admitted as a voter", ErrBadMember, id)
 	}
 	addr := HostPort(NormalizeAddr(peerAddr))
 	err := e.node.AddMember(id, addr, AddMemberTimeout)
@@ -185,9 +191,10 @@ func (e *Engine) Members() []MemberView {
 			mv.AdminAddr = p.AdminAddr
 			mv.ClientAddr = p.ClientAddr
 			mv.Down = p.Down
-			// The self-announced role wins (voter/both both mean "votes"):
-			// a both node reports both, not the bare voter the config
-			// implies for the raft axis alone.
+			// The self-announced role wins over the config-derived voter: an
+			// announced voter says voter either way, and a directory learner
+			// never enters the raft configuration (see AddMember), so the two
+			// sources can only disagree on the not-yet-announced window.
 			if p.Role != "" {
 				mv.Role = p.Role
 			}
@@ -221,8 +228,9 @@ type MemberView struct {
 type Adoption struct {
 	ID       string
 	PeerAddr string
-	// Role is the shape to be admitted with: RoleLearner (data plane, no
-	// vote) or "" (voter — the classic every-node-votes admission).
+	// Role is the shape to be admitted with: RoleVoter (the raft-configuration
+	// admission) or RoleLearner (data plane, no vote). One of the two is
+	// required — an offer without a role is refused.
 	Role string
 }
 
@@ -311,6 +319,9 @@ func (j *Joiner) Run(ctx context.Context) {
 func (e *Engine) acceptAdoption(ctx context.Context, ad *Adoption) error {
 	if ad.ID == "" || ad.PeerAddr == "" {
 		return fmt.Errorf("adopt: incomplete offer")
+	}
+	if ad.Role != RoleVoter && ad.Role != RoleLearner {
+		return fmt.Errorf("adopt: role %q must be %s or %s", ad.Role, RoleVoter, RoleLearner)
 	}
 	if e.node == nil {
 		return fmt.Errorf("adopt: no raft node")

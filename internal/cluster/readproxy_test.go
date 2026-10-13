@@ -363,10 +363,10 @@ func TestLeaderReplicaRemoteSlot(t *testing.T) {
 	defer st.Close()
 	e := NewEngine(nil, st, "node-1", nil)
 
-	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{
+	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner,
 		ID: "node-1", PeerAddr: "127.0.0.1:8391", AdminAddr: "127.0.0.1:8091", ClientAddr: "127.0.0.1:8591",
 	}})
-	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{
+	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner,
 		ID: "node-2", PeerAddr: "127.0.0.1:8392", AdminAddr: "127.0.0.1:8092", ClientAddr: "127.0.0.1:8592",
 	}})
 	// This test needs a slot led by node-2 with node-1 as a removable replica;
@@ -410,10 +410,10 @@ func TestLocalReadForwardsToClientPlane(t *testing.T) {
 	defer st.Close()
 	e := NewEngine(nil, st, "node-1", nil)
 
-	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{
+	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner,
 		ID: "node-1", PeerAddr: "127.0.0.1:8391", AdminAddr: "127.0.0.1:8091", ClientAddr: "127.0.0.1:8591",
 	}})
-	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{
+	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner,
 		ID: "node-2", PeerAddr: "127.0.0.1:8392", AdminAddr: "127.0.0.1:8092", ClientAddr: "127.0.0.1:8592",
 	}})
 	// This test needs a slot led by node-2 with node-1 as a removable replica;

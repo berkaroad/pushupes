@@ -462,11 +462,11 @@ func TestFailoverPicksTheFreshestReplica(t *testing.T) {
 		addrs[id] = newPeerHarness(t, e)
 	}
 	for _, id := range []string{"node-2", "node-3", "node-4", "node-5"} {
-		p := Peer{ID: id, PeerAddr: addrs[id], ClientAddr: addrs[id]}
+		p := Peer{Role: RoleLearner, ID: id, PeerAddr: addrs[id], ClientAddr: addrs[id]}
 		if _, ok := addrs[id]; !ok {
 			// node-5 announced addresses nobody serves: it is a candidate that
 			// cannot be reached, so the pick must skip it.
-			p = Peer{ID: id, PeerAddr: "127.0.0.1:1", ClientAddr: "http://127.0.0.1:1"}
+			p = Peer{Role: RoleLearner, ID: id, PeerAddr: "127.0.0.1:1", ClientAddr: "http://127.0.0.1:1"}
 		}
 		applyCmd(t, ctrl, &Command{Op: OpJoinNode, Peer: &p})
 	}
@@ -498,7 +498,7 @@ func TestFailoverPicksTheFreshestReplica(t *testing.T) {
 func TestFailoverPrefersTheControllersPick(t *testing.T) {
 	tbl := NewTable(8, 3)
 	for _, id := range []string{"node-1", "node-2", "node-3", "node-4", "node-5"} {
-		tbl.Peers[id] = Peer{ID: id, ClientAddr: "http://" + id + ":8591"}
+		tbl.Peers[id] = Peer{Role: RoleLearner, ID: id, ClientAddr: "http://" + id + ":8591"}
 	}
 	tbl.Slots[0] = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-3", "node-4"}, Epoch: 1, State: SlotStable}
 	tbl.Slots[1] = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-3", "node-4"}, Epoch: 1, State: SlotStable}
@@ -522,7 +522,7 @@ func TestFailoverPrefersTheControllersPick(t *testing.T) {
 
 	// Invalid picks fall back: an unknown member, a member that is not a replica,
 	// the failed node itself, and an offline replica.
-	tbl.Peers["node-4"] = Peer{ID: "node-4"} // drops its announced client addr -> offline
+	tbl.Peers["node-4"] = Peer{Role: RoleLearner, ID: "node-4"} // drops its announced client addr -> offline
 	for i, pick := range []string{"node-9", "node-5", "node-2", "node-4"} {
 		s := int32(10 + i)
 		tbl.Slots[s] = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-3", "node-4"}, Epoch: 1, State: SlotStable}
@@ -555,8 +555,8 @@ func TestFollowerReportReachesController(t *testing.T) {
 	foll.node = follNode
 	// Its directory maps the controller id it knows to the controller's peer
 	// plane; the rest is irrelevant to this hop.
-	applyCmd(t, foll, &Command{Op: OpJoinNode, Peer: &Peer{ID: leaderID, PeerAddr: ctrlAddr}})
-	applyCmd(t, foll, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-9", PeerAddr: "127.0.0.1:1"}})
+	applyCmd(t, foll, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: leaderID, PeerAddr: ctrlAddr}})
+	applyCmd(t, foll, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: "node-9", PeerAddr: "127.0.0.1:1"}})
 
 	foll.reportLeaderUnreachable("node-3")
 

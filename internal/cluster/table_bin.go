@@ -178,8 +178,8 @@ func (t *Table) EncodeTableBinary() []byte {
 		} else {
 			body.WriteByte(0)
 		}
-		// Role (v6): who may carry slots. "" (both) is a length-zero
-		// string — the pre-role reading of every old entry.
+		// Role (v6): who may carry slots (voter / learner). A length-zero
+		// string is an entry recorded before roles landed.
 		putStr(&body, p.Role)
 	}
 	n = binary.PutUvarint(tmp[:], uint64(len(names)))

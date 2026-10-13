@@ -180,26 +180,28 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 ### 手工启动单个节点
 
 ```bash
-# 全新集群：节点同一次拉起、给同一份 -peers。写初始配置的是 id 最小的节点（node-1），
-# 其余节点以种子身份启动并向它报名 —— 不需要额外参数。
-# peers 主格式 node-id=host:peerport（等号分隔，只配 peer 端口，admin/client 地址由
-# 各节点经注册协议自报进路由表；每槽副本数由成员数推导）
-./bin/pushupes -node node-1 \
+# 最小部署 = 1 个控制节点（voter）+ 1 个数据节点（learner）。-role 必填，
+# 只能是这两个值：voter 投票但不承载槽副本，learner 承载副本但不投票。
+# -peers 只列控制面（voter）节点：它既是 voter 的初始配置种子，也是 learner
+# 连控制面的投递点（注册与布局分发都走 peer 端口）。
+# learner 要先进目录（控制面 POST /admin/cluster/nodes {"role":"learner"}）
+# 再启动进程；准入与拉起顺序见 scripts/cluster.sh。
+./bin/pushupes -node node-1 -role voter \
   -peer 127.0.0.1:8391 -admin 127.0.0.1:8091 -client 127.0.0.1:8591 \
   -data ./node-1 \
-  -peers 'node-1=127.0.0.1:8391,node-2=127.0.0.1:8392'
+  -peers 'node-1=127.0.0.1:8391'
 
-./bin/pushupes -node node-2 \
+./bin/pushupes -node node-2 -role learner \
   -peer 127.0.0.1:8392 -admin 127.0.0.1:8092 -client 127.0.0.1:8592 \
   -data ./node-2 \
-  -peers 'node-1=127.0.0.1:8391,node-2=127.0.0.1:8392'
+  -peers 'node-1=127.0.0.1:8391'
 
-# 已有集群上加一个节点：-peers 列出成（旧+新）成员即可，node-3 会向它们报名；-
-# join 只想指定某一个成员时才需要。要单独启动「第一个」节点时才用 -bootstrap。
-./bin/pushupes -node node-3 \
+# 再加一个控制成员：它不在配置里，按 -peers 里的成员报名进 raft（无需 -join
+# 也能轮转报名；-join 只用于点名某一个成员）。
+./bin/pushupes -node node-3 -role voter \
   -peer 127.0.0.1:8393 -admin 127.0.0.1:8093 -client 127.0.0.1:8593 \
   -data ./node-3 \
-  -peers 'node-1=127.0.0.1:8391,node-2=127.0.0.1:8392' \
+  -peers 'node-1=127.0.0.1:8391' \
   -join 127.0.0.1:8391
 ```
 
@@ -211,7 +213,7 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 | flag | env | 默认 | 说明 |
 |---|---|---|---|
 | `-node` | `PUSHUPES_NODE` | `node-1` | 节点 id |
-| `-role` | `PUSHUPES_ROLE` | `both` | 节点角色：`voter`=控制面（参与选举、**不承载槽副本**）、`learner`=数据面（不投票，从控制面接收布局分发）、`both`=经典单面形态（既投票又承载副本）。角色由节点自报进复制目录，布局池只认非 voter 成员；非法值启动即报错。`learner` 的槽表由控制面经 `WatchLayout` 流分发（DESIGN §12.4），它不建共识组、不提交、也不报名成为投票者 |
+| `-role` | `PUSHUPES_ROLE` | 无（必填） | 节点角色，只能是两者之一：`voter`=控制面（参与选举、**不承载槽副本**）、`learner`=数据面（不投票，从控制面接收布局分发）。最小部署 = 1 个 `voter` + 1 个 `learner`；缺失或非法值启动即报错。角色由节点自报进复制目录，布局池只认 `learner` 成员。`learner` 的槽表由控制面经 `WatchLayout` 流分发（DESIGN §12.4），它不建共识组、不提交、也不报名成为投票者 |
 | `-peer` | `PUSHUPES_PEER` | `http://127.0.0.1:8391` | peer 面：Raft + PeerService gRPC（全部节点间流量，运维只需配这个端口） |
 | `-admin` | `PUSHUPES_ADMIN` | `http://127.0.0.1:8091` | admin 面：HTTP 管理 API + pprof |
 | `-client` | `PUSHUPES_CLIENT` | `http://127.0.0.1:8591` | client 面：gRPC 事件读写唯一入口 |

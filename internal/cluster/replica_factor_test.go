@@ -24,7 +24,7 @@ func populatePeers(t *testing.T, tbl *Table, ids []string) {
 	t.Helper()
 	for _, id := range ids {
 		addr := "http://127.0.0.1:1"
-		tbl.Peers[id] = Peer{ID: id, PeerAddr: "127.0.0.1:1", AdminAddr: addr, ClientAddr: addr}
+		tbl.Peers[id] = Peer{Role: RoleLearner, ID: id, PeerAddr: "127.0.0.1:1", AdminAddr: addr, ClientAddr: addr}
 	}
 }
 

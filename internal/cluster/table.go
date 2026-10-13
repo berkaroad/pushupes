@@ -190,12 +190,10 @@ func (t *Table) PeerIDs() []string {
 }
 
 // HostingIDs is the layout pool: directory members that may carry slot
-// replicas (role != voter). plan_slots/replan_slots spread over THIS set
-// and the policy's factor derives from its size: the control plane's voters
-// keep their machine to themselves — a raft timing must never share a host
-// with a data-plane load, which is the point of splitting the planes.
-// Empty-role entries count as hosting (both): the default is the classic
-// single-plane shape.
+// replicas (role = learner, registered). plan_slots/replan_slots spread over
+// THIS set and the policy's factor derives from its size: the control plane's
+// voters keep their machine to themselves — a raft timing must never share a
+// host with a data-plane load, which is the point of splitting the planes.
 func (t *Table) HostingIDs() []string {
 	ids := make([]string, 0, len(t.Peers))
 	for id, p := range t.Peers {
@@ -670,9 +668,10 @@ func (t *Table) Apply(c *Command) error {
 		}
 		p.AdminAddr, p.ClientAddr = c.Peer.AdminAddr, c.Peer.ClientAddr
 		if c.Peer.Role != "" {
-			// A pre-role replayed announcement leaves the recorded role
-			// alone; an announcement carrying one updates it (the node's
-			// own -role flag is the authority on its role).
+			// The announcement carries the node's -role (voter or learner)
+			// and the node's flag is the only authority on it. A role-less
+			// form exists only in logs written before roles landed; replay
+			// keeps the recorded role for those.
 			p.Role = c.Peer.Role
 		}
 		t.Peers[c.Peer.ID] = p

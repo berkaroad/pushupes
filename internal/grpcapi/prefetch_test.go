@@ -93,9 +93,9 @@ func TestPrefetchRoutesPlannedTable(t *testing.T) {
 			t.Fatalf("apply %s: %v", c.Op, err)
 		}
 	}
-	apply(&cluster.Command{Op: cluster.OpJoinNode, Peer: &cluster.Peer{
+	apply(&cluster.Command{Op: cluster.OpJoinNode, Peer: &cluster.Peer{Role: cluster.RoleLearner,
 		ID: "node-1", PeerAddr: "p1", AdminAddr: "http://127.0.0.1:18091", ClientAddr: "http://127.0.0.1:18591"}})
-	apply(&cluster.Command{Op: cluster.OpJoinNode, Peer: &cluster.Peer{
+	apply(&cluster.Command{Op: cluster.OpJoinNode, Peer: &cluster.Peer{Role: cluster.RoleLearner,
 		ID: "node-2", PeerAddr: "p2", AdminAddr: "http://127.0.0.1:18092", ClientAddr: "http://127.0.0.1:18592"}})
 	apply(&cluster.Command{Op: cluster.OpPlanSlots})
 

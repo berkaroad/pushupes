@@ -111,10 +111,10 @@ func TestRebalanceRoundHonoursRetryBackoff(t *testing.T) {
 	newAddr := newPeerHarness(t, neu)
 
 	for _, e := range []*Engine{old, neu} {
-		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-1", PeerAddr: oldAddr}})
-		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-2", PeerAddr: newAddr}})
-		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-1", AdminAddr: oldAddr, ClientAddr: oldAddr}})
-		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-2", AdminAddr: newAddr, ClientAddr: newAddr}})
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: "node-1", PeerAddr: oldAddr}})
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: "node-2", PeerAddr: newAddr}})
+		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{Role: RoleLearner, ID: "node-1", AdminAddr: oldAddr, ClientAddr: oldAddr}})
+		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{Role: RoleLearner, ID: "node-2", AdminAddr: newAddr, ClientAddr: newAddr}})
 		pinReplicas(t, e, 2)
 		applyCmd(t, e, &Command{Op: OpPlanSlots})
 	}

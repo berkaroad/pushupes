@@ -625,7 +625,7 @@ POST /admin/flow-control {tokens,period}      # 设置本节点流控（**节点
 GET  /admin/flow-control                       # 本节点流控配置与累计拒绝数（节点级 total_hits + 每槽列表；同样节点本地）
 DELETE /admin/flow-control                     # 恢复本节点不限流（节点本地，同上）
 GET  /admin/cluster/nodes                      # 列出当前 raft 成员（本节点视角：id/peer/admin/client/down）
-POST /admin/cluster/nodes {id,peer_addr}       # 运行时加成员（控制器专属，同上；admin/client 地址由新节点自报）
+POST /admin/cluster/nodes {id,peer_addr,role}  # 运行时加成员（控制器专属，同上；role 必填 voter|learner；admin/client 地址由新节点自报）
 DELETE /admin/cluster/nodes/{id}               # 运行时摘成员（控制器专属，同上；仅离线节点，在线回 400）
 GET  /healthz
 ```
@@ -636,9 +636,10 @@ Raft 配置（谁投票）与复制的成员目录（槽表里的成员列表）
 绑在一起。**接口只在 admin 面，且只有 controller（Raft leader）能执行**：follower
 拒绝并回 `controller`/`controller_admin_addr`（客户端改投），admin 面从不转发。
 
-- **加成员 `POST /admin/cluster/nodes {"id":"node-4","peer_addr":"10.0.0.4:8394"}`**：
-  只给 peer（共识）地址。leader 先把新节点当 **learner**（只收日志、不计入
-  quorum）复制，追到 leader 当时的 commit index 后才把 `add_member` 配置项写进日志
+- **加成员 `POST /admin/cluster/nodes {"id":"node-4","peer_addr":"10.0.0.4:8394","role":"voter"}`**：
+  只给 peer（共识）地址，`role` 必填（见 §12.1）。加 `voter` 时 leader 先把新节点当
+  **raft 追赶者**（只收日志、不计入 quorum）复制，追到 leader 当时的 commit index
+  后才把 `add_member` 配置项写进日志
   （20s 追不上也放行，避免死节点卡住操作）——否则新成员可能空日志就参与 quorum，
   leader 被它替换后读不出数据。配置项提交后：目录同步自动补 `join_node`，
   它自己通过注册协议补 admin/client 地址，`replan_slots` 按副本因子补齐副本集，
@@ -1463,37 +1464,41 @@ Wait(lsn)            → 阻塞到自己的 LSN 落盘
 - WAL 写失败的极端情况下，已挂起的 follower ack 靠 RPC 超时回收（写失败即节点
   不可用，不做额外降级）。
 
-## 12. 控制面与数据面的角色分离（voter / learner / both）
+## 12. 控制面与数据面的角色分离（voter / learner）
 
 > 状态：**角色轴、准入、布局口径已实现并验收**；数据面节点（learner）自身的
 > 布局分发流见 §12.4（已接线）。
 
-### 12.1 三个角色
+### 12.1 两个角色
 
-节点用 `-role`（env `PUSHUPES_ROLE`，默认 `both`）声明自己的位置：
+节点用 `-role`（env `PUSHUPES_ROLE`）声明自己的位置。角色**必填**，取值只有
+两个：一个节点要么是控制面成员，要么是数据面成员。最小部署 = 1 个控制节点
+（voter）+ 1 个数据节点（learner）——开发环境与生产环境因此始终跑同一套
+节点间通讯拓扑，这正是只留两种形态的目的。
 
 | 角色 | 投票（Raft） | 承载槽副本 | 用途 |
 |---|---|---|---|
 | `voter` | 是 | **否** | 控制面：选举域与数据面负载彻底分开，压测/高写入不再干扰心跳 |
 | `learner` | 否 | 是 | 数据面：只从控制面接收布局，不参与 quorum（见 §12.4） |
-| `both` | 是 | 是 | 经典单面形态，也是默认值——不声明角色 = 行为与历史一致 |
 
 角色是**节点自报**的：与 admin/client 地址同一条注册公告（`RegisterRequest.role`）
 写进复制目录的 `peers[].role`，而不是由控制面代为假定——只有节点自己知道它的
-`-role`。因此目录里的角色也随快照持久化（表编码 v6，v5 及更早文件按空值 = both 读入）。
+`-role`。因此目录里的角色也随快照持久化（表编码 v6；早于 v6 的文件里的成员以
+空角色读入，节点重新公告后由注册命令把角色补齐）。
 
 ### 12.2 布局口径
 
-- `Table.HostingIDs()` 是唯一的布局池：目录里 `role != voter` 的成员（空值算 both）。
-  `plan_slots`/`replan_slots`、副本因子推导（`ReplicaCountForPolicy` 取的就是
+- `Table.HostingIDs()` 是唯一的布局池：目录里 `role = learner` 且已自报 client
+  地址的成员。`plan_slots`/`replan_slots`、副本因子推导（`ReplicaCountForPolicy`
+  取的就是
   这个池的大小）与 `OnlinePeerIDs()` 的候选集全部只认这个池。
 - 纯控制节点因此**不持有任何席位**，也不出现在故障转移/再平衡的目标集里。
 - **计划等池稳定一拍**：池是按注册逐个长出来的，所以「第一个成员一注册就规划」会
-  规划一个还没到齐的集群——经典 both 冷启动曾经如此：首个 plan 落在最先注册的那一
+  规划一个还没到齐的集群——旧单面形态的冷启动曾经如此：首个 plan 落在最先注册的那一
   个成员上（factor 1、1680 槽全在它身上），第二个成员注册后再把 1680 个副本集全部
   重排（factor 2），之后领导权还要按再均衡节奏慢慢挪。现在计划只在「池与上一轮观察
   相同」或「已推迟满两轮」时才提交（`Engine.poolSettled`），代价是冷启动晚一个对账
-  周期，换来的是第一个布局就是目标形状：实测 3 节点 both 冷启动在 t=3.0s 一次性以
+  周期，换来的是第一个布局就是目标形状：实测旧单面形态 3 节点冷启动在 t=3.0s 一次性以
   factor 2 / 560-560-560 落地，不再出现 factor 1 窗口，也没有随后的席位重排波。
 - 池为空（集群只有 voter）时：不提交 plan（避免失败条目每秒重提交把 commit
   推高），槽表保持零条目；客户端在该节点写入得到显式拒绝
@@ -1506,8 +1511,8 @@ Wait(lsn)            → 阻塞到自己的 LSN 落盘
 - 加数据面节点：`POST /admin/cluster/nodes {"id":..,"peer_addr":..,"role":"learner"}`
   ——提交一条**目录命令**（`join_node` + role），不改 raft 配置：learner 不进投票集，
   其席位由 replan 铺开；节点进程随后自报地址与角色。
-- 加投票成员：同接口省略 `role`（或 `voter`/`both`）——走原有两阶段（learner 追平后
-  晋升），语义不变。
+- 加投票成员：同接口 `{"role":"voter"}`（必填，与 learner 一样点名角色）——走原有
+  两阶段（learner 追平后晋升），语义不变。
 - 撤销：`DELETE /admin/cluster/nodes/{id}` 对 learner 提交目录 `leave_node`，对 voter
   仍是 raft 配置变更；两者都只允许撤销**已下线**的成员（在线成员持有的席位正在被
   集群使用）。
@@ -1558,6 +1563,6 @@ learner 的槽表与投票节点的是同一份复制状态，因此路由、取
   控制面共识目录）：它自己做完全部 8 步并断言每一步，退出码即结论。注意围栏判的是
   「以领导者身份服务」的副本，因此一个在本世代不领槽的数据节点报 0 条 pending 是
   正确行为（它的旧副本归抓取/发散检测管）。
-- 关再均衡（`PUSHUPES_REBALANCE_INTERVAL=0`）下的同一套验收也通过：经典 3 节点
-  both 冷启动即 560-560-560（factor 2），拆分形态 840-840，冒烟与 slotcheck 首跑
+- 关再均衡（`PUSHUPES_REBALANCE_INTERVAL=0`）下的同一套验收也通过：旧单面形态
+  3 节点冷启动即 560-560-560（factor 2），拆分形态 840-840，冒烟与 slotcheck 首跑
   即绿——需要「无在途领导权移交」的稳定窗口时用这个姿势。

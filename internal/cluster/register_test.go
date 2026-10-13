@@ -54,7 +54,7 @@ func TestRegistrationUnchangedDoesNotCommit(t *testing.T) {
 	join(t, e, "node-1", "127.0.0.1:9491")
 	join(t, e, "node-2", "127.0.0.1:9492")
 
-	reg := &Registration{ID: "node-2", AdminAddr: "127.0.0.1:9492", ClientAddr: "127.0.0.1:9492"}
+	reg := &Registration{ID: "node-2", AdminAddr: "127.0.0.1:9492", ClientAddr: "127.0.0.1:9492", Role: RoleLearner}
 	before := commitIndexOf(t, e.node)
 
 	// Three heartbeat rounds' worth of the exact same announcement.
@@ -78,7 +78,7 @@ func TestRegistrationChangeStillCommits(t *testing.T) {
 
 	before := commitIndexOf(t, e.node)
 	if err := e.acceptRegistration(&Registration{
-		ID: "node-2", AdminAddr: "127.0.0.1:9592", ClientAddr: "127.0.0.1:9792",
+		ID: "node-2", AdminAddr: "127.0.0.1:9592", ClientAddr: "127.0.0.1:9792", Role: RoleLearner,
 	}); err != nil {
 		t.Fatalf("changed registration: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestRegistrationChangeStillCommits(t *testing.T) {
 	// ...and once adopted, repeating it is a no-op again.
 	stable := commitIndexOf(t, e.node)
 	if err := e.acceptRegistration(&Registration{
-		ID: "node-2", AdminAddr: "127.0.0.1:9592", ClientAddr: "127.0.0.1:9792",
+		ID: "node-2", AdminAddr: "127.0.0.1:9592", ClientAddr: "127.0.0.1:9792", Role: RoleLearner,
 	}); err != nil {
 		t.Fatalf("re-registration after change: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestPeerAddrForNodeUsesDirectory(t *testing.T) {
 	// Static fallback still answers for a configured peer the directory has
 	// not seeded yet (a bootstrapped node that never registered).
 	nd := e.node.(*Node)
-	nd.cfg.Peers = append(nd.cfg.Peers, Peer{ID: "node-8", PeerAddr: "127.0.0.1:9498"})
+	nd.cfg.Peers = append(nd.cfg.Peers, Peer{Role: RoleLearner, ID: "node-8", PeerAddr: "127.0.0.1:9498"})
 	if got := e.peerAddrForNode("node-8"); got != "127.0.0.1:9498" {
 		t.Fatalf("static-list-only peer resolved to %q, want the configured addr", got)
 	}

@@ -194,7 +194,7 @@ func TestFencePushDoesNotStrandTargetAggregate(t *testing.T) {
 // registerPeerForTest installs a peer entry directly, without Raft.
 func (e *Engine) registerPeerForTest(t *testing.T, id, peerAddr string) {
 	t.Helper()
-	c := &Command{Op: OpJoinNode, Peer: &Peer{
+	c := &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner,
 		ID: id, PeerAddr: peerAddr, AdminAddr: peerAddr, ClientAddr: peerAddr,
 	}}
 	if _, err := e.ApplyCommand(c.Encode()); err != nil {

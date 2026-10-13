@@ -527,9 +527,9 @@ func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID       string `json:"id"`
 		PeerAddr string `json:"peer_addr"`
-		// Role admits the member with: "learner" (data plane, no vote — a
-		// replicated directory entry) or voter/both/"" (the raft-configuration
-		// admission, the classic shape).
+		// Role admits the member with, and it must be stated: "learner"
+		// (data plane, no vote — a replicated directory entry) or "voter"
+		// (the raft-configuration admission).
 		Role string `json:"role"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" || req.PeerAddr == "" {

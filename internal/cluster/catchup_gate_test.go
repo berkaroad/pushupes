@@ -108,7 +108,7 @@ func TestCatchUpGateAcceptsInvisibleRecords(t *testing.T) {
 	// placement: the fence resolves the target's peer address from the table and
 	// only acts on a slot the source believes is migrating out.
 	for _, id := range []string{"node-1", "node-2", "node-3"} {
-		applyCmd(t, src, &Command{Op: OpJoinNode, Peer: &Peer{
+		applyCmd(t, src, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner,
 			ID: id, PeerAddr: "127.0.0.1:1", AdminAddr: "127.0.0.1:1", ClientAddr: "127.0.0.1:1",
 		}})
 	}

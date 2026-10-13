@@ -33,7 +33,7 @@ import (
 func TestTableBinaryRoundTripsPlacementOutsideDirectory(t *testing.T) {
 	tbl := NewTable(4, 2)
 	for _, id := range []string{"node-1", "node-2", "node-4", "node-5", "node-7"} {
-		tbl.Peers[id] = Peer{ID: id, PeerAddr: "127.0.0.1:8391", ClientAddr: "http://127.0.0.1:8591"}
+		tbl.Peers[id] = Peer{Role: RoleLearner, ID: id, PeerAddr: "127.0.0.1:8391", ClientAddr: "http://127.0.0.1:8591"}
 	}
 	// node-6 is no longer a directory member, yet the placements still name
 	// it (leader and replica), exactly like the real table did.
@@ -78,7 +78,7 @@ func TestTableBinaryRoundTripsPlacementOutsideDirectory(t *testing.T) {
 func TestTableBinaryDictionaryOrderStaysPeerFirst(t *testing.T) {
 	tbl := NewTable(4, 2)
 	for _, id := range []string{"node-2", "node-1"} {
-		tbl.Peers[id] = Peer{ID: id}
+		tbl.Peers[id] = Peer{Role: RoleLearner, ID: id}
 	}
 	tbl.Slots[0] = &Placement{Leader: "node-1", Replicas: []string{"node-1", "node-2"}, Epoch: 1, State: SlotStable}
 	out, err := DecodeTableBinary(tbl.EncodeTableBinary())

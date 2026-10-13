@@ -63,30 +63,32 @@ type Applier interface {
 }
 
 // Node roles (-role): who votes in the consensus group and who may host
-// slot replicas. The two axes are deliberately separate:
+// slot replicas. A node is exactly one of the two — the single flag, with no
+// per-node third shape, is what keeps every deployment speaking one
+// inter-node protocol (the dev cluster and the production cluster run the
+// same code path on purpose):
 //
 //   - voter:   control-plane member — votes and is elected; hosts NO slots,
 //     so its raft timings never share a machine with a data-plane load.
 //   - learner: data-plane member — receives the replicated layout over the
 //     control plane's distribution stream; never votes, never elects.
-//   - both:    the classic single-plane shape (every node votes and hosts)
-//     and the default, so a cluster that never names a role behaves exactly
-//     as it always did.
+//
+// The smallest deployment is one voter plus one learner. The role is never
+// implied: -role is required, and admissions, adoptions and registrations all
+// carry an explicit voter or learner.
 const (
 	RoleVoter   = "voter"
 	RoleLearner = "learner"
-	RoleBoth    = "both"
 )
 
-// NormalizeRole validates a role name ("" means the default, both).
+// NormalizeRole validates a role name; a role must be stated (voter or
+// learner), there is no default.
 func NormalizeRole(role string) (string, error) {
 	switch role {
-	case "", RoleBoth:
-		return RoleBoth, nil
 	case RoleVoter, RoleLearner:
 		return role, nil
 	}
-	return "", fmt.Errorf("cluster: unknown role %q (want voter, learner or both)", role)
+	return "", fmt.Errorf("cluster: role %q is not a valid role: -role must state voter (control plane) or learner (data plane); the smallest deployment is one control node plus one data node", role)
 }
 
 // Peer is a cluster member. AdminAddr serves inter-node replication and
@@ -113,7 +115,7 @@ type Peer struct {
 // conditions, both about the node having said what it is and where to reach
 // it:
 //
-//   - it is not a pure control node (a voter hosts nothing, by role);
+//   - it announced its role as learner (the data plane; a voter hosts nothing);
 //   - it has announced a client address. An entry that has never registered is
 //     a static -peers seed or a directory entry the controller derived from the
 //     Raft configuration — a node clients cannot route to, and one the
@@ -129,7 +131,7 @@ type Peer struct {
 // Note what is deliberately NOT a condition: Down. A failed node keeps its
 // seats (its copies are what a failover hands leadership to); "can this node
 // be a target right now" is a different question, answered by Offline.
-func (p Peer) Hosts() bool { return p.Role != RoleVoter && p.ClientAddr != "" }
+func (p Peer) Hosts() bool { return p.Role == RoleLearner && p.ClientAddr != "" }
 
 // PureControl reports whether the directory says this node is control-plane
 // only — the one case where an unassigned slot must not be served locally
@@ -150,9 +152,9 @@ type Config struct {
 	PeerAddr   string
 	AdminAddr  string
 	ClientAddr string
-	// Role is this node's place in the cluster (RoleVoter / RoleLearner /
-	// RoleBoth; "" means both). It lands in the peer directory through the
-	// registration announcement and decides whether the layout may place
+	// Role is this node's place in the cluster (RoleVoter or RoleLearner;
+	// required, there is no default). It lands in the peer directory through
+	// the registration announcement and decides whether the layout may place
 	// slots here (see Peer.Hosts).
 	Role    string
 	DataDir string

@@ -51,7 +51,7 @@ func join(t *testing.T, e *Engine, id, addr string) {
 	// tests treat all three plane addresses as one value; peer-plane
 	// dials (fetch/forward/probe) follow whichever address the code under
 	// test consults.
-	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: id, PeerAddr: addr, AdminAddr: addr, ClientAddr: addr}})
+	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: id, PeerAddr: addr, AdminAddr: addr, ClientAddr: addr}})
 	applyCmd(t, e, &Command{Op: OpConfig, Replicas: fixtureFactor(len(e.TableSnapshot().Peers))})
 }
 

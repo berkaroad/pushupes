@@ -84,7 +84,7 @@ func newTestRaftCluster(t *testing.T, ids []string, appliers map[string]Applier)
 			t.Fatalf("peer mux %s: %v", id, err)
 		}
 		c.muxes[id] = mux
-		c.peers = append(c.peers, Peer{
+		c.peers = append(c.peers, Peer{Role: RoleLearner,
 			ID:         id,
 			PeerAddr:   mux.Addr(),
 			AdminAddr:  "http://" + mux.Addr(),
@@ -137,7 +137,7 @@ func (c *testRaftCluster) peerOf(id string) Peer {
 			return p
 		}
 	}
-	return Peer{ID: id}
+	return Peer{Role: RoleLearner, ID: id}
 }
 
 func (c *testRaftCluster) waitLeader(within time.Duration) string {

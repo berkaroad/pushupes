@@ -3,11 +3,11 @@ export interface Peer {
   peer_addr: string
   admin_addr: string
   client_addr: string
-  // The node's self-announced plane: 'voter' (control only, hosts nothing),
-  // 'learner' (data plane), 'both'/'' (classic single-plane). The replica
-  // factor derives from the members that HOST (role != 'voter' with an
-  // announced client_addr — the backend's Table.HostingIDs pool), not from
-  // the whole directory.
+  // The node's self-announced plane: 'voter' (control only, hosts nothing) or
+  // 'learner' (data plane) — one of the two, always stated. The replica factor
+  // derives from the members that HOST (role === 'learner' with an announced
+  // client_addr — the backend's Table.HostingIDs pool), not from the whole
+  // directory.
   role?: string
   // The controller's replicated liveness verdict: consecutive peer-plane
   // probes failed. The directory entry (addresses included) survives a

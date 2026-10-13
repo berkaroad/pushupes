@@ -35,7 +35,7 @@ func TestAcceptAdoptionCommitsOnLeader(t *testing.T) {
 
 	// The offer is delivered by the node itself; here we call the handler
 	// directly, which is exactly what the Adopt RPC does on the leader.
-	if err := le.acceptAdoption(ctx, &Adoption{ID: "node-4", PeerAddr: added}); err != nil {
+	if err := le.acceptAdoption(ctx, &Adoption{ID: "node-4", PeerAddr: added, Role: RoleVoter}); err != nil {
 		t.Fatalf("acceptAdoption: %v", err)
 	}
 	deadline := time.Now().Add(10 * time.Second)
@@ -49,7 +49,7 @@ func TestAcceptAdoptionCommitsOnLeader(t *testing.T) {
 		t.Fatalf("membership = %d, want 4 after adoption", got)
 	}
 	// Idempotent.
-	if err := le.acceptAdoption(ctx, &Adoption{ID: "node-4", PeerAddr: added}); err != nil {
+	if err := le.acceptAdoption(ctx, &Adoption{ID: "node-4", PeerAddr: added, Role: RoleVoter}); err != nil {
 		t.Fatalf("repeat adoption must be a no-op: %v", err)
 	}
 	if got := len(c.nodes[leader].Members()); got != 4 {

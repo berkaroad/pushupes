@@ -28,10 +28,14 @@ import (
 // decides it. These tests pin the pool, the admission commands, and the
 // write-path guard that keeps a pure control node off slot data.
 
+// roleTable seeds a table whose members are registered data-plane nodes
+// (learner, announced); tests re-register any member with the role they are
+// modelling. There is no role-less shape any more: an entry only hosts when
+// its announced role says learner.
 func roleTable(members map[string]string) *Table {
 	t := NewTable(8, 2)
 	for id, addr := range members {
-		t.Peers[id] = Peer{ID: id, PeerAddr: addr, AdminAddr: addr, ClientAddr: addr, Role: ""}
+		t.Peers[id] = Peer{ID: id, PeerAddr: addr, AdminAddr: addr, ClientAddr: addr, Role: RoleLearner}
 	}
 	return t
 }
@@ -112,8 +116,8 @@ func TestTableBinaryCarriesRoles(t *testing.T) {
 	if back.Peers["ctrl"].Role != RoleVoter {
 		t.Fatalf("role lost through the snapshot encoding: %+v", back.Peers["ctrl"])
 	}
-	if back.Peers["d1"].Role != "" {
-		t.Fatalf("unannounced role materialized: %+v", back.Peers["d1"])
+	if back.Peers["d1"].Role != RoleLearner {
+		t.Fatalf("data-plane role lost through the snapshot encoding: %+v", back.Peers["d1"])
 	}
 	// The restored table plans without the voter: the pool survives a
 	// snapshot, so a restarted cluster never re-seats the control plane.
@@ -225,10 +229,10 @@ func TestMembersViewListsBothPlanes(t *testing.T) {
 }
 
 // TestVoterRefusesUnassignedWrites pins the write-path half of the split:
-// the classic cluster answers an unassigned slot locally (single-node shape),
-// but a node the directory knows as a pure control node must refuse — its
-// WAL growing an unknown seq space is exactly the contamination the layout
-// rule exists to keep off the control plane.
+// a node that has not announced a role yet answers an unassigned slot
+// locally (the bootstrap window), but a node the directory knows as a pure
+// control node must refuse — its WAL growing an unknown seq space is exactly
+// the contamination the layout rule exists to keep off the control plane.
 func TestVoterRefusesUnassignedWrites(t *testing.T) {
 	e, _ := newTestEngine(t, "node-1")
 	e.tableMu.Lock()
@@ -266,5 +270,51 @@ func TestVoterRefusesUnassignedWrites(t *testing.T) {
 	}
 	if out[0] == out[1] {
 		t.Fatal("batch records share one response object; each wire answer must be its own")
+	}
+}
+
+// TestRolesAreRequired pins the two-role-only model: voter and learner are
+// the only shapes a node can take, every boundary (the -role flag through
+// NormalizeRole, admissions, adoption offers, registrations) refuses a
+// missing or third-role name, and directory entries only host when their
+// announced role is learner.
+func TestRolesAreRequired(t *testing.T) {
+	for _, bad := range []string{"", "both", "control", "Voter"} {
+		if _, err := NormalizeRole(bad); err == nil {
+			t.Fatalf("NormalizeRole(%q) accepted a non-role", bad)
+		}
+	}
+	for _, ok := range []string{RoleVoter, RoleLearner} {
+		if got, err := NormalizeRole(ok); err != nil || got != ok {
+			t.Fatalf("NormalizeRole(%q) = %q, %v", ok, got, err)
+		}
+	}
+
+	e := newLeaderEngine(t)
+	ctx := context.Background()
+	if err := e.AddMember(ctx, "node-8", "127.0.0.1:9908", ""); !errors.Is(err, ErrBadMember) {
+		t.Fatalf("AddMember without a role: %v, want ErrBadMember", err)
+	}
+	if err := e.AddMember(ctx, "node-8", "127.0.0.1:9908", "both"); !errors.Is(err, ErrBadMember) {
+		t.Fatalf("AddMember with the removed both role: %v, want ErrBadMember", err)
+	}
+	// An adoption offer must name its shape too.
+	if err := e.acceptAdoption(ctx, &Adoption{ID: "node-8", PeerAddr: "127.0.0.1:9908"}); err == nil {
+		t.Fatal("role-less adoption offer accepted")
+	}
+	// ...and so must a registration announcement.
+	if err := e.acceptRegistration(&Registration{ID: "node-1", AdminAddr: "127.0.0.1:9001", ClientAddr: "127.0.0.1:9001"}); err == nil {
+		t.Fatal("role-less registration accepted")
+	}
+
+	// A directory entry only hosts when its announced role is learner:
+	// even with a client address, a voter — or an entry that never
+	// announced a role — stays out of the layout pool.
+	tbl := NewTable(8, 2)
+	tbl.Peers["v"] = Peer{ID: "v", ClientAddr: "http://v:8591", Role: RoleVoter}
+	tbl.Peers["s"] = Peer{ID: "s", ClientAddr: "http://s:8591"}
+	tbl.Peers["d"] = Peer{ID: "d", ClientAddr: "http://d:8591", Role: RoleLearner}
+	if got := tbl.HostingIDs(); len(got) != 1 || got[0] != "d" {
+		t.Fatalf("HostingIDs = %v, want only the learner", got)
 	}
 }

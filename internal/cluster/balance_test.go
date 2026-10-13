@@ -32,7 +32,7 @@ func rebalanceTable(nodes ...string) *Table {
 	for _, id := range nodes {
 		// tests model ONLINE members by default: the ring anchors on the
 		// self-announced client addr (see OnlinePeerIDs).
-		tbl.Peers[id] = Peer{ID: id, ClientAddr: "http://" + id + ":8591"}
+		tbl.Peers[id] = Peer{Role: RoleLearner, ID: id, ClientAddr: "http://" + id + ":8591"}
 	}
 	tbl.Slots = PlanSlots(nodes, tbl.SlotCount, 2)
 	return tbl
@@ -84,8 +84,8 @@ func TestPlanLeaderRebalanceRingAnchored(t *testing.T) {
 	// is the case the rebalancer exists for. The join seed carries no
 	// client addr (the -peers shape); re-entering the ring requires the
 	// re-registration first.
-	apply(&Command{Op: OpJoinNode, Peer: &Peer{ID: "node-1"}})
-	apply(&Command{Op: OpRegister, Peer: &Peer{ID: "node-1", AdminAddr: "http://127.0.0.1:8091", ClientAddr: "http://127.0.0.1:8591"}})
+	apply(&Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: "node-1"}})
+	apply(&Command{Op: OpRegister, Peer: &Peer{Role: RoleLearner, ID: "node-1", AdminAddr: "http://127.0.0.1:8091", ClientAddr: "http://127.0.0.1:8591"}})
 	apply(&Command{Op: OpReplanSlots})
 	moves = PlanLeaderRebalance(tbl)
 	if len(moves) != 3 {
@@ -144,7 +144,7 @@ func TestPlanLeaderRebalanceIgnoresWhatItMustNotTouch(t *testing.T) {
 
 	// Single node: nothing to rebalance between.
 	single := NewTable(4, 1)
-	single.Peers["node-1"] = Peer{ID: "node-1"}
+	single.Peers["node-1"] = Peer{Role: RoleLearner, ID: "node-1"}
 	single.Slots = PlanSlots([]string{"node-1"}, 4, 1)
 	if moves := PlanLeaderRebalance(single); moves != nil {
 		t.Fatalf("single-node plan: %v", moves)
@@ -159,7 +159,7 @@ func TestPlanLeaderRebalanceSkipsOfflinePeers(t *testing.T) {
 	// onto it. Here node-3 is offline in that sense: the plan treats the
 	// cluster as a 2-node ring.
 	tbl := rebalanceTable("node-1", "node-2", "node-3")
-	tbl.Peers["node-3"] = Peer{ID: "node-3"} // no ClientAddr: offline
+	tbl.Peers["node-3"] = Peer{Role: RoleLearner, ID: "node-3"} // no ClientAddr: offline
 	// Everything piled on node-1 (an outage's worst shape): with node-3
 	// offline the online ring is node-1/node-2, so the plan must shed the
 	// ODD slots to node-2 and never touch node-3 — neither as a target nor
@@ -183,7 +183,7 @@ func TestPlanLeaderRebalanceSkipsOfflinePeers(t *testing.T) {
 	}
 	// once node-3 re-registers, the 3-node ring is authoritative again and
 	// the plan hands node-3's own slots back to it
-	tbl.Peers["node-3"] = Peer{ID: "node-3", ClientAddr: "http://node-3:8591"}
+	tbl.Peers["node-3"] = Peer{Role: RoleLearner, ID: "node-3", ClientAddr: "http://node-3:8591"}
 	var back int
 	for _, m := range PlanLeaderRebalance(tbl) {
 		if m.To == "node-3" {
@@ -300,17 +300,17 @@ func TestRebalanceHandBackEndToEnd(t *testing.T) {
 		// the PeerAddr from the raft config; registration patches the
 		// self-announced admin/client addrs in place. node-3 gets an address
 		// nobody listens on, so its liveness gate genuinely fires.
-		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-1", PeerAddr: oldAddr}})
-		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-2", PeerAddr: newAddr}})
-		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-3", PeerAddr: "127.0.0.1:9"}})
-		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-1", AdminAddr: oldAddr, ClientAddr: oldAddr}})
-		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-2", AdminAddr: newAddr, ClientAddr: newAddr}})
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: "node-1", PeerAddr: oldAddr}})
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: "node-2", PeerAddr: newAddr}})
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: "node-3", PeerAddr: "127.0.0.1:9"}})
+		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{Role: RoleLearner, ID: "node-1", AdminAddr: oldAddr, ClientAddr: oldAddr}})
+		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{Role: RoleLearner, ID: "node-2", AdminAddr: newAddr, ClientAddr: newAddr}})
 		// node-3 announces a client addr NOBODY listens on: it counts as
 		// online (so it enters the ring), and the liveness gate fires for
 		// real when a round tries to move leadership onto it. An
 		// UNregistered peer would not even be planned — see
 		// TestPlanLeaderRebalanceSkipsOfflinePeers.
-		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-3", AdminAddr: "127.0.0.1:9", ClientAddr: "127.0.0.1:9"}})
+		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{Role: RoleLearner, ID: "node-3", AdminAddr: "127.0.0.1:9", ClientAddr: "127.0.0.1:9"}})
 		// The hand-back needs each slot to carry a replica on another node,
 		// which is what the ring layout over three members gives; the
 		// fixture states it instead of relying on a startup default.
@@ -373,8 +373,8 @@ func TestRebalanceHandBackEndToEnd(t *testing.T) {
 	// they are equivalent already — and the batch limit (1) must stop the
 	// round after the first one of them.
 	for _, e := range []*Engine{old, neu} {
-		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-1", PeerAddr: oldAddr}})
-		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-1", AdminAddr: oldAddr, ClientAddr: oldAddr}})
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: "node-1", PeerAddr: oldAddr}})
+		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{Role: RoleLearner, ID: "node-1", AdminAddr: oldAddr, ClientAddr: oldAddr}})
 		applyCmd(t, e, &Command{Op: OpReplanSlots})
 	}
 	if p, _ := neu.TableSnapshot().Slots[slot0]; p.Leader != "node-2" || !replicaListHas(p.Replicas, "node-1") {
@@ -680,8 +680,8 @@ func TestFactorOneGrowthConvergesEndToEnd(t *testing.T) {
 	// cluster is clamped to whatever the policy is), the full plan run before
 	// the second member existed.
 	for _, e := range []*Engine{old, neu} {
-		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-1", PeerAddr: oldAddr}})
-		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-1", AdminAddr: oldAddr, ClientAddr: oldAddr}})
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: "node-1", PeerAddr: oldAddr}})
+		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{Role: RoleLearner, ID: "node-1", AdminAddr: oldAddr, ClientAddr: oldAddr}})
 		pinReplicas(t, e, 1)
 		applyCmd(t, e, &Command{Op: OpPlanSlots})
 	}
@@ -705,8 +705,8 @@ func TestFactorOneGrowthConvergesEndToEnd(t *testing.T) {
 
 	// node-2 joins: join + register + the controller's replan.
 	for _, e := range []*Engine{old, neu} {
-		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-2", PeerAddr: newAddr}})
-		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: "node-2", AdminAddr: newAddr, ClientAddr: newAddr}})
+		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: "node-2", PeerAddr: newAddr}})
+		applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{Role: RoleLearner, ID: "node-2", AdminAddr: newAddr, ClientAddr: newAddr}})
 		applyCmd(t, e, &Command{Op: OpReplanSlots})
 	}
 	if p := neu.TableSnapshot().Slots[moved]; p.Leader != "node-1" || !replicaListHas(p.Replicas, "node-2") {
@@ -847,8 +847,8 @@ func reclaimHarness(t *testing.T) (*Engine, map[string]*Engine, map[string]*stor
 	for _, id := range ids {
 		e := engines[id]
 		for _, p := range ids {
-			applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: p, PeerAddr: addrs[p]}})
-			applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: p, AdminAddr: addrs[p], ClientAddr: addrs[p]}})
+			applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: p, PeerAddr: addrs[p]}})
+			applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{Role: RoleLearner, ID: p, AdminAddr: addrs[p], ClientAddr: addrs[p]}})
 		}
 		applyCmd(t, e, &Command{Op: OpConfig, Replicas: 2})
 		applyCmd(t, e, &Command{Op: OpPlanSlots})
@@ -950,7 +950,7 @@ func TestReclaimParksAnUnreachablePeerButStillRetiresTheRest(t *testing.T) {
 	}
 
 	// node-4 answers no probe: unregister its peer address.
-	applyCmd(t, ctr, &Command{Op: OpJoinNode, Peer: &Peer{ID: "node-4", PeerAddr: ""}})
+	applyCmd(t, ctr, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: "node-4", PeerAddr: ""}})
 
 	// Both slots carry a surplus seat that is redundant on its own terms: the
 	// seats that stay hold the same data.
@@ -1027,8 +1027,8 @@ func TestReclaimRoundDropsSurplusSeat(t *testing.T) {
 	for _, id := range ids {
 		e := engines[id]
 		for _, p := range ids {
-			applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{ID: p, PeerAddr: addrs[p]}})
-			applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{ID: p, AdminAddr: addrs[p], ClientAddr: addrs[p]}})
+			applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: p, PeerAddr: addrs[p]}})
+			applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{Role: RoleLearner, ID: p, AdminAddr: addrs[p], ClientAddr: addrs[p]}})
 		}
 		applyCmd(t, e, &Command{Op: OpConfig, Replicas: 2})
 		applyCmd(t, e, &Command{Op: OpPlanSlots})

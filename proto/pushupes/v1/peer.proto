@@ -156,8 +156,8 @@ message RegisterRequest {
   string id = 1;
   string admin_addr = 2;  // management HTTP base (scheme carried)
   string client_addr = 3; // client-facing gRPC base (scheme carried)
-  string role = 4;        // self-announced place in the cluster: voter /
-                          // learner / both ("" = both, the classic shape)
+  string role = 4;        // self-announced place in the cluster, required:
+                          // voter or learner
 }
 message RegisterResponse {}
 
@@ -167,8 +167,8 @@ message RegisterResponse {}
 message AdoptRequest {
   string id = 1;
   string peer_addr = 2;
-  string role = 3; // the role to be admitted with ("" = voter, the
-                   // classic every-node-votes shape)
+  string role = 3; // the role to be admitted with, required: voter or
+                   // learner
 }
 message AdoptResponse {}
 

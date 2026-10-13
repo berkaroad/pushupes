@@ -654,7 +654,7 @@ type RegisterRequest struct {
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
 	AdminAddr     string                 `protobuf:"bytes,2,opt,name=admin_addr,json=adminAddr,proto3" json:"admin_addr,omitempty"`    // management HTTP base (scheme carried)
 	ClientAddr    string                 `protobuf:"bytes,3,opt,name=client_addr,json=clientAddr,proto3" json:"client_addr,omitempty"` // client-facing gRPC base (scheme carried)
-	Role          string                 `protobuf:"bytes,4,opt,name=role,proto3" json:"role,omitempty"`                               // self-announced place in the cluster: voter /
+	Role          string                 `protobuf:"bytes,4,opt,name=role,proto3" json:"role,omitempty"`                               // self-announced place in the cluster, required:
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -760,7 +760,7 @@ type AdoptRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
 	PeerAddr      string                 `protobuf:"bytes,2,opt,name=peer_addr,json=peerAddr,proto3" json:"peer_addr,omitempty"`
-	Role          string                 `protobuf:"bytes,3,opt,name=role,proto3" json:"role,omitempty"` // the role to be admitted with ("" = voter, the
+	Role          string                 `protobuf:"bytes,3,opt,name=role,proto3" json:"role,omitempty"` // the role to be admitted with, required: voter or
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

@@ -287,10 +287,10 @@ export default function ClusterPage() {
   const savePolicy = () => {
     const st = statusRef.current
     const cur = (st?.replica_policy ?? 'medium') as ReplicaPolicy
-    // 因子按数据面池推导（后端 Table.HostingIDs）：纯控制节点不承载副本，
+    // 因子按数据面池推导（后端 Table.HostingIDs）：voter 不承载副本，
     // 不进这个数。
     const dataNodes = st
-      ? Object.values(st.peers).filter((p) => p.role !== 'voter' && p.client_addr).length
+      ? Object.values(st.peers).filter((p) => p.role === 'learner' && p.client_addr).length
       : 0
     const from = st?.replica_factor ?? replicaFactorFor(cur, dataNodes)
     const to = replicaFactorFor(policyDraft, dataNodes)
@@ -415,8 +415,8 @@ export default function ClusterPage() {
 
   const peers = Object.values(status.peers)
   // 数据面池规模——副本因子就是按这个数推导的（后端 Table.HostingIDs 口径：
-  // 非纯控制、且已自报 client 地址的成员）。
-  const dataNodes = peers.filter((p) => p.role !== 'voter' && p.client_addr).length
+  // 自报 learner 角色、且已上报 client 地址的成员）。
+  const dataNodes = peers.filter((p) => p.role === 'learner' && p.client_addr).length
   // The summary row splits the fleet by plane: control nodes are the raft
   // voters, data nodes the learners; each card counts online members with the
   // cluster's own offline rule (isOnlinePeer).

@@ -95,7 +95,7 @@ func TestStorageGaugeSumsLeaderCopies(t *testing.T) {
 	// A leader that cannot be reached leaves the sample partial instead of
 	// failing it: the bytes that were collected still show up.
 	self.tableMu.Lock()
-	self.table.Peers["node-2"] = Peer{ID: "node-2", PeerAddr: "127.0.0.1:1"}
+	self.table.Peers["node-2"] = Peer{Role: RoleLearner, ID: "node-2", PeerAddr: "127.0.0.1:1"}
 	self.tableMu.Unlock()
 	self.refreshStorage()
 	bytes, complete = self.ClusterStorageBytes()

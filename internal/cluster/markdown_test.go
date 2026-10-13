@@ -23,7 +23,7 @@ import (
 func markdownTable() *Table {
 	tbl := NewTable(8, 2)
 	for _, id := range []string{"node-1", "node-2", "node-3"} {
-		tbl.Peers[id] = Peer{ID: id, PeerAddr: "http://" + id + ":8391",
+		tbl.Peers[id] = Peer{Role: RoleLearner, ID: id, PeerAddr: "http://" + id + ":8391",
 			AdminAddr: "http://" + id + ":8091", ClientAddr: "http://" + id + ":8591"}
 	}
 	tbl.Slots = PlanSlots([]string{"node-1", "node-2", "node-3"}, 8, 2)
@@ -135,9 +135,9 @@ func TestOfflinePeerLeavesTheRebalanceRing(t *testing.T) {
 // clients can reach when one exists in the set.
 func TestBackupLeaderPrefersActive(t *testing.T) {
 	tbl := NewTable(2, 2)
-	tbl.Peers["node-1"] = Peer{ID: "node-1", ClientAddr: "http://node-1:8591"}
-	tbl.Peers["node-2"] = Peer{ID: "node-2"} // joined, not registered: offline shell
-	tbl.Peers["node-3"] = Peer{ID: "node-3", ClientAddr: "http://node-3:8591"}
+	tbl.Peers["node-1"] = Peer{Role: RoleLearner, ID: "node-1", ClientAddr: "http://node-1:8591"}
+	tbl.Peers["node-2"] = Peer{Role: RoleLearner, ID: "node-2"} // joined, not registered: offline shell
+	tbl.Peers["node-3"] = Peer{Role: RoleLearner, ID: "node-3", ClientAddr: "http://node-3:8591"}
 	tbl.Slots[0] = &Placement{Leader: "node-1", Replicas: []string{"node-2", "node-1", "node-3"}, Epoch: 1}
 	if err := tbl.Apply(&Command{Op: OpMarkDown, NodeID: "node-1"}); err != nil {
 		t.Fatal(err)

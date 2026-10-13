@@ -43,8 +43,16 @@ admin_port() { echo $((ADMIN_BASE + $1 - 1)); }
 base_url()   { echo "http://$HOST:$(admin_port "$1")"; }
 node_dir()   { echo "$RUN_DIR/node-$1"; }
 
-# 每个节点的角色来自 ROLE_<n>（与 cluster.sh 同源）。
-node_n_role() { local v="ROLE_$1"; printf '%s' "${!v:-}"; }
+# 每个节点的角色来自 ROLE_<n>（与 cluster.sh 同源：默认 node-1=voter、其余=learner）。
+# 序号超过 REPLICAS 的是运行时加入者，没有显式 ROLE_<n> 就没有角色 —— 否则
+# data_nodes 会把空序号也当成 learner 数进降级计划。
+node_n_role() {
+  local v="ROLE_$1"; local r="${!v:-}"
+  if [[ -z "$r" && "$1" -le "$REPLICAS" ]]; then
+    if [[ "$1" == "1" ]]; then r=voter; else r=learner; fi
+  fi
+  printf '%s' "$r"
+}
 
 control_nodes() {
   if [[ -n "${CONTROL_NODES:-}" ]]; then printf '%s\n' $CONTROL_NODES; return; fi
