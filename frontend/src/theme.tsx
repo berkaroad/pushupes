@@ -36,6 +36,11 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
         locale={zhCN}
         theme={{
           algorithm: mode === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm,
+          components: {
+            // 统计卡的数值 16px：比标签（fontSize=14）大一档保住「值」的层级，
+            // 又不去扛 antd 默认的 24px 大数字——控制台走「标签-值」紧凑阅读。
+            Statistic: { contentFontSize: 16 },
+          },
         }}
       >
         <App>{children}</App>

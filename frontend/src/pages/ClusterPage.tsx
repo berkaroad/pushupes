@@ -504,16 +504,17 @@ export default function ClusterPage() {
         )}
       </Card>
       {/* The node directory split by plane. Control on top: voters get a row
-          of three PLAIN cards — no rate chart and no flow control (a voter
-          never leads writes; flow control is a data-plane face) — and the
-          answering node keeps its 当前 tag here, where it lives. Below it the
+          of TWO PLAIN cards (same span as the data cards below) — no rate
+          chart and no flow control (a voter never leads writes; flow control
+          is a data-plane face) — and the answering node keeps its 当前 tag
+          here, where it lives. Below it the
           data plane: learners get two full cards per row, and 当前 is gone
           from them (the answering node is a control member). Neither block
           carries membership actions: add and remove are CLI operations. */}
       <Card title="控制节点">
         <Row gutter={[16, 16]}>
           {controlPeers.map((p) => (
-            <Col span={8} key={p.id}>
+            <Col span={12} key={p.id}>
               <PeerCard peer={p} current={p.id === status.node} slots={leaderCount[p.id] ?? 0} plain />
             </Col>
           ))}

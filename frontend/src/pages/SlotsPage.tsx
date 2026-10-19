@@ -336,8 +336,17 @@ export default function SlotsPage() {
   if (!status) return null
 
   const nodeIDs = Object.keys(status.peers)
+  // 数据面成员（learner ∪ both，即后端 HostingIDs 的角色半边）：只有它们承载
+  // 槽副本、可能成为某槽的 leader——Leader 过滤下拉列它们，纯控制节点（voter）
+  // 不进候选（选了也永远过滤不出结果）。迁移目标选择器仍用全目录。
+  const dataNodeIDs = nodeIDs.filter((id) => status.peers[id].role !== 'voter')
   const columns: ColumnsType<(typeof rows)[number]> = [
-    { title: 'Slot', dataIndex: 'slot', width: 80, sorter: (a, b) => a.slot - b.slot },
+    {
+      // 详情入口就是槽号本身（按钮换成单元格超链接，抽屉逻辑不动）。
+      // 表头排序不受影响——链接只接管点击，排序仍归列头。
+      title: 'Slot', dataIndex: 'slot', width: 80, sorter: (a, b) => a.slot - b.slot,
+      render: (v: number) => <Typography.Link onClick={() => openDetail(v)}>{v}</Typography.Link>,
+    },
     {
       title: '状态', dataIndex: 'state', width: 120,
       render: (v: string) => <Tag color={stateColor[v] ?? 'default'}>{v}</Tag>,
@@ -366,14 +375,9 @@ export default function SlotsPage() {
       },
     },
     {
-      title: '迁移目标', dataIndex: 'migrating_to', width: 110,
-      render: (v?: string) => v ?? '-',
-    },
-    {
-      title: '操作', key: 'ops', width: 250,
+      title: '操作', key: 'ops', width: 180,
       render: (_, r) => (
         <Space>
-          <Button size="small" onClick={() => openDetail(r.slot)}>详情</Button>
           <Button size="small" onClick={() => openStreams(r.slot)}>事件流</Button>
           <Button size="small" type="link" onClick={() => {
             setMigrate({ slot: r.slot, placement: { leader: r.leader, replicas: r.replicas, epoch: r.epoch, state: r.state } })
@@ -407,12 +411,15 @@ export default function SlotsPage() {
           options={[{ value: 'all', label: '全部' }, ...Object.keys(stateColor).map((k) => ({ value: k, label: k }))]} />
         <Typography.Text>Leader</Typography.Text>
         <Select value={filterLeader} style={{ width: 160 }} onChange={setFilterLeader}
-          options={[{ value: 'all', label: '全部' }, ...nodeIDs.map((n) => ({ value: n, label: n }))]} />
+          options={[{ value: 'all', label: '全部' }, ...dataNodeIDs.map((n) => ({ value: n, label: n }))]} />
         <Button onClick={refresh}>刷新</Button>
         <Typography.Text type="secondary">共 {rows.length} / {Object.keys(status.slots).length} 槽</Typography.Text>
       </Space>
+      {/* pageSize would CONTROL the size (rc-pagination treats the prop as the
+          live value and the size changer's choice never sticks); defaultPageSize
+          seeds it uncontrolled so the changer owns the state afterwards. */}
       <Table rowKey="slot" size="small" columns={columns} dataSource={rows}
-        pagination={{ pageSize: 32, showSizeChanger: true, pageSizeOptions: [16, 32, 64, 128] }} />
+        pagination={{ defaultPageSize: 32, showSizeChanger: true, pageSizeOptions: [16, 32, 64, 128] }} />
 
       <Drawer open={!!detail} onClose={() => setDetail(null)} width={480}
         title={detail ? `Slot ${detail.slot}` : ''}>

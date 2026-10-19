@@ -50,6 +50,18 @@ assert('light token bg is #fff', tkLight.colorBgContainer === '#ffffff')
 assert('dark token bg is #141414', tkDark.colorBgContainer === '#141414')
 assert('dark differs from light', tkLight.colorBgLayout !== tkDark.colorBgLayout)
 
+// Statistic values sit one step above the label: the stat cards are a
+// label/value grid, and antd's default content font (fontSizeHeading3 = 24)
+// dwarfs the 14px title. ThemeProvider — the wrapper main.tsx puts around the
+// whole App — sets the component token once (16px: above the 14px title, far
+// lighter than 24), so every Statistic (today: the cluster page's eight
+// cards) reads 16 in BOTH themes; the algorithms do not override it, which is
+// why the default-size assertion below holds for both token sets.
+const { ThemeProvider } = await vite.ssrLoadModule('/src/theme.tsx')
+assert('the theme pins the Statistic content size', String(ThemeProvider).includes('Statistic: { contentFontSize: 16 }'))
+assert('the size it overrides is 24px by default',
+  tkLight.fontSizeHeading3 === 24 && tkDark.fontSizeHeading3 === 24)
+
 assert('slots route renders', renderRoute('/slots', 'light').length > 0)
 
 // The console's stream listing goes through this helper; when a cluster is
@@ -119,12 +131,12 @@ assert('the two cards count voters and learners',
   pageSrc.includes('role === "voter"') && pageSrc.includes('role === "learner"'))
 assert('the summary row is four span-6 cards', (pageSrc.match(/span: 6/g) ?? []).length === 4)
 // The node directory splits into two blocks: 控制节点 on top (voters as
-// plain cards — no chart, no flow control — three per row, the answering
-// node keeps 当前 here) and 数据节点 below (learners as full cards, two per
-// row, no 当前). The merged 节点 title is gone.
+// plain cards — no chart, no flow control — two per row like the data
+// block, the answering node keeps 当前 here) and 数据节点 below (learners
+// as full cards, two per row, no 当前). The merged 节点 title is gone.
 assert('the plain node block is gone', !pageSrc.includes('title: "节点"'))
 assert('the node blocks carry the split grids',
-  (pageSrc.match(/span: 8/g) ?? []).length === 1 && (pageSrc.match(/span: 12/g) ?? []).length === 3
+  (pageSrc.match(/span: 8/g) ?? []).length === 0 && (pageSrc.match(/span: 12/g) ?? []).length === 4
   && pageSrc.includes('plain'))
 assert('当前 rides the control block only',
   (pageSrc.match(/current: p\.id === status\.node/g) ?? []).length === 1)
@@ -152,6 +164,36 @@ const { default: SlotsPage } = await vite.ssrLoadModule('/src/pages/SlotsPage.ts
 const slotsSrc = String(SlotsPage)
 assert('the slot drawer lists each stream\'s latest UTC time',
   slotsSrc.includes('最近UTC时间') && slotsSrc.includes('unix_time') && slotsSrc.includes('utcStamp'))
+// The 迁移目标 column is gone: a migrating slot already names its target —
+// the incoming replica shows in the 副本集 tags, the state sits in the status
+// column — so a dedicated column was pure extra width. Pinned out (both the
+// title string and the backend field name) so it cannot creep back.
+assert('the migration-target column is gone',
+  !slotsSrc.includes('迁移目标') && !slotsSrc.includes('migrating_to'))
+// The detail entry is the Slot cell itself (Typography.Link -> openDetail);
+// the old 详情 button in the ops column is gone — pinned in the compiled
+// children form so it cannot come back as a button.
+assert('the detail entry is the Slot column link',
+  slotsSrc.includes('Typography.Link') && slotsSrc.includes('openDetail(v)'))
+assert('the 详情 button is gone', !slotsSrc.includes('children: "详情"'))
+// The slot table's page-size changer must actually take effect. A controlled
+// `pageSize` prop makes rc-pagination pin the size and discard the user's
+// choice (the bug: changing page size did nothing), so the table seeds
+// `defaultPageSize` and lets the changer own the state. The drawer's stream
+// table keeps a hardcoded `pageSize: 20` on purpose (no size changer shown),
+// so the assertion targets the row table's non-controlled seed, not the
+// presence of any `pageSize`.
+assert('the slot table seeds page size uncontrolled',
+  slotsSrc.includes('defaultPageSize: 32') && !slotsSrc.includes('pagination: { pageSize: 32'))
+// The Leader filter's candidate list is the DATA plane (learner ∪ both —
+// the role half of the backend's HostingIDs): a pure control voter can never
+// lead a slot, so listing it offered options that always filtered to nothing.
+// Pinned both ways: the Select maps the filtered set, and the directory-wide
+// `nodeIDs.map` is gone from this control (the migrate-target picker keeps
+// `nodeIDs.filter` on purpose).
+assert('the Leader filter lists data-plane members only',
+  slotsSrc.includes('role !== "voter"') && slotsSrc.includes('dataNodeIDs.map')
+  && !slotsSrc.includes('nodeIDs.map'))
 const liveAdmin = (process.env.PUSHUPES_ADMIN ?? '').trim()
 if (liveAdmin) {
   try {
