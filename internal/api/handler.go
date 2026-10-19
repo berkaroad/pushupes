@@ -300,6 +300,12 @@ func (s *Server) handleWrites(w http.ResponseWriter, r *http.Request) {
 		// console asks every node and marks the replica whose copy is on its
 		// way out. Same shape as bytes/streams.
 		"dropping": s.Engine.PendingDrops(),
+		// Sync gauge for the console's 同步状态 card: [slots this node leads,
+		// of those ones converged on the table's replica factor — replica set
+		// AND in-sync copies (leader included, see Engine.SyncedLeaderSlots)
+		// both reaching it]. The console sums the pair across the fleet and
+		// subtracts from slot_count: what is left is still building.
+		"synced_slots": func() []int { led, synced := s.Engine.SyncedLeaderSlots(); return []int{led, synced} }(),
 		// Flow control (node-level throttle of this node's slot leaders):
 		// the config currently in force, and the per-slot cumulative
 		// rejection counts index-aligned with writes. The console diffs

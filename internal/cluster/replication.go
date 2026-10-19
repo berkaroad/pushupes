@@ -2289,6 +2289,53 @@ func (e *Engine) RaftStats() map[string]any {
 // ISR exposes the in-sync replica set (public form for the admin API).
 func (e *Engine) ISR(slot int32) []string { return e.isr(slot) }
 
+// SyncedLeaderSlots is the fleet gauge behind the console's 同步状态 card:
+// (led, synced) over the slots THIS node leads — the handler pairs it with
+// slot_count so the console can say how many slots the WHOLE cluster has not
+// converged on yet. A leading slot counts as synced only when BOTH the
+// placement's replica set reaches the table's replica factor AND the in-sync
+// copies reach it too: this leader (it owns the log, the same convention the
+// ack promise uses — isr() lists followers only) plus every follower holding
+// a fresh, non-building, still-served, not-down position (exactly isr()'s
+// set). A seat the re-plan just seated is building — it COUNTS the placement
+// but not the sync — so this gauge is precisely the 构建中 window the card
+// names, and the low tier (factor 1) reads synced by construction: the
+// leader alone satisfies both halves.
+//
+// One lock hold for the whole sweep (replMu -> tableMu, the order noteSeatAges
+// already uses): the poller runs it against every node every 2s, and a
+// per-slot isr()/peerDown() walk would be thousands of lock round-trips.
+func (e *Engine) SyncedLeaderSlots() (led, synced int) {
+	e.replMu.Lock()
+	defer e.replMu.Unlock()
+	e.tableMu.RLock()
+	defer e.tableMu.RUnlock()
+	factor := e.table.Replicas
+	cutoff := time.Now().Add(-isrStaleAfter)
+	for s, p := range e.table.Slots {
+		if p == nil || p.Leader != e.self {
+			continue
+		}
+		led++
+		if len(p.Replicas) < factor {
+			continue // the placement itself is still short of the factor
+		}
+		inSync := 1 // this leader owns the slot's log
+		if sr := e.repl[s]; sr != nil {
+			for i, node := range sr.node {
+				if sr.lastOK[i].After(cutoff) && !sr.isBuilding(node) &&
+					!e.sessionGone(node, sr.lastOK[i]) && !e.table.Peers[node].Down {
+					inSync++
+				}
+			}
+		}
+		if inSync >= factor {
+			synced++
+		}
+	}
+	return led, synced
+}
+
 // SubmitCommand is the exported Raft submission entry point (admin triggers
 // like the slot re-plan). It is controller-only: on a follower it refuses with
 // a *NotControllerError naming the controller (node id + admin address) —

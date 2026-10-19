@@ -127,6 +127,13 @@ export interface NodeWrites {
   // at which that node drops its local copy of the slot. Per-node by nature —
   // the console marks a replica from the node that reported it.
   dropping?: number[]
+  // The 同步状态 gauge: [slots THIS node leads, of those ones converged on the
+  // table's replica factor — replica set AND in-sync copies (leader included)
+  // both reaching it; backend Engine.SyncedLeaderSlots]. The cluster page sums
+  // the pair across the nodes and subtracts the synced part from slot_count:
+  // what remains is still building. Absent from older nodes — the card shows
+  // '-' then.
+  synced_slots?: number[]
   // Node-level flow control (throttle of this node's slot leaders).
   // `flow_control` is the config in force (configured=true drives the node
   // card's 流控 tag); `flow_control_hits` is the per-slot cumulative

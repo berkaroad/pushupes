@@ -1307,3 +1307,58 @@ func TestConcurrentMFetchRoundsDoNotShareTheScanBuffer(t *testing.T) {
 // back to the deterministic table-only rule (the first live replica). The pick
 // travels in the replicated command, so every node must reach the same verdict
 // from the same table.
+
+// TestSyncedLeaderSlotsGauge pins the /admin/writes sync gauge that feeds the
+// console's 同步状态 card: this node counts its leading slots, and a slot
+// counts as converged only when the replica set AND the in-sync copies (the
+// leader included — isr() lists followers) both reach the table's factor.
+func TestSyncedLeaderSlotsGauge(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	pinReplicas(t, e, 2)
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	// Factor 2 over the two members: node-1 leads half the table, but no
+	// follower has ever reported — every leading slot is placed-but-not-in-
+	// sync, which is exactly the 构建中 window the card names.
+	led, synced := e.SyncedLeaderSlots()
+	if led == 0 || synced != 0 {
+		t.Fatalf("before any follower report: led=%d synced=%d, want led>0 and synced=0", led, synced)
+	}
+
+	// One write on a slot this node leads, and the follower's report reaching
+	// the leader's LEO makes its seat in-sync: that slot has both halves at
+	// the factor — replica set {leader, follower} and in-sync {leader,
+	// follower}.
+	aggH := aggInSlot(t, e, 0)
+	if _, err := st.Append(makeRecord(aggH, 1, "g-1")); err != nil {
+		t.Fatal(err)
+	}
+	e.NoteReplicaProgress(0, "node-2", 1)
+	led2, synced2 := e.SyncedLeaderSlots()
+	if led2 != led {
+		t.Fatalf("led count moved with a progress report: %d want %d", led2, led)
+	}
+	if synced2 != 1 {
+		t.Fatalf("after one converged slot: synced=%d want 1", synced2)
+	}
+
+	// The low tier (factor 1): the leader alone satisfies both halves, so
+	// every slot this node leads reads converged at once — 同步中 with no
+	// follower report at all.
+	pinReplicas(t, e, 1)
+	led3, synced3 := e.SyncedLeaderSlots()
+	if led3 != led || synced3 != led3 {
+		t.Fatalf("factor 1: led=%d synced=%d want both %d", led3, synced3, led)
+	}
+
+	// A marked-down follower drops out of the in-sync set again: the slot
+	// falls back to 构建中 at factor 2, because the card must not vouch for
+	// copies the cluster cannot currently reach.
+	pinReplicas(t, e, 2)
+	applyCmd(t, e, &Command{Op: OpMarkDown, NodeID: "node-2"})
+	if _, synced4 := e.SyncedLeaderSlots(); synced4 != 0 {
+		t.Fatalf("after downing the follower: synced=%d want 0", synced4)
+	}
+}

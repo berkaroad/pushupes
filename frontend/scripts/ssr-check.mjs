@@ -151,6 +151,13 @@ assert('write-speed is two cards, not one',
   pageSrc.includes('写入速度（数量）') && pageSrc.includes('写入速度（大小）')
   && !pageSrc.includes('写入速度（数量 / 大小）'))
 assert('write-speed sums at slot leaders', pageSrc.includes('leaderWriteTotals'))
+// The 同步状态 card rides the same 2s writes poll: the page reads each node's
+// synced_slots pair and names the three states (pinning the compiled forms
+// of both the state strings and the remaining-slots template).
+assert('the sync-state card is wired to the writes poll',
+  pageSrc.includes('同步状态') && pageSrc.includes('synced_slots'))
+assert('the sync state renders 同步中 / 构建中（剩余 …）',
+  pageSrc.includes('同步中') && pageSrc.includes('构建中（剩余 '))
 assert('write-speed polls the light counters endpoint', pageSrc.includes('fetchNodeWrites'))
 assert('write-speed reads the byte counters', pageSrc.includes('write_bytes'))
 const { humanBytes, humanBytesPerSec, utcStamp } = await vite.ssrLoadModule('/src/format.ts')
@@ -198,6 +205,15 @@ const liveAdmin = (process.env.PUSHUPES_ADMIN ?? '').trim()
 if (liveAdmin) {
   try {
     const st = await (await fetch(`${liveAdmin}/admin/cluster/status`)).json()
+    // The sync gauge must read back in its pinned shape: a [led, synced]
+    // pair of non-negative ints with synced <= led (a node cannot report
+    // more converged slots than it leads).
+    const w = await (await fetch(`${liveAdmin}/admin/writes`)).json()
+    const pair = w.synced_slots
+    assert('live writes carries synced_slots as [led, synced]',
+      Array.isArray(pair) && pair.length === 2
+      && pair.every((x) => Number.isInteger(x) && x >= 0) && pair[1] <= pair[0])
+    console.log(`  (live sync gauge: led=${pair[0]} synced=${pair[1]} of slot_count=${st.slot_count})`)
     assert('live status carries storage_bytes', typeof st.storage_bytes === 'number')
     assert('live status carries storage_bytes_complete', typeof st.storage_bytes_complete === 'boolean')
     console.log(`  (live probe: storage_bytes=${st.storage_bytes} → ${humanBytes(st.storage_bytes)}, complete=${st.storage_bytes_complete})`)

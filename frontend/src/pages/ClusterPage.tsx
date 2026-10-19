@@ -71,8 +71,12 @@ export default function ClusterPage() {
   // the last one. Timers live in a ref map so a re-arm cancels cleanly.
   const [flowFiring, setFlowFiring] = useState<Record<string, boolean>>({})
   const flowFiringTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
-  // per-node last snapshot of flow_control_hits, keyed by admin addr.
+  // per-node last snapshot of flow_control_hits, keyed by node id.
   const lastFlowHits = useRef<Record<string, number[]>>({})
+  // 同步状态 gauge, summed from this same 2s writes poll: [slots led, slots
+  // converged] across the nodes that reported the pair (see the replica
+  // policy card). Null until the first node answers with the field.
+  const [syncGauge, setSyncGauge] = useState<{ led: number; synced: number } | null>(null)
   const fireFlow = (id: string) => {
     setFlowFiring((m) => (m[id] ? m : { ...m, [id]: true }))
     clearTimeout(flowFiringTimers.current[id])
@@ -173,6 +177,21 @@ export default function ClusterPage() {
         }
         flowConfiguredRef.current = fc
         setFlowConfigured(fc)
+        // Sync gauge: sum the [led, synced] pairs this round's nodes reported
+        // (backend Engine.SyncedLeaderSlots, rides the same /admin/writes poll).
+        // A node that did not answer simply does not contribute — its led
+        // slots then fall into the "remaining" side, the conservative
+        // direction: misreporting 构建中 beats misreporting 同步中.
+        let syncLed = 0, syncSynced = 0, syncSeen = false
+        for (const m of Object.values(perNode)) {
+          const pair = m.synced_slots
+          if (Array.isArray(pair) && pair.length === 2) {
+            syncLed += pair[0]
+            syncSynced += pair[1]
+            syncSeen = true
+          }
+        }
+        if (syncSeen) setSyncGauge({ led: syncLed, synced: syncSynced })
         // A sample counts for the rate only when BOTH totals are complete
         // (every ledged slot answered its writes AND its bytes at its
         // leader). Skipping an incomplete sample rather than storing it
@@ -417,6 +436,13 @@ export default function ClusterPage() {
   // 数据面池规模——副本因子就是按这个数推导的（后端 Table.HostingIDs 口径：
   // 自报 learner 角色、且已上报 client 地址的成员）。
   const dataNodes = peers.filter((p) => p.role === 'learner' && p.client_addr).length
+  // 同步状态（拍板口径）：剩余 = slot_count − Σsynced——未分配、leader 未应答
+  // 的槽都算构建中；纯控制面（无槽可同步）与首个样本前显示 '-'；同步中 =
+  // 每个槽的副本集与 ISR（leader 计入）都达到副本因子（判定在
+  // Engine.SyncedLeaderSlots，与槽抽屉的 ISR 字段同源）。
+  const syncRemaining = status.slot_count - (syncGauge?.synced ?? 0)
+  const syncValue = syncGauge === null || status.slot_count === 0 ? '-'
+    : syncRemaining <= 0 ? '同步中' : `构建中（剩余 ${syncRemaining} 个槽位）`
   // The summary row splits the fleet by plane: control nodes are the raft
   // voters, data nodes the learners; each card counts online members with the
   // cluster's own offline rule (isOnlinePeer).
@@ -495,10 +521,13 @@ export default function ClusterPage() {
             <Space size={24}>
               <Statistic title="策略" value={status.replica_policy ?? '-'} />
               <Statistic title="副本因子" value={status.replica_factor ?? '-'} suffix="份 / 槽" />
+              <Statistic title="同步状态" value={syncValue}
+                valueStyle={syncValue.startsWith('构建中') ? { color: '#faad14' } : undefined} />
             </Space>
             <Typography.Text type="secondary">
               策略写入 Raft 复制的槽表，全集群生效并持久保留；启动参数 -replica-policy 只用于新集群的初始值，
               之后的修改都从这里提交。因子由策略与数据节点数推导（当前 {dataNodes} 个数据节点），控制器每轮把副本集收敛到该因子。
+              同步状态看的是每个槽的副本集与 ISR 是否都达到因子——翻转档位后新席位在追平前，这里如实显示构建中。
             </Typography.Text>
           </Space>
         )}
