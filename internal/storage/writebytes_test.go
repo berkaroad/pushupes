@@ -112,3 +112,68 @@ func TestWriteByteCountsTracksDurableWrites(t *testing.T) {
 		}
 	}
 }
+
+// TestClientWriteCountsOnlyClientPath pins the split the console's 写入速度
+// needs: the client-origin counters grow ONLY on the batch-append serving
+// path, while the catch-up paths (AppendAtSeq, AppendFrameAtSeq — how a
+// replica or a migration target lands a leader's records) move the lifetime
+// counters but never these. Diffing the client pair into a rate is therefore
+// immune to rebalance and migration traffic reading as write speed.
+func TestClientWriteCountsOnlyClientPath(t *testing.T) {
+	st, err := OpenStore(t.TempDir(), 8, DefaultSegmentBytes, FlushPolicy{})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	cw := st.ClientWriteCounts()
+	cb := st.ClientWriteByteCounts()
+	if len(cw) != 8 || len(cb) != 8 {
+		t.Fatalf("fresh store: len=%d/%d, want 8/8", len(cw), len(cb))
+	}
+
+	// The client path moves both families.
+	rec := recFor("agg-client-only", 1, "cmd-c1")
+	out, err := st.Append(rec)
+	if err != nil || out.Status != data.StatusSuccess {
+		t.Fatalf("client append: err=%v status=%v", err, out.Status)
+	}
+	slot := st.SlotOf(rec.AggregateID)
+	if got := st.ClientWriteCounts()[slot]; got != 1 {
+		t.Fatalf("client path: client_writes=%d, want 1", got)
+	}
+	if got := st.ClientWriteByteCounts()[slot]; got != uint64(rec.EncodedSize()) {
+		t.Fatalf("client path: client_bytes=%d, want %d", got, rec.EncodedSize())
+	}
+
+	// Catch-up lands: the lifetime counters move, the client counters do not.
+	rec2 := recFor("agg-client-only-2", 1, "cmd-c2")
+	slot2 := st.SlotOf(rec2.AggregateID)
+	if err := st.AppendAtSeq(slot2, 1, rec2); err != nil {
+		t.Fatalf("append at seq: %v", err)
+	}
+	if st.WriteCounts()[slot2] != 1 || st.ClientWriteCounts()[slot2] != 0 {
+		t.Fatalf("AppendAtSeq: writes=%d client_writes=%d, want 1/0",
+			st.WriteCounts()[slot2], st.ClientWriteCounts()[slot2])
+	}
+	rec3 := recFor("agg-client-only-3", 1, "cmd-c3")
+	frame := rec3.EncodeBinary(nil)
+	slot3 := st.SlotOf(rec3.AggregateID)
+	if err := st.AppendFrameAtSeq(slot3, 1, frame); err != nil {
+		t.Fatalf("append frame at seq: %v", err)
+	}
+	if st.WriteCounts()[slot3] != 1 || st.ClientWriteCounts()[slot3] != 0 || st.ClientWriteByteCounts()[slot3] != 0 {
+		t.Fatalf("AppendFrameAtSeq: writes=%d client=%d/%d, want 1/0/0",
+			st.WriteCounts()[slot3], st.ClientWriteCounts()[slot3], st.ClientWriteByteCounts()[slot3])
+	}
+
+	// A rejected version conflict on the client path counts nowhere — the
+	// split must not quietly become "every Append call counts".
+	if _, err := st.Append(recFor(rec.AggregateID, 1, "cmd-dup")); err != nil {
+		t.Fatalf("conflict append: %v", err)
+	}
+	if st.ClientWriteCounts()[slot] != 1 || st.ClientWriteByteCounts()[slot] != uint64(rec.EncodedSize()) {
+		t.Fatalf("after conflict: client=%d/%d, want 1/%d (unchanged)",
+			st.ClientWriteCounts()[slot], st.ClientWriteByteCounts()[slot], rec.EncodedSize())
+	}
+}

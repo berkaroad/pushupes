@@ -288,6 +288,13 @@ func (s *Server) handleWrites(w http.ResponseWriter, r *http.Request) {
 		// with `writes`: clients diff the two arrays against their last
 		// snapshot to get a message rate and a byte rate for one window.
 		"write_bytes": s.Engine.WriteByteCounts(),
+		// Client-origin counters (see Engine.ClientWriteCounts): the writes
+		// pair above also grows when the catch-up paths land a leader's
+		// records here — node-to-node movement, not client write speed — so
+		// the console diffs THESE for the 写入速度 cards and the node charts.
+		// Index-aligned with `writes`; read at each slot's leader.
+		"client_writes": s.Engine.ClientWriteCounts(),
+		"client_bytes":  s.Engine.ClientWriteByteCounts(),
 		// Console gauges, one entry per slot id: WAL bytes on disk and event
 		// stream count. A slot this node has not loaded reads as zero instead
 		// of being opened (that would scan every segment of it) — the console

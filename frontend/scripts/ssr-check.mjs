@@ -131,9 +131,9 @@ assert('the two cards count voters and learners',
   pageSrc.includes('role === "voter"') && pageSrc.includes('role === "learner"'))
 assert('the summary row is four span-6 cards', (pageSrc.match(/span: 6/g) ?? []).length === 4)
 // The node directory splits into two blocks: 控制节点 on top (voters as
-// plain cards — no chart, no flow control — two per row like the data
-// block, the answering node keeps 当前 here) and 数据节点 below (learners
-// as full cards, two per row, no 当前). The merged 节点 title is gone.
+// plain cards — no chart, no flow control — the answering node keeps 当前
+// here) and 数据节点 below (learners as full cards, two per row, no 当前).
+// The merged 节点 title is gone.
 assert('the plain node block is gone', !pageSrc.includes('title: "节点"'))
 assert('the node blocks carry the split grids',
   (pageSrc.match(/span: 8/g) ?? []).length === 0 && (pageSrc.match(/span: 12/g) ?? []).length === 4
@@ -147,8 +147,13 @@ assert('the console offers no membership UI',
   !pageSrc.includes('添加节点') && !pageSrc.includes('移除')
   && !pageSrc.includes('doAdd') && !pageSrc.includes('setAdding')
   && !pageSrc.includes('askRemove') && !pageSrc.includes('removingId'))
-assert('write-speed is two cards, not one',
-  pageSrc.includes('写入速度（数量）') && pageSrc.includes('写入速度（大小）')
+// The two rate cards are CLIENT-only now (rebalance/migration traffic moved
+// to the charts' dashed total lines), and the titles say so. The old bare
+// title must be gone, not merely overlapped by the new substring.
+assert('client write-speed is two cards, named for the client path',
+  pageSrc.includes('title: "客户端写入速度（数量）"')
+  && pageSrc.includes('title: "客户端写入速度（大小）"')
+  && !pageSrc.includes('title: "写入速度（数量）"')
   && !pageSrc.includes('写入速度（数量 / 大小）'))
 assert('write-speed sums at slot leaders', pageSrc.includes('leaderWriteTotals'))
 // The 同步状态 card rides the same 2s writes poll: the page reads each node's
@@ -218,6 +223,13 @@ if (liveAdmin) {
     // pair of non-negative ints with synced <= led (a node cannot report
     // more converged slots than it leads).
     const w = await (await fetch(`${liveAdmin}/admin/writes`)).json()
+    // The client-origin pair the rate cards diff must exist and align with
+    // the lifetime arrays it replaced (same slot per index).
+    assert('live writes carries client_writes/client_bytes aligned with writes',
+      Array.isArray(w.client_writes) && Array.isArray(w.client_bytes)
+      && w.client_writes.length === w.writes.length
+      && w.client_bytes.length === w.writes.length
+      && w.client_writes.every((v, i) => v <= w.writes[i]))
     const pair = w.synced_slots
     assert('live writes carries synced_slots as [led, synced]',
       Array.isArray(pair) && pair.length === 2
@@ -447,24 +459,45 @@ assert('the data card keeps the 流控 face and the chart',
   fullCard.includes('流控') && fullCard.includes('采集中'))
 assert('a card without the current prop renders no 当前 tag', !fullCard.includes('当前'))
 
-// The node-card dual-axis chart: two polylines (msg/s left axis primary,
-// KiB/s right axis orange) over one time axis, and the sampling hint below
-// two points.
+// The node-card dual-axis chart: FOUR polylines over one time axis — solid
+// client lines and dashed total lines per unit — with a same-timestamp
+// hover box, and the sampling hint below two points.
 const { NodeRateChart } = await vite.ssrLoadModule('/src/NodeRateChart.tsx')
 const nrPoints = [
-  { t: Date.parse('2026-10-10T08:00:00'), msg: 100, kib: 12 },
-  { t: Date.parse('2026-10-10T08:00:02'), msg: 200, kib: 25 },
-  { t: Date.parse('2026-10-10T08:00:04'), msg: 150, kib: 18 },
-  { t: Date.parse('2026-10-10T08:00:06'), msg: 300, kib: 30 },
+  { t: Date.parse('2026-10-10T08:00:00'), msg: 100, kib: 12, totalMsg: 180, totalKib: 22 },
+  { t: Date.parse('2026-10-10T08:00:02'), msg: 200, kib: 25, totalMsg: 260, totalKib: 40 },
+  { t: Date.parse('2026-10-10T08:00:04'), msg: 150, kib: 18, totalMsg: 330, totalKib: 60 },
+  { t: Date.parse('2026-10-10T08:00:06'), msg: 300, kib: 30, totalMsg: 450, totalKib: 75 },
 ]
 const nrChart = renderToString(
   React.createElement(ConfigProvider, { theme: { algorithm: theme.defaultAlgorithm } },
     React.createElement(NodeRateChart, { points: nrPoints })),
 )
-assert('node chart draws two polylines', (nrChart.match(/<polyline/g) ?? []).length === 2)
+assert('node chart draws four polylines (solid client + dashed total per unit)',
+  (nrChart.match(/<polyline/g) ?? []).length === 4
+  && (nrChart.match(/stroke-dasharray="5 4"/g) ?? []).length === 2)
 assert('node chart labels both y axes', nrChart.includes('msg/s') && nrChart.includes('KiB/s'))
-assert('node chart legend names both lines with latest values',
-  nrChart.includes('写入速度（数量）300') && nrChart.includes('写入速度（大小）30'))
+assert('node chart legend names all four lines with latest values',
+  nrChart.includes('客户端写入速度（数量）300') && nrChart.includes('客户端写入速度（大小）30')
+  && nrChart.includes('总写入速度（数量）450') && nrChart.includes('总写入速度（大小）75'))
+// …one metric PER LINE: the legend is the chart's second vertical Space
+// (the plot wrapper is the first) — exactly two in the rendered HTML.
+assert('node chart legend stacks the four metrics one per line',
+  (nrChart.match(/ant-space-vertical/g) ?? []).length === 2)
+// The hover box cannot be exercised by SSR (no mouse), so pin its wiring in
+// the compiled function text: pointer handlers + the same-timestamp rows.
+const nrSrc = String(NodeRateChart)
+assert('node chart hovers into a same-timestamp metric box',
+  nrSrc.includes('onMouseMove') && nrSrc.includes('onMouseLeave')
+  && nrSrc.includes('客户端写入速度（数量） ${') && nrSrc.includes('总写入速度（数量） ${'))
+// The guide sits AT THE MOUSE, not at a rect-guessed position: the mouse x
+// maps through the SVG's own transform (letterbox margins when the card is
+// wider than the 440 viewBox were pushing the line off the cursor), the
+// guide line carries that raw x while markers and box snap to the nearest
+// sample. Pinned on the compiled forms.
+assert('hover guide tracks the mouse through the SVG transform',
+  nrSrc.includes('getScreenCTM') && nrSrc.includes('matrixTransform')
+  && nrSrc.includes('x1: hover.x') && nrSrc.includes('xAt(hover.i)'))
 assert('node chart ticks the x axis with sample times', (nrChart.match(/\d{2}:\d{2}:\d{2}/g) ?? []).length >= 2)
 const nrEmpty = renderToString(
   React.createElement(ConfigProvider, { theme: { algorithm: theme.defaultAlgorithm } },

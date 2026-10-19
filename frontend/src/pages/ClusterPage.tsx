@@ -18,17 +18,17 @@ const NODE_RATE_POINTS = 60
 // rather than freezing mid-sample.
 const AUTO_REFRESH_MS = 2000
 
-// leaderWriteTotals sums one counter field (durable writes, or their bytes)
-// over every slot AT ITS LEADER (per-slot arrays are indexed by slot id):
-// replicas apply replicated records into their own counters and a migrating
-// slot advances counters on both ends until it lands, so counting a slot only
-// at its placement's current leader counts each record exactly once — the
-// same one-leader rule the backend's storage gauge follows. It answers null
-// when any ledged slot's leader did not report the number (unreachable node,
-// or an older node without the field): a partial sum would diff against the
-// last full one into a fake dip, so the caller keeps its previous rate.
+// leaderWriteTotals sums one per-slot counter field over every slot AT ITS
+// LEADER (the arrays are indexed by slot id): replicas apply replicated
+// records into their own counters and a migrating slot advances counters on
+// both ends until it lands, so counting a slot only at its placement's
+// current leader counts each record exactly once — the same one-leader rule
+// the backend's storage gauge follows. It answers null when any ledged
+// slot's leader did not report the number (unreachable node, or an older
+// node without the field): a partial sum would misstate the absolute cards.
 function leaderWriteTotals(
-  st: ClusterStatus, perNode: Record<string, NodeWrites>, field: 'writes' | 'write_bytes',
+  st: ClusterStatus, perNode: Record<string, NodeWrites>,
+  field: 'writes' | 'write_bytes' | 'client_writes' | 'client_bytes',
 ): number | null {
   const idToAddr: Record<string, string> = {}
   for (const p of Object.values(st.peers)) idToAddr[p.id] = p.admin_addr
@@ -114,14 +114,19 @@ export default function ClusterPage() {
     return () => clearInterval(t)
   }, [refresh, auto])
 
-  // The write-speed cards: the cluster's durable write rate, msg/s and bytes/s.
-  // It rides the same light /admin/writes poll the slots page uses — every
-  // peer answers its per-slot counters, and leaderWriteTotals folds the table
-  // into ONE number per field by summing each slot at its leader. Two
-  // consecutive samples diff into the rate; the first sample (and any sample
-  // whose leaders were not all reporting) keeps the last known rate.
+  // The write-speed cards: what CLIENTS landed cluster-wide per second, msg
+  // and bytes. It rides the same light /admin/writes poll — every peer
+  // answers its per-slot counters — and diffs the CLIENT-origin pair
+  // (client_writes/client_bytes: grown only by the batch-append serving
+  // path; replica fetch and migration copy land through AppendAtSeq/
+  // AppendFrameAtSeq, which move the lifetime counters but never these).
+  // Node-to-node movement is not write speed, and the card must say so even
+  // mid-rebalance. The diff is taken at slot identity (see the tick), so a
+  // slot changing leaders contributes nothing to that window instead of
+  // diffing its new leader's whole history into a fake burst.
   const [writeRate, setWriteRate] = useState<{ msg: number; bytes: number } | null>(null)
-  const lastSample = useRef<{ at: number; writes: number; bytes: number } | null>(null)
+  const lastSlotFold = useRef<Map<number, { node: string; w: number; b: number }>>(new Map())
+  const lastFoldAt = useRef(0)
 
   // 存储数量: the records stored cluster-wide, summed at each slot's LEADER
   // (the same one-leader fold the rate uses — the leader's durable write
@@ -129,18 +134,24 @@ export default function ClusterPage() {
   // The card shows '-' until the poll sees one complete sample.
   const [storedRecords, setStoredRecords] = useState<number | null>(null)
 
-  // The per-node card charts: same poll, same one-leader rule applied to
-  // ONE node's led slots only (the card answers "what lands on this node
-  // as a leader", which is also the face flow control governs). Ring
-  // buffers of NODE_RATE_POINTS samples (2 min at 2s, the drawer's window);
-  // a sample is skipped when the node's leaders did not all report both
-  // counters — a partial total would diff into a fake jump or dip. The
-  // series lives in state (cards re-render as it grows), the per-node last
-  // sample and a mirror ref in refs, so the 2s tick only pushes state when
-  // some node actually gained a sample.
+  // The per-node card charts: four series per 2s window — the client pair
+  // (same stable-identity diff as the cards, bucketed to the node that LED
+  // the slot) AND the totals pair (everything that landed on the node,
+  // catch-up included; see lastNodeTotals). The pair gap is the node-to-node
+  // movement rebalance causes, plotted where it happens. Ring buffers of
+  // NODE_RATE_POINTS samples (2 min at 2s, the drawer's window). The
+  // per-slot baseline makes the old node-level completeness rule
+  // unnecessary: a slot whose leader did not answer simply gets no delta
+  // this round. The series lives in state with a mirror ref, so the tick
+  // only pushes state when some node gained a sample.
   const [nodeRates, setNodeRates] = useState<Record<string, NodeRatePoint[]>>({})
   const nodeRatesRef = useRef<Record<string, NodeRatePoint[]>>({})
-  const lastNodeSample = useRef<Record<string, { at: number; writes: number; bytes: number }>>({})
+  // The TOTAL series baseline: each node's lifetime counters summed over
+  // ALL its slots (led or replica) — the whole node, not a leader fold, so
+  // a rebalance cannot retarget it; catch-up lands here on purpose, that is
+  // what 总写入速度 is for. Per-node sums are complete by construction (one
+  // node reporting its own arrays), so no slot-completeness rule applies.
+  const lastNodeTotals = useRef<Record<string, { w: number; b: number }>>({})
 
   useEffect(() => {
     let stop = false
@@ -194,74 +205,88 @@ export default function ClusterPage() {
           }
         }
         if (syncSeen) setSyncGauge({ led: syncLed, synced: syncSynced })
-        // A sample counts for the rate only when BOTH totals are complete
-        // (every ledged slot answered its writes AND its bytes at its
-        // leader). Skipping an incomplete sample rather than storing it
-        // keeps the diff windows honest: a partial sum held as "last" would
-        // turn the next full sum into a fake jump, and the reverse a dip.
-        // Per-node totals for the card charts (see nodeRates): sum each
-        // node's LED slots only; skip the node when any led slot's counter
-        // array is missing or short. A node that leads nothing sums 0/0 —
-        // the flat line is the truthful picture of "no led writes".
+        // The rate window: diff the client-origin counters at SLOT identity.
+        // A slot counts toward this window's rate only when both samples saw
+        // it led by the SAME node (counters are per-node histories; a slot
+        // that just moved must not diff its new leader's whole history into
+        // a fake burst — that burst was this card's bug: rebalance and
+        // migration traffic read as write speed). Negatives clamp like
+        // before (counters only move forward; the clamp only ever fires
+        // against a restarted process's fresh counters).
         const nowMs = Date.now()
-        const prevNode = lastNodeSample.current
-        const nextNode: Record<string, { at: number; writes: number; bytes: number }> = {}
-        let ratesChanged = false
-        const nr = { ...nodeRatesRef.current }
+        const prevFold = lastSlotFold.current
+        const prevAt = lastFoldAt.current
+        const nextFold = new Map<number, { node: string; w: number; b: number }>()
+        const nodeDelta: Record<string, { msg: number; bytes: number }> = {}
+        let winMsg = 0
+        let winBytes = 0
         for (const p of Object.values(st.peers)) {
-          let w = 0
-          let b = 0
-          let ok = true
+          const m = perNode[p.admin_addr]
+          if (!m?.client_writes || !m.client_bytes) continue
           for (const [slotStr, sp] of Object.entries(st.slots)) {
             if (sp.leader !== p.id) continue
-            const m = perNode[p.admin_addr]
             const s = Number(slotStr)
-            if (!m?.writes || s >= m.writes.length || !m.write_bytes || s >= m.write_bytes.length) {
-              ok = false
-              break
-            }
-            w += m.writes[s]
-            b += m.write_bytes[s]
+            if (s >= m.client_writes.length || s >= m.client_bytes.length) continue
+            const cur = { node: p.id, w: m.client_writes[s], b: m.client_bytes[s] }
+            nextFold.set(s, cur)
+            const prev = prevFold.get(s)
+            if (!prev || prev.node !== p.id || prevAt === 0 || nowMs <= prevAt) continue
+            const dm = Math.max(0, cur.w - prev.w)
+            const db = Math.max(0, cur.b - prev.b)
+            winMsg += dm
+            winBytes += db
+            const nd = (nodeDelta[p.id] ??= { msg: 0, bytes: 0 })
+            nd.msg += dm
+            nd.bytes += db
           }
-          if (!ok) continue
-          nextNode[p.id] = { at: nowMs, writes: w, bytes: b }
-          const prev = prevNode[p.id]
-          if (!prev || nowMs <= prev.at) continue
-          const dt = (nowMs - prev.at) / 1000
-          // Counters only move forward; a slot changing leaders retargets
-          // which node answers for it, so clamp negatives (one flat sample
-          // at the boundary beats a fake dip).
-          const arr = [...(nr[p.id] ?? []), {
-            t: nowMs,
-            msg: Math.max(0, (w - prev.writes) / dt),
-            kib: Math.max(0, (b - prev.bytes) / dt / 1024),
-          }]
-          nr[p.id] = arr.length > NODE_RATE_POINTS ? arr.slice(arr.length - NODE_RATE_POINTS) : arr
-          ratesChanged = true
         }
-        lastNodeSample.current = nextNode
+        lastSlotFold.current = nextFold
+        lastFoldAt.current = nowMs
+
+        // The card charts (see nodeRates): one point per answered node,
+        // bucketed from the same stable-identity diff; a node that led
+        // writes-free slots keeps the flat zero line — the truthful picture
+        // of "no led writes". The absolute 存储数量 card still rides the
+        // LIFETIME writes sum at leaders (what a copy holds is what it
+        // holds, however it arrived) and keeps the all-slotted completeness
+        // rule, because a partial SUM misstates (a diff would only mislead).
+        const haveWindow = prevAt > 0 && nowMs > prevAt
+        const dt = haveWindow ? (nowMs - prevAt) / 1000 : 0
+        const nr = { ...nodeRatesRef.current }
+        let ratesChanged = false
+        if (haveWindow) {
+          for (const p of Object.values(st.peers)) {
+            const m = perNode[p.admin_addr]
+            if (!m?.client_writes || !m.client_bytes) continue
+            const nd = nodeDelta[p.id] ?? { msg: 0, bytes: 0 }
+            // Total = lifetime counters over the node's WHOLE slot set.
+            let tw = 0
+            let tb = 0
+            if (m.writes && m.write_bytes) {
+              for (const v of m.writes) tw += v
+              for (const v of m.write_bytes) tb += v
+            }
+            const pt = lastNodeTotals.current[p.id]
+            lastNodeTotals.current[p.id] = { w: tw, b: tb }
+            // A restarted process resets its counters; clamp (same rule as
+            // the client pair, and the totals then simply re-baseline).
+            const dm = pt ? Math.max(0, tw - pt.w) : 0
+            const db = pt ? Math.max(0, tb - pt.b) : 0
+            const arr = [...(nr[p.id] ?? []), {
+              t: nowMs, msg: nd.msg / dt, kib: nd.bytes / dt / 1024,
+              totalMsg: dm / dt, totalKib: db / dt / 1024,
+            }]
+            nr[p.id] = arr.length > NODE_RATE_POINTS ? arr.slice(arr.length - NODE_RATE_POINTS) : arr
+            ratesChanged = true
+          }
+          setWriteRate({ msg: winMsg / dt, bytes: winBytes / dt })
+        }
         if (ratesChanged) {
           nodeRatesRef.current = nr
           setNodeRates(nr)
         }
-
         const writes = leaderWriteTotals(st, perNode, 'writes')
-        const bytes = leaderWriteTotals(st, perNode, 'write_bytes')
-        // The 存储数量 card rides this same leader-only sum: it updates on any
-        // complete writes sample, even while bytes is still incomplete.
         if (writes !== null) setStoredRecords(writes)
-        if (writes === null || bytes === null) return
-        const prev = lastSample.current
-        const now = Date.now()
-        lastSample.current = { at: now, writes, bytes }
-        if (!prev || now <= prev.at) return
-        const dt = (now - prev.at) / 1000
-        // Counters only move forward; a leader change can retarget which
-        // node answers for a slot mid-poll, so clamp negatives to 0.
-        setWriteRate({
-          msg: Math.max(0, (writes - prev.writes) / dt),
-          bytes: Math.max(0, (bytes - prev.bytes) / dt),
-        })
       } catch {
         /* poll failure: keep the last rate */
       }
@@ -482,8 +507,8 @@ export default function ClusterPage() {
           suffix={storageLowerBound ? '（下界）' : undefined} /></Card></Col>
       </Row>
       <Row gutter={16}>
-        <Col span={12}><Card><Statistic title="写入速度（数量）" value={writeSpeedMsg} /></Card></Col>
-        <Col span={12}><Card><Statistic title="写入速度（大小）" value={writeSpeedBytes} /></Card></Col>
+        <Col span={12}><Card><Statistic title="客户端写入速度（数量）" value={writeSpeedMsg} /></Card></Col>
+        <Col span={12}><Card><Statistic title="客户端写入速度（大小）" value={writeSpeedBytes} /></Card></Col>
       </Row>
       {/* The replica policy, its own card above the node block. The tier and
           the factor it derives are cluster state (replicated through the slot

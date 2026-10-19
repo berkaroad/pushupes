@@ -127,6 +127,13 @@ export interface NodeWrites {
   // at which that node drops its local copy of the slot. Per-node by nature —
   // the console marks a replica from the node that reported it.
   dropping?: number[]
+  // Client-origin counters, index-aligned with writes/write_bytes: durable
+  // records/bytes that landed HERE from the client batch-append path only.
+  // Catch-up traffic (replica fetch, migration copy — AppendAtSeq /
+  // AppendFrameAtSeq on the backend) grows writes/write_bytes but never
+  // these, so the 写入速度 cards and the node charts diff these instead.
+  client_writes?: number[]
+  client_bytes?: number[]
   // The 同步状态 gauge: [slots THIS node leads, of those ones converged on the
   // table's replica factor — replica set AND in-sync copies (leader included)
   // both reaching it; backend Engine.SyncedLeaderSlots]. The cluster page sums

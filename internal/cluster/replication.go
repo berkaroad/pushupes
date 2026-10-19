@@ -707,8 +707,18 @@ func (e *Engine) WriteCounts() []uint64 { return e.store.WriteCounts() }
 
 // WriteByteCounts snapshots this node's per-slot durable write byte counters,
 // index-aligned with WriteCounts: the admin API ships both, so clients diff
-// successive snapshots into a message rate and a byte rate for one window.
+// successive pairs into the message rate and the byte rate of one window.
 func (e *Engine) WriteByteCounts() []uint64 { return e.store.WriteByteCounts() }
+
+// ClientWriteCounts / ClientWriteByteCounts snapshot the client-origin
+// counters (what batch appends landed HERE as the slots' leader; catch-up
+// paths never touch them), index-aligned with WriteCounts. The console
+// writes its 写入速度 cards and node charts from these — WriteCounts would
+// also count migration/replication traffic, which the operator is not
+// asking about.
+func (e *Engine) ClientWriteCounts() []uint64 { return e.store.ClientWriteCounts() }
+
+func (e *Engine) ClientWriteByteCounts() []uint64 { return e.store.ClientWriteByteCounts() }
 
 // TableSnapshot returns a copy of the current table (for the admin API).
 func (e *Engine) TableSnapshot() *Table {

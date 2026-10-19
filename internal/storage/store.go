@@ -66,6 +66,15 @@ type Store struct {
 	// write adds its bytes — so the admin API diffs both into a message
 	// rate and a byte rate for the same window.
 	writeBytes []atomic.Uint64
+
+	// per-slot counters of the CLIENT writes only — the record path a batch
+	// append lands at this node as the slot's leader (Store.Append). The
+	// two counters above also grow from internal traffic (replica and
+	// migration catch-up applying leader-assigned frames), which is exactly
+	// what an operator does not mean by write speed: these counters carry
+	// the rate the console names. Index-aligned with `writes` as well.
+	clientWrites     []atomic.Uint64
+	clientWriteBytes []atomic.Uint64
 }
 
 // OpenStore loads every existing slot directory under dir and creates the
@@ -90,15 +99,17 @@ func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushP
 		segmentBytes = DefaultSegmentBytes
 	}
 	st := &Store{
-		Dir:          dir,
-		SlotCount:    slotCount,
-		SegmentBytes: segmentBytes,
-		FlushPolicy:  flush,
-		slots:        make([]atomic.Pointer[Slot], slotCount),
-		writes:       make([]atomic.Uint64, slotCount),
-		writeBytes:   make([]atomic.Uint64, slotCount),
-		dirty:        map[int32]bool{},
-		wakeBus:      make(chan struct{}),
+		Dir:              dir,
+		SlotCount:        slotCount,
+		SegmentBytes:     segmentBytes,
+		FlushPolicy:      flush,
+		slots:            make([]atomic.Pointer[Slot], slotCount),
+		writes:           make([]atomic.Uint64, slotCount),
+		writeBytes:       make([]atomic.Uint64, slotCount),
+		clientWrites:     make([]atomic.Uint64, slotCount),
+		clientWriteBytes: make([]atomic.Uint64, slotCount),
+		dirty:            map[int32]bool{},
+		wakeBus:          make(chan struct{}),
 	}
 	st.flusher = newFlusher(st)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -324,6 +335,8 @@ func (st *Store) Append(rec *data.EventRecord) (*AppendOutcome, error) {
 	if err == nil && out.Status == data.StatusSuccess {
 		st.writes[slotID].Add(1)
 		st.writeBytes[slotID].Add(uint64(rec.EncodedSize()))
+		st.clientWrites[slotID].Add(1)
+		st.clientWriteBytes[slotID].Add(uint64(rec.EncodedSize()))
 		st.markDirty(slotID)
 	}
 	return out, err
@@ -522,6 +535,28 @@ func (st *Store) WriteByteCounts() []uint64 {
 	out := make([]uint64, len(st.writeBytes))
 	for i := range st.writeBytes {
 		out[i] = st.writeBytes[i].Load()
+	}
+	return out
+}
+
+// ClientWriteCounts / ClientWriteByteCounts snapshot the client-origin
+// counters (Store.Append only). Catch-up paths — AppendAtSeq and
+// AppendFrameAtSeq, how replicas and migration land a leader's records —
+// never touch them, so diffing these into a rate measures what lands from
+// clients, not what nodes move between themselves. Index-aligned with
+// WriteCounts.
+func (st *Store) ClientWriteCounts() []uint64 {
+	out := make([]uint64, len(st.clientWrites))
+	for i := range st.clientWrites {
+		out[i] = st.clientWrites[i].Load()
+	}
+	return out
+}
+
+func (st *Store) ClientWriteByteCounts() []uint64 {
+	out := make([]uint64, len(st.clientWriteBytes))
+	for i := range st.clientWriteBytes {
+		out[i] = st.clientWriteBytes[i].Load()
 	}
 	return out
 }
