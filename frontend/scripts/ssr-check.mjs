@@ -158,6 +158,15 @@ assert('the sync-state card is wired to the writes poll',
   pageSrc.includes('同步状态') && pageSrc.includes('synced_slots'))
 assert('the sync state renders 同步中 / 构建中（剩余 …）',
   pageSrc.includes('同步中') && pageSrc.includes('构建中（剩余 '))
+// One refresh cadence rules this page (自动刷新 2s): the status poll AND the
+// /admin/writes poll behind the value cards and the node charts both run on
+// AUTO_REFRESH_MS, and the writes interval is gated by the same switch —
+// off means nothing refreshes. Pinned against the old 5s constant too.
+assert('both pollers share the 2s auto-refresh cadence and the switch gates them',
+  pageSrc.includes('自动刷新 2s') && !pageSrc.includes('自动刷新 5s')
+  && pageSrc.includes('setInterval(refresh, AUTO_REFRESH_MS)')
+  && pageSrc.includes('auto ? setInterval(tick, AUTO_REFRESH_MS) : null')
+  && !pageSrc.includes('WRITES_POLL_MS') && !pageSrc.includes('5000'))
 assert('write-speed polls the light counters endpoint', pageSrc.includes('fetchNodeWrites'))
 assert('write-speed reads the byte counters', pageSrc.includes('write_bytes'))
 const { humanBytes, humanBytesPerSec, utcStamp } = await vite.ssrLoadModule('/src/format.ts')

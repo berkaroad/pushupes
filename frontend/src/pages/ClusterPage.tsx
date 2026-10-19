@@ -11,10 +11,12 @@ import type { NodeRatePoint } from '../NodeRateChart'
 // same two-minute window the slot drawer's rate chart keeps.
 const NODE_RATE_POINTS = 60
 
-// The write-speed cards sample every node's durable counters on the same
-// cadence the slots page polls them at (2s): the rate is the diff between two
-// samples of the leaders-only totals.
-const WRITES_POLL_MS = 2000
+// THE one refresh cadence of this page (the header switch "自动刷新 2s"):
+// both pollers — the cluster status and the per-node /admin/writes samples
+// behind the value cards and the node charts — run on it, and the switch
+// gates both. Off means nothing refreshes; the charts hold their last curve
+// rather than freezing mid-sample.
+const AUTO_REFRESH_MS = 2000
 
 // leaderWriteTotals sums one counter field (durable writes, or their bytes)
 // over every slot AT ITS LEADER (per-slot arrays are indexed by slot id):
@@ -108,7 +110,7 @@ export default function ClusterPage() {
   useEffect(() => {
     refresh()
     if (!auto) return
-    const t = setInterval(refresh, 5000)
+    const t = setInterval(refresh, AUTO_REFRESH_MS)
     return () => clearInterval(t)
   }, [refresh, auto])
 
@@ -265,10 +267,10 @@ export default function ClusterPage() {
       }
     }
     tick()
-    const t = setInterval(tick, WRITES_POLL_MS)
+    const t = auto ? setInterval(tick, AUTO_REFRESH_MS) : null
     const firingTimers = flowFiringTimers.current
-    return () => { stop = true; clearInterval(t); Object.values(firingTimers).forEach(clearTimeout) }
-  }, [])
+    return () => { stop = true; if (t) clearInterval(t); Object.values(firingTimers).forEach(clearTimeout) }
+  }, [auto])
 
   // The replica policy. The tier lives in the replicated slot table (the
   // startup flag only seeds a brand-new cluster), so this card is the
@@ -461,7 +463,7 @@ export default function ClusterPage() {
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       <Space>
-        <Typography.Text>自动刷新 5s</Typography.Text>
+        <Typography.Text>自动刷新 2s</Typography.Text>
         <Switch checked={auto} onChange={setAuto} size="small" />
       </Space>
       {err ? <Alert type="warning" closable message={err} onClose={() => setErr(null)} /> : null}
