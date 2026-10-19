@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, App, Button, Card, Col, Form, Input, InputNumber, Modal, Row, Select, Space, Statistic, Switch, Typography } from 'antd'
 import { EditOutlined } from '@ant-design/icons'
 import type { ClusterStatus, FlowControlDetail, NodeWrites } from '../types'
@@ -6,6 +6,7 @@ import { humanBytes, humanBytesPerSec } from '../format'
 import { clearFlowControl, ensureLeader, fetchFlowControl, fetchNodeWrites, setReplicaPolicy, setFlowControl, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
 import { PeerCard, isOnlinePeer } from '../PeerCard'
 import type { NodeRatePoint } from '../NodeRateChart'
+import { RailContext } from '../rail'
 
 // NODE_RATE_POINTS is the card chart's ring size: 60 samples x 2s = the
 // same two-minute window the slot drawer's rate chart keeps.
@@ -44,6 +45,10 @@ function leaderWriteTotals(
 }
 
 export default function ClusterPage() {
+  // 菜单栏折叠（App 的 RailContext）是这一页的宽度预算信号：折叠态下
+  // PeerCard 各降一档密度——数据节点一行 1 个、控制节点一行 2 个；展开
+  // 态默认数据一行 2 个、控制一行 3 个。
+  const railCollapsed = useContext(RailContext)
   const [status, setStatus] = useState<ClusterStatus | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [auto, setAuto] = useState(true)
@@ -559,18 +564,18 @@ export default function ClusterPage() {
           </Space>
         )}
       </Card>
-      {/* The node directory split by plane. Control on top: voters get a row
-          of TWO PLAIN cards (same span as the data cards below) — no rate
+      {/* The node directory split by plane. Control on top: voters get THREE
+          PLAIN cards per row (two when the menu rail is collapsed) — no rate
           chart and no flow control (a voter never leads writes; flow control
           is a data-plane face) — and the answering node keeps its 当前 tag
           here, where it lives. Below it the
-          data plane: learners get two full cards per row, and 当前 is gone
+          data plane: learners get two full cards per row (one collapsed), and 当前 is gone
           from them (the answering node is a control member). Neither block
           carries membership actions: add and remove are CLI operations. */}
       <Card title="控制节点">
         <Row gutter={[16, 16]}>
           {controlPeers.map((p) => (
-            <Col span={12} key={p.id}>
+            <Col span={railCollapsed ? 12 : 8} key={p.id}>
               <PeerCard peer={p} current={p.id === status.node} slots={leaderCount[p.id] ?? 0} plain />
             </Col>
           ))}
@@ -583,7 +588,7 @@ export default function ClusterPage() {
       <Card title="数据节点">
         <Row gutter={[16, 16]}>
           {dataPeers.map((p) => (
-            <Col span={12} key={p.id}>
+            <Col span={railCollapsed ? 24 : 12} key={p.id}>
               <PeerCard peer={p} slots={leaderCount[p.id] ?? 0}
                 flowControlConfigured={flowConfigured[p.id] ?? false}
                 flowControlFiring={!!flowFiring[p.id]}

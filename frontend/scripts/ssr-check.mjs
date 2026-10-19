@@ -132,11 +132,16 @@ assert('the two cards count voters and learners',
 assert('the summary row is four span-6 cards', (pageSrc.match(/span: 6/g) ?? []).length === 4)
 // The node directory splits into two blocks: 控制节点 on top (voters as
 // plain cards — no chart, no flow control — the answering node keeps 当前
-// here) and 数据节点 below (learners as full cards, two per row, no 当前).
-// The merged 节点 title is gone.
+// here) and 数据节点 below (learners as full cards, no 当前). The density
+// follows the menu rail (RailContext): data 2 per row and 1 collapsed,
+// control 3 per row and 2 collapsed; the bare span-12s left are the two
+// speed cards. The merged 节点 title is gone.
 assert('the plain node block is gone', !pageSrc.includes('title: "节点"'))
 assert('the node blocks carry the split grids',
-  (pageSrc.match(/span: 8/g) ?? []).length === 0 && (pageSrc.match(/span: 12/g) ?? []).length === 4
+  pageSrc.includes('RailContext')
+  && (pageSrc.match(/span: railCollapsed \? 24 : 12/g) ?? []).length === 1
+  && (pageSrc.match(/span: railCollapsed \? 12 : 8/g) ?? []).length === 1
+  && (pageSrc.match(/span: 8/g) ?? []).length === 0 && (pageSrc.match(/span: 12/g) ?? []).length === 2
   && pageSrc.includes('plain'))
 assert('当前 rides the control block only',
   (pageSrc.match(/current: p\.id === status\.node/g) ?? []).length === 1)

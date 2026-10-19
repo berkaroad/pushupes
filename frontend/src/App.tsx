@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { RailContext } from './rail'
 import { Layout, Menu, Segmented, Typography } from 'antd'
 import { SunOutlined, MoonOutlined, ClusterOutlined, AppstoreOutlined } from '@ant-design/icons'
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
@@ -63,11 +64,13 @@ export default function App() {
           />
         </Layout.Header>
         <Layout.Content style={{ padding: 24 }}>
-          <Routes>
-            <Route path="/" element={<Navigate to="/cluster" replace />} />
-            <Route path="/cluster" element={<ClusterPage />} />
-            <Route path="/slots" element={<SlotsPage />} />
-          </Routes>
+          <RailContext.Provider value={collapsed}>
+            <Routes>
+              <Route path="/" element={<Navigate to="/cluster" replace />} />
+              <Route path="/cluster" element={<ClusterPage />} />
+              <Route path="/slots" element={<SlotsPage />} />
+            </Routes>
+          </RailContext.Provider>
         </Layout.Content>
       </Layout>
     </Layout>
