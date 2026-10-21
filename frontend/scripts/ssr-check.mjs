@@ -117,7 +117,7 @@ assert('storage card flags a lower bound', pageSrc.includes('storage_bytes_compl
 // The stat row's slot card merged the old 迁移中槽位 into 槽位（迁移中 / 总数）
 // ("1 / 1680") — that card is now the 存储数量 card: the records stored
 // cluster-wide, the durable writes counter summed at each slot's LEADER from
-// the same /admin/writes poll the write-speed cards use ('-' until a complete
+// the same /admin/status poll the write-speed cards use ('-' until a complete
 // sample lands). The two write-speed cards stay on their own row.
 assert('storage-count card replaced the slot card',
   pageSrc.includes('"存储数量"') && !pageSrc.includes('槽位（迁移中 / 总数）')
@@ -166,10 +166,29 @@ assert('write-speed sums at slot leaders', pageSrc.includes('leaderWriteTotals')
 // of both the state strings and the remaining-slots template).
 assert('the sync-state card is wired to the writes poll',
   pageSrc.includes('同步状态') && pageSrc.includes('synced_slots'))
-assert('the sync state renders 同步中 / 构建中（剩余 …）',
-  pageSrc.includes('同步中') && pageSrc.includes('构建中（剩余 '))
+assert('the sync state renders 同步中 / 构建中（剩余 …） / 待就位（…）',
+  pageSrc.includes('同步中') && pageSrc.includes('构建中（剩余 ')
+  && pageSrc.includes('待就位（') && pageSrc.includes('个槽位待补齐副本集')
+  && pageSrc.includes('pending_seats'))
+// The same gauge, per card: each data node's own led − synced (from its
+// synced_slots poll) drives the orange 同步中 N tag. The wiring reads the
+// pair with the conservative floor and hands it to exactly ONE of the two
+// PeerCard call sites — the data-plane block; control cards never take it.
+assert('the per-card syncing count is derived from each node\'s synced_slots',
+  pageSrc.includes('Math.max(0, pair[0] - pair[1])') && pageSrc.includes('setSyncingByNode'))
+assert('only the data-plane cards are handed the syncing count',
+  pageSrc.split('syncing: syncingByNode').length - 1 === 1)
+// The fenced local copies ride the same poll (the endpoint grew a
+// pending_slots field and was renamed /admin/writes -> /admin/status):
+// the page reads the array per node and hands it to exactly ONE PeerCard
+// call site — the data-plane block. The old endpoint name is pinned gone.
+assert('the page reads pending_slots off the renamed /admin/status poll',
+  pageSrc.includes('pending_slots') && pageSrc.includes('setFencedByNode')
+  && !pageSrc.includes('admin/writes'))
+assert('only the data-plane cards are handed the fenced list',
+  pageSrc.split('fenced: fencedByNode').length - 1 === 1)
 // One refresh cadence rules this page (自动刷新 2s): the status poll AND the
-// /admin/writes poll behind the value cards and the node charts both run on
+// /admin/status poll behind the value cards and the node charts both run on
 // AUTO_REFRESH_MS, and the writes interval is gated by the same switch —
 // off means nothing refreshes. Pinned against the old 5s constant too.
 assert('both pollers share the 2s auto-refresh cadence and the switch gates them',
@@ -177,7 +196,7 @@ assert('both pollers share the 2s auto-refresh cadence and the switch gates them
   && pageSrc.includes('setInterval(refresh, AUTO_REFRESH_MS)')
   && pageSrc.includes('auto ? setInterval(tick, AUTO_REFRESH_MS) : null')
   && !pageSrc.includes('WRITES_POLL_MS') && !pageSrc.includes('5000'))
-assert('write-speed polls the light counters endpoint', pageSrc.includes('fetchNodeWrites'))
+assert('write-speed polls the light counters endpoint', pageSrc.includes('fetchNodeStatus') && !pageSrc.includes('fetchNodeWrites'))
 assert('write-speed reads the byte counters', pageSrc.includes('write_bytes'))
 const { humanBytes, humanBytesPerSec, utcStamp } = await vite.ssrLoadModule('/src/format.ts')
 assert('byte formatter renders sizes', humanBytes(0) === '0 B' && humanBytes(1536) === '1.5 KiB' && humanBytes(70496329) === '67.2 MiB')
@@ -227,7 +246,7 @@ if (liveAdmin) {
     // The sync gauge must read back in its pinned shape: a [led, synced]
     // pair of non-negative ints with synced <= led (a node cannot report
     // more converged slots than it leads).
-    const w = await (await fetch(`${liveAdmin}/admin/writes`)).json()
+    const w = await (await fetch(`${liveAdmin}/admin/status`)).json()
     // The client-origin pair the rate cards diff must exist and align with
     // the lifetime arrays it replaced (same slot per index).
     assert('live writes carries client_writes/client_bytes aligned with writes',
@@ -239,6 +258,15 @@ if (liveAdmin) {
     assert('live writes carries synced_slots as [led, synced]',
       Array.isArray(pair) && pair.length === 2
       && pair.every((x) => Number.isInteger(x) && x >= 0) && pair[1] <= pair[0])
+    // 待就位 rides next to the pair: a plain non-negative count of leading
+    // slots whose replica SET is short of the factor (outside led).
+    assert('live status carries pending_seats',
+      Number.isInteger(w.pending_seats) && w.pending_seats >= 0)
+    // The fenced view rides the same answer: an array of {slot, reason,
+    // table_leader, table_epoch} verdicts (possibly empty).
+    assert('live status carries pending_slots in the fenced-view shape',
+      Array.isArray(w.pending_slots)
+      && w.pending_slots.every((v) => Number.isInteger(v.slot) && typeof v.reason === 'string' && typeof v.table_leader === 'string' && Number.isInteger(v.table_epoch)))
     console.log(`  (live sync gauge: led=${pair[0]} synced=${pair[1]} of slot_count=${st.slot_count})`)
     assert('live status carries storage_bytes', typeof st.storage_bytes === 'number')
     assert('live status carries storage_bytes_complete', typeof st.storage_bytes_complete === 'boolean')
@@ -463,6 +491,30 @@ assert('a plain card still marks the answering node', plainCard.includes('当前
 assert('the data card keeps the 流控 face and the chart',
   fullCard.includes('流控') && fullCard.includes('采集中'))
 assert('a card without the current prop renders no 当前 tag', !fullCard.includes('当前'))
+// The leader-side replica pending tag: an orange 同步中 N when the node
+// still leads slots whose replicas have not caught up; gone at zero, and
+// never on a plain (control-plane) card.
+const syncingCard = pc({ peer: plainPeer, slots: 3, syncing: 7 })
+assert('a pending leader card shows the orange 同步中 tag',
+  syncingCard.includes('同步中') && syncingCard.includes('ant-tag-orange'))
+assert('a fully synced leader card shows no 同步中 tag',
+  !pc({ peer: plainPeer, slots: 3, syncing: 0 }).includes('同步中'))
+assert('a control-plane card never shows 同步中',
+  !pc({ peer: plainPeer, slots: 3, syncing: 9, plain: true }).includes('同步中'))
+// The red 已围栏 N tag: shown when the node reports fenced copies (count off
+// the array length; SSR splits the number behind a comment marker, so pin
+// the text prefix), never at zero, never on a plain card. The tooltip
+// content itself is not in SSR output — the cap shape is pinned on the
+// compiled card text instead.
+const fenceViews = (n) => Array.from({ length: n }, (_, i) => ({ slot: i, reason: 'owner record names a different cluster generation', table_leader: 'node-1', table_epoch: 9 }))
+assert('a fenced node card shows the red 已围栏 tag',
+  pc({ peer: plainPeer, slots: 3, fenced: fenceViews(12) }).includes('已围栏 ') && pc({ peer: plainPeer, slots: 3, fenced: fenceViews(1) }).includes('ant-tag-red'))
+assert('a card with no fenced copies shows no 已围栏 tag', !pc({ peer: plainPeer, slots: 3, fenced: [] }).includes('已围栏'))
+assert('a control-plane card never shows 已围栏', !pc({ peer: plainPeer, slots: 3, fenced: fenceViews(3), plain: true }).includes('已围栏'))
+const pcardSrc = String(pc && (await vite.ssrLoadModule('/src/PeerCard.tsx')).PeerCard)
+assert('the fenced tooltip lists slot + reason, capped at ten rows with a total line',
+  pcardSrc.includes('slice(0, 10)') && pcardSrc.includes('共 ') && pcardSrc.includes('个槽')
+  && pcardSrc.includes('槽 ') && pcardSrc.includes('reason'))
 
 // The node-card dual-axis chart: FOUR polylines over one time axis — solid
 // client lines and dashed total lines per unit — with a same-timestamp

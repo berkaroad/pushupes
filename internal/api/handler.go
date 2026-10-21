@@ -56,7 +56,7 @@ func New(eng *cluster.Engine, store *storage.Store) *Server {
 
 	// admin
 	s.mux.HandleFunc("GET /admin/cluster/status", s.handleClusterStatus)
-	s.mux.HandleFunc("GET /admin/writes", s.handleWrites)
+	s.mux.HandleFunc("GET /admin/status", s.handleStatus)
 	s.mux.HandleFunc("GET /admin/stats", s.handleStats)
 	s.mux.HandleFunc("GET /admin/slots/{slot}/describe", s.handleSlotDescribe)
 	s.mux.HandleFunc("GET /admin/slots/pending", s.handlePendingSlots)
@@ -278,7 +278,10 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 // diffs every 2s to derive write rates, plus the per-slot gauges it shows as
 // columns (WAL bytes, event stream count). Clients that poll it already hold
 // the table from the slower status refresh.
-func (s *Server) handleWrites(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	// One sweep for both sync fields (the gauge walks the whole slot table
+	// under replMu+tableMu; calling it per field would double that per poll).
+	sLed, sSynced, sSeats := s.Engine.SyncedLeaderSlots()
 	bytesOnDisk, streams := s.Store.SlotGauges()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"node":       s.Engine.Self(),
@@ -307,12 +310,23 @@ func (s *Server) handleWrites(w http.ResponseWriter, r *http.Request) {
 		// console asks every node and marks the replica whose copy is on its
 		// way out. Same shape as bytes/streams.
 		"dropping": s.Engine.PendingDrops(),
-		// Sync gauge for the console's 同步状态 card: [slots this node leads,
-		// of those ones converged on the table's replica factor — replica set
-		// AND in-sync copies (leader included, see Engine.SyncedLeaderSlots)
-		// both reaching it]. The console sums the pair across the fleet and
-		// subtracts from slot_count: what is left is still building.
-		"synced_slots": func() []int { led, synced := s.Engine.SyncedLeaderSlots(); return []int{led, synced} }(),
+		// Sync gauge for the console's 同步状态 card: [slots this node leads
+		// whose placement is complete, of those ones converged on the table's
+		// replica factor — replica set AND in-sync copies (leader included,
+		// see Engine.SyncedLeaderSlots) both reaching it]. The console sums
+		// the pair across the fleet and subtracts from slot_count: what is
+		// left is still building. pending_seats counts the OTHER wait — slots
+		// this node leads whose replica SET is still short of the factor
+		// (re-plan pending); those are outside led/synced so a scale-out
+		// shows as 待就位 N, not as every leader slot lagging forever.
+		"synced_slots":  []int{sLed, sSynced},
+		"pending_seats": sSeats,
+		// THIS node's fenced local copies (same view GET /admin/slots/pending
+		// answers): slot + the verdict that fences it, refusing writes until
+		// adopted. The console rides the SAME poll to hang the red 已围栏 N
+		// tag on the node's card — an independent poll per node would be pure
+		// extra traffic (same piggyback shape as synced_slots).
+		"pending_slots": s.Engine.PendingSlots(),
 		// Flow control (node-level throttle of this node's slot leaders):
 		// the config currently in force, and the per-slot cumulative
 		// rejection counts index-aligned with writes. The console diffs

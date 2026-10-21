@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Button, Descriptions, Drawer, Form, Input, Modal, Select, Space, Table, Tag, Typography } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
-import type { ClusterStatus, NodeWrites, Placement, SlotDescribe, SlotStream, SlotStreams } from '../types'
-import { ensureLeader, fetchNodeWrites, fetchSlotDescribe, fetchSlotStreams, migrateSlot } from '../api'
+import type { ClusterStatus, NodeStatus, Placement, SlotDescribe, SlotStream, SlotStreams } from '../types'
+import { ensureLeader, fetchNodeStatus, fetchSlotDescribe, fetchSlotStreams, migrateSlot } from '../api'
 import { RATE_POINTS, RateChart, type RatePoint } from '../RateChart'
 import { humanBytes, utcStamp } from '../format'
 import { ReplicaTags, dropHint } from '../ReplicaTags'
@@ -58,7 +58,7 @@ export default function SlotsPage() {
   // sample); sampled from the slot's leader counter, replicas count their
   // replication applies too and would double count.
   const [rateSeries, setRateSeries] = useState<RatePoint[]>([])
-  // per-slot WAL bytes for the 总字节 column, taken from the same /admin/writes
+  // per-slot WAL bytes for the 总字节 column, taken from the same /admin/status
   // poll as the counters (no extra request): the node holding the slot answers
   // with real numbers, a node that has not loaded it reports 0.
   const [slotBytes, setSlotBytes] = useState<Record<number, number>>({})
@@ -85,7 +85,7 @@ export default function SlotsPage() {
   useEffect(() => { refresh() }, [refresh])
 
   // Gauge poller: uses the cached table (leaders/peers) and polls each peer's
-  // /admin/writes — per-slot counters and gauges only, instead of re-fetching
+  // /admin/status — per-slot counters and gauges only, instead of re-fetching
   // the full slot-table status every 2s. The write rate is no longer a column:
   // the detail drawer samples the opened slot's own counter (see below).
   useEffect(() => {
@@ -95,9 +95,9 @@ export default function SlotsPage() {
         const st = statusRef.current
         if (!st) return
         const addrs = Object.values(st.peers).map((p) => p.admin_addr)
-        const results = await Promise.allSettled(addrs.map((a) => fetchNodeWrites(a)))
+        const results = await Promise.allSettled(addrs.map((a) => fetchNodeStatus(a)))
         if (stop) return
-        const perNode: Record<string, NodeWrites> = {}
+        const perNode: Record<string, NodeStatus> = {}
         results.forEach((r, i) => {
           if (r.status === 'fulfilled' && r.value.writes) perNode[addrs[i]] = r.value
         })
@@ -166,7 +166,7 @@ export default function SlotsPage() {
         .filter((a): a is string => !!a)
       for (const a of addrs) {
         try {
-          const m = await fetchNodeWrites(a)
+          const m = await fetchNodeStatus(a)
           const counter = m.writes?.[slot]
           if (counter === undefined) continue
           const now = Date.now()

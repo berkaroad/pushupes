@@ -40,7 +40,7 @@ function makeServer(id) {
       }))
       return
     }
-    if (req.url.startsWith('/admin/writes')) {
+    if (req.url.startsWith('/admin/status')) {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
       res.end(JSON.stringify({ node: id, slot_count: 8, writes: [1, 2], bytes: [10, 20], streams: [3, 4] }))
       return

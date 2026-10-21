@@ -2300,9 +2300,9 @@ func (e *Engine) RaftStats() map[string]any {
 func (e *Engine) ISR(slot int32) []string { return e.isr(slot) }
 
 // SyncedLeaderSlots is the fleet gauge behind the console's 同步状态 card:
-// (led, synced) over the slots THIS node leads — the handler pairs it with
-// slot_count so the console can say how many slots the WHOLE cluster has not
-// converged on yet. A leading slot counts as synced only when BOTH the
+// (led, synced, seats) over the slots THIS node leads — the handler pairs it
+// with slot_count so the console can say how many slots the WHOLE cluster has
+// not converged on yet. A leading slot counts as synced only when BOTH the
 // placement's replica set reaches the table's replica factor AND the in-sync
 // copies reach it too: this leader (it owns the log, the same convention the
 // ack promise uses — isr() lists followers only) plus every follower holding
@@ -2312,10 +2312,17 @@ func (e *Engine) ISR(slot int32) []string { return e.isr(slot) }
 // names, and the low tier (factor 1) reads synced by construction: the
 // leader alone satisfies both halves.
 //
+// slots whose replica SET is still short of the factor are NOT part of (led,
+// synced) at all — they come back as seats (the 待就位 side of the card): the
+// placement has to be completed by the layout first (serial re-plan after a
+// scale-out), and counting that wait inside 同步中 made every node read
+// "all of its slots lagging" for the whole re-plan window, data fully caught
+// up or not (the shape that looked like a stuck sync).
+//
 // One lock hold for the whole sweep (replMu -> tableMu, the order noteSeatAges
 // already uses): the poller runs it against every node every 2s, and a
 // per-slot isr()/peerDown() walk would be thousands of lock round-trips.
-func (e *Engine) SyncedLeaderSlots() (led, synced int) {
+func (e *Engine) SyncedLeaderSlots() (led, synced, seats int) {
 	e.replMu.Lock()
 	defer e.replMu.Unlock()
 	e.tableMu.RLock()
@@ -2326,10 +2333,11 @@ func (e *Engine) SyncedLeaderSlots() (led, synced int) {
 		if p == nil || p.Leader != e.self {
 			continue
 		}
-		led++
 		if len(p.Replicas) < factor {
-			continue // the placement itself is still short of the factor
+			seats++ // placement incomplete: 待就位, not 构建中
+			continue
 		}
+		led++
 		inSync := 1 // this leader owns the slot's log
 		if sr := e.repl[s]; sr != nil {
 			for i, node := range sr.node {
@@ -2343,7 +2351,7 @@ func (e *Engine) SyncedLeaderSlots() (led, synced int) {
 			synced++
 		}
 	}
-	return led, synced
+	return led, synced, seats
 }
 
 // SubmitCommand is the exported Raft submission entry point (admin triggers
@@ -2454,6 +2462,17 @@ func (b *progressBatch) apply(e *Engine) {
 			sr.lastOK[j] = b.now
 			if !wasFresh {
 				changed = append(changed, slot) // re-joined: HW may move
+			} else if b.stamp && sr.isBuilding(b.follower) {
+				// The sweep doubles as the building mark's RE-CHECK: a
+				// re-plan can re-mark an alive, caught-up copy as a fresh
+				// transition (syncSeats' seat-away-and-back churn on a
+				// scale-out's serial re-plan), and an idle slot's LEO never
+				// changes to trigger the ordinary advance. Without this the
+				// mark — and the 0-synced reading of every churned slot —
+				// stuck until the NEXT write to each slot. advanceHW makes
+				// the real call: a mark clears only when the LEO reaches the
+				// leader's, so a genuinely building seat just stays marked.
+				changed = append(changed, slot)
 			}
 		}
 	}

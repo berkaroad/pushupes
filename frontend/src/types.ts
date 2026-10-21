@@ -114,7 +114,7 @@ export interface SlotStreams {
 // One node's per-slot poll answer: durable counters (diffed into write
 // rates) plus gauges — WAL bytes on disk and event-stream count per slot.
 // A slot this node has not loaded reads as 0 in both gauge arrays.
-export interface NodeWrites {
+export interface NodeStatus {
   node?: string
   slot_count?: number
   writes: number[]
@@ -135,6 +135,11 @@ export interface NodeWrites {
   // these, so the 写入速度 cards and the node charts diff these instead.
   client_writes?: number[]
   client_bytes?: number[]
+  // THIS node's fenced local copies — the same view GET /admin/slots/pending
+  // answers, riding the same poll so the data-node card can hang the red
+  // 已围栏 N tag with the per-slot reasons in its tooltip. Empty or absent
+  // means the node fences nothing.
+  pending_slots?: PendingSlotView[]
   // The 同步状态 gauge: [slots THIS node leads, of those ones converged on the
   // table's replica factor — replica set AND in-sync copies (leader included)
   // both reaching it; backend Engine.SyncedLeaderSlots]. The cluster page sums
@@ -142,6 +147,11 @@ export interface NodeWrites {
   // what remains is still building. Absent from older nodes — the card shows
   // '-' then.
   synced_slots?: number[]
+  // Slots THIS node leads whose replica SET is still short of the factor
+  // (the placement waits on re-plan after a scale-out). 待就位, not 构建中:
+  // they are outside synced_slots' led — a lagging card would otherwise
+  // read "every slot syncing" for the whole serial re-plan window.
+  pending_seats?: number
   // Node-level flow control (throttle of this node's slot leaders).
   // `flow_control` is the config in force (configured=true drives the node
   // card's 流控 tag); `flow_control_hits` is the per-slot cumulative
@@ -151,7 +161,21 @@ export interface NodeWrites {
   flow_control_hits?: number[]
 }
 
-// FlowControlView is the config shape /admin/writes reports per node.
+// PendingSlotView is one fenced local copy of a slot: the verdict (reason)
+// that refuses writes to it until an operator adopts it
+// (POST /admin/slots/pending/adopt). Mirrors cluster.PendingSlotView.
+export interface PendingSlotView {
+  slot: number
+  reason: string
+  table_leader: string
+  table_epoch: number
+  owner_leader?: string
+  owner_epoch?: number
+  owner_replica?: boolean
+  owner_topology?: string
+}
+
+// FlowControlView is the config shape /admin/status reports per node.
 export interface FlowControlView {
   tokens: number
   period_ms: number

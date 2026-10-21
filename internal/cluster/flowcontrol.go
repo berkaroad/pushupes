@@ -273,7 +273,7 @@ func (e *Engine) FlowStats() (cfg FlowConfig, total uint64, slots []FlowSlotStat
 // FlowConfigForAdmin exposes the node's current config to the admin surface.
 func (e *Engine) FlowConfigForAdmin() FlowConfig { return e.flow.config() }
 
-// FlowHitsPerSlot snapshots the per-slot hit counters for /admin/writes,
+// FlowHitsPerSlot snapshots the per-slot hit counters for /admin/status,
 // index-aligned with the other per-slot arrays: slots this node has ever
 // throttled report their cumulative count, everything else reads 0. The
 // console diffs successive snapshots to see whether flow control fired in

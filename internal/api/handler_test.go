@@ -197,7 +197,7 @@ func TestAdminStatsMergesFlushAndRepl(t *testing.T) {
 // TestFlowControlAdminEndpoints pins the node-local flow-control surface:
 // POST sets {tokens, period} (a duration string), GET reads it back
 // with the hit tallies, DELETE clears it, a bad period is refused, and
-// /admin/writes carries the config view plus the per-slot hit array the
+// /admin/status carries the config view plus the per-slot hit array the
 // console diffs. Nothing here is controller-only: the node that answers is
 // the node that throttles.
 func TestFlowControlAdminEndpoints(t *testing.T) {
@@ -239,9 +239,9 @@ func TestFlowControlAdminEndpoints(t *testing.T) {
 		t.Fatalf("POST echo wrong: %v", body)
 	}
 
-	// /admin/writes carries the config view; a fresh throttle has no hits.
+	// /admin/status carries the config view; a fresh throttle has no hits.
 	rr = httptest.NewRecorder()
-	srv.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/admin/writes", nil))
+	srv.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/admin/status", nil))
 	body = decodeBody(t, rr)
 	fc, _ := body["flow_control"].(map[string]any)
 	if fc == nil || fc["configured"] != true || fc["tokens"] != float64(10) {

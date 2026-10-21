@@ -1,9 +1,9 @@
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, App, Button, Card, Col, Form, Input, InputNumber, Modal, Row, Select, Space, Statistic, Switch, Typography } from 'antd'
 import { EditOutlined } from '@ant-design/icons'
-import type { ClusterStatus, FlowControlDetail, NodeWrites } from '../types'
+import type { ClusterStatus, FlowControlDetail, NodeStatus, PendingSlotView } from '../types'
 import { humanBytes, humanBytesPerSec } from '../format'
-import { clearFlowControl, ensureLeader, fetchFlowControl, fetchNodeWrites, setReplicaPolicy, setFlowControl, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
+import { clearFlowControl, ensureLeader, fetchFlowControl, fetchNodeStatus, setReplicaPolicy, setFlowControl, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
 import { PeerCard, isOnlinePeer } from '../PeerCard'
 import type { NodeRatePoint } from '../NodeRateChart'
 import { RailContext } from '../rail'
@@ -13,7 +13,7 @@ import { RailContext } from '../rail'
 const NODE_RATE_POINTS = 60
 
 // THE one refresh cadence of this page (the header switch "自动刷新 2s"):
-// both pollers — the cluster status and the per-node /admin/writes samples
+// both pollers — the cluster status and the per-node /admin/status samples
 // behind the value cards and the node charts — run on it, and the switch
 // gates both. Off means nothing refreshes; the charts hold their last curve
 // rather than freezing mid-sample.
@@ -28,7 +28,7 @@ const AUTO_REFRESH_MS = 2000
 // slot's leader did not report the number (unreachable node, or an older
 // node without the field): a partial sum would misstate the absolute cards.
 function leaderWriteTotals(
-  st: ClusterStatus, perNode: Record<string, NodeWrites>,
+  st: ClusterStatus, perNode: Record<string, NodeStatus>,
   field: 'writes' | 'write_bytes' | 'client_writes' | 'client_bytes',
 ): number | null {
   const idToAddr: Record<string, string> = {}
@@ -83,7 +83,16 @@ export default function ClusterPage() {
   // 同步状态 gauge, summed from this same 2s writes poll: [slots led, slots
   // converged] across the nodes that reported the pair (see the replica
   // policy card). Null until the first node answers with the field.
-  const [syncGauge, setSyncGauge] = useState<{ led: number; synced: number } | null>(null)
+  const [syncGauge, setSyncGauge] = useState<{ led: number; synced: number; seats: number } | null>(null)
+  // Per-node view of the same gauge: led − synced from each node's own
+  // synced_slots poll — the count of slots where THIS node is leader and
+  // replicas are still pending. An unanswered node simply gets no entry
+  // (no tag), the same conservative shape as the cluster gauge.
+  const [syncingByNode, setSyncingByNode] = useState<Record<string, number>>({})
+  // Per-node fenced local copies (pending_slots off the same poll): the red
+  // 已围栏 tag with the per-slot verdicts in its tooltip. A node that did not
+  // answer simply gets no entry — no tag, no claim either way.
+  const [fencedByNode, setFencedByNode] = useState<Record<string, PendingSlotView[]>>({})
   const fireFlow = (id: string) => {
     setFlowFiring((m) => (m[id] ? m : { ...m, [id]: true }))
     clearTimeout(flowFiringTimers.current[id])
@@ -120,7 +129,7 @@ export default function ClusterPage() {
   }, [refresh, auto])
 
   // The write-speed cards: what CLIENTS landed cluster-wide per second, msg
-  // and bytes. It rides the same light /admin/writes poll — every peer
+  // and bytes. It rides the same light /admin/status poll — every peer
   // answers its per-slot counters — and diffs the CLIENT-origin pair
   // (client_writes/client_bytes: grown only by the batch-append serving
   // path; replica fetch and migration copy land through AppendAtSeq/
@@ -165,9 +174,9 @@ export default function ClusterPage() {
         const st = statusRef.current
         if (!st) return
         const addrs = Object.values(st.peers).map((p) => p.admin_addr)
-        const results = await Promise.allSettled(addrs.map((a) => fetchNodeWrites(a)))
+        const results = await Promise.allSettled(addrs.map((a) => fetchNodeStatus(a)))
         if (stop) return
-        const perNode: Record<string, NodeWrites> = {}
+        const perNode: Record<string, NodeStatus> = {}
         results.forEach((r, i) => {
           if (r.status === 'fulfilled' && r.value.writes) perNode[addrs[i]] = r.value
         })
@@ -196,11 +205,11 @@ export default function ClusterPage() {
         flowConfiguredRef.current = fc
         setFlowConfigured(fc)
         // Sync gauge: sum the [led, synced] pairs this round's nodes reported
-        // (backend Engine.SyncedLeaderSlots, rides the same /admin/writes poll).
+        // (backend Engine.SyncedLeaderSlots, rides the same /admin/status poll).
         // A node that did not answer simply does not contribute — its led
         // slots then fall into the "remaining" side, the conservative
         // direction: misreporting 构建中 beats misreporting 同步中.
-        let syncLed = 0, syncSynced = 0, syncSeen = false
+        let syncLed = 0, syncSynced = 0, syncSeats = 0, syncSeen = false
         for (const m of Object.values(perNode)) {
           const pair = m.synced_slots
           if (Array.isArray(pair) && pair.length === 2) {
@@ -208,8 +217,21 @@ export default function ClusterPage() {
             syncSynced += pair[1]
             syncSeen = true
           }
+          if (typeof m.pending_seats === 'number') syncSeats += m.pending_seats
         }
-        if (syncSeen) setSyncGauge({ led: syncLed, synced: syncSynced })
+        if (syncSeen) setSyncGauge({ led: syncLed, synced: syncSynced, seats: syncSeats })
+        const nextSyncing: Record<string, number> = {}
+        for (const p of Object.values(st.peers)) {
+          const pair = perNode[p.admin_addr]?.synced_slots
+          if (Array.isArray(pair) && pair.length === 2) nextSyncing[p.id] = Math.max(0, pair[0] - pair[1])
+        }
+        setSyncingByNode(nextSyncing)
+        const nextFenced: Record<string, PendingSlotView[]> = {}
+        for (const p of Object.values(st.peers)) {
+          const ps = perNode[p.admin_addr]?.pending_slots
+          if (Array.isArray(ps) && ps.length > 0) nextFenced[p.id] = ps
+        }
+        setFencedByNode(nextFenced)
         // The rate window: diff the client-origin counters at SLOT identity.
         // A slot counts toward this window's rate only when both samples saw
         // it led by the SAME node (counters are per-node histories; a slot
@@ -468,12 +490,16 @@ export default function ClusterPage() {
   // 数据面池规模——副本因子就是按这个数推导的（后端 Table.HostingIDs 口径：
   // 自报 learner 角色、且已上报 client 地址的成员）。
   const dataNodes = peers.filter((p) => p.role === 'learner' && p.client_addr).length
-  // 同步状态（拍板口径）：剩余 = slot_count − Σsynced——未分配、leader 未应答
-  // 的槽都算构建中；纯控制面（无槽可同步）与首个样本前显示 '-'；同步中 =
-  // 每个槽的副本集与 ISR（leader 计入）都达到副本因子（判定在
-  // Engine.SyncedLeaderSlots，与槽抽屉的 ISR 字段同源）。
-  const syncRemaining = status.slot_count - (syncGauge?.synced ?? 0)
+  // 同步状态（拍板口径）：三块账——已同步 Σsynced、构建中（副本集到位、
+  // 副本还没追平）、待就位（Σpending_seats：扩容后副本集本身还短，串行重排
+  // 正在补席位——这不是追平慢，是布局没到，旧口径把它记进构建中会让每个
+  // leader 在整个重排窗口显示「全部同步中」）。剩余 = slot_count − Σsynced −
+  // 待就位；纯控制面与首个样本前显示 '-'；判定在 Engine.SyncedLeaderSlots，
+  // 与槽抽屉的 ISR 字段同源。
+  const syncSeats = syncGauge?.seats ?? 0
+  const syncRemaining = status.slot_count - (syncGauge?.synced ?? 0) - syncSeats
   const syncValue = syncGauge === null || status.slot_count === 0 ? '-'
+    : syncSeats > 0 ? `待就位（${syncSeats} 个槽位待补齐副本集）`
     : syncRemaining <= 0 ? '同步中' : `构建中（剩余 ${syncRemaining} 个槽位）`
   // The summary row splits the fleet by plane: control nodes are the raft
   // voters, data nodes the learners; each card counts online members with the
@@ -553,7 +579,7 @@ export default function ClusterPage() {
               <Statistic title="策略" value={status.replica_policy ?? '-'} />
               <Statistic title="副本因子" value={status.replica_factor ?? '-'} suffix="份 / 槽" />
               <Statistic title="同步状态" value={syncValue}
-                valueStyle={syncValue.startsWith('构建中') ? { color: '#faad14' } : undefined} />
+                valueStyle={syncValue.startsWith('构建中') ? { color: '#faad14' } : syncValue.startsWith('待就位') ? { color: '#fa8c16' } : undefined} />
             </Space>
             <Typography.Text type="secondary">
               策略写入 Raft 复制的槽表，全集群生效并持久保留；启动参数 -replica-policy 只用于新集群的初始值，
@@ -589,6 +615,8 @@ export default function ClusterPage() {
           {dataPeers.map((p) => (
             <Col span={railCollapsed ? 24 : 12} key={p.id}>
               <PeerCard peer={p} slots={leaderCount[p.id] ?? 0}
+                syncing={syncingByNode[p.id] ?? 0}
+                fenced={fencedByNode[p.id]}
                 flowControlConfigured={flowConfigured[p.id] ?? false}
                 flowControlFiring={!!flowFiring[p.id]}
                 ratePoints={nodeRates[p.id]}

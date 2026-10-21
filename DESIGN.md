@@ -523,7 +523,7 @@ Body: Record*，每条记录：
 全部删完（每节点一次唤醒），磁盘 345→140 MiB/节点。
 时长 = `-drop-after`（默认 30s，`0` 取默认值，负数启动即报错）；**没有关闭选项**：前源节点的
 那份副本已成死数据，长期留在盘上会把节点写满。倒计时期间该调度对 admin 面可见
-（`/admin/writes` 的 `dropping[]`、`/admin/slots/{slot}/describe` 的 `pending_drop_at`），
+（`/admin/status` 的 `dropping[]`、`/admin/slots/{slot}/describe` 的 `pending_drop_at`），
 控制台据此把该副本置灰。若期间该槽又回到本节点名下（回滚、故障切换或又被加回副本集），
 取消调度、保留数据；到期时还会**再查一次表**，成员/leader 的副本一律不删。倒计时只存在于
 内存：进程重启即丢失，副本保留（等下一轮迁移或人工回收），**重启绝不删数据**。
@@ -711,7 +711,7 @@ leader 才有（从副本进度上报里维护，`isr` 列的是**已同步的�
 **先问 leader、再问副本**（旧实现只问控制台代理到的那个节点，非持有节点自然回
 0/空）。该接口**不代开槽**：`Store.Slot()` 会在不持有该槽的节点上建出目录并
 遍历其全部分段，只读视图两者都不该做；未加载的槽回 `loaded:false` + 零值。
-**槽位列表的总字节/事件流数量走同一套「不开槽」口径**：`GET /admin/writes`
+**槽位列表的总字节/事件流数量走同一套「不开槽」口径**：`GET /admin/status`
 在 durable 计数之外再回两条按槽下标对齐的数组 `bytes[]`/`streams[]`
 （已加载槽给真实值，未加载槽直接读 0、不去开它——开槽就是遍历该槽全部分段），
 前端沿用已有的 2s 轮询，取「持有该槽的节点中数值最大的那个」作答，不额外发
@@ -727,7 +727,7 @@ follower 收到这类命令一律**拒绝**（HTTP 425 + `err_id=1005`，响应�
 1005），**重读一次 status 换新 controller 重试一次**，仍失败则报可读错误
 （`withController`，见 `frontend/src/api.ts`）。
 
-**待清理副本口径**：`GET /admin/writes` 的 `dropping[]` 与 `/admin/slots/{slot}/describe`
+**待清理副本口径**：`GET /admin/status` 的 `dropping[]` 与 `/admin/slots/{slot}/describe`
 的 `pending_drop_at` 都按槽下标对齐，`0` = 无待清理；非 0 是**本节点**执行自动清理
 （`DropSlot`）的时刻（unix 秒）。两个字段都是**节点自己的视角**（只有持有那份
 待清理副本的节点知道），所以前端按节点聚合：`dropping[slot] > 0` 的那个节点，
@@ -772,7 +772,7 @@ localAppend/batchLocal 的落盘之前，与写栅栏、路由表读取同一条
 保存 POST / 恢复不限流 DELETE，直发该节点 admin 面）。槽位页与槽详情抽屉不带
 流控面：桶是节点级的，「哪个槽被拒」的观测留在数据面（`flow_control_hits`），
 UI 只在治理发生的对象——节点——上呈现。数据都不走新请求：per-node
-`GET /admin/writes` 轮询顺带 `flow_control`（配置视图）与 `flow_control_hits`
+`GET /admin/status` 轮询顺带 `flow_control`（配置视图）与 `flow_control_hits`
 （与 writes 同下标的每槽累计拒绝数，前端按节点作差判触发）。
 
 **客户端库把 1006 吸收为回压**：`pkg/client` 的 `BatchAppend` 从不把 1006 交给调用方。

@@ -707,6 +707,51 @@ func TestDialRefusedDistinguishesDeadFromSlow(t *testing.T) {
 // A slow server (deadline), a session this node stopped (cancellation), a
 // routing answer or an application error are not — reporting those would mark a
 // healthy leader down, which is exactly what the probe threshold guards against.
+func TestSweepRoundReleasesCaughtUpBuildingSeat(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	pinReplicas(t, e, 2)
+	applyCmd(t, e, &Command{Op: OpPlanSlots})
+
+	// One write, and the follower's report at the leader's LEO puts the seat
+	// in-sync: the baseline the re-mark below must not silently undo.
+	aggH := aggInSlot(t, e, 0)
+	if _, err := st.Append(makeRecord(aggH, 1, "g-1")); err != nil {
+		t.Fatal(err)
+	}
+	e.NoteReplicaProgress(0, "node-2", 1)
+	if _, synced, _ := e.SyncedLeaderSlots(); synced != 1 {
+		t.Fatalf("setup: synced=%d want 1", synced)
+	}
+
+	// A re-plan churns the slot's set away and back while this node KEEPS
+	// leading (the shape of a scale-out's serial re-plan): syncSeats treats
+	// the copy as a fresh transition and re-marks it building, even though
+	// its ledger entry is alive and caught up.
+	e.replMu.Lock()
+	sr := e.repl[0]
+	sr.syncSeats([]string{"node-1"})
+	sr.syncSeats([]string{"node-1", "node-2"})
+	e.replMu.Unlock()
+	if !sr.isBuilding("node-2") {
+		t.Fatal("setup: the re-mark did not happen as the churn would")
+	}
+
+	// The follower's very next round is the steady one: an unchanged LEO,
+	// stamped for liveness (a sweep round). The mark must NOT stick — the
+	// sweep is also the re-check that clears it. This is the bug that froze
+	// "syncing N" on every leader of a churned fleet: idle slots never
+	// change LEO, so without a sweep re-check the building mark (and with
+	// it the 0-synced reading) lasted until the NEXT write to each slot.
+	b := &progressBatch{follower: "node-2", stamp: true, now: time.Now()}
+	b.add(0, 1)
+	b.apply(e)
+	if _, synced, _ := e.SyncedLeaderSlots(); synced != 1 {
+		t.Fatalf("sweep round left a caught-up seat marked building: synced=%d want 1", synced)
+	}
+}
+
 func TestTakeoverKeepsBuildingSeatsOutOfTheHW(t *testing.T) {
 	e, st := newTestEngine(t, "node-1")
 	join(t, e, "node-1", "127.0.0.1:1")
@@ -1308,7 +1353,7 @@ func TestConcurrentMFetchRoundsDoNotShareTheScanBuffer(t *testing.T) {
 // travels in the replicated command, so every node must reach the same verdict
 // from the same table.
 
-// TestSyncedLeaderSlotsGauge pins the /admin/writes sync gauge that feeds the
+// TestSyncedLeaderSlotsGauge pins the /admin/status sync gauge that feeds the
 // console's 同步状态 card: this node counts its leading slots, and a slot
 // counts as converged only when the replica set AND the in-sync copies (the
 // leader included — isr() lists followers) both reach the table's factor.
@@ -1322,7 +1367,7 @@ func TestSyncedLeaderSlotsGauge(t *testing.T) {
 	// Factor 2 over the two members: node-1 leads half the table, but no
 	// follower has ever reported — every leading slot is placed-but-not-in-
 	// sync, which is exactly the 构建中 window the card names.
-	led, synced := e.SyncedLeaderSlots()
+	led, synced, _ := e.SyncedLeaderSlots()
 	if led == 0 || synced != 0 {
 		t.Fatalf("before any follower report: led=%d synced=%d, want led>0 and synced=0", led, synced)
 	}
@@ -1336,7 +1381,7 @@ func TestSyncedLeaderSlotsGauge(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.NoteReplicaProgress(0, "node-2", 1)
-	led2, synced2 := e.SyncedLeaderSlots()
+	led2, synced2, _ := e.SyncedLeaderSlots()
 	if led2 != led {
 		t.Fatalf("led count moved with a progress report: %d want %d", led2, led)
 	}
@@ -1348,7 +1393,7 @@ func TestSyncedLeaderSlotsGauge(t *testing.T) {
 	// every slot this node leads reads converged at once — 同步中 with no
 	// follower report at all.
 	pinReplicas(t, e, 1)
-	led3, synced3 := e.SyncedLeaderSlots()
+	led3, synced3, _ := e.SyncedLeaderSlots()
 	if led3 != led || synced3 != led3 {
 		t.Fatalf("factor 1: led=%d synced=%d want both %d", led3, synced3, led)
 	}
@@ -1358,7 +1403,32 @@ func TestSyncedLeaderSlotsGauge(t *testing.T) {
 	// copies the cluster cannot currently reach.
 	pinReplicas(t, e, 2)
 	applyCmd(t, e, &Command{Op: OpMarkDown, NodeID: "node-2"})
-	if _, synced4 := e.SyncedLeaderSlots(); synced4 != 0 {
+	if _, synced4, _ := e.SyncedLeaderSlots(); synced4 != 0 {
 		t.Fatalf("after downing the follower: synced=%d want 0", synced4)
+	}
+
+	// A placement SHORT of the factor is 待就位, not 构建中: factor 3 over
+	// two members can seat at most two copies, so every leading slot fails
+	// the replica-set half structurally — the gauge must report them as
+	// seats, outside (led, synced). Pinning this is the fix for the shape
+	// where a scale-out left every leader reading "256/256 syncing" for the
+	// whole serial re-plan window.
+	pinReplicas(t, e, 3)
+	led5, synced5, seats5 := e.SyncedLeaderSlots()
+	if led5 != 0 || synced5 != 0 {
+		t.Fatalf("factor above the pool: led=%d synced=%d want both 0", led5, synced5)
+	}
+	// node-1 leads every slot at factor 2 in this two-node plan, so at
+	// factor 3 the same set is all short of the replica-set half.
+	e.tableMu.RLock()
+	want := 0
+	for _, p := range e.table.Slots {
+		if p != nil && p.Leader == e.self {
+			want++
+		}
+	}
+	e.tableMu.RUnlock()
+	if seats5 != want {
+		t.Fatalf("incomplete placements must count as seats: seats=%d want %d", seats5, want)
 	}
 }

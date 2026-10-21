@@ -1,6 +1,6 @@
 import axios from 'axios'
 import type {
-  ClusterStatus, FlowControlDetail, NodeWrites, SlotDescribe, SlotStreams,
+  ClusterStatus, FlowControlDetail, NodeStatus, SlotDescribe, SlotStreams,
 } from './types'
 
 // ---- admin endpoint pool ----------------------------------------------------
@@ -157,15 +157,15 @@ export function ensureLeader(): Promise<ClusterStatus> {
   return p
 }
 
-// fetchNodeWrites pulls one node's per-slot counters AND gauges over CORS —
+// fetchNodeStatus pulls one node's per-slot counters AND gauges over CORS —
 // the light endpoint (no full per-slot table) the console polls every 2s:
 // `writes` is diffed into per-slot write rates, `bytes`/`streams` are shown as
 // columns. A node that has not loaded a slot reports 0 for it rather than
 // opening it (opening scans the slot's WAL), so the caller takes the answer
 // from whichever node holds the slot. Admin addresses from the status API
 // carry an http:// scheme; older/bare host:port values are tolerated.
-export async function fetchNodeWrites(addr: string): Promise<NodeWrites> {
-  const { data } = await axios.get<NodeWrites>(`${normalizeAdminBase(addr)}/admin/writes`, { timeout: 5000 })
+export async function fetchNodeStatus(addr: string): Promise<NodeStatus> {
+  const { data } = await axios.get<NodeStatus>(`${normalizeAdminBase(addr)}/admin/status`, { timeout: 5000 })
   return data
 }
 
