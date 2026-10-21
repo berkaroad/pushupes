@@ -227,11 +227,14 @@ medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(�
 响应附 `controller` 与 `controller_admin_addr`）、`1006` 本节点流控拒绝
 （见「节点级流控」；经 `pkg/client` 写入时该码被库吸收为回压，调用方看不到它）、
 `1007` 本地副本来源未证实（owner 围栏拦下该槽：leader 拒写、本地读答空，直到
-运维经 `/admin/slots/pending/adopt` 采纳、或删除槽目录，见 DESIGN §3.1）。世代号
+运维经 `/admin/slots/pending/adopt` 采纳、或删除槽目录，见 DESIGN §3.1。来源
+证明以复制表为权威：表把你的节点排进某槽，该槽目录即由表盖章；只有整个数据
+目录的准入戳指向别的世代（指错 `-data`、共识状态重建）且副本无记录时才会围栏，
+adopt 一条命令即可同时采纳副本与准入目录）。世代号
 是复制状态里的集群级值（`GET /admin/cluster/status` 的 `topology`，每个节点报同一个），
 只有真正重建共识状态才会换世代；普通重启、raft 换主都不影响副本来源的证明。
 
-admin 面 HTTP（仅管理）：`GET /admin/cluster/status`、`GET /admin/writes`、
+admin 面 HTTP（仅管理）：`GET /admin/cluster/status`、`GET /admin/status`、
 `GET /admin/slots/{slot}/describe`、`GET /admin/slots/{slot}/streams`、
 `POST /admin/slots/{slot}/migrate`、`POST /admin/slots/{slot}/remove-replica`、
 `POST /admin/cluster/plan`、`POST /admin/cluster/replica-policy`、

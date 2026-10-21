@@ -138,13 +138,11 @@ type Engine struct {
 	// owner fence (owner.go): pendingOwners is the set of slots whose local
 	// copy is unproven for the live table (leader service refused with
 	// fail/1007 until adopted, or until the copy is removed from disk by
-	// the operator); bornSet captures which slots
-	// had a WAL when the process started — the "predates this process"
-	// witness that separates an upgraded copy from bytes this generation
-	// produced.
+	// the operator) — the verdict a stranger-dir admission stamp renders
+	// on record-less data; every other member slot is proven by its
+	// placement and stamped.
 	ownerMu       sync.Mutex
 	pendingOwners map[int32]ownerReason
-	bornSet       map[int32]bool
 	ownerKick     chan struct{}
 
 	// migration commit fence: one preallocated write gate per slot (a writer
@@ -594,17 +592,6 @@ func NewEngine(node consensus, store *storage.Store, self string, logger *slog.L
 	e.divergedConfirm = divergedConfirmWindow
 	e.fetchScratchPool.New = func() any { return &fetchScratch{} }
 	e.fences = make([]slotFence, store.SlotCount)
-	// The owner fence's birth witness (owner.go): which slots already hold a
-	// WAL. It MUST be taken here — the first moment the engine can exist
-	// alongside its store — because "predates this process" is exactly the
-	// line between an upgraded copy (unproven until adopted) and bytes this
-	// generation wrote under the live table (proven by construction).
-	e.bornSet = make(map[int32]bool)
-	for i := int32(0); i < store.SlotCount; i++ {
-		if store.HasWAL(i) {
-			e.bornSet[i] = true
-		}
-	}
 	if e.logger == nil {
 		l := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 		e.logger = l.With("component", "cluster")
@@ -642,6 +629,11 @@ func (e *Engine) ApplyCommand(cmd []byte) ([]byte, error) {
 	case OpMarkDown, OpLeaveNode, OpSlotRemoveReplica:
 		e.releaseWatermarksFor(c.NodeID)
 	}
+	// The apply-path half of the owner fence's promise (owner.go): a slot
+	// this commit hands to self carries its record from THIS moment — the
+	// new leader never serves, waits, or reads unproven while a fence tick
+	// catches up.
+	e.stampAppliedSlots(c)
 	return nil, nil
 }
 

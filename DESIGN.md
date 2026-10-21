@@ -196,12 +196,21 @@ Body: Record*，每条记录：
   共识 ⇒ 新世代 ⇒ 所有旧记录自动不匹配，这是围栏的主判据。值必须是集群级的：voter
   各自的目录 id 互不相同，若把「轮到哪个 leader 的目录 id」当作世代，普通重启换了
   leader 就会让数据面读到另一个 id，把整片副本误判成「另一个世代」全部围栏。
-- **出生见证**：进程启动瞬间扫描一遍哪些槽目录带 WAL。「本进程生命周期内
-  出现的副本」（首写、迁移推送、fetch 补齐）天然属于当前世代，直接盖记录；
-  「出生就在盘上、又没有匹配记录」的副本才是来历不明，等待运维裁决。
+- **表席位即证明**：复制表就是来源权威——controller 只会把节点排进它跟踪过
+  的槽的副本集，所以「表把我放在这个槽的席位上」本身就是这份副本属于当前
+  世代的证明。无记录的成员槽（leader 或席位，有 WAL 或还没有）一律直接盖章；
+  空槽的记录是出生证明——此后在该目录下出现的任何字节都是本表写出来的。
+- **晋升同步盖章**：任何把 leader 交给本节点的提交（leader_move、迁移提交、
+  重排）在 `ApplyCommand` 应用表的同时写好新 leader 的 owner.json——新 leader
+  从提交那一刻起就带着记录服务，不存在「等围栏 tick 补上」的窗口。席位记录
+  由围栏循环（每次表变更 kick + 2s tick，比较后写，稳态零文件 IO）补齐。
+- **目录级准入戳**：表看不见的是整个数据目录的历史——`-data` 指错了旧部署、
+  或共识状态在同 id 节点上重建。准入戳 `<data>/admission.json {topology}` 在
+  本目录第一次见到活表时写下世代号；戳与现表不符的目录里，「leader + 有数据 +
+  无记录」的副本来历不明，等待运维裁决（空席位不算——没有字节就没有争议）。
 - **判定**（leader 席位才会被围栏；冗余副本的读由同步证明门控，写由复制协议
-  对账）：记录匹配 ⇒ 盖新记录（表变化后刷新，比较后写，稳态零文件 IO）；
-  记录缺失/世代不符/任期倒退 ⇒ 该槽 PENDING——leader 拒写 `fail/1007`
+  对账）：记录匹配 ⇒ 盖新记录（表变化后刷新）；目录为外来世代且副本无记录 /
+  记录世代不符 / 任期倒退 ⇒ 该槽 PENDING——leader 拒写 `fail/1007`
   （不落 WAL，与 1006 同级的前置拒绝）、本地读答空。围栏只拒绝，从不删除：
   证据留在盘上等运维决定。
 - **运维裁决**（节点本地接口，不经 Raft、不转发，与 §6.2 流控同形）：
@@ -210,12 +219,12 @@ Body: Record*，每条记录：
   确认；请求体 `{}` 或空=全部被围槽——升级到这个特性后的首启全量采纳就走
   这条，`{"slots":[3,5]}`=只点名槽，非 pending 的槽一律回 in skipped、绝不
   顺手采纳）。丢弃没有接口：删除一份集群仍在引用的副本会造成来源分裂
-  （幸存副本随时可能带着旧 seq 空间复活），所以运维按传统方式删除磁盘目录
-  `slot-xxx/`，下一拍围栏见 WAL 已不在自然解除裁决。手动删除 owner.json
-  表达的是「这份副本来历不明」（重新进 pending），不是丢弃。
-- **席位记录防「借位转正」**：来历不明的出生副本在席位阶段不盖章，晋升为
-  leader 的那一刻按 leader 规则重新判定，未证实的副本不能靠持有只读席位
-  洗白来源。
+  幸存副本随时可能带着旧 seq 空间复活），所以运维按传统方式删除磁盘目录
+  `slot-xxx/`，下一拍围栏见 WAL 已不在自然解除裁决。adopt 同时刷新目录准入戳
+  （「这些副本属于当前世代」的声明正是「这个目录准入于当前世代」的意思；不刷
+  戳的话，同目录下一个无记录槽会再次进 pending）。手动删除 owner.json 会把
+  该槽交回表/戳重新裁决：本目录内的槽两拍内被表重新盖章，外来目录里的槽则
+  进 pending——删记录从来不是丢弃手段，丢弃只有删目录一条路。
 
 ## 4. 高可用（复制设计）
 
@@ -602,6 +611,7 @@ gRPC  PeerService/ReplicaProgress 副本 LEO 上报（批量）
 gRPC  PeerService/Replicate       提交栅栏的冻结尾巴推送（同 seq 落盘，幂等）
 gRPC  PeerService/SlotLeo         查询节点某槽 LEO（提交前置判据，见 §5）
 gRPC  PeerService/DropSlot        丢弃对端某槽本地副本（分叉副本重新入场用）
+
 gRPC  PeerService/Ping            探活（controller 故障切换）
 gRPC  PeerService/Register        数据面地址自报（OpRegister 提交/转发）
 gRPC  PeerService/Adopt           新节点自报入编（add_member 提交/转发，见 §6.1）
@@ -618,7 +628,7 @@ GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（�
                                                #   每 2s 采一次样（自己 leader 的槽本地读，其余问 peer），
                                                #   status 读缓存值；storage_bytes_complete=false 表示
                                                #   有 slot leader 没应答，此时该值是下界
-GET  /admin/writes                             # 每槽 durable 计数 + 每槽落盘字节 write_bytes（与计数同下标；两条落盘路径共用：batch append 与追平路径 AppendAtSeq/AppendFrameAtSeq——副本拉取、迁移搬运都会计入，所以它们是「本节点落了什么」的总量口径，不是客户端写入口径）+ client_writes/client_bytes（与计数同下标的**仅客户端**口径：只有 batch append 落盘才增长，追平路径不碰；控制台的「客户端写入速度」卡片与折线图的实线对它按槽做「leader 身份两拍相同」的稳定作差——换主的槽该窗不计，节点间流量不进速率，折线图的虚线「总写入速度」才按 writes/write_bytes 全槽求和作差）+ 槽内总字节/事件流数量 + 本节点待清理副本 + 本节点流控（flow_control = 生效配置视图 {tokens, period_ms, configured}；flow_control_hits = 每槽累计流控拒绝数——桶是节点的、计数归槽——与计数同下标）+ 同步计量 synced_slots = [本节点领导的槽数, 其中已按副本因子收敛的槽数]——「收敛」= 副本集与 in-sync 副本（leader 计入，follower 用 ISR 同口径）都达到表里的因子（Engine.SyncedLeaderSlots）；控制台按「slot_count − Σsynced」给出构建中剩余数（前端轮询）
+GET  /admin/status                             # 每槽 durable 计数 + 每槽落盘字节 write_bytes（与计数同下标；两条落盘路径共用：batch append 与追平路径 AppendAtSeq/AppendFrameAtSeq——副本拉取、迁移搬运都会计入，所以它们是「本节点落了什么」的总量口径，不是客户端写入口径）+ client_writes/client_bytes（与计数同下标的**仅客户端**口径：只有 batch append 落盘才增长，追平路径不碰；控制台的「客户端写入速度」卡片与折线图的实线对它按槽做「leader 身份两拍相同」的稳定作差——换主的槽该窗不计，节点间流量不进速率，折线图的虚线「总写入速度」才按 writes/write_bytes 全槽求和作差）+ 槽内总字节/事件流数量 + 本节点待清理副本 + 本节点流控（flow_control = 生效配置视图 {tokens, period_ms, configured}；flow_control_hits = 每槽累计流控拒绝数——桶是节点的、计数归槽——与计数同下标）+ 同步计量 synced_slots = [本节点领导且**副本集已到位**的槽数, 其中已按副本因子收敛的槽数] + pending_seats = 本节点领导的槽里副本集仍短于因子的数量（扩容后布局重排尚未补齐席位——「待就位」，不进 led/synced 的账）——「收敛」= 副本集与 in-sync 副本（leader 计入，follower 用 ISR 同口径）都达到表里的因子（Engine.SyncedLeaderSlots）；控制台按「slot_count − Σsynced」给出构建中剩余数（前端轮询）；pending_slots = 本节点被围栏的本地副本数组（与 `GET /admin/slots/pending` 同一视图 PendingSlotView：槽号 + 围栏判词 reason + 表 leader/epoch + owner 现场），采纳（adopt）前拒写；控制台搭同一轮询在数据节点卡上打红色「已围栏 N」tag（tooltip 逐槽列槽号+判词，超 10 行截断计数）——本接口原名 `/admin/writes`，字段早已超出写计数口径，2026-10-21 更名
 GET  /admin/stats[?worst=N]                    # 三个「等在哪里」自视合一：flush = 待刷记录数/最老未刷记录年龄/刷盘队列长度与在飞数/fsync 排队等待与 syscall 服务时间分位/每次新覆盖字节与覆盖的段文件大小；repl = `hw < LEO` 的槽数与最老等待时长（?worst=N 列出最久的槽）/每副本上报新鲜度与 LEO 落后/fetch 轮次与「按数据唤醒 vs 按等待预算到期」计数；ack = 每条写入的确认链路四段耗时（栅栏+路由 / 本地 WAL 落地 / 等 ISR 高水位 / 整调用）与结果、失败原因分布、正在等待的调用数、水位落后条数（?worst=N 列出等得最久的槽）
 GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本+最新记录 unix_time，仅内存索引，不读 WAL）
 GET  /admin/slots/pending                      # 本节点被 owner 围栏拦下的槽（slot/原因/表与记录的 leader-epoch-世代；节点本地）

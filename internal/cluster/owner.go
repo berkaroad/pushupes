@@ -14,50 +14,43 @@
 
 // owner.go — the slot-data provenance fence (DESIGN §3).
 //
-// Two independent recovery paths meet in one hazard: a node's slot WAL says
-// "I hold records 1..N", while the replicated table says "this slot is new".
-// That happens when the consensus state is lost or replaced while the data
-// dir survives (a wiped <data>/cluster/, a rebuilt cluster the old data dirs
-// join). Serving such a copy as leader mixes two seq spaces into one slot:
-// reads return the old events without complaint, and writes append on top
-// of a version floor the client was never told about.
+// The replicated table is the provenance authority: a controller seats a
+// node on a slot only for copies its fetch protocol has tracked, so a live
+// placement already names the generation the bytes belong to. Every slot
+// dir in this node's table picture — leader OR seat, WAL present or not —
+// carries the per-slot record owner.json: {topology, leader, epoch,
+// replica, state}. A placement without data yet gets its record too: the
+// record is the copy's birth certificate, and any bytes that appear under
+// it afterwards were written under this table.
 //
-// The fence is a per-slot record — slot-<id>/owner.json — written by the
-// node WHILE the table has that slot in this node's replica set (leader or
-// seat): {topology, leader, epoch, replica, state}. It is evidence of which
-// cluster generation the bytes under it belong to, and the node only serves
-// as leader of a slot whose record it can reconcile with the live table:
+// The promise the console depends on: any change of a slot's leader installs
+// the new leader's record on disk WITH the table apply (ApplyCommand's
+// synchronous stamp), so leadership arriving here never waits on a fence
+// tick, never fences, and never reads as "unproven". The fence round
+// (refreshOwners: every table kick plus a 2s tick) re-verifies every member
+// slot and rewrites records the layout aged out — zero file IO at steady
+// state, since a record is written only when the table-implied content
+// differs.
 //
-//   - the record names this node's topology id (the data dir was not rebuilt
-//     out from under the copy),
-//   - its epoch never runs ahead of the table's (a consensus rollback is a
-//     fork, not a continuation),
-//   - its lineage leads somewhere: it was stamped while this node LED the
-//     slot at that placement, or it was stamped while this node HELD A SEAT
-//     (the fetch protocol vouched the bytes) and the promotion since then
-//     only moved leadership.
+// One hazard lives OUTSIDE the table: a whole data dir predating this
+// cluster generation — a mispointed -data, or consensus state rebuilt under
+// the same node id. The dir answers that with its own admission stamp,
+// <data>/admission.json {topology}, written the first time a live table
+// applies here. In a dir stamped for a DIFFERENT generation, a member slot
+// with no record is unproven: the leader refuses appends (fail/1007
+// SlotUnproven, reason foreignDir) and local reads answer empty until an
+// operator acts explicitly — adopt (POST /admin/slots/pending/adopt: "this
+// dir's copies ARE this generation's"; adopting also refreshes the admission
+// stamp, which is exactly what that declaration means) or discard (remove
+// the slot directory on disk — deliberately NOT an endpoint: deleting a
+// copy the cluster still references through another node's seat forks the
+// slot's lineage between the surviving replica and a rebuilt leader log).
 //
-// A slot that fails the check goes PENDING: the leader refuses appends
-// (fail/1007 SlotUnproven) and local reads answer empty. Nothing is deleted
-// — the evidence stays — until an operator acts on it explicitly:
-// adopt (POST /admin/slots/pending/adopt: "this copy IS this generation's",
-// whole list or empty=all, pending slots only) or discard (remove the slot
-// directory on disk — deliberately NOT an endpoint: deleting a copy the
-// cluster still references through another node's seat forks the slot's
-// lineage between the surviving replica and a rebuilt leader log).
-// Deleting owner.json by
-// hand means exactly "the copy is unproven": a WAL with no record is
-// pending whenever it predates the process (it was on disk at startup); a
-// WAL that appeared mid-life is this generation's own bytes (migration
-// push, fetch catch-up, first writes) and is stamped immediately.
-//
-// Upgrade note: a cluster adopting this feature starts with no records at
-// all. Every leader slot it restarts into is pending by the rule above, and
-// one explicit call per node — POST /admin/slots/pending/adopt — stamps
-// the whole fleet against the live table, which is the operator confirming
-// "my consensus history is continuous". The strict default is deliberate:
-// guessing adoption from "the dir looks old" is exactly the ambiguity this
-// fence exists to refuse.
+// Records that exist are still held to the table: a record naming another
+// topology id, or running its epoch ahead of the placement's, or claiming a
+// lineage this node cannot lead under, fences the leader copy
+// (topoMismatch / epochBackward / lineageUnknown). A record matching the
+// table is refreshed whenever the implied content differs.
 
 package cluster
 
@@ -124,7 +117,7 @@ type ownerReason string
 
 const (
 	ownerOK             ownerReason = ""
-	ownerMissing        ownerReason = "owner record absent for a copy that predates this process"
+	ownerForeignDir     ownerReason = "the data dir was admitted to a different cluster generation; this copy predates the admission"
 	ownerTopoMismatch   ownerReason = "owner record names a different cluster generation (consensus state was rebuilt)"
 	ownerEpochBackward  ownerReason = "owner record's epoch is ahead of the table's (consensus state rewound)"
 	ownerLineageUnknown ownerReason = "owner record was stamped for a placement that cannot lead here (no seat, foreign leader)"
@@ -142,33 +135,41 @@ const (
 // decideOwner is the whole fence rule as a pure function: it decides how a
 // node may treat its LOCAL copy of one slot given the replicated placement.
 //
-//   - hasWAL: the slot dir holds segment files.
-//   - bornWAL: the dir already held segments when this process started
-//     (a copy that appeared mid-life was written under the table's own
-//     protocol and belongs to this generation by construction).
+//   - strangerDir: the dir-level admission stamp names a different
+//     generation than the live table — the whole data dir predates this
+//     admission, the one fact the table itself cannot see.
 //   - The fence (pending) can only fall on the LEADER: that is the role that
 //     writes into the seq space and answers local reads from the copy.
-//   - A SEAT stamps its record only when provenance holds (a matching,
-//     current record refreshed; or a copy received while this process ran)
-//     — a born copy without a record stays unstamped, so the promotion into
-//     leader judges it under the leader rules and an unproven copy can
-//     never buy provenance by holding a read-fenced seat.
+//   - A member slot WITHOUT a record is proven by its table placement: the
+//     controller seated this node for that copy, so the record is written
+//     (ownerStamp) — with or without a WAL, leader or seat. The one
+//     exception is a stranger dir: there a record-less leader copy that
+//     ALREADY HOLDS DATA waits for the operator's adopt (an empty placement
+//     is just a seat — no bytes, nothing to dispute, no stamp to risk),
+//     and a record-less seat is left unstamped, so a promotion judges it
+//     under the same leader rule.
+//   - hasWAL: whether the slot dir holds segment files (fence input only —
+//     a WAL-less placement still gets its birth certificate when the dir
+//     belongs here).
+//   - A record that EXISTS is held to the table: matching topology, epoch
+//     not ahead of the placement's, and a lineage this node can lead (it
+//     named us leader, or seated us). Proven and current ⇒ nothing; proven
+//     and aged ⇒ refresh; unproven while leading ⇒ pending.
 //   - Not a member of the slot: no verdict here — the post-migration
 //     countdown owns surplus copies, and its drop deletes the record with
 //     the data (the "authoritative copy elsewhere" path).
-func decideOwner(topo, self string, p *Placement, owner slotOwner, hasOwner, hasWAL, bornWAL bool) (ownerAction, ownerReason) {
-	if !hasWAL {
-		return ownerNone, ownerOK
-	}
+func decideOwner(topo, self string, p *Placement, owner slotOwner, hasOwner, hasWAL, strangerDir bool) (ownerAction, ownerReason) {
 	lead := p.Leader == self
 	if !lead && !replicaListHas(p.Replicas, self) {
 		return ownerNone, ownerOK
 	}
 	if !hasOwner {
-		if lead && bornWAL {
-			return ownerPending, ownerMissing
-		}
-		if !lead && bornWAL {
+		if strangerDir {
+			// Only bytes can dispute; an empty placement in a stranger
+			// dir is just a seat — nothing predates anything yet.
+			if lead && hasWAL {
+				return ownerPending, ownerForeignDir
+			}
 			return ownerNone, ownerOK
 		}
 		return ownerStamp, ownerOK
@@ -202,6 +203,117 @@ func desiredOwner(topo, self string, p *Placement) slotOwner {
 		Epoch:    p.Epoch,
 		Replica:  replicaListHas(p.Replicas, self),
 		State:    string(p.State),
+	}
+}
+
+// stampPlacement is the table-apply path's synchronous half of the fence
+// promise: when a leadership (re)arrival lands here, the owner record is
+// installed WITH the apply, not one fence tick later — the new leader never
+// serves (or waits) without it. Idempotent by the implied-content check, and
+// silent on a stranger dir: adoption there is the operator's call, not the
+// table's.
+func (e *Engine) stampPlacement(s int32, p *Placement) {
+	if p == nil || p.Leader != e.self {
+		return
+	}
+	topo := e.topologyID()
+	if e.strangerDir(topo) {
+		return
+	}
+	want := desiredOwner(topo, e.self, p)
+	dir := e.store.SlotDir(s)
+	if cur, has, err := readOwner(dir); err == nil && has && cur == want {
+		return
+	}
+	if err := writeOwner(dir, want); err != nil {
+		e.logger.Warn("owner fence: apply-path stamp failed", "slot", s, "err", err)
+	}
+}
+
+// stampAppliedSlots is the ApplyCommand hook behind the apply-path promise:
+// it stamps every slot whose leadership this commit landed on self (and, for
+// a full re-plan, walks the table for exactly those slots). Slots untouched
+// by the commit cost nothing; a re-plan costs one small read per leading
+// slot, and re-plans are rare by construction.
+func (e *Engine) stampAppliedSlots(c *Command) {
+	e.tableMu.RLock()
+	type rec struct {
+		s int32
+		p Placement
+	}
+	want := make([]rec, 0, len(c.Slots))
+	if c.Op == OpPlanSlots {
+		for s, p := range e.table.Slots {
+			if p != nil && p.Leader == e.self {
+				want = append(want, rec{s, *p})
+			}
+		}
+	} else if len(c.Slots) > 0 {
+		for _, s := range c.Slots {
+			if p := e.table.Slots[s]; p != nil && p.Leader == e.self {
+				want = append(want, rec{s, *p})
+			}
+		}
+	}
+	e.tableMu.RUnlock()
+	for _, r := range want {
+		p := r.p
+		e.stampPlacement(r.s, &p)
+	}
+}
+
+// ---- dir-level admission stamp ----
+
+// admissionFileName is the data-dir stamp naming the cluster generation this
+// dir was first admitted under. It answers the one hazard the replicated
+// table cannot see: a whole dir that predates the generation (a mispointed
+// -data, or consensus state rebuilt under the same node id).
+const admissionFileName = "admission.json"
+
+type admission struct {
+	Topology string `json:"topology"`
+}
+
+func admissionPath(dataDir string) string { return filepath.Join(dataDir, admissionFileName) }
+
+// strangerDir consults the admission stamp: a missing stamp is written with
+// the live topology (this is the dir's first table — the common first boot
+// and every re-admission of a dir this generation already owns), a matching
+// stamp says "this dir belongs here", and a mismatched one makes the
+// record-less member slots of this dir unproven until an adopt declares
+// otherwise (AdoptPending refreshes the stamp — that declaration IS its
+// meaning). A stamp that cannot be read fails open toward the table: the
+// placement, not the dir's paperwork, remains the primary proof.
+func (e *Engine) strangerDir(topo string) bool {
+	b, err := os.ReadFile(admissionPath(e.store.Dir))
+	if os.IsNotExist(err) {
+		e.writeAdmissionStamp(topo)
+		return false
+	}
+	if err != nil {
+		return false
+	}
+	var a admission
+	if json.Unmarshal(b, &a) != nil || a.Topology == "" {
+		e.writeAdmissionStamp(topo)
+		return false
+	}
+	return a.Topology != topo
+}
+
+func (e *Engine) writeAdmissionStamp(topo string) {
+	path := admissionPath(e.store.Dir)
+	b, err := json.Marshal(admission{Topology: topo})
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		e.logger.Warn("owner fence: admission stamp could not be written", "err", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		e.logger.Warn("owner fence: admission stamp install failed", "err", err)
 	}
 }
 
@@ -319,12 +431,10 @@ func (e *Engine) refreshOwners() {
 	e.tableMu.RUnlock()
 
 	topo := e.topologyID()
+	stranger := e.strangerDir(topo)
 	next := map[int32]ownerReason{}
 	for slot, p := range member {
 		p := p
-		if !e.store.HasWAL(slot) {
-			continue // empty copy: nothing to fence, nothing proven yet
-		}
 		dir := e.store.SlotDir(slot)
 		owner, hasOwner, err := readOwner(dir)
 		if err != nil {
@@ -334,7 +444,7 @@ func (e *Engine) refreshOwners() {
 			}
 			continue
 		}
-		act, reason := decideOwner(topo, e.self, &p, owner, hasOwner, true, e.bornWAL(slot))
+		act, reason := decideOwner(topo, e.self, &p, owner, hasOwner, e.store.HasWAL(slot), stranger)
 		switch act {
 		case ownerPending:
 			next[slot] = reason
@@ -348,14 +458,6 @@ func (e *Engine) refreshOwners() {
 	e.ownerMu.Lock()
 	e.pendingOwners = next
 	e.ownerMu.Unlock()
-}
-
-// bornWAL reports whether the slot held segments when this process started
-// (the snapshot is taken in NewEngine, before any append can land).
-func (e *Engine) bornWAL(slot int32) bool {
-	e.ownerMu.Lock()
-	defer e.ownerMu.Unlock()
-	return e.bornSet[slot]
 }
 
 // slotPending reports the fence verdict for one slot's write path. The check
@@ -408,11 +510,14 @@ func (e *Engine) PendingSlots() []PendingSlotView {
 // adopted — the pending set is the fence's own verdict, and adopting
 // anything else would be declaring provenance for bytes nobody disputed
 // (which is to say: no-op at best, papering over a fork at worst). An empty
-// want list means "every pending slot" (the one-time upgrade action for a
-// cluster adopting the fence); named slots that are not pending are skipped
-// and reported back, they are never adopted implicitly. Discarding a copy
-// is deliberately NOT an endpoint: the operator removes the slot directory
-// on disk, and the next fence round clears the verdict on its own.
+// want list means "every pending slot" (the one call per node that clears a
+// disputed dir); named slots that are not pending are skipped and reported
+// back, they are never adopted implicitly. Adopting also refreshes the
+// dir-level admission stamp: declaring the copies this generation's is
+// exactly declaring the dir admitted to this generation, and without it the
+// next record-less slot would fence again. Discarding a copy is
+// deliberately NOT an endpoint: the operator removes the slot directory on
+// disk, and the next fence round clears the verdict on its own.
 func (e *Engine) AdoptPending(want []int32) (adopted int, skipped []int32) {
 	e.ownerMu.Lock()
 	targets := make([]int32, 0, len(e.pendingOwners))
@@ -458,6 +563,7 @@ func (e *Engine) AdoptPending(want []int32) (adopted int, skipped []int32) {
 		adopted++
 	}
 	if adopted > 0 {
+		e.writeAdmissionStamp(e.topologyID())
 		e.loggerf("%d slot(s) adopted: local copies declared this generation's", adopted)
 	}
 	return adopted, skipped

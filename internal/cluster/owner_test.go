@@ -31,8 +31,8 @@ type ownerCase struct {
 	replicas []string
 	epoch    int64
 	owner    *slotOwner // nil = no record on disk
-	hasWAL   bool
-	bornWAL  bool
+	hasWAL   bool       // the slot dir holds segments (fence input)
+	stranger bool       // the dir's admission stamp names another generation
 	want     ownerAction
 	wantWhy  ownerReason
 }
@@ -44,37 +44,49 @@ func TestDecideOwnerMatrix(t *testing.T) {
 	}
 	stampOK := slotOwner{Topology: topo, Leader: self, Epoch: 4, Replica: true, State: "stable"}
 	cases := []ownerCase{
-		{name: "no-wal", leader: self, replicas: []string{self}, epoch: 1, hasWAL: false, want: ownerNone},
+		// The table is the proof: every member slot without a record gets
+		// one — leader or seat, WAL or no WAL yet (an empty placement is
+		// stamped as the copy's birth certificate).
+		{name: "empty-leader-placement-stamps", leader: self, replicas: []string{self}, epoch: 1,
+			owner: nil, want: ownerStamp},
 		{name: "born-copy-no-record-leader", leader: self, replicas: []string{self}, epoch: 1,
-			owner: nil, hasWAL: true, bornWAL: true, want: ownerPending, wantWhy: ownerMissing},
+			owner: nil, hasWAL: true, want: ownerStamp},
 		{name: "fresh-copy-no-record-leader", leader: self, replicas: []string{self}, epoch: 1,
-			owner: nil, hasWAL: true, bornWAL: false, want: ownerStamp},
+			owner: nil, want: ownerStamp},
 		{name: "matching-record-refreshes", leader: self, replicas: []string{self}, epoch: 4,
-			owner: &stampOK, hasWAL: true, want: ownerNone},
+			owner: &stampOK, want: ownerNone},
 		{name: "leader-continues-across-epoch-bump", leader: self, replicas: []string{self}, epoch: 5,
-			owner: &stampOK, hasWAL: true, want: ownerStamp}, // stale record: re-stamp, not fence
+			owner: &stampOK, want: ownerStamp}, // stale record: re-stamp, not fence
 		{name: "topology-rotation-fences", leader: self, replicas: []string{self}, epoch: 1,
-			owner: &slotOwner{Topology: "gen-B", Leader: self, Epoch: 1}, hasWAL: true,
-			want: ownerPending, wantWhy: ownerTopoMismatch},
+			owner: &slotOwner{Topology: "gen-B", Leader: self, Epoch: 1},
+			want:  ownerPending, wantWhy: ownerTopoMismatch},
 		{name: "epoch-ahead-of-table-fences", leader: self, replicas: []string{self}, epoch: 2,
-			owner: &slotOwner{Topology: topo, Leader: self, Epoch: 7}, hasWAL: true,
-			want: ownerPending, wantWhy: ownerEpochBackward},
+			owner: &slotOwner{Topology: topo, Leader: self, Epoch: 7},
+			want:  ownerPending, wantWhy: ownerEpochBackward},
 		{name: "foreign-leader-record-without-seat-fences", leader: self, replicas: []string{self}, epoch: 3,
-			owner: &slotOwner{Topology: topo, Leader: "node-2", Epoch: 3}, hasWAL: true,
-			want: ownerPending, wantWhy: ownerLineageUnknown},
+			owner: &slotOwner{Topology: topo, Leader: "node-2", Epoch: 3},
+			want:  ownerPending, wantWhy: ownerLineageUnknown},
 		{name: "promoted-seat-is-proven", leader: self, replicas: []string{self, "node-2"}, epoch: 6,
-			owner: &slotOwner{Topology: topo, Leader: "node-2", Epoch: 5, Replica: true}, hasWAL: true,
-			want: ownerStamp}, // proven: refresh the record to name the new leader
+			owner: &slotOwner{Topology: topo, Leader: "node-2", Epoch: 5, Replica: true},
+			want:  ownerStamp}, // proven: refresh the record to name the new leader
 		{name: "surplus-copy-not-fenced-here", leader: "node-2", replicas: []string{"node-2"}, epoch: 4,
-			owner: nil, hasWAL: true, bornWAL: true, want: ownerNone},
-		{name: "born-seat-without-record-stays-unstamped", leader: "node-2", replicas: []string{"node-2", self}, epoch: 4,
-			owner: nil, hasWAL: true, bornWAL: true, want: ownerNone},
-		{name: "midlife-seat-without-record-stamps", leader: "node-2", replicas: []string{"node-2", self}, epoch: 4,
-			owner: nil, hasWAL: true, bornWAL: false, want: ownerStamp},
+			owner: nil, want: ownerNone},
+		{name: "seat-without-record-stamps", leader: "node-2", replicas: []string{"node-2", self}, epoch: 4,
+			owner: nil, want: ownerStamp},
+		// The stranger dir is the one shape the table cannot vouch for:
+		// its record-less leader copy waits for the operator's adopt, and
+		// a record-less seat stays unstamped so a later promotion judges
+		// it under the same leader rule.
+		{name: "stranger-dir-leader-without-record-fences", leader: self, replicas: []string{self, "node-2"}, epoch: 1,
+			owner: nil, hasWAL: true, stranger: true, want: ownerPending, wantWhy: ownerForeignDir},
+		{name: "stranger-dir-empty-placement-just-seats", leader: self, replicas: []string{self}, epoch: 1,
+			owner: nil, hasWAL: false, stranger: true, want: ownerNone},
+		{name: "stranger-dir-seat-without-record-unstamped", leader: "node-2", replicas: []string{"node-2", self}, epoch: 4,
+			owner: nil, stranger: true, want: ownerNone},
 		{name: "seat-refreshes-a-stale-but-matching-record", leader: "node-2", replicas: []string{"node-2", self}, epoch: 4,
-			owner: &slotOwner{Topology: topo, Leader: "node-2", Epoch: 3, Replica: true}, hasWAL: true, want: ownerStamp},
+			owner: &slotOwner{Topology: topo, Leader: "node-2", Epoch: 3, Replica: true}, want: ownerStamp},
 		{name: "seat-foreign-record-not-proven-no-fence", leader: "node-2", replicas: []string{"node-2", self}, epoch: 4,
-			owner: &slotOwner{Topology: topo, Leader: self, Epoch: 3}, hasWAL: true, want: ownerNone},
+			owner: &slotOwner{Topology: topo, Leader: self, Epoch: 3}, want: ownerNone},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -84,7 +96,7 @@ func TestDecideOwnerMatrix(t *testing.T) {
 				o, has = *tc.owner, true
 			}
 			p := mk(tc.leader, tc.replicas, tc.epoch)
-			act, why := decideOwner(topo, self, p, o, has, tc.hasWAL, tc.bornWAL)
+			act, why := decideOwner(topo, self, p, o, has, tc.hasWAL, tc.stranger)
 			if act != tc.want {
 				t.Fatalf("action = %v, want %v", act, tc.want)
 			}
@@ -155,7 +167,7 @@ func ownerRecord(agg string, version uint32, cmd string) *data.EventRecord {
 
 func TestOwnerFenceEndToEnd(t *testing.T) {
 	e, st := newTestEngine(t, "node-1")
-	// Slot 3 and 5: this node leads at epoch 1; slot 4 stays clean.
+	// Slot 3, 4 and 5: this node leads at epoch 1.
 	e.tableMu.Lock()
 	e.table.Slots[3] = &Placement{Leader: "node-1", Replicas: []string{"node-1"}, Epoch: 1, State: SlotStable}
 	e.table.Slots[4] = &Placement{Leader: "node-1", Replicas: []string{"node-1"}, Epoch: 1, State: SlotStable}
@@ -163,8 +175,7 @@ func TestOwnerFenceEndToEnd(t *testing.T) {
 	e.tableMu.Unlock()
 	agg3, agg4, agg5 := aggForSlot(t, e, 3), aggForSlot(t, e, 4), aggForSlot(t, e, 5)
 
-	// (a) A copy that appeared mid-life (migration push / first writes) is
-	// this generation's own bytes: stamped, never fenced.
+	// (a) A copy written under the live table is stamped, never fenced.
 	if err := st.AppendAtSeq(3, 1, ownerRecord(agg3, 1, "cmd-3")); err != nil {
 		t.Fatal(err)
 	}
@@ -177,19 +188,41 @@ func TestOwnerFenceEndToEnd(t *testing.T) {
 		t.Fatalf("fresh copy not stamped: %+v has=%v err=%v", owner, has, err)
 	}
 
-	// (b) A copy that predates the process with no record is unproven:
-	// fenced out of writes AND local reads, with the reason surfaced.
+	// (b) The table is the proof: a record-less copy in a dir admitted to
+	// THIS generation — the shape that used to fence every slot of a
+	// scale-out's promoted seats — is stamped by the placement itself and
+	// stays in service.
 	if err := st.AppendAtSeq(5, 1, ownerRecord(agg5, 1, "cmd-5")); err != nil {
 		t.Fatal(err)
 	}
-	e.ownerMu.Lock()
-	e.bornSet[5] = true
-	e.ownerMu.Unlock()
+	if err := os.Remove(ownerPath(st.SlotDir(5))); err != nil {
+		t.Fatal(err)
+	}
 	e.refreshOwners()
-	if !e.slotPending(5) {
-		t.Fatal("a born copy without an owner record passed the fence")
+	if e.slotPending(5) {
+		t.Fatal("a record-less copy inside the admitted dir was fenced: the table placement is the proof")
+	}
+	if _, has, _ := readOwner(st.SlotDir(5)); !has {
+		t.Fatal("the placement did not re-stamp its copy")
 	}
 	resp, err := e.landLocalAppend(5, ownerRecord(agg5, 2, "cmd-5b"))
+	if err != nil || resp.Status == data.StatusFail {
+		t.Fatalf("append after the placement stamp: %+v/%v", resp, err)
+	}
+
+	// (c) The stranger dir is the one shape the table cannot vouch for: the
+	// admission stamp names another generation, so a record-less leader
+	// copy is unproven — refused on writes AND local reads, with the
+	// reason surfaced, and nothing deleted while the operator decides.
+	e.writeAdmissionStamp("gen-B")
+	if err := os.Remove(ownerPath(st.SlotDir(5))); err != nil {
+		t.Fatal(err)
+	}
+	e.refreshOwners()
+	if !e.slotPending(5) {
+		t.Fatal("a record-less copy in a dir stamped for another generation passed the fence")
+	}
+	resp, err = e.landLocalAppend(5, ownerRecord(agg5, 3, "cmd-5c"))
 	if err != nil || resp.Status != data.StatusFail || resp.ErrID != data.ErrIDSlotUnproven {
 		t.Fatalf("fenced append = %+v/%v, want fail/1007", resp, err)
 	}
@@ -197,37 +230,45 @@ func TestOwnerFenceEndToEnd(t *testing.T) {
 		t.Fatalf("fenced leader read admission bound = %d, want 0 (empty answer)", bound)
 	}
 	pend := e.PendingSlots()
-	if len(pend) != 1 || pend[0].Slot != 5 || !strings.Contains(pend[0].Reason, "absent") {
-		t.Fatalf("pending view = %+v, want slot 5 with the missing-record reason", pend)
+	if len(pend) != 1 || pend[0].Slot != 5 || !strings.Contains(pend[0].Reason, "admission") {
+		t.Fatalf("pending view = %+v, want slot 5 with the foreign-dir reason", pend)
 	}
-	// The fence holds the slot out of service but never deletes: the WAL —
-	// the evidence the operator decides over — must still be on disk.
 	if !st.HasWAL(5) {
 		t.Fatal("the fence removed the local WAL it was judging")
 	}
 
-	// (c) Adopt: the operator's declaration puts the copy in service again.
+	// (d) Adopt: the operator's declaration puts the copy in service and
+	// admits the dir — without the stamp refresh every later record-less
+	// slot would fence all over again.
 	if n, sk := e.AdoptPending([]int32{5}); n != 1 || len(sk) != 0 {
 		t.Fatalf("adopt(5) = (%d, %v), want one adopted none skipped", n, sk)
 	}
 	if e.slotPending(5) {
 		t.Fatal("adopt left the slot fenced")
 	}
-	resp, err = e.landLocalAppend(5, ownerRecord(agg5, 2, "cmd-5c"))
+	e.refreshOwners()
+	if e.slotPending(5) {
+		t.Fatal("adopt did not refresh the admission stamp: the next round fenced it again")
+	}
+	resp, err = e.landLocalAppend(5, ownerRecord(agg5, 2, "cmd-5d"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Status != data.StatusSuccess && resp.Status != data.StatusExists {
-		t.Fatalf("adopted append = %+v, want success", resp)
+	// Any verdict INSIDE the seq space proves the slot is back in service:
+	// 1001 here would be a version conflict, which the fence (1007) could
+	// never produce.
+	if resp.ErrID == data.ErrIDSlotUnproven || resp.Status == data.StatusFail && resp.ErrID == 0 {
+		t.Fatalf("adopted append still fenced: %+v", resp)
 	}
 
-	// (d) Discard: WAL and record go together, the seat comes back empty.
+	// (e) Discard: WAL and record go together, the seat comes back empty.
+	e.writeAdmissionStamp("gen-C")
+	if err := os.Remove(ownerPath(st.SlotDir(4))); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.AppendAtSeq(4, 1, ownerRecord(agg4, 1, "cmd-4")); err != nil {
 		t.Fatal(err)
 	}
-	e.ownerMu.Lock()
-	e.bornSet[4] = true
-	e.ownerMu.Unlock()
 	e.refreshOwners()
 	if !e.slotPending(4) {
 		t.Fatal("setup: slot 4 should be fenced before discard")
@@ -240,47 +281,56 @@ func TestOwnerFenceEndToEnd(t *testing.T) {
 		t.Fatalf("after discard: wal=%v pending=%v", st.HasWAL(4), e.slotPending(4))
 	}
 
-	// (e2) A born seat copy cannot buy provenance by holding the seat: it
-	// stays unstamped while it is a seat, and the promotion into leader
-	// fences it under the leader rules.
+	// (f) A seat's copy is stamped too (the record documents the placement,
+	// it is not a service grant), and a promotion from that seat serves
+	// immediately — the shape that froze a scale-out's rebalanced fleet.
+	e.writeAdmissionStamp(e.topologyID())
 	e.tableMu.Lock()
 	e.table.Slots[4] = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-1"}, Epoch: 3, State: SlotStable}
 	e.tableMu.Unlock()
 	if err := st.AppendAtSeq(4, 1, ownerRecord(agg4, 1, "cmd-4b")); err != nil {
 		t.Fatal(err)
 	}
-	e.ownerMu.Lock()
-	e.bornSet[4] = true
-	e.ownerMu.Unlock()
 	e.refreshOwners()
-	if _, has, _ := readOwner(st.SlotDir(4)); has {
-		t.Fatal("a born seat stamped itself: unproven copies must not buy provenance through a seat")
+	if _, has, _ := readOwner(st.SlotDir(4)); !has {
+		t.Fatal("a member seat without a record was not stamped by its placement")
 	}
 	e.tableMu.Lock()
-	e.table.Slots[4] = &Placement{Leader: "node-1", Replicas: []string{"node-1"}, Epoch: 4, State: SlotStable}
+	e.table.Slots[4] = &Placement{Leader: "node-1", Replicas: []string{"node-1", "node-2"}, Epoch: 4, State: SlotStable}
 	e.tableMu.Unlock()
 	e.refreshOwners()
-	if !e.slotPending(4) {
-		t.Fatal("promoting a born unproven seat to leader was not fenced")
+	if e.slotPending(4) {
+		t.Fatal("promoting a stamped seat to leader fenced it")
 	}
-	if err := st.DropSlot(4); err != nil {
+}
+
+// TestApplyStampsNewLeaderRecordSynchronously pins the apply-path promise:
+// a commit that hands leadership here installs owner.json WITH the apply —
+// the new leader never serves, waits, or reads unproven while a fence tick
+// catches up.
+func TestApplyStampsNewLeaderRecordSynchronously(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	join(t, e, "node-2", "127.0.0.1:2")
+	e.tableMu.Lock()
+	e.table.Slots[6] = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-1"}, Epoch: 1, State: SlotStable}
+	e.tableMu.Unlock()
+	agg6 := aggForSlot(t, e, 6)
+	if err := st.AppendAtSeq(6, 1, ownerRecord(agg6, 1, "cmd-6")); err != nil {
 		t.Fatal(err)
+	}
+	if _, has, _ := readOwner(st.SlotDir(6)); has {
+		t.Fatal("setup: slot 6 should arrive without a record")
 	}
 
-	// (f) Adopt-all is the one-time upgrade action.
-	if err := os.Remove(ownerPath(st.SlotDir(5))); err != nil {
-		t.Fatal(err)
+	// The commit that moves leadership to node-1 applies...
+	applyCmd(t, e, &Command{Op: OpLeaderMove, Slots: []int32{6}, NewLeader: "node-1"})
+	// ...and the record is on disk already — before any refreshOwners run.
+	owner, has, err := readOwner(st.SlotDir(6))
+	if err != nil || !has {
+		t.Fatalf("the apply did not stamp the new leader: has=%v err=%v", has, err)
 	}
-	e.refreshOwners()
-	// Slot 3 is proven (not pending): asking for it by name is skipped,
-	// never adopted behind the fence's back. Empty want = every pending slot.
-	if n, sk := e.AdoptPending([]int32{3}); n != 0 || len(sk) != 1 || sk[0] != 3 {
-		t.Fatalf("adopt(3) on a proven slot = (%d, %v), want (0, [3])", n, sk)
-	}
-	if n, sk := e.AdoptPending(nil); n != 1 || len(sk) != 0 {
-		t.Fatalf("adopt-all = (%d, %v), want one slot adopted", n, sk)
-	}
-	if e.slotPending(5) {
-		t.Fatal("adopt-all left the slot fenced")
+	if owner.Leader != "node-1" || owner.Topology != e.topologyID() {
+		t.Fatalf("stamped record = %+v, wants the live placement", owner)
 	}
 }
