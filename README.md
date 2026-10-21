@@ -33,8 +33,8 @@ Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分
   │ 探活 / 新节点报名（peer 面 83xx）
   ▼
 数据面 · 2 个数据节点（role=learner）—— 承载槽副本：append-only WAL + 派生索引
-  data-1：leader 槽 0–2047 ┃ 副本 槽 2048–4095
-  data-2：leader 槽 2048–4095 ┃ 副本 槽 0–2047
+  data-1：leader 槽 0–511 ┃ 副本 槽 512–1023
+  data-2：leader 槽 512–1023 ┃ 副本 槽 0–511
   data-1 ◀──MFetch 长轮询拉取（peer 面 83xx，与 Raft 同端口族）──▶ data-2
   follower 按 leader 分组批量拉增量，应答是裸 WAL 字节、原样落盘，
   批量回报 LEO，leader 推进 HW = ISR 内最小 LEO；
@@ -59,11 +59,11 @@ Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分
 
 ### 存储
 
-- 固定 **4096 个哈希槽**（`mix64(FNV-1a(aggregate_id)) % 4096`）。槽数不可配置，
-  `4096 = 2^12` 按「最多 1024 个数据节点、每节点至少 4 槽」估算；数据节点数取
-  偶数，2 的幂次节点数（2~1024）都整除 4096、每节点槽主数完全相同，其余偶数
+- 固定 **1024 个哈希槽**（`mix64(FNV-1a(aggregate_id)) % 1024`）。槽数不可配置，
+  `1024 = 2^10` 按「最多 256 个数据节点、每节点至少 4 槽」估算；数据节点数取
+  偶数，2 的幂次节点数（2~256）都整除 1024、每节点槽主数完全相同，其余偶数
   按环布局摊到相差不超过 1（推导见 DESIGN.md §7.2）。
-- 每槽一条 **append-only WAL**，默认按 256MiB 分段（可配 64MiB~2GiB，须为 64MiB
+- 每槽一条 **append-only WAL**，默认按 64MiB 分段（可配 64MiB~2GiB，须为 64MiB
   的整数倍）。**段文件名即 baseSeq**，整段可独立滚动、拷贝、删除，因此槽级
   热迁移走复制协议按 seq 追平（见「槽位热迁移」）。
 - 每段附带追加式的**派生索引文件**（`.idx`/`.agx`/`.spx`/`.cidx`/`.aidx`），
@@ -262,12 +262,12 @@ medium：1/2/每个数据节点一份全量）：该值只为新集群种初始�
 | `-replica-policy` | `PUSHUPES_REPLICA_POLICY` | medium | 副本策略档位：`low`=每槽 1 份、`medium`=2 份（默认）、`high`=每个数据节点各存一份全量（因子=数据节点数）。**只用于新集群的初始值**：策略存放在 Raft 复制的槽表里，之后只能经 `POST /admin/cluster/replica-policy` 修改，重启不会重刷；任何一档的因子按数据节点数（布局池 `HostingIDs()`）钳制（1 个数据节点时都是 1 份）。`GET /admin/cluster/status` 的 `replica_policy` / `replica_factor` 读回当前值；非法值启动即报错 |
 | `-flush-messages` | `PUSHUPES_FLUSH_MESSAGES` | 1000 | 每 N 条 fsync（0 关闭） |
 | `-flush-interval` | `PUSHUPES_FLUSH_INTERVAL` | 5s | 每周期 fsync（0 关闭） |
-| `-segment-bytes` | `PUSHUPES_SEGMENT_BYTES` | 256MiB | WAL 段滚动大小：64MiB 整数倍，≤2GiB；可写字节数或带单位（`256MiB`/`1GiB`），env 同样接受带单位形式 |
+| `-segment-bytes` | `PUSHUPES_SEGMENT_BYTES` | 64MiB | WAL 段滚动大小：64MiB 整数倍，≤2GiB；可写字节数或带单位（`64MiB`/`1GiB`），env 同样接受带单位形式 |
 | `-fetch-settle` | `PUSHUPES_FETCH_SETTLE` | 200µs | fetch 轮被数据唤醒后的合并窗口：一轮覆盖整批写入涉及的多个槽；每次 ack 都要付它一次，换的是轮次与上报次数；0=首个槽有数据就答（轮次更多） |
 | `-drop-after` | `PUSHUPES_DROP_AFTER` | 30s | 迁移后前源副本保留期；0=默认，负数启动即报错，不可关闭 |
 | `-rebalance-interval` | `PUSHUPES_REBALANCE_INTERVAL` | 2s | controller 每隔多久检查一次 leader 布局并执行回切（节点宕机恢复后把槽 leader 迁回环上预期节点）；**每轮只提交一次**（提交严格串行，任一时刻只有一个槽在交接栅栏上），所以收敛时间由这个间隔决定；0=关闭，负数启动即报错 |
 | `-grpc-max-msg-size` | `PUSHUPES_GRPC_MAX_MSG_SIZE` | 4MiB | client 面 gRPC 消息上限（recv/send 同值）；`BatchAppend` 单批要装进它，可写 `16MiB` 等带单位形式（env 同样接受）；≤0 启动即报错 |
-| `-batch-slot-parallelism` | `PUSHUPES_BATCH_SLOT_PARALLELISM` | 100 | `BatchAppend` 一批最多同时执行几个槽（异槽并行、同槽串行；铺满 4096 槽的宽批也不会瞬间压上等量并发 WAL 写者）；≤0 启动即报错 |
+| `-batch-slot-parallelism` | `PUSHUPES_BATCH_SLOT_PARALLELISM` | 100 | `BatchAppend` 一批最多同时执行几个槽（异槽并行、同槽串行；铺满 1024 槽的宽批也不会瞬间压上等量并发 WAL 写者）；≤0 启动即报错 |
 | `-raft-heartbeat-timeout` | `PUSHUPES_RAFT_HEARTBEAT_TIMEOUT` | 100ms | 共识心跳间隔。leader 的心跳没按时到达就会被投票换掉，所以宿主机可能拖住共识事件循环时要与 `-raft-election-timeout` 一起放大 |
 | `-raft-election-timeout` | `PUSHUPES_RAFT_ELECTION_TIMEOUT` | 500ms | follower 多久收不到心跳就发起选举。必须 ≥ 2× 心跳，否则一次迟到的心跳就会掀掉 leader（启动即报错）；与心跳是一对比例，一起放大而不是只收窄其中一个 |
 | `-raft-flush-interval` | `PUSHUPES_RAFT_FLUSH_INTERVAL` | 200µs | 共识 WAL 组提交窗口：窗口内到达的追加共用一次 fsync |

@@ -38,6 +38,17 @@ func TestSlotOfGolden(t *testing.T) {
 		{"seed-7-3", 4096, 2118},
 		{"grpc-smoke-x", 4096, 176},
 		{"世界", 4096, 2865},
+		// the fixed cluster default (1024 = 2^10), values recomputed by the
+		// independent reference implementation in the same session that
+		// reproduced every vector above
+		{"", 1024, 155},
+		{"a", 1024, 248},
+		{"agg-1", 1024, 607},
+		{"bench-0", 1024, 522},
+		{"bench-99", 1024, 826},
+		{"seed-7-3", 1024, 70},
+		{"grpc-smoke-x", 1024, 176},
+		{"世界", 1024, 817},
 		// a non-power-of-two count exercises the uint64 modulo
 		{"agg-1", 1680, 223},
 		{"bench-0", 1680, 1322},

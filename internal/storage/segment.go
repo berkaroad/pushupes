@@ -59,8 +59,14 @@ const (
 	indexIntervalB = int64(64 << 10) // one entry per 64KiB
 )
 
-// DefaultSegmentBytes is the 256MiB roll threshold from the design.
-const DefaultSegmentBytes = int64(256 * 1024 * 1024)
+// DefaultSegmentBytes is the 64MiB roll threshold from the design: on the
+// planned node (4 cores / 16GiB / 1TiB, records typically 1-4KiB) the live
+// tail is 8 B/record per HOT slot and every slot on a single-data-node
+// cluster is hot — 64MiB keeps the unsealed-seq term at ~0.25GiB for 1KiB
+// records (DESIGN §7.2). Small segments cost segment count, WAL fds and
+// index files; the planned historical-segment merge reclaims the segment
+// count once it lands, which is why the default sits at the small end now.
+const DefaultSegmentBytes = int64(64 * 1024 * 1024)
 
 // A configured segment size must be a whole number of SegmentBytesMultiple
 // bytes, between MinSegmentBytes and MaxSegmentBytes. The floor exists because

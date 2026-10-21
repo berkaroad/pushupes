@@ -872,7 +872,7 @@ func syncRingPair(t *testing.T, ctr *Engine, stores map[string]*storage.Store, s
 // TestReclaimSweepsEverySurplusSeatInOneRound pins the sweep: ONE round retires
 // every surplus seat it can prove redundant, instead of one seat per round. That
 // is the case that matters — shrinking the factor on a large table used to take
-// one seat per round interval (4096 slots is about two hours).
+// one seat per round interval (1024 slots is about half an hour).
 func TestReclaimSweepsEverySurplusSeatInOneRound(t *testing.T) {
 	ctr, _, stores, _ := reclaimHarness(t)
 	slots := []int32{0, 1, 2, 3, 4, 5}

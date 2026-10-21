@@ -80,7 +80,7 @@ const (
 	// reclaimBudget bounds one reclaim sweep. The sweep retires every surplus
 	// seat it can inside the budget and the next round continues, so a factor
 	// decrease on a large table converges in a round or two instead of one seat
-	// per round (4096 slots at one seat per interval is about two hours). It must
+	// per round (1024 slots at one seat per interval is about half an hour). It must
 	// stay under the round interval so a sweep cannot run back to back with the
 	// next round.
 	reclaimBudget = 1 * time.Second
@@ -430,7 +430,7 @@ func probeParked(parked map[string]bool, p *Placement, drop string) bool {
 //   - a bounded probe pool plus one table command per node: the copy checks run
 //     reclaimProbeConcurrency at a time, and the removals for one seat travel in
 //     a single command (OpSlotRemoveReplica carries a slot list), so a
-//     4096-seat reclaim costs a handful of Raft entries, not thousands.
+//     1024-seat reclaim costs a handful of Raft entries, not thousands.
 //
 // The safety rule is unchanged: a seat only comes off once every seat that STAYS
 // holds a copy equivalent to the leader's (keptCopiesInSync), so the dropped
