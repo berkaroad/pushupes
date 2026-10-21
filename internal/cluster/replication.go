@@ -2570,9 +2570,11 @@ type fetchScan struct {
 	// far behind the follower is, which is what separates an ACK-CRITICAL
 	// position from bulk catch-up (see the visit order in HandleMFetchCtx).
 	leos []uint64
-	// order is scratch for the visit order's backlog class (the pooled order
-	// slice holds the round's own visit order).
+	// order and bulk are the visit order's two backlog classes — the ring
+	// seats and the rest — kept in SEPARATE scratch buffers (see
+	// buildFetchOrder; the pooled order slice holds the round's visit order).
 	order []int
+	bulk  []int
 }
 
 func (f *fetchScan) resize(n int) {
@@ -2588,6 +2590,14 @@ func (f *fetchScan) resize(n int) {
 	f.moved = f.moved[:n]
 	f.wakes = f.wakes[:n]
 	f.leos = f.leos[:n]
+	if cap(f.order) < n {
+		f.order = make([]int, n*2)
+	}
+	f.order = f.order[:n]
+	if cap(f.bulk) < n {
+		f.bulk = make([]int, n*2)
+	}
+	f.bulk = f.bulk[:n]
 }
 
 // ackCritical reports whether position i is one a live append is waiting on:
@@ -2686,6 +2696,40 @@ func (e *Engine) ringCatchUpBusy(self string) bool {
 	return busy
 }
 
+// buildFetchOrder fills order with the round's visit sequence: ACK-critical
+// positions first, then the follower's RING seats that have pending data,
+// then the remaining bulk. The ring and bulk classes write SEPARATE scratch
+// buffers and land in order one after the other, so order is always a
+// permutation of [0, n) — every entry feeds straight into req.Slots, and a
+// single shared buffer with a moving ring offset overwrites a placed bulk
+// entry whenever the classes interleave, leaving a hole that copies the
+// pooled buffer's stale residue (a previous, larger round's index) into the
+// visit order. Returns whether any ring seat still waits (the layout's
+// critical path).
+func buildFetchOrder(n, rot int, order, ringScratch, bulkScratch []int, ack, ringMoved func(i int) bool) bool {
+	head, ringN, bulkN := 0, 0, 0
+	pending := false
+	for k := 0; k < n; k++ {
+		i := (k + rot) % n
+		if ack(i) {
+			order[head] = i
+			head++
+			continue
+		}
+		if ringMoved(i) {
+			ringScratch[ringN] = i
+			ringN++
+			pending = true
+			continue
+		}
+		bulkScratch[bulkN] = i
+		bulkN++
+	}
+	copy(order[head:], ringScratch[:ringN])
+	copy(order[head+ringN:], bulkScratch[:bulkN])
+	return pending
+}
+
 func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetchResponse, error) {
 	n := len(req.Slots)
 	if n != len(req.FromSeqs) || n > 8192 {
@@ -2750,12 +2794,6 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 		order = make([]int, n*2)
 	}
 	order = order[:n]
-	rest := scan.order
-	if cap(rest) < n {
-		rest = make([]int, n)
-	}
-	rest = rest[:n]
-	scan.order = rest
 	rot := int(e.fetchRot.Add(1)) % max(1, n)
 	// Within the bulk, the follower's RING seats lead its factor seats. A ring
 	// seat is a share of the layout the node has to carry — it joined, came
@@ -2764,25 +2802,12 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 	// redundancy, and can lag. Both classes keep the rotation order inside
 	// themselves, so neither starves its peers.
 	ringSeats := own.ring[req.Follower]
-	head, ringN, bulk := 0, 0, 0
-	ringPending := false
-	for k := 0; k < n; k++ {
-		i := (k + rot) % n
-		if scan.ackCritical(i, req.FromSeqs) {
-			order[head] = i
-			head++
-			continue
-		}
-		if _, isRing := ringSeats[req.Slots[i]]; isRing && scan.moved[i] {
-			rest[ringN] = i
-			ringN++
-			ringPending = true
-			continue
-		}
-		rest[ringN+bulk] = i
-		bulk++
-	}
-	copy(order[head:], rest[:ringN+bulk])
+	ringPending := buildFetchOrder(n, rot, order, scan.order, scan.bulk,
+		func(i int) bool { return scan.ackCritical(i, req.FromSeqs) },
+		func(i int) bool {
+			_, isRing := ringSeats[req.Slots[i]]
+			return isRing && scan.moved[i]
+		})
 	e.noteRingCatchUp(req.Follower, ringPending)
 	if ringPending {
 		e.diag.mfetchRingCatchUp.Add(1)
