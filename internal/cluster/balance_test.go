@@ -677,7 +677,7 @@ func TestFactorOneGrowthConvergesEndToEnd(t *testing.T) {
 	newAddr := newPeerHarness(t, neu)
 
 	// The bootstrap: node-1 alone, one copy per slot (the shape a 1-member
-	// cluster is clamped to whatever the policy is), the full plan run before
+	// cluster takes MIN with whatever the policy asks for), the full plan run before
 	// the second member existed.
 	for _, e := range []*Engine{old, neu} {
 		applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{Role: RoleLearner, ID: "node-1", PeerAddr: oldAddr}})

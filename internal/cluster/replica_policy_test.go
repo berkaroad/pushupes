@@ -16,10 +16,9 @@ package cluster
 
 import "testing"
 
-// TestReplicaCountForPolicy pins the three tiers. low and medium are fixed
-// factors, clamped to whatever members exist (a cluster cannot hold more
-// copies of a slot than it has nodes); high IS the data plane: every hosting
-// member holds every slot.
+// TestReplicaCountForPolicy pins the tiers and the numeric form: the factor
+// is MIN(data-node count, copies asked for) — low 1, medium 2, high 3, or the
+// number itself.
 func TestReplicaCountForPolicy(t *testing.T) {
 	cases := []struct {
 		policy  ReplicaPolicy
@@ -29,17 +28,21 @@ func TestReplicaCountForPolicy(t *testing.T) {
 		{ReplicaPolicyLow, 1, 1},
 		{ReplicaPolicyLow, 3, 1},
 		{ReplicaPolicyLow, 7, 1},
-		{ReplicaPolicyMedium, 1, 1}, // clamped: one node, one copy
+		{ReplicaPolicyMedium, 1, 1}, // one node, one copy — the MIN side
 		{ReplicaPolicyMedium, 2, 2},
 		{ReplicaPolicyMedium, 5, 2},
 		{ReplicaPolicyMedium, 7, 2},
 		{ReplicaPolicyHigh, 0, 1}, // no members enumerated yet: never below one copy
-		{ReplicaPolicyHigh, 1, 1},
+		{ReplicaPolicyHigh, 1, 1}, // small pools take the MIN side...
 		{ReplicaPolicyHigh, 2, 2},
 		{ReplicaPolicyHigh, 3, 3},
-		{ReplicaPolicyHigh, 5, 5},
-		{ReplicaPolicyHigh, 7, 7},
-		{ReplicaPolicyHigh, 9, 9},
+		{ReplicaPolicyHigh, 5, 3}, // ...and high is three copies, not the pool
+		{ReplicaPolicyHigh, 7, 3},
+		{ReplicaPolicyHigh, 9, 3},
+		{ReplicaPolicy("1"), 5, 1}, // numeric policy: the factor is the number
+		{ReplicaPolicy("3"), 5, 3},
+		{ReplicaPolicy("5"), 5, 5},
+		{ReplicaPolicy("9"), 5, 5}, // MIN with the data-node count still applies
 	}
 	for _, c := range cases {
 		got := ReplicaCountForPolicy(c.policy, c.members)
@@ -48,6 +51,25 @@ func TestReplicaCountForPolicy(t *testing.T) {
 		}
 		if c.members > 0 && got > c.members {
 			t.Errorf("%d members must never plan more replicas (%d) than members", c.members, got)
+		}
+	}
+}
+
+// TestNormalizeReplicaPolicyNumbers pins the numeric seed form: positive
+// integers normalize to their canonical digits, anything else (zero, signs,
+// spaces, junk) is rejected exactly like an unknown tier name.
+func TestNormalizeReplicaPolicyNumbers(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"1", "1"}, {"5", "5"}, {"007", "7"}, {"low", "low"}, {"", "medium"},
+	} {
+		got, err := NormalizeReplicaPolicy(c.in)
+		if err != nil || string(got) != c.want {
+			t.Errorf("NormalizeReplicaPolicy(%q) = %q/%v, want %q", c.in, got, err, c.want)
+		}
+	}
+	for _, bad := range []string{"0", "-3", "3.5", " 3", "high2"} {
+		if _, err := NormalizeReplicaPolicy(bad); err == nil {
+			t.Errorf("NormalizeReplicaPolicy(%q): want rejection, got none", bad)
 		}
 	}
 }
@@ -71,7 +93,8 @@ func TestSetPolicyCommandAppliesTierAndFactor(t *testing.T) {
 	}{
 		{"low", 1, false},
 		{"medium", 2, false},
-		{"high", len(members), false}, // high: every data-plane node holds every slot
+		{"high", 3, false}, // high: three copies, fixed — not one per member
+		{"5", 5, false},    // numeric policy: the factor is the number
 		{"bogus", 0, true},
 	} {
 		err := tbl.Apply(&Command{Op: OpSetPolicy, Policy: c.policy})
@@ -96,24 +119,25 @@ func TestSetPolicyCommandAppliesTierAndFactor(t *testing.T) {
 // TestPolicyChangeReLaysReplicaSets is the regression for the operator's knob:
 // a tier change moves the factor, and the controller's existing factor-change
 // path — OpConfig + replan to fill a raised factor, then seat reclaim for a
-// lowered one — converges the layout. Medium -> high (2 -> 5 copies over five
-// members: high seats every member on every slot) must add the ring's remaining
-// seats to every slot; high -> medium (5 -> 2) must leave surplus seats for
-// reclaimRound to take off, never drop one in the replan itself.
+// lowered one — converges the layout. Medium -> high (2 -> 3 copies over five
+// members) adds the ring's third seat to every slot; high -> medium (3 -> 2)
+// leaves the surplus seat for reclaimRound to take off, never dropping it in
+// the replan itself. Numeric policies take the same path: high -> "5" raises
+// the factor to the pool and back.
 func TestPolicyChangeReLaysReplicaSets(t *testing.T) {
 	members := []string{"node-1", "node-2", "node-3", "node-4", "node-5"}
 	tbl := NewTable(16, 2) // the medium layout over five members
 	populatePeers(t, tbl, members)
 	tbl.Slots = PlanSlots(members, tbl.SlotCount, tbl.Replicas)
 
-	// medium -> high: the factor rises 2 -> 5 (every data-plane node holds
-	// every slot), and the replan adds the remaining ring seats to every
-	// stable slot.
+	// medium -> high: the factor rises 2 -> 3, and the replan adds the
+	// ring's third seat to every stable slot (members 4 and 5 stay out —
+	// high is three copies, not one per member).
 	if err := tbl.Apply(&Command{Op: OpSetPolicy, Policy: "high"}); err != nil {
 		t.Fatalf("set policy: %v", err)
 	}
-	if tbl.Replicas != 5 {
-		t.Fatalf("five members on high must want five copies, got %d", tbl.Replicas)
+	if tbl.Replicas != 3 {
+		t.Fatalf("high wants three copies on any pool above three, got %d", tbl.Replicas)
 	}
 	if !tbl.layoutStale() {
 		t.Fatal("a factor change must leave the layout stale until the replan")
@@ -122,17 +146,17 @@ func TestPolicyChangeReLaysReplicaSets(t *testing.T) {
 		t.Fatalf("replan: %v", err)
 	}
 	for s, p := range tbl.Slots {
-		if len(p.Replicas) < 5 {
-			t.Fatalf("slot %d has %d replicas after the replan, want 5: %v", s, len(p.Replicas), p.Replicas)
+		if len(p.Replicas) < 3 {
+			t.Fatalf("slot %d has %d replicas after the replan, want 3: %v", s, len(p.Replicas), p.Replicas)
 		}
-		for i := 0; i < 5; i++ {
+		for i := 0; i < 3; i++ {
 			if on := members[(int(s)+i)%len(members)]; !replicaListHas(p.Replicas, on) {
 				t.Fatalf("slot %d does not hold the ring's seat %s: %v", s, on, p.Replicas)
 			}
 		}
 	}
 
-	// high -> medium: the factor drops 5 -> 2. The replan never DROPS a seat
+	// high -> medium: the factor drops 3 -> 2. The replan never DROPS a seat
 	// (the copies a stale set holds are what has been replicating the slot;
 	// the surplus comes off later via reclaimRound), so a settled-to-3 set
 	// stays where it is and the round must not burn a Raft entry on it.

@@ -2257,7 +2257,7 @@ func (e *Engine) SetBootPolicy(p ReplicaPolicy) { e.bootPolicy = p }
 // high (one copy on every data-plane node). The tier lives in the replicated
 // slot table, so the change is one Raft command: it takes effect on every node
 // and survives restarts. The factor the tier implies is derived at apply
-// time from the data-plane member count (clamped to it), and the controller's
+// time as MIN(data-node count, copies the policy asks for), and the controller's
 // next round converges the replica sets on the new factor — the same
 // factor-change path a membership change drives (DESIGN §4). Submitting the
 // tier the table already holds is a no-op. It returns the live tier and the

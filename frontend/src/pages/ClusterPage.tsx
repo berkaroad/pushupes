@@ -309,17 +309,17 @@ export default function ClusterPage() {
   // selecting), 保存 names the layout move in a confirm dialog and only then
   // submits the one controller-only Raft command, 取消 drops the draft and
   // returns to the pre-edit display. replicaFactorFor mirrors the backend's
-  // derivation (clamped to the member count) so the confirm dialog can name
+  // derivation (MIN with the data-node count) so the confirm dialog can name
   // what the replica sets will move to.
   const [policyEditing, setPolicyEditing] = useState(false)
   const [policyDraft, setPolicyDraft] = useState<ReplicaPolicy>('medium')
   const [policySaving, setPolicySaving] = useState(false)
 
-  // 推导口径与后端 cluster.ReplicaCountForPolicy 一致：low=1 份、medium=2 份、
-  // high=每个数据节点一份全量（因子就是数据节点数），并按数据节点数钳制。
+  // 推导口径与后端 cluster.ReplicaCountForPolicy 一致：副本数 = MIN(数据节点数,
+  // 档位份数)——low=1、medium=2、high=3。
   const replicaFactorFor = (policy: ReplicaPolicy, dataNodes: number) => {
     const n = Math.max(dataNodes, 1)
-    const want = policy === 'low' ? 1 : policy === 'high' ? n : 2
+    const want = policy === 'low' ? 1 : policy === 'high' ? 3 : 2
     return Math.min(want, n)
   }
 
@@ -540,8 +540,7 @@ export default function ClusterPage() {
               />
             </Space>
             <Typography.Text type="secondary">
-              副本因子按「策略 × 数据节点数（{dataNodes}）」推导：low 每槽 1 份、medium 每槽 2 份（默认）、
-              high 每个数据节点一份全量；保存前不会改动集群。
+              副本数=MIN(数据节点数, 副本因子)；保存前不会改动集群。
             </Typography.Text>
             <Space>
               <Button type="primary" loading={policySaving} onClick={savePolicy}>保存</Button>

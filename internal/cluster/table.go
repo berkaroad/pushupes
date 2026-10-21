@@ -103,7 +103,7 @@ type Table struct {
 	SlotCount int32 `json:"slot_count"`
 	Replicas  int   `json:"replicas"`
 	// Policy is the cluster-wide replica strategy tier behind Replicas; the
-	// controller re-derives Replicas from it (clamped to the member count)
+	// controller re-derives Replicas from it (MIN with the data-node count)
 	// every round, so the factor tracks both the policy and the membership.
 	Policy ReplicaPolicy `json:"policy"`
 	// Topology is this cluster's consensus generation: one random id per
@@ -289,10 +289,9 @@ func PlanSlots(nodes []string, slotCount int32, replicaFactor int) map[int32]*Pl
 //     member joined, so the factor rose and they hold too few);
 //   - a member the ring plan gives a seat to that holds no replica seat in ANY
 //     stable slot: the layout has left a member out entirely. That is the shape
-//     of every membership change that does NOT move the factor — the low and
-//     medium tiers hold the factor steady against membership (the single-member
-//     clamp is the only place it moves), and the high tier's even counts reuse
-//     the odd count below them — and it strands the new member exactly as a
+//     of every membership change — every policy names a fixed number of
+//     copies (1 / 2 / 3, or a direct factor), so membership alone only ever
+//     moves the MIN side down — and it strands the new member exactly as a
 //     factor change does: the ring's expected leader for its slots is not a
 //     replica, and the rebalancer only ever hands leadership to an existing
 //     replica, so it can never act on them (observed: a low-policy cluster
@@ -676,7 +675,7 @@ func (t *Table) Apply(c *Command) error {
 			return fmt.Errorf("set_policy: %w", err)
 		}
 		t.Policy = policy
-		// The factor follows the tier immediately, clamped to the members the
+		// The factor follows the policy immediately, MIN'd with the members the
 		// directory holds; the layout itself converges on the next replan (the
 		// same factor-change path a membership change drives, see DESIGN §4).
 		t.Replicas = ReplicaCountForPolicy(policy, len(t.HostingIDs()))
@@ -794,12 +793,11 @@ func (t *Table) Apply(c *Command) error {
 		// slot that is still unassigned, and add the ring's seats to every
 		// stable slot while the layout is stale (applyReplanSlots).
 		// The re-layout therefore happens when the factor moves — a policy
-		// change (OpSetPolicy, any tier) or, under the high tier, the ODD
-		// member counts (3 -> 2 copies, 5 -> 3, 7 -> 4...) — and when the
-		// layout has left a member out: an even member count under the high
-		// tier leaves the derived count where it was, and the low/medium
-		// tiers hold the factor steady against membership, so such a member
-		// holds no seat at all, the ring's expected leader for its slots is
+		// change (OpSetPolicy; the tiers are fixed numbers, so membership
+		// alone never moves the factor) — and when the layout has left a
+		// member out: a membership change holds the factor where it is, so
+		// without a re-seat such a member holds no seat at all, the ring's
+		// expected leader for its slots is
 		// not a replica, and the rebalancer can never act on them (see
 		// layoutStale). The re-seat seats the new member as the follower of
 		// the slots the ring gives it; the ordinary fetch and the rebalance

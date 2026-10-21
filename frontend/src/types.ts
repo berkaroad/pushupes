@@ -40,9 +40,10 @@ export interface ClusterStatus {
   slot_count: number
   replicas?: number
   // replica_factor is the per-slot copy count in force; replica_policy is the
-  // tier behind it (low = 1 copy, medium = 2 — the default —, high = one copy
-  // on every data-plane node). The factor is derived from the policy and the
-  // data-plane member count by the controller; the policy is set through
+  // tier behind it (low = 1 copy, medium = 2 — the default —, high = 3
+  // copies, or a positive number used as the factor directly). The
+  // controller re-derives MIN(data-node count, copies asked for) every
+  // round. The policy is set through
   // POST /admin/cluster/replica-policy (the startup flag only seeds a new
   // cluster), so this is the live cluster-wide value every node reads back.
   replica_factor?: number

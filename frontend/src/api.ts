@@ -321,14 +321,15 @@ export async function removeSlotReplica(
 }
 
 // ReplicaPolicy is the cluster-wide tier behind the per-slot replica factor:
-// low = 1 copy, medium = 2 (the default), high = one copy on EVERY data-plane
-// node (the factor is the hosting pool's size).
+// low = 1 copy, medium = 2 (the default), high = 3 copies — or a plain
+// positive integer, a direct factor. The factor in force is always
+// MIN(data-node count, copies the policy asks for).
 export type ReplicaPolicy = 'low' | 'medium' | 'high'
 
 export const REPLICA_POLICY_LABELS: Record<ReplicaPolicy, string> = {
-  low: 'low（每槽 1 副本）',
-  medium: 'medium（每槽 2 副本）',
-  high: 'high（每个数据节点一份全量）',
+  low: 'low（副本因子：1）',
+  medium: 'medium（副本因子：2）',
+  high: 'high（副本因子：3）',
 }
 
 // setReplicaPolicy changes the cluster-wide replica policy tier, addressed to

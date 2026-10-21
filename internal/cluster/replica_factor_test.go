@@ -62,7 +62,7 @@ func TestReplicaFactorRaisesExistingTable(t *testing.T) {
 	}
 
 	// The controller's reconcile step: raise the table's factor to the
-	// configured (member-clamped) value.
+	// configured value — MIN(data-node count, copies asked for).
 	if err := tbl.Apply(&Command{Op: OpConfig, Replicas: 3}); err != nil {
 		t.Fatalf("apply config: %v", err)
 	}

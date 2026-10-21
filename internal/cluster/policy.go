@@ -22,18 +22,18 @@ import "fmt"
 // startup flag only seeds a brand-new cluster, and the admin endpoint is the
 // entry point for every later change.
 //
-// The member count a tier derives against is the DATA-PLANE pool — the
-// directory members that host slots (Table.HostingIDs) — not the whole
-// directory: a control-only member holds no seat and no copy, so counting it
-// into the factor would ask every slot for replicas that cannot exist.
+// The per-slot replica factor is MIN(data-node count, copies the policy
+// asks for), the data-node count being the directory members that host
+// slots (Table.HostingIDs).
 //
 //	ReplicaPolicyLow     — factor 1: one copy per slot.
 //	ReplicaPolicyMedium  — factor 2: a leader plus one replica (the default).
-//	ReplicaPolicyHigh    — one copy on EVERY data-plane node: the factor is
-//	                       the pool's own size, so every slot keeps a full
-//	                       copy on every member that can hold data — the
-//	                       strongest durability tier, at the price of every
-//	                       data node storing every byte.
+//	ReplicaPolicyHigh    — factor 3: a leader plus two replicas.
+//
+// A policy may also be a plain positive integer — `-replica-policy 5` seeds
+// (and the admin endpoint carries) a direct factor of five copies — stored
+// verbatim in the table. The tier names are the readable aliases for the
+// factors 1, 2 and 3.
 type ReplicaPolicy string
 
 const (
@@ -46,34 +46,59 @@ const (
 	DefaultReplicaPolicy = ReplicaPolicyMedium
 )
 
-// ValidReplicaPolicy reports whether s names one of the three tiers.
+// ValidReplicaPolicy reports whether s names a tier or a positive integer
+// factor.
 func ValidReplicaPolicy(s string) bool {
 	switch ReplicaPolicy(s) {
 	case ReplicaPolicyLow, ReplicaPolicyMedium, ReplicaPolicyHigh:
 		return true
 	}
-	return false
+	return replicaFactorDigits(s) > 0
 }
 
-// NormalizeReplicaPolicy maps an empty policy onto the default and validates
-// the rest, so a hand-built table and a decoded command share one rule.
+// replicaFactorDigits parses s as a positive decimal factor, returning 0
+// when s is not a plain number.
+func replicaFactorDigits(s string) int {
+	if s == "" {
+		return 0
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0
+		}
+	}
+	n := 0
+	for _, c := range []byte(s) {
+		n = n*10 + int(c-'0')
+		if n > 1<<20 { // a factor past a million is a typo, not a plan
+			return 0
+		}
+	}
+	return n
+}
+
+// NormalizeReplicaPolicy maps an empty policy onto the default, rewrites a
+// numeric factor onto its canonical digit form, and validates the rest, so
+// a hand-built table, a seed flag and a decoded command share one rule.
 func NormalizeReplicaPolicy(s string) (ReplicaPolicy, error) {
 	if s == "" {
 		return DefaultReplicaPolicy, nil
 	}
-	if !ValidReplicaPolicy(s) {
-		return "", fmt.Errorf("unknown replica policy %q (want low, medium or high)", s)
+	if n := replicaFactorDigits(s); n > 0 {
+		return ReplicaPolicy(fmt.Sprintf("%d", n)), nil
 	}
-	return ReplicaPolicy(s), nil
+	switch ReplicaPolicy(s) {
+	case ReplicaPolicyLow, ReplicaPolicyMedium, ReplicaPolicyHigh:
+		return ReplicaPolicy(s), nil
+	}
+	return "", fmt.Errorf("unknown replica policy %q (want low, medium, high, or a positive number)", s)
 }
 
 // ReplicaCountForPolicy is the policy's per-slot replica factor for a data
-// plane of `members` hosting members (Table.HostingIDs): low is always one
-// copy, medium is always two, high is the pool itself — every data node holds
-// every slot. The result is clamped to the member count — a factor larger
-// than the pool would ask slots for replicas that cannot exist (a 1-member
-// data plane on the medium tier plans one copy, not two). An unrecognised
-// policy value falls back to the medium derivation, same as the seed path.
+// plane of `members` hosting members (Table.HostingIDs): the factor is
+// MIN(members, copies the policy asks for) — low one copy, medium two, high
+// three, or the number itself for a numeric policy. An unrecognised policy
+// value falls back to the medium derivation, same as the seed path.
 func ReplicaCountForPolicy(policy ReplicaPolicy, members int) int {
 	if members < 1 {
 		members = 1
@@ -83,9 +108,13 @@ func ReplicaCountForPolicy(policy ReplicaPolicy, members int) int {
 	case ReplicaPolicyLow:
 		want = 1
 	case ReplicaPolicyHigh:
-		want = members // every data-plane node holds every slot
-	default: // medium (and any unknown value, which the table cannot hold anyway)
-		want = 2
+		want = 3
+	default:
+		if n := replicaFactorDigits(string(policy)); n > 0 {
+			want = n // numeric policy: the factor is the number
+		} else {
+			want = 2 // medium, and any value the table cannot hold anyway
+		}
 	}
 	if want > members {
 		want = members

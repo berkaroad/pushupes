@@ -292,9 +292,9 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 	// derivation, which on the classic 3-member cluster landed on two copies
 	// — the medium tier's number. Tag the restored table medium and keep the
 	// recorded factor; the controller re-derives on its next round like it
-	// does for any table. (high no longer means "derived from the member
-	// count's floor half", it means "a copy on every data node", and that
-	// would silently inflate a restored v3 cluster.)
+	// does for any table. (high now means three fixed copies — no tier
+	// derives from the member count, so nothing inflates a restored v3
+	// cluster on its own.)
 	policy := ReplicaPolicyMedium
 	if policyInHeader {
 		policyStr, err := readStr(r)

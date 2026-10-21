@@ -114,7 +114,7 @@ CLIENT_BASE="${CLIENT_BASE:-8591}"
 SEGMENT_BYTES="${SEGMENT_BYTES:-64MiB}"
 seg_args=(-segment-bytes "$SEGMENT_BYTES")
 # 副本策略不在此转发：PUSHUPES_REPLICA_POLICY 若已在环境里，子进程自然继承；
-# 否则用节点自己的默认档（medium=每槽 2 份）。high=每个数据节点各存一份全量。
+# 否则用节点自己的默认档（medium=每槽 2 份）。high=每槽 3 份。
 # raft 的两个时间旋钮：只在显式设置时才转发，否则用节点自己的默认值（避免把默认值
 # 复制到脚本里，节点改默认值时脚本不需要跟着改）。
 RAFT_ELECTION_TIMEOUT="${RAFT_ELECTION_TIMEOUT:-}"

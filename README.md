@@ -131,7 +131,7 @@ pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可
 `restart`/`stop`/`status`/`smoke` 都按它执行，命令行显式传的变量仍优先；运行目录里
 只有节点目录而没有 `cluster.env`（老目录）时脚本按最大 `node-N` 推断节点数并提示补传
 角色。每槽副本数由副本策略分档（`PUSHUPES_REPLICA_POLICY`=low/medium/high，默认
-medium：1/2/每个数据节点一份全量）：该值只为新集群种初始值，策略存放在 Raft 复制的
+medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(数据节点数, 策略要求份数)）：该值只为新集群种初始值，策略存放在 Raft 复制的
 槽表里，之后改档位走 `POST /admin/cluster/replica-policy`（控制台集群页的「副本策略」
 卡片即可操作）。扩节点两种做法等价：`REPLICAS=<新总数> cluster.sh start`（集群已存在
 时，缺的节点自动报名加入）或逐个 `cluster.sh join N`。
@@ -186,7 +186,7 @@ medium：1/2/每个数据节点一份全量）：该值只为新集群种初始�
 | `-join` | `PUSHUPES_JOIN` | 空 | 启动时向指定成员（`host:peerport`）报名。可选：不写时，非 `-peers` 首位的节点也会按配置成员轮转报名，`-join` 用于指定其中一个 |
 | `-adopt-interval` | `PUSHUPES_ADOPT_INTERVAL` | 3s | 尚未成为集群成员的节点每隔多久重试一次报名 |
 | `-bootstrap` | — | false | 由本节点写下集群的初始配置。默认由 `-peers` 里 id 最小的节点写；其余配置了 `-peers` 的节点以种子身份启动、向这些成员报名加入，自己不写配置 |
-| `-replica-policy` | `PUSHUPES_REPLICA_POLICY` | medium | 副本策略档位：`low`=每槽 1 份、`medium`=2 份（默认）、`high`=每个数据节点各存一份全量（因子=数据节点数）。**只用于新集群的初始值**：策略存放在 Raft 复制的槽表里，之后只能经 `POST /admin/cluster/replica-policy` 修改，重启不会重刷；任何一档的因子按数据节点数（布局池 `HostingIDs()`）钳制（1 个数据节点时都是 1 份）。`GET /admin/cluster/status` 的 `replica_policy` / `replica_factor` 读回当前值；非法值启动即报错 |
+| `-replica-policy` | `PUSHUPES_REPLICA_POLICY` | medium | 副本策略档位：`low`=每槽 1 份、`medium`=2 份（默认）、`high`=每槽 3 份（容忍失去 2 个数据节点），或**正整数直接指定副本因子**。**只用于新集群的初始值**：策略存放在 Raft 复制的槽表里，之后只能经 `POST /admin/cluster/replica-policy` 修改，重启不会重刷；副本因子 = MIN(数据节点数（布局池 `HostingIDs()`）, 策略要求份数)。`GET /admin/cluster/status` 的 `replica_policy` / `replica_factor` 读回当前值；非法值启动即报错 |
 | `-flush-messages` | `PUSHUPES_FLUSH_MESSAGES` | 1000 | 每 N 条 fsync（0 关闭） |
 | `-flush-interval` | `PUSHUPES_FLUSH_INTERVAL` | 5s | 每周期 fsync（0 关闭） |
 | `-segment-bytes` | `PUSHUPES_SEGMENT_BYTES` | 64MiB | WAL 段滚动大小：64MiB 整数倍，≤2GiB；可写字节数或带单位（`64MiB`/`1GiB`），env 同样接受带单位形式 |

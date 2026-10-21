@@ -435,9 +435,10 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 // (low / medium / high) — the knob behind the per-slot replica factor. The
 // tier lives in the replicated slot table, so this is one controller-only
 // Raft command: it takes effect on every node and survives restarts. The
-// factor the tier implies is derived from the data-plane member count
-// (clamped to it), and the controller converges the replica sets on the next
-// round — the same factor-change path a membership change drives. The startup
+// factor it implies is MIN(data-node count, copies asked for) — low 1,
+// medium 2, high 3, or the number itself for a numeric policy — and the
+// controller converges the replica sets on the next round, the same
+// factor-change path a membership change drives. The startup
 // -replica-policy flag only seeds a brand-new cluster; this endpoint is the
 // entry point for every change after that.
 //
@@ -447,7 +448,7 @@ func (s *Server) handleSetReplicaPolicy(w http.ResponseWriter, r *http.Request) 
 		Policy string `json:"policy"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Policy == "" {
-		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "policy required (low, medium or high)")
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "policy required (low, medium, high, or a positive number)")
 		return
 	}
 	policy, factor, err := s.Engine.SetReplicaPolicy(req.Policy)

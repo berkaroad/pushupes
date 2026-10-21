@@ -70,7 +70,7 @@ func main() {
 		// (POST /admin/cluster/replica-policy) is the entry point for every
 		// change. See DESIGN §4.
 		replicaPolicy = flag.String("replica-policy", envOr("PUSHUPES_REPLICA_POLICY", string(cluster.DefaultReplicaPolicy)),
-			"replica policy tier for a NEW cluster: low (1 copy per slot), medium (2, the default), high (one copy per data-plane node); applied on the table's first plan only — an existing cluster keeps the policy the admin endpoint last set (env PUSHUPES_REPLICA_POLICY)")
+			"replica policy tier for a NEW cluster: low (1 copy per slot), medium (2, the default), high (3 copies per slot), or a positive number used as the factor directly; applied on the table's first plan only — an existing cluster keeps the policy the admin endpoint last set (env PUSHUPES_REPLICA_POLICY)")
 		segmentB = byteSize(envByteSizeOr("PUSHUPES_SEGMENT_BYTES", storage.DefaultSegmentBytes))
 		flushN   = flag.Int64("flush-messages", envInt64Or("PUSHUPES_FLUSH_MESSAGES", 1000), "fsync every N records (0 disables) (env PUSHUPES_FLUSH_MESSAGES)")
 		flushD   = flag.Duration("flush-interval", envDurationOr("PUSHUPES_FLUSH_INTERVAL", 5*time.Second), "fsync every interval (0 disables) (env PUSHUPES_FLUSH_INTERVAL)")
@@ -212,10 +212,10 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 		return fmt.Errorf("-replica-policy: %w", err)
 	}
 	eng.SetBootPolicy(bootPolicy)
-	// The per-slot replica factor follows from that policy tier and the member
-	// count, re-derived by the controller every round — so a cluster that
-	// grows at runtime raises its own copy count under the high tier, while
-	// low/medium hold theirs.
+	// The per-slot replica factor follows from the policy — low 1 / medium 2 /
+	// high 3, or a plain number for a direct factor — as
+	// MIN(data-node count, copies asked for), re-derived by the controller
+	// every round. Membership changes move the ring's seats, not the factor.
 	// Leader rebalance: interval 0 is the operator's off switch; a negative
 	// value is a startup error (same fail-fast rule as -drop-after). Commits
 	// are strictly serial inside the loop, so this cadence paces convergence.
