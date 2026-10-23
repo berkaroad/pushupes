@@ -416,3 +416,54 @@ func TestSealedBloomGapSelfHealsAtStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A lookup opening the .cidx has no use for the bloom section (the gate
+// answer came from memory before the open): the open skips reading and
+// decoding it, while the binary search over the entries still answers.
+func TestOpenSegCmdIndexWithoutBloomStillSearches(t *testing.T) {
+	dir := t.TempDir()
+	sl, err := OpenSlotRepairing(dir, 7, 1<<40, FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 600; i++ {
+		mustAppend(t, sl, mkRec(fmt.Sprintf("a%04d", i), 1, fmt.Sprintf("c%04d", i)))
+	}
+	roll(t, sl)
+	mustAppend(t, sl, mkRec("a9999", 1, "c9999"))
+	base := sl.segments[0].BaseSeq
+	if err := sl.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ix, err := openSegCmdIndex(dir, 7, base, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ix == nil {
+		t.Fatal("index not opened")
+	}
+	if ix.Bloom() != nil {
+		t.Errorf("wantBloom=false still decoded a bloom set")
+	}
+	found, err := ix.LookupCmd(uint32(data.HashCommandID("c0007")>>32), func(e segCmdEntry) bool {
+		return e.seq == 8
+	})
+	if err != nil || !found {
+		t.Errorf("entry search without bloom: found=%v err=%v", found, err)
+	}
+	ix.Close()
+
+	// And the bloom does come back when the caller asks for it.
+	ix2, err := openSegCmdIndex(dir, 7, base, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ix2.Bloom() == nil {
+		t.Errorf("wantBloom=true decoded no bloom")
+	}
+	if !ix2.Bloom().maybe(data.HashCommandID("c0007")) {
+		t.Errorf("decoded bloom lost a placed hash")
+	}
+	ix2.Close()
+}

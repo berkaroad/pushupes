@@ -276,7 +276,11 @@ func collectSegCmdEntries(seg *Segment) ([]segCmdEntry, error) {
 
 // openSegCmdIndex opens a sealed segment's command index; nil when it is not
 // there or does not validate (the caller then falls back to walking).
-func openSegCmdIndex(dir string, slotID int32, baseSeq uint64) (*segCmdIndex, error) {
+// wantBloom loads (and decodes) the file's bloom section: only the slot-open
+// path needs it — a lookup binary-searches the entries and gates on the
+// segment's filters already in memory, so decoding a ~80KB filter on every
+// open would be pure CPU for an answer nobody reads.
+func openSegCmdIndex(dir string, slotID int32, baseSeq uint64, wantBloom bool) (*segCmdIndex, error) {
 	f, err := os.Open(segCidxPath(dir, baseSeq))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -304,15 +308,17 @@ func openSegCmdIndex(dir string, slotID int32, baseSeq uint64) (*segCmdIndex, er
 		return nil, nil
 	}
 	ix := &segCmdIndex{dir: dir, slotID: slotID, baseSeq: baseSeq, count: count, f: f, block: -1}
-	if bloomLen := int(binary.BigEndian.Uint32(h[28:32])); bloomLen > 0 {
-		last := count % segCidxBlockMax
-		entryBytes := int64(segCidxBlocks(count)) * int64(segCidxBlockMax*segCidxEntryBytes+4)
-		if last != 0 {
-			entryBytes -= int64(segCidxBlockMax*segCidxEntryBytes + 4 - (last*segCidxEntryBytes + 4))
-		}
-		buf := make([]byte, bloomLen)
-		if err := readAtFull(f, buf, int64(segCidxHeaderByte)+entryBytes); err == nil {
-			ix.blm = decodeBloomSet(buf)
+	if wantBloom {
+		if bloomLen := int(binary.BigEndian.Uint32(h[28:32])); bloomLen > 0 {
+			last := count % segCidxBlockMax
+			entryBytes := int64(segCidxBlocks(count)) * int64(segCidxBlockMax*segCidxEntryBytes+4)
+			if last != 0 {
+				entryBytes -= int64(segCidxBlockMax*segCidxEntryBytes + 4 - (last*segCidxEntryBytes + 4))
+			}
+			buf := make([]byte, bloomLen)
+			if err := readAtFull(f, buf, int64(segCidxHeaderByte)+entryBytes); err == nil {
+				ix.blm = decodeBloomSet(buf)
+			}
 		}
 	}
 	segIndexUsed.Add(1)

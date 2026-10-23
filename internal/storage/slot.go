@@ -206,7 +206,7 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 		if !isTail && seg.RecordCnt > 0 {
 			// A sealed segment's command bloom either comes off its index file
 			// or is rebuilt at startup from the records indexed just below.
-			ix, ierr := openSegCmdIndex(s.Dir, s.ID, seg.BaseSeq)
+			ix, ierr := openSegCmdIndex(s.Dir, s.ID, seg.BaseSeq, true)
 			if ierr != nil {
 				seg.Close()
 				return nil, fmt.Errorf("slot %d command index %s: %w", slotID, p, ierr)
@@ -1124,7 +1124,7 @@ func (s *Slot) lookupCommandLocked(commandID string, hash uint64) (*data.EventRe
 			continue
 		}
 		idemSealedOpens.Add(1)
-		ix, err := openSegCmdIndex(s.Dir, s.ID, seg.BaseSeq)
+		ix, err := openSegCmdIndex(s.Dir, s.ID, seg.BaseSeq, false)
 		if err != nil {
 			return nil, 0, false, err
 		}
