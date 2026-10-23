@@ -42,7 +42,7 @@ func TestDecideOwnerMatrix(t *testing.T) {
 	mk := func(leader string, replicas []string, epoch int64) *Placement {
 		return &Placement{Leader: leader, Replicas: replicas, Epoch: epoch, State: SlotStable}
 	}
-	stampOK := slotOwner{Topology: topo, Leader: self, Epoch: 4, Replica: true, State: "stable"}
+	stampOK := slotOwner{Topology: topo, Leader: self, Epoch: 4, State: "stable"}
 	cases := []ownerCase{
 		// The table is the proof: every member slot without a record gets
 		// one — leader or seat, WAL or no WAL yet (an empty placement is
@@ -63,11 +63,11 @@ func TestDecideOwnerMatrix(t *testing.T) {
 		{name: "epoch-ahead-of-table-fences", leader: self, replicas: []string{self}, epoch: 2,
 			owner: &slotOwner{Topology: topo, Leader: self, Epoch: 7},
 			want:  ownerPending, wantWhy: ownerEpochBackward},
-		{name: "foreign-leader-record-without-seat-fences", leader: self, replicas: []string{self}, epoch: 3,
+		{name: "same-epoch-with-a-different-leader-fences", leader: self, replicas: []string{self}, epoch: 3,
 			owner: &slotOwner{Topology: topo, Leader: "node-2", Epoch: 3},
 			want:  ownerPending, wantWhy: ownerLineageUnknown},
 		{name: "promoted-seat-is-proven", leader: self, replicas: []string{self, "node-2"}, epoch: 6,
-			owner: &slotOwner{Topology: topo, Leader: "node-2", Epoch: 5, Replica: true},
+			owner: &slotOwner{Topology: topo, Leader: "node-2", Epoch: 5},
 			want:  ownerStamp}, // proven: refresh the record to name the new leader
 		{name: "surplus-copy-not-fenced-here", leader: "node-2", replicas: []string{"node-2"}, epoch: 4,
 			owner: nil, want: ownerNone},
@@ -84,9 +84,11 @@ func TestDecideOwnerMatrix(t *testing.T) {
 		{name: "stranger-dir-seat-without-record-unstamped", leader: "node-2", replicas: []string{"node-2", self}, epoch: 4,
 			owner: nil, stranger: true, want: ownerNone},
 		{name: "seat-refreshes-a-stale-but-matching-record", leader: "node-2", replicas: []string{"node-2", self}, epoch: 4,
-			owner: &slotOwner{Topology: topo, Leader: "node-2", Epoch: 3, Replica: true}, want: ownerStamp},
-		{name: "seat-foreign-record-not-proven-no-fence", leader: "node-2", replicas: []string{"node-2", self}, epoch: 4,
-			owner: &slotOwner{Topology: topo, Leader: self, Epoch: 3}, want: ownerNone},
+			owner: &slotOwner{Topology: topo, Leader: "node-2", Epoch: 3}, want: ownerStamp},
+		// A seat whose record names an older leader is proven (older epoch ⇒
+		// the demotion path) and refreshed, not ignored.
+		{name: "seat-refreshes-a-record-from-the-previous-leader", leader: "node-2", replicas: []string{"node-2", self}, epoch: 4,
+			owner: &slotOwner{Topology: topo, Leader: self, Epoch: 3}, want: ownerStamp},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -398,5 +400,58 @@ func TestWriteOwnerConcurrentNoGarbage(t *testing.T) {
 	}
 	for k := 0; k < 32; k++ {
 		<-done
+	}
+}
+
+// TestOwnerRecordIsIdenticalAcrossMembers pins the reason the record no longer
+// carries a per-node fact: two members of one slot must end up with the same
+// bytes, so an operator can diff the files to spot a copy that belongs to a
+// different lineage instead of reading per-node noise.
+func TestOwnerRecordIsIdenticalAcrossMembers(t *testing.T) {
+	one, st1 := newTestEngine(t, "node-1")
+	two, st2 := newTestEngine(t, "node-2")
+	for _, e := range []*Engine{one, two} {
+		// Same replicated generation on both sides (a fresh temp dir mints its
+		// own id, and the generation is part of the record).
+		applyCmd(t, e, &Command{Op: OpSetTopology, Topology: "gen-shared"})
+		e.tableMu.Lock()
+		e.table.Slots[9] = &Placement{Leader: "node-1", Replicas: []string{"node-1", "node-2"}, Epoch: 2, State: SlotStable}
+		e.tableMu.Unlock()
+		e.refreshOwners()
+	}
+	got1, has1, err1 := readOwner(st1.SlotDir(9))
+	got2, has2, err2 := readOwner(st2.SlotDir(9))
+	if err1 != nil || err2 != nil || !has1 || !has2 {
+		t.Fatalf("both members must hold a record: has=(%v,%v) err=(%v,%v)", has1, has2, err1, err2)
+	}
+	if got1 != got2 {
+		t.Fatalf("members disagree about one slot:\n  leader copy: %+v\n  seat copy:   %+v", got1, got2)
+	}
+	b1, _ := os.ReadFile(ownerPath(st1.SlotDir(9)))
+	b2, _ := os.ReadFile(ownerPath(st2.SlotDir(9)))
+	if string(b1) != string(b2) {
+		t.Fatalf("record bytes differ across members:\n%s\n%s", b1, b2)
+	}
+}
+
+// TestNonMemberSlotIsNeverStamped pins the other half of "the file names a
+// member": a copy this node holds without a seat (a leftover the retention
+// drop has not collected yet) is not a member slot, so the fence leaves it
+// alone — its record, if any, stays as the stale evidence it is.
+func TestNonMemberSlotIsNeverStamped(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	e.tableMu.Lock()
+	e.table.Slots[7] = &Placement{Leader: "node-2", Replicas: []string{"node-2"}, Epoch: 3, State: SlotStable}
+	e.tableMu.Unlock()
+	// A real leftover copy, not just an empty dir.
+	if err := st.AppendAtSeq(7, 1, ownerRecord(aggForSlot(t, e, 7), 1, "cmd-7")); err != nil {
+		t.Fatal(err)
+	}
+	e.refreshOwners()
+	if rec, has, err := readOwner(st.SlotDir(7)); has || err != nil {
+		t.Fatalf("a non-member slot must stay unstamped: %+v has=%v err=%v", rec, has, err)
+	}
+	if e.slotPending(7) {
+		t.Fatal("a copy this node does not seat must not fence its own slot")
 	}
 }

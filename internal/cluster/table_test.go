@@ -344,10 +344,10 @@ func TestClusterGenerationComesFromTheReplicatedState(t *testing.T) {
 
 	// Provenance records are stamped with it, so a copy written before a
 	// failover still matches the fence's value after it.
-	rec := desiredOwner(e.topologyID(), "node-1",
+	rec := desiredOwner(e.topologyID(),
 		&Placement{Leader: "node-1", Replicas: []string{"node-1"}, Epoch: 1, State: SlotStable})
-	if rec.Topology != "gen-a" || !rec.Replica {
-		t.Fatalf("owner stamp = %+v, want the replicated generation and the seat", rec)
+	if rec.Topology != "gen-a" || rec.Leader != "node-1" || rec.Epoch != 1 {
+		t.Fatalf("owner stamp = %+v, want the replicated generation and placement", rec)
 	}
 }
 

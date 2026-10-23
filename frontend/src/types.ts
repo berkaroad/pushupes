@@ -171,7 +171,6 @@ export interface PendingSlotView {
   table_epoch: number
   owner_leader?: string
   owner_epoch?: number
-  owner_replica?: boolean
   owner_topology?: string
 }
 

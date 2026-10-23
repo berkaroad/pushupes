@@ -74,13 +74,18 @@ const ownerFileName = "owner.json"
 // topologyFileName is the per-node generation id inside the consensus dir.
 const topologyFileName = "topology"
 
-// slotOwner is the decoded owner.json.
+// slotOwner is the decoded owner.json. Its content is a pure function of the
+// replicated table (topology + this slot's placement), so every member of a
+// slot holds the SAME bytes at steady state — the per-node "I held a seat then"
+// bit it used to carry is gone, and provenance is decided by the generation and
+// the slot's leader epoch instead. During a table change the members may sit one
+// apply apart (each stamps its own applied view); they converge as the applies
+// land, and the fence tick rewrites any member left behind.
 type slotOwner struct {
-	Topology string `json:"topology"`          // node generation that wrote it
-	Leader   string `json:"leader"`            // slot leader the table named then
-	Epoch    int64  `json:"epoch"`             // placement epoch the record was stamped at
-	Replica  bool   `json:"replica,omitempty"` // this node held a seat then
-	State    string `json:"state,omitempty"`   // slot state the table named then
+	Topology string `json:"topology"`        // node generation that wrote it
+	Leader   string `json:"leader"`          // slot leader the table named then
+	Epoch    int64  `json:"epoch"`           // placement epoch the record was stamped at
+	State    string `json:"state,omitempty"` // slot state the table named then
 }
 
 // loadOrInitTopology returns the consensus dir's generation id, creating it
@@ -175,10 +180,20 @@ func decideOwner(topo, self string, p *Placement, owner slotOwner, hasOwner, has
 		}
 		return ownerStamp, ownerOK
 	}
-	proven := owner.Topology == topo && owner.Epoch <= p.Epoch &&
-		(owner.Leader == p.Leader || owner.Replica)
+	// Provenance is carried by the generation and the slot's leader epoch
+	// alone, both monotonic properties of the replicated table, so a record
+	// stamped anywhere in this generation describes the same bytes on every
+	// member (see desiredOwner) and two members' files for one slot are
+	// identical and directly comparable.
+	//
+	// An OLDER epoch may name a different leader — that is the demotion and
+	// promotion path. The SAME epoch may not: the epoch is bumped on every
+	// leader change, so a record claiming epoch E with a leader the table does
+	// not name at E is contradicting the table, not merely stale.
+	proven := owner.Topology == topo &&
+		(owner.Epoch < p.Epoch || (owner.Epoch == p.Epoch && owner.Leader == p.Leader))
 	if proven {
-		if owner == desiredOwner(topo, self, p) {
+		if owner == desiredOwner(topo, p) {
 			return ownerNone, ownerOK
 		}
 		return ownerStamp, ownerOK
@@ -197,12 +212,11 @@ func decideOwner(topo, self string, p *Placement, owner slotOwner, hasOwner, has
 }
 
 // desiredOwner is the record content the table today implies for this node.
-func desiredOwner(topo, self string, p *Placement) slotOwner {
+func desiredOwner(topo string, p *Placement) slotOwner {
 	return slotOwner{
 		Topology: topo,
 		Leader:   p.Leader,
 		Epoch:    p.Epoch,
-		Replica:  replicaListHas(p.Replicas, self),
 		State:    string(p.State),
 	}
 }
@@ -221,7 +235,7 @@ func (e *Engine) stampPlacement(s int32, p *Placement) {
 	if e.strangerDir(topo) {
 		return
 	}
-	want := desiredOwner(topo, e.self, p)
+	want := desiredOwner(topo, p)
 	dir := e.store.SlotDir(s)
 	// clearFence lifts this slot's local fence verdict NOW, in the apply
 	// path. The replicated table names self leader and the on-disk record
@@ -397,14 +411,13 @@ func writeFileSticky(path string, b []byte, dir string) error {
 
 // PendingSlotView is one fenced slot in the admin view.
 type PendingSlotView struct {
-	Slot         int32  `json:"slot"`
-	Reason       string `json:"reason"`
-	TableLeader  string `json:"table_leader"`
-	TableEpoch   int64  `json:"table_epoch"`
-	OwnerLeader  string `json:"owner_leader,omitempty"`
-	OwnerEpoch   int64  `json:"owner_epoch,omitempty"`
-	OwnerReplica bool   `json:"owner_replica,omitempty"`
-	OwnerTopo    string `json:"owner_topology,omitempty"`
+	Slot        int32  `json:"slot"`
+	Reason      string `json:"reason"`
+	TableLeader string `json:"table_leader"`
+	TableEpoch  int64  `json:"table_epoch"`
+	OwnerLeader string `json:"owner_leader,omitempty"`
+	OwnerEpoch  int64  `json:"owner_epoch,omitempty"`
+	OwnerTopo   string `json:"owner_topology,omitempty"`
 }
 
 // ownerRefreshInterval bounds how long a placement change may go unstamped;
@@ -490,7 +503,7 @@ func (e *Engine) refreshOwners() {
 			var typeErr *json.UnmarshalTypeError
 			if !stranger && (errors.As(err, &syn) || errors.As(err, &typeErr)) {
 				e.logger.Warn("owner fence: corrupt record re-stamped from the table", "slot", slot, "err", err)
-				if err := writeOwner(dir, desiredOwner(topo, e.self, &p)); err != nil {
+				if err := writeOwner(dir, desiredOwner(topo, &p)); err != nil {
 					e.logger.Warn("owner fence: repair stamp failed", "slot", slot, "err", err)
 				}
 				continue
@@ -506,7 +519,7 @@ func (e *Engine) refreshOwners() {
 		case ownerPending:
 			next[slot] = reason
 		case ownerStamp:
-			if err := writeOwner(dir, desiredOwner(topo, e.self, &p)); err != nil {
+			if err := writeOwner(dir, desiredOwner(topo, &p)); err != nil {
 				e.logger.Warn("owner fence: stamp failed", "slot", slot, "err", err)
 			}
 		}
@@ -553,7 +566,7 @@ func (e *Engine) PendingSlots() []PendingSlotView {
 			v.TableLeader, v.TableEpoch = p.Leader, p.Epoch
 		}
 		if o, has, err := readOwner(e.store.SlotDir(slot)); err == nil && has {
-			v.OwnerLeader, v.OwnerEpoch, v.OwnerReplica, v.OwnerTopo = o.Leader, o.Epoch, o.Replica, o.Topology
+			v.OwnerLeader, v.OwnerEpoch, v.OwnerTopo = o.Leader, o.Epoch, o.Topology
 		}
 		out = append(out, v)
 	}
@@ -609,7 +622,7 @@ func (e *Engine) AdoptPending(want []int32) (adopted int, skipped []int32) {
 			skipped = append(skipped, slot)
 			continue
 		}
-		if err := writeOwner(e.store.SlotDir(slot), desiredOwner(e.topologyID(), e.self, &copy)); err != nil {
+		if err := writeOwner(e.store.SlotDir(slot), desiredOwner(e.topologyID(), &copy)); err != nil {
 			e.logger.Warn("owner fence: adopt stamp failed", "slot", slot, "err", err)
 			skipped = append(skipped, slot)
 			continue
