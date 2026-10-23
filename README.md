@@ -238,6 +238,7 @@ admin 面 HTTP（仅管理）：`GET /admin/cluster/status`、`GET /admin/status
 `GET /admin/slots/{slot}/describe`、`GET /admin/slots/{slot}/streams`、
 `POST /admin/slots/{slot}/migrate`、`POST /admin/slots/{slot}/remove-replica`、
 `POST /admin/cluster/plan`、`POST /admin/cluster/replica-policy`、
+`DELETE /admin/cluster/nodes/{id}`（摘成员：服务端先排干再正式移除，在线与否不问，客户端无中断）、
 `POST/GET/DELETE /admin/flow-control`（节点本地：收到请求的节点就是被设置/查询/
 恢复的节点）、`GET /admin/slots/pending`、`POST /admin/slots/pending/adopt`
 （owner 围栏：查看被拦副本并采纳「属于当前世代」，同样节点本地；丢弃走运维

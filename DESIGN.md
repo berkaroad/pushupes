@@ -42,6 +42,10 @@ EventRecord（事件流中的一条记录）
 - **副本落盘逐条校验**：`appendAtSeq` 对已存在的 seq 比对命令号与版本，
   相符才认「已复制」；**不相符即报 `ErrSeqDivergence`**，绝不覆盖。
   复制路径按槽隔离该错误，不拖垮整条会话。
+- **隔离之后是重建**：被隔离的分叉副本不是终点——它丢弃本地槽副本并从
+  seq 1 向 leader 全量重拉；当本地 LEO 追到「分叉轮次里 leader 的尾号」时
+  隔离自动解除、进度上报恢复，副本重新入组。leader 自己的 WAL 不在此列
+  （它携带已确认的写，没有人能向 leader 之下重拉），该侧分叉交由迁移机制处理。
 
 **规则 2：槽内 seq 严格单调递增、不断层。**
 
@@ -65,9 +69,12 @@ seq 升序重放同一批记录，把计数器重建到 LEO。
 
 写入侧由 `indexMetaLocked` 保障：目录只采纳「流的下一个版本」，
 不采纳无法解析的版本（既不采纳、就不存在「声称了却读不到」的目录状态）。
-但**记录层面的缺口仍可能出现**：迁移栅栏的 `pushFrames` 从目标自报的
-`tgtLEO` 起推帧，若目标某聚合流短于其槽 LEO，推来的记录会落盘却不被目录
-采纳，形成「已落盘但不可见」的缺口，而目标的 LEO 已推进到该位置。
+乱序到达的记录（版本跳号——典型来源是重建/追赶把一段聚合流按不同顺序落盘）
+会被记住（stranded 集，每聚合封顶），而**一旦某个落盘的帧补上了断链的前驱，
+目录就地继续吃进整段被欠的版本链**——运行期与启动重放共用这一条路径，所以
+「已落盘但不可见」只存在于前驱真正缺失的窗口，且随缺口被填上而即刻闭合。
+真正的断链（某个前驱版本在盘上根本不存在）依然停在缺失号之前：
+修补不发明可解析性。
 
 **因此：「追平」判据只验证规则 2（seq 到位），不验证规则 3（记录可见）。**
 凡以 `LEO` 比较作为「已同步/可提交」依据的地方（迁移 `awaitCaughtUp`、
@@ -352,9 +359,11 @@ Body: Record*，每条记录：
   （目录成员、该槽的副本、不是失败节点自己、自己不在离线态），不满足就落回表内兜底规则，
   所以有 pick 没 pick 的命令都能收敛。代价是故障切换前多**一轮** peer RTT（毫秒级）。分界
   与排除：已被 controller 判 down、或探活已连续失败的节点不作为候选——把槽交给一个正在
-  死的过程等于没换。**运维移除（`leave_node`）不接这套 pick**：按流程 `scripts/cluster.sh
-  remove` 先等该成员被判离线，那时它名下的槽早被上面的 `mark_down` 换走了，leave_node 只
-  兜异常路径，用表内规则即可（它也不是「刚死」的时刻，没有新鲜度可比）。
+  死的过程等于没换。**运维移除（`leave_node`）不接这套 pick**：`scripts/cluster.sh
+  remove` 的 DELETE 会让服务端先排干——活节点名下槽走常规交接让空，死节点（或标记后
+  才死的）走**无 fence 的表命令直交**（没有写者要冻结，epoch 即栅栏，等价于 mark_down
+  的移交但由移除意图驱动），排干后 `leave_node` 只兜表内规则收尾（它不是「刚死」的
+  时刻，没有新鲜度可比）。
   这段成本的账（事件驱动、非心跳）：单次故障 (N-1)×~100-150B ≈ 0.5~1KB，连接走既有
   peer 客户端池（无新握手），controller 侧只是一张带 TTL 的见证者表，落库仍只有那一条
   `mark_down`；空闲时为零，比它要替代的那 1s 周期探活还便宜。
@@ -492,6 +501,11 @@ Body: Record*，每条记录：
    （c）`OpLeaderMove`（epoch+1）原子切换 leader；
    （d）回收多余席位（`OpSlotRemoveReplica`，best effort）。
    栅栏是唯一的冻结窗口，且每轮 controller 只提交一次（严格串行），所以任一时刻被冻结的槽 ≤1。
+   移交目标的权威在 controller：`FenceSlot` 请求显式携带 `target`，源端按指令投递冻结尾巴，
+   不依赖自己表里的 migrating_out（controller 只等自己的 apply 落地，源端表可能还慢一拍）；
+   源端「看不到目标」时**报错中止**而不是当作「无货可推」——后者会把栅栏采样之后、提交
+   之前确认过的记录**搁浅在已降位的源端**：新 leader 从不向旧 leader 拉数据，那截尾巴
+   就此永久隐身，客户端在下一次写撞见 tail 倒退（已确认记录蒸发）。
 
 **提交前置判据（唯一）**：`slotCopyStatus` 比较两端目录摘要与 LEO——
 
@@ -557,7 +571,17 @@ Body: Record*，每条记录：
   配置（默认 4MiB，recv/send 同值）：`BatchAppend` 一整批要装进这个上限，
   批次大小随它一起调。
   MOVED/ASK 重定向的 `node` 字段携带槽 leader 的 **client 地址**（路由表
-  Peer 同时记 PeerAddr/AdminAddr/ClientAddr），客户端据此重连。读准入
+  Peer 同时记 PeerAddr/AdminAddr/ClientAddr），客户端据此重连。
+  **连接存活探测（gRPC keepalive，两端配对）**：`pkg/client` 对每个节点连接
+  每 5s 发 HTTP/2 ping、2s 无应答即判死（`PermitWithoutStream`，空闲连接也保
+  持探测）；服务端 enforcement 放行这个节奏（`MinTime=5s`+`PermitWithoutStream`，
+  否则默认 5 分钟阈值会 GOAWAY 健康连接），服务端同时以 30s/10s 反向探客户端。
+  这组参数封的是「网络硬断」那条轴：进程死有 TCP RST 当场可见，拔线/宕机没有
+  RST，静默的连接会把每个请求挂到 30s 调用超时——ping 把黑洞检测压到 ~7s，
+  断连后走的是与 transport 失败相同的吸收链（死地址惩罚 → 盲转 → command_id
+  幂等重发）。实测（TCP 黑洞中继注入）：写 94.7 万条 fail=0，吞吐无掉拍，
+  黑洞节点上「写入已落盘、应答被黑洞」的批次恢复后重发答 exists，slotcheck
+  0 发散。调用方预算纪律不变：自己的 ctx 超时须 ≥ 探测窗口。读准入
   （`Engine.LocalRead`）决定服务端是否本地作答：**leader 恒本地**（读自己的
   durable LEO，不受水位约束）；**副本必须「同步已证明」才本地**——取到过该
   槽**当前 placement epoch** 的 HW 账本样本、且本副本 durable LEO ≥ 样本水位，
@@ -642,7 +666,7 @@ GET  /admin/flow-control                       # 本节点流控配置与累计�
 DELETE /admin/flow-control                     # 恢复本节点不限流（节点本地，同上）
 GET  /admin/cluster/nodes                      # 列出当前 raft 成员（本节点视角：id/peer/admin/client/down）
 POST /admin/cluster/nodes {id,peer_addr,role}  # 运行时加成员（控制器专属，同上；role 必填 voter|learner；admin/client 地址由新节点自报）
-DELETE /admin/cluster/nodes/{id}               # 运行时摘成员（控制器专属，同上；仅离线节点，在线回 400）
+DELETE /admin/cluster/nodes/{id}               # 运行时摘成员（控制器专属，同上；一条命令 = 先排干再正式移除：在线未排干回 202 draining{leading,inflight}，排干完成由服务端自动摘除，幂等重发=查进度）
 GET  /healthz
 ```
 
@@ -665,15 +689,36 @@ Raft 配置（谁投票）与复制的成员目录（槽表里的成员列表）
   日志还是靠装快照追平，推出来的成员表都和集群一致。少了这一条，新节点只知道
   「把自己加进来」那一项，会以「整个集群就我一个」的姿态运行（quorum=1、日志陈旧
   也能自己当选、能确认别人没有的写入）。
-- **摘成员 `DELETE /admin/cluster/nodes/{id}`**：提交 `remove_member`。只允许
-  摘**离线**成员（与 `Peer.Offline` 同一条规则：未上报 client 地址或被 controller
-  标记 down）；在线成员回 400（`cluster.ErrOnlineMember`），要摘必须先把它下线
-  ——摘除是死节点的清理动作，不是重新调度在线槽位分布的手段。leader **不会
-  立刻断开**被摘节点：它要等该节点确认收到配置项，再发一轮带新 commit 的
-  AppendEntries，让被摘方本地也提交该配置后才停复制（否则被摘节点留着未提交的
-  尾巴，仍信旧配置、可能对幸存者发起竞选；共识层同时在握手后拒绝非成员的共识流量）。
-  之后 controller 把它的槽主迁到存活副本、`replan_slots` 补副本。幂等；拒绝摘掉
-  最后一个成员（否则集群会把自己配没了）。
+- **摘成员 `DELETE /admin/cluster/nodes/{id}`：一条命令 = 先排干、再正式移除**。
+  服务端**不检测在线/离线**——目录 + 槽表就是全部事实，移除管线对活节点和死节点
+  同一条路：名下还有 leader 槽（或在途迁移）时，DELETE 提交 `drain_node{drain,
+  then_remove}` 给目录条目打上**排干标记 + 移除意图**（两个字段同一条命令进表，
+  意图随共识复制，controller 换主也不丢），回 202 `{leading, inflight}`；重发同一
+  条 DELETE 只报进度、不重启管线。排干标记把它逐出一切**布局角色**：ring/plan/
+  replan 不再选它当 leader（`OnlinePeerIDs`）也不再落新席位（`planCandidates`），
+  迁移目标三层拒绝（migrate 入口 400、提交侧、表 apply 对 `leader_move`/
+  `slot_add_replica` 的排水目的地直接拒绝命令），failover 择主把活排水副本排在
+  最后（只剩它时仍可当选——槽不能因标记饿死）。**读写不拦**：它名下的槽在移交
+  提交前照常服务（这正是客户端全程无中断的原因），换主瞬间按 MOVED 重定向走。
+  移交由 rebalancer 的排水轮推进：活源走常规交接（fence 停写 → 追平 → commit 换
+  主），每轮预算放宽到 64（同轮内仍逐槽串行，任一时刻被冻结的槽仍只有一个）；
+  **死源走无 fence 的表命令直交**（没有写者可冻结，epoch 即栅栏）。排水存在时
+  rebalancer 以 2s 节奏**无视 `-rebalance-interval` 开关**强制推进——没人移交，
+  DELETE 就永远出不去。排干的那一刻（无槽领导、无在途），同一轮 `finishPending-
+  Removals` 执行正式摘除：learner 摘目录（`leave_node`），voter 先 raft
+  `RemoveMember` 再清目录——leader 不会立刻断开被摘的活 voter：它要等该节点确认
+  收到配置项、再发一轮带新 commit 的 AppendEntries 让它本地也提交该配置后才停
+  复制（否则被摘方留着未提交的尾巴，仍信旧配置、可能对幸存者发起竞选；共识层
+  同时拒绝非成员的共识流量）。之后 `replan_slots` 把它的席位补还剩余池。若全池
+  都被打排水标记，布局回退到含排水成员的旧池——标记是移出布局的手段，不是把池
+  掏空的手段（没有候选可选时总得有人领导）。**撤销 = 运维重新准入**：`join_node`（POST
+  /admin/cluster/nodes / 控制台 / `cluster.sh join`）遇同 id 带标记条目即清两
+  个标记，布局角色当场恢复。**节点自己的启动自注册（adoption/`AdmitSelf`）
+  没有这个权力**——移除是运维发起的决定，正在被移除的节点重启归队不能把自己
+  的移除取消掉（否则排水永远在和一个重生的节点拉锯）；register 心跳同样不碰
+  标记，被摘节点的回连由「register 拒绝非成员」封死。`scripts/cluster.sh remove` 轮询同一条 DELETE 直到
+  200，**先摘后停**（表里已经没有它、没有任何槽指向它，此刻停进程对客户端无感）。
+  幂等；仍拒绝摘掉最后一个成员（否则集群会把自己配没了）。
 - **开局节点 `-join`**：**不是配置作者的节点**（即 id 不等于 `-peers` 最小值、且没有
   `-bootstrap`）以种子身份启动：`-peers` 只当成员地址列表，它向其中之一（或 `-join`
   指定的那个）发 `Adopt` 报名，leader 走上面的加成员流程。因此「把新节点用更大的
