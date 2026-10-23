@@ -863,30 +863,33 @@ func scanIdxEntries(path, magic string, slotID int32, baseSeq uint64, entryBytes
 // can only span windows by corruption and the walk re-windows at its start.
 const segIdxScanWindowB = 256 << 10
 
-// scanIdxEntriesFile is scanIdxEntries over an already-open handle — the
-// writable segment's lookup reads through the index writer's own fd.
-func scanIdxEntriesFile(f *os.File, magic string, slotID int32, baseSeq uint64, entryBytes int, fn func(raw []byte) bool) (int64, error) {
+// scanIdxBlocksFile is the walk kernel: it hands each CRC-validated block's
+// entry payload to onBlock and stops when onBlock returns false. It reports
+// how many body bytes were read and whether any validated block was seen
+// (a file whose first block is torn yields none).
+func scanIdxBlocksFile(f *os.File, magic string, slotID int32, baseSeq uint64, entryBytes int, onBlock func(payload []byte) bool) (int64, bool, error) {
 	var h [segIdxHeaderBytes]byte
 	if err := readAtFull(f, h[:], 0); err != nil {
-		return 0, nil
+		return 0, false, nil
 	}
 	if !checkSegIdxHeader(h[:], magic, slotID, baseSeq) {
-		return 0, nil
+		return 0, false, nil
 	}
 	st, err := f.Stat()
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	size := st.Size()
 	buf := make([]byte, segIdxScanWindowB)
 	var walked int64
+	sawBlock := false
 	for off := int64(segIdxHeaderBytes); off+segIdxBlockHead <= size; {
 		win := int64(len(buf))
 		if size-off < win {
 			win = size - off
 		}
 		if err := readAtFull(f, buf[:win], off); err != nil {
-			return walked, err
+			return walked, sawBlock, err
 		}
 		p := int64(0)
 		for p+segIdxBlockHead <= win {
@@ -894,20 +897,19 @@ func scanIdxEntriesFile(f *os.File, magic string, slotID int32, baseSeq uint64, 
 			payload := int64(count) * int64(entryBytes)
 			block := int64(segIdxBlockHead) + payload
 			if count <= 0 || off+p+block > size {
-				return walked, nil // torn: only the validated prefix is handed out
+				return walked, sawBlock, nil // torn: only the validated prefix is handed out
 			}
 			if p+block > win {
 				break // block runs past the window: walk it from a dedicated read
 			}
 			if crc32.Checksum(buf[p+4:p+block], segIdxCRC) != binary.BigEndian.Uint32(buf[p:p+4]) {
-				return walked, nil
-			}
-			for i := int64(0); i < payload; i += int64(entryBytes) {
-				if !fn(buf[p+segIdxBlockHead+i : p+segIdxBlockHead+i+int64(entryBytes)]) {
-					return walked, nil
-				}
+				return walked, sawBlock, nil
 			}
 			walked += block
+			sawBlock = true
+			if !onBlock(buf[p+segIdxBlockHead : p+block]) {
+				return walked, sawBlock, nil
+			}
 			p += block
 		}
 		if p == 0 {
@@ -919,27 +921,72 @@ func scanIdxEntriesFile(f *os.File, magic string, slotID int32, baseSeq uint64, 
 			payload := int64(count) * int64(entryBytes)
 			block := int64(segIdxBlockHead) + payload
 			if count <= 0 || off+block > size {
-				return walked, nil
+				return walked, sawBlock, nil
 			}
 			big := make([]byte, block)
 			if err := readAtFull(f, big, off); err != nil {
-				return walked, err
+				return walked, sawBlock, err
 			}
 			if crc32.Checksum(big[4:], segIdxCRC) != binary.BigEndian.Uint32(big[0:4]) {
-				return walked, nil
-			}
-			for i := int64(0); i < payload; i += int64(entryBytes) {
-				if !fn(big[segIdxBlockHead+i : segIdxBlockHead+i+int64(entryBytes)]) {
-					return walked, nil
-				}
+				return walked, sawBlock, nil
 			}
 			walked += block
+			sawBlock = true
+			if !onBlock(big[segIdxBlockHead:]) {
+				return walked, sawBlock, nil
+			}
 			off += block
 			continue
 		}
 		off += p
 	}
-	return walked, nil
+	return walked, sawBlock, nil
+}
+
+// scanIdxEntriesFile is scanIdxEntries over an already-open handle — the
+// writable segment's lookup reads through the index writer's own fd.
+func scanIdxEntriesFile(f *os.File, magic string, slotID int32, baseSeq uint64, entryBytes int, fn func(raw []byte) bool) (int64, error) {
+	walked, _, err := scanIdxBlocksFile(f, magic, slotID, baseSeq, entryBytes, func(payload []byte) bool {
+		for i := 0; i+entryBytes <= len(payload); i += entryBytes {
+			if !fn(payload[i : i+entryBytes]) {
+				return false
+			}
+		}
+		return true
+	})
+	return walked, err
+}
+
+// scanIdxEntriesHashFile is the idempotency lookup's walk: the 8-byte hash
+// comparison runs inline in the block scan (the hash is every entry's first
+// word), so the callback — which pays a record read per candidate — only
+// runs for entries that can actually answer for the command being looked
+// up. It also reports whether the walk saw any validated block.
+func scanIdxEntriesHashFile(f *os.File, magic string, slotID int32, baseSeq uint64, entryBytes int, target uint64, onMatch func(raw []byte) bool) (int64, bool, error) {
+	return scanIdxBlocksFile(f, magic, slotID, baseSeq, entryBytes, func(payload []byte) bool {
+		for i := 0; i+entryBytes <= len(payload); i += entryBytes {
+			if binary.BigEndian.Uint64(payload[i:]) == target {
+				if !onMatch(payload[i : i+entryBytes]) {
+					return false
+				}
+			}
+		}
+		return true
+	})
+}
+
+// scanIdxEntriesHash is scanIdxEntriesHashFile through a path (the writable
+// segment without an open index writer).
+func scanIdxEntriesHash(path, magic string, slotID int32, baseSeq uint64, entryBytes int, target uint64, onMatch func(raw []byte) bool) (int64, bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	defer f.Close()
+	return scanIdxEntriesHashFile(f, magic, slotID, baseSeq, entryBytes, target, onMatch)
 }
 
 // segDictEntry is one aggregate dictionary entry.

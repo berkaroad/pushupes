@@ -15,6 +15,7 @@
 package storage
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"testing"
@@ -105,6 +106,41 @@ func BenchmarkCidxOpenForLookup(b *testing.B) {
 		b.Fatal(err)
 	}
 	ix.Close()
+}
+
+// B: the tail walk with the hash comparison inline vs per-entry callbacks.
+// A miss (the false-positive case) walks the whole file and pays every
+// entry either way; the specialised form pays an integer compare instead
+// of a callback and a slice header.
+func BenchmarkTailScanWalk(b *testing.B) {
+	fx := newBenchFixture(b, 60000)
+	f, err := os.Open(fx.idxPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer f.Close()
+	miss := ^uint64(0) // no entry holds it: the full-file walk
+	b.ReportAllocs()
+	b.Run("per-entry-callback", func(b *testing.B) {
+		// The shape before the specialised walk: one callback per entry
+		// with a slice header, the comparison inside the callback.
+		for i := 0; i < b.N; i++ {
+			if _, err := scanIdxEntriesFile(f, segIdxMagic, 7, fx.baseSeq, segIdxEntryBytes, func(raw []byte) bool {
+				return binary.BigEndian.Uint64(raw[0:8]) != miss
+			}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("specialised-hash-walk", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if _, _, err := scanIdxEntriesHashFile(f, segIdxMagic, 7, fx.baseSeq, segIdxEntryBytes, miss, func([]byte) bool {
+				return true
+			}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func hashOf(cmd string) uint64 { return data.HashCommandID(cmd) }

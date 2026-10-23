@@ -417,6 +417,82 @@ func TestSealedBloomGapSelfHealsAtStartup(t *testing.T) {
 	}
 }
 
+// The hash-specialised walk is the per-entry walk with the comparison
+// pulled inline: same candidates in the same order, the same stop
+// semantics, and a "saw a validated block" flag that distinguishes an
+// empty or torn file from a file with no match.
+func TestScanIdxEntriesHashWalkEquivalence(t *testing.T) {
+	dir := t.TempDir()
+	w, err := openSegIndexWriter(dir, 3, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const total = 5120 // 20 blocks
+	for i := 0; i < total; i++ {
+		w.add(uint64(i%2), uint64(1000+i), "agg", uint32(i+1), int64(i)) // two hashes, interleaved across all 20 blocks
+	}
+	if w.err != nil {
+		t.Fatal(w.err)
+	}
+	if err := w.close(); err != nil {
+		t.Fatal(err)
+	}
+	path := segIdxPath(dir, 1000)
+
+	// Cross-check: the specialised walk over hash 0 must hand out exactly
+	// the entries the general walk reports for the same hash, in order.
+	var want []byte
+	if _, err := scanIdxEntries(path, segIdxMagic, 3, 1000, segIdxEntryBytes, func(raw []byte) bool {
+		if binary.BigEndian.Uint64(raw[0:8]) == 0 {
+			want = append(want, raw...)
+		}
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var got []byte
+	matches := 0
+	read, saw, err := scanIdxEntriesHash(path, segIdxMagic, 3, 1000, segIdxEntryBytes, 0, func(raw []byte) bool {
+		matches++
+		got = append(got, raw...)
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !saw {
+		t.Fatalf("a walk over 20 blocks reported no validated block")
+	}
+	if read == 0 || !bytes.Equal(got, want) {
+		t.Fatalf("hash walk yielded %d matches (%d bytes read), general walk agrees on %d bytes", matches, read, len(want))
+	}
+
+	// A hash with no entries: the walk runs, matches nothing, saw=true.
+	if _, saw, err := scanIdxEntriesHash(path, segIdxMagic, 3, 1000, segIdxEntryBytes, 77, func([]byte) bool {
+		t.Error("match callback on a hash the file never holds")
+		return true
+	}); err != nil || !saw {
+		t.Fatalf("no-match walk: saw=%v err=%v", saw, err)
+	}
+
+	// Early stop after the first match.
+	n := 0
+	if _, _, err := scanIdxEntriesHash(path, segIdxMagic, 3, 1000, segIdxEntryBytes, 1, func([]byte) bool {
+		n++
+		return false
+	}); err != nil || n != 1 {
+		t.Fatalf("early stop ran %d callbacks, want 1 (err %v)", n, err)
+	}
+
+	// Missing file: zero bytes, no validated block, no error.
+	if read, saw, err := scanIdxEntriesHash(segIdxPath(dir, 4242), segIdxMagic, 3, 4242, segIdxEntryBytes, 0, func([]byte) bool {
+		t.Error("callback on a missing index file")
+		return true
+	}); err != nil || saw || read != 0 {
+		t.Fatalf("missing file: read=%d saw=%v err=%v", read, saw, err)
+	}
+}
+
 // A lookup opening the .cidx has no use for the bloom section (the gate
 // answer came from memory before the open): the open skips reading and
 // decoding it, while the binary search over the entries still answers.

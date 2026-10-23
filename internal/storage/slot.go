@@ -1200,12 +1200,8 @@ func (s *Slot) lookupTailCommandLocked(seg *Segment, commandID string, hash uint
 	}
 	var hit *data.EventRecord
 	var hitSeq uint64
-	sawEntries := false
-	walk := func(raw []byte) bool {
-		sawEntries = true
-		if binary.BigEndian.Uint64(raw[0:8]) != hash {
-			return true // keep scanning
-		}
+	var sawEntries bool
+	walk := func(raw []byte) bool { // called for hash matches only
 		seq := seg.BaseSeq + uint64(binary.BigEndian.Uint32(raw[8:12]))
 		got, err := s.readBySeqLocked(seq)
 		if err != nil || got == nil || got.CommandID != commandID {
@@ -1218,9 +1214,9 @@ func (s *Slot) lookupTailCommandLocked(seg *Segment, commandID string, hash uint
 	var read int64
 	var err error
 	if seg.idx != nil {
-		read, err = scanIdxEntriesFile(seg.idx.idx, segIdxMagic, s.ID, seg.BaseSeq, segIdxEntryBytes, walk)
+		read, sawEntries, err = scanIdxEntriesHashFile(seg.idx.idx, segIdxMagic, s.ID, seg.BaseSeq, segIdxEntryBytes, hash, walk)
 	} else {
-		read, err = scanIdxEntries(segIdxPath(s.Dir, seg.BaseSeq), segIdxMagic, s.ID, seg.BaseSeq, segIdxEntryBytes, walk)
+		read, sawEntries, err = scanIdxEntriesHash(segIdxPath(s.Dir, seg.BaseSeq), segIdxMagic, s.ID, seg.BaseSeq, segIdxEntryBytes, hash, walk)
 	}
 	idemTailBytes.Add(uint64(read))
 	if err != nil {
