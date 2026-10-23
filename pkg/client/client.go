@@ -25,6 +25,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 
 	pushupesv1 "github.com/berkaroad/pushupes/pkg/grpcapi/pushupes/v1"
 )
@@ -49,13 +50,21 @@ type Config struct {
 // cluster answered — except the 1006 itself, which the library absorbs as
 // waiting rather than relaying.
 type Client struct {
-	cfg         Config
-	connsMu     sync.Mutex
-	conns       map[string]*grpc.ClientConn
-	gatesMu     sync.Mutex
-	gates       map[string]*gateT // per-node flow-control gate; created open on the first 1006, kept until the Client is dropped
-	routes      *routeTable
-	rr          atomic.Uint64 // round-robin cursor for entry picks
+	cfg     Config
+	connsMu sync.Mutex
+	conns   map[string]*grpc.ClientConn
+	gatesMu sync.Mutex
+	gates   map[string]*gateT // per-node flow-control gate; created open on the first 1006, kept until the Client is dropped
+	routes  *routeTable
+	rr      atomic.Uint64 // round-robin cursor for entry picks
+	// Dead-address penalty box: an entry address whose transport just
+	// failed is skipped by the guess-rotation for entryPenalty, so a node
+	// that left the cluster (a scale-down removes it from the table, not
+	// from the caller's static entry list) stops burning Attempts on
+	// dial timeouts. Entries are immutable after New, so a plain map under
+	// its own mutex is enough.
+	penaltyMu   sync.Mutex
+	penalty     map[string]time.Time
 	redirects   atomic.Uint64
 	flowPauses  atomic.Uint64
 	refreshStop chan struct{}
@@ -101,7 +110,8 @@ func New(nodes []string, cfg *Config) (*Client, error) {
 	if c.cfg.FlowBackoff <= 0 {
 		c.cfg.FlowBackoff = 100 * time.Millisecond
 	}
-	c.routes = &routeTable{entries: entries, client: c}
+	c.routes = &routeTable{entries: entries, client: c, wake: make(chan struct{}, 1)}
+	c.penalty = map[string]time.Time{}
 	if err := c.routes.fetch(); err != nil {
 		return nil, err
 	}
@@ -150,7 +160,23 @@ func (c *Client) event(addr string) pushupesv1.EventServiceClient {
 	cc, ok := c.conns[addr]
 	if !ok {
 		var err error
-		cc, err = grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		cc, err = grpc.NewClient(addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			// Liveness pings on the client surface: a node whose network
+			// DIED HARD (no TCP RST — a pulled cable, a hung host) would
+			// otherwise park every RPC on its connections until the call
+			// timeout, because a silent peer is indistinguishable from an
+			// idle one. An unanswered ping closes the transport within
+			// Time+Timeout (7s), so the failure lands in the ordinary
+			// retry path (penalty box + rotation + command_id idempotency)
+			// instead of a 30s stall. PermitWithoutStream keeps pings
+			// alive between calls too — an idle connection that blacked
+			// out must fail BEFORE the next request rides on it.
+			grpc.WithKeepaliveParams(keepalive.ClientParameters{
+				Time:                clientKeepaliveTime,
+				Timeout:             clientKeepaliveTimeout,
+				PermitWithoutStream: true,
+			}))
 		if err != nil {
 			panic(err) // malformed target: a programming error, not runtime state
 		}
@@ -390,10 +416,17 @@ func (c *Client) sendGroup(ctx context.Context, attempt int, addr string,
 		// transport failure or misaligned answer: rotate the route and
 		// requeue these records for the next attempt. A rotation is a
 		// guess, not a redirect the cluster told us — the Redirects()
-		// counter stays out of it.
+		// counter stays out of it. The destination itself just failed at
+		// the transport, so it goes in the penalty box: a node removed by
+		// a scale-down never leaves the caller's static entry list, and
+		// without the box every guess rotation re-fires a dial timeout
+		// into it until the attempt budget burns out (no-response).
+		if err != nil {
+			c.markUnhealthy(addr)
+		}
 		for _, i := range idx {
 			c.routes.patch(c.slotOf(recs[i].AggregateId),
-				c.routes.entries[(int(c.rr.Load())+attempt+1)%len(c.routes.entries)])
+				c.healthyEntry(int(c.rr.Load())+attempt+1))
 		}
 		return append(next, idx...), lastErr
 	}
@@ -410,7 +443,7 @@ func (c *Client) sendGroup(ctx context.Context, attempt int, addr string,
 	}
 	if !aligned {
 		for _, i := range idx {
-			c.routes.patch(c.slotOf(recs[i].AggregateId), c.routes.entries[(int(c.rr.Load())+attempt+1)%len(c.routes.entries)])
+			c.routes.patch(c.slotOf(recs[i].AggregateId), c.healthyEntry(int(c.rr.Load())+attempt+1))
 		}
 		return append(next, idx...), lastErr
 	}
@@ -521,7 +554,7 @@ func readWithRedirect[T any](c *Client, ctx context.Context, aggID string,
 			// transport failure: a rotation is a guess, not a redirect
 			// the cluster told us — the Redirects() counter stays out of it.
 			lastErr = err
-			c.routes.patch(slot, c.routes.entries[(int(c.rr.Load())+attempt+1)%len(c.routes.entries)])
+			c.routes.patch(slot, c.healthyEntry(int(c.rr.Load())+attempt+1))
 			continue
 		}
 		switch errID {
@@ -658,8 +691,9 @@ func (c *Client) readTailsRound(ctx context.Context, attempt int, idxs []int,
 		r := <-done
 		if r.err != nil {
 			lastErr = r.err
+			c.markUnhealthy(r.g.addr)
 			for _, i := range r.g.idx {
-				c.routes.patch(c.slotOf(aggIDs[i]), c.routes.entries[(int(c.rr.Load())+attempt+1)%len(c.routes.entries)])
+				c.routes.patch(c.slotOf(aggIDs[i]), c.healthyEntry(int(c.rr.Load())+attempt+1))
 				next = append(next, i)
 			}
 			continue
@@ -667,7 +701,7 @@ func (c *Client) readTailsRound(ctx context.Context, attempt int, idxs []int,
 		if len(r.results) != len(r.g.ids) {
 			lastErr = fmt.Errorf("client: read tails: %s answered %d results for %d ids", r.g.addr, len(r.results), len(r.g.ids))
 			for _, i := range r.g.idx {
-				c.routes.patch(c.slotOf(aggIDs[i]), c.routes.entries[(int(c.rr.Load())+attempt+1)%len(c.routes.entries)])
+				c.routes.patch(c.slotOf(aggIDs[i]), c.healthyEntry(int(c.rr.Load())+attempt+1))
 				next = append(next, i)
 			}
 			continue
@@ -679,7 +713,7 @@ func (c *Client) readTailsRound(ctx context.Context, attempt int, idxs []int,
 			if res.GetAggregateId() != aggIDs[i] {
 				lastErr = fmt.Errorf("client: read tails: result echo mismatch from %s at %d: %q", r.g.addr, k, res.GetAggregateId())
 				for _, j := range r.g.idx {
-					c.routes.patch(c.slotOf(aggIDs[j]), c.routes.entries[(int(c.rr.Load())+attempt+1)%len(c.routes.entries)])
+					c.routes.patch(c.slotOf(aggIDs[j]), c.healthyEntry(int(c.rr.Load())+attempt+1))
 					next = append(next, j)
 				}
 				break
@@ -756,6 +790,12 @@ type routeTable struct {
 	entries   []string // every known node addr, the round-robin fallback set
 	cursor    int      // last entry addr that answered a fetch
 	client    *Client
+	// wake asks the refresh loop to fetch NOW, not on the next ticker
+	// beat: when an address is declared unhealthy the cached table is
+	// known-stale (a scale-down just moved its slots), and the blind
+	// entry rotation over empty rows is a slower convergence than one
+	// table fetch from a live node. Buffered size 1; extra wakes coalesce.
+	wake chan struct{}
 }
 
 // fetch pulls the whole routing table, trying entry nodes round-robin.
@@ -793,6 +833,8 @@ func (rt *routeTable) refreshEvery(d time.Duration, stop <-chan struct{}) {
 			return
 		case <-tk.C:
 			rt.fetch()
+		case <-rt.wake:
+			rt.fetch()
 		}
 	}
 }
@@ -823,6 +865,23 @@ func (rt *routeTable) addrFor(slot int32, fallback int) string {
 	return rt.entries[fallback%len(rt.entries)]
 }
 
+// invalidateAddr forgets every cached row pointing at addr — the transport
+// failure answer to "this node is not answering": a scale-down leader holds
+// a CONTIGUOUS REGION of slots, so patching only the rows of the batch that
+// just failed would leave the next batch (other aggregates, same dead
+// leader) to burn its own attempt budget on the same address. Dropping the
+// whole region sends every later guess through the healthy rotation
+// instead; the next authoritative refresh re-arms the rows as needed.
+func (rt *routeTable) invalidateAddr(addr string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	for i, a := range rt.bySlot {
+		if a == addr {
+			rt.bySlot[i] = ""
+		}
+	}
+}
+
 // patch points one slot's row at addr (the MOVED/ASK answer, or a rotated
 // guess after a transport failure). The next refresh overwrites it with
 // the authoritative table.
@@ -836,8 +895,63 @@ func (rt *routeTable) patch(slot int32, addr string) {
 
 func (c *Client) slotOf(agg string) int32 { return c.routes.slotOf(agg) }
 
+// Liveness-ping cadence for the client surface, matching what the server's
+// keepalive enforcement policy allows (cmd/pushupes: MinTime covers the
+// interval, PermitWithoutStream covers the idle gaps).
+const (
+	clientKeepaliveTime    = 5 * time.Second
+	clientKeepaliveTimeout = 2 * time.Second
+)
+
 func (c *Client) routeFor(slot int32, fallback int) string {
 	return c.routes.addrFor(slot, fallback)
+}
+
+// entryPenalty is how long a transport-failed entry address stays out of the
+// guess-rotation. It is deliberately shorter than any operator would wait:
+// a node that is really gone is off the routing rows anyway (redirects never
+// name it again), and a node that was only sick gets a second chance quickly.
+const entryPenalty = 3 * time.Second
+
+// markUnhealthy puts an address in the penalty box (transport failure or a
+// misaligned answer — the shapes where the destination itself is suspect,
+// NOT a business-level answer riding back on a healthy connection) and
+// drops every cached routing row that still names it: the destination is
+// not answering, so no slot should keep aiming at it. A scale-down leader
+// holds a contiguous region of slots; patching only the batch that just
+// failed would make every later batch re-burn its attempts on the same
+// dead address (the no-response signature this closes).
+func (c *Client) markUnhealthy(addr string) {
+	c.penaltyMu.Lock()
+	c.penalty[addr] = time.Now().Add(entryPenalty)
+	c.penaltyMu.Unlock()
+	c.routes.invalidateAddr(addr)
+	// The dead destination's slots moved — fetch the real table instead
+	// of letting the next batches rotate blind through entries guessing
+	// (that guessing is what turned a scale-down stop into no-response
+	// failures when the ticker had not refreshed yet).
+	select {
+	case c.routes.wake <- struct{}{}:
+	default:
+	}
+}
+
+// healthyEntry walks the entry list from base and returns the first address
+// outside the penalty window. When every entry is penalised the rotation
+// proceeds anyway — a guess that might be the only live node beats refusing
+// to send.
+func (c *Client) healthyEntry(base int) string {
+	ents := c.routes.entries
+	now := time.Now()
+	c.penaltyMu.Lock()
+	defer c.penaltyMu.Unlock()
+	for k := range ents {
+		addr := ents[(base+k)%len(ents)]
+		if until, bad := c.penalty[addr]; !bad || now.After(until) {
+			return addr
+		}
+	}
+	return ents[base%len(ents)]
 }
 
 // hostPort strips a URL scheme for gRPC dialing (routing-table addresses

@@ -39,6 +39,7 @@ import (
 	"github.com/berkaroad/pushupes/internal/storage"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 
 	"github.com/berkaroad/pushupes/internal/grpcapi"
 )
@@ -291,6 +292,21 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 	grpcOpts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(int(grpcMaxMsgBytes)),
 		grpc.MaxSendMsgSize(int(grpcMaxMsgBytes)),
+		// Liveness pings, both directions, on the client surface. The
+		// enforcement policy exists so the server does NOT GOAWAY the
+		// pkg/client's 5s idle pings (the default 5m min would kill healthy
+		// connections whose only crime is keeping themselves warm). The
+		// server-side params detect a client whose network died hard — its
+		// in-flight batches then fail fast and free the handler instead of
+		// holding a half-open stream until the call timeout.
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             5 * time.Second,
+			PermitWithoutStream: true,
+		}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    30 * time.Second,
+			Timeout: 10 * time.Second,
+		}),
 	}
 	grpcSrv := grpc.NewServer(grpcOpts...)
 	grpcapi.NewServer(eng, store, logger, batchParallelism, clientAddr).Register(grpcSrv)
