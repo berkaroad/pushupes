@@ -89,6 +89,13 @@ var (
 	segIndexUnusable atomic.Uint64 // segments that had to be walked (no index)
 	segCmdBuilt      atomic.Uint64 // sealed command indexes written at startup
 	segAggBuilt      atomic.Uint64 // sealed aggregate indexes written at startup
+	// Idempotency-lookup counters: how often each filter gate talked a disk
+	// walk out of running, and what the walks that did run read.
+	idemTailScans   atomic.Uint64 // tail .idx scans started
+	idemTailSkips   atomic.Uint64 // tail scans the tail's own filter talked off
+	idemTailBytes   atomic.Uint64 // bytes read by those scans
+	idemSealedOpens atomic.Uint64 // sealed .cidx files opened by a lookup
+	idemSealedSkips atomic.Uint64 // sealed segments their own filter talked off
 )
 
 // segIndexEntry is one record's index entry.
@@ -831,56 +838,103 @@ func readAtFull(f *os.File, buf []byte, off int64) error {
 
 // scanIdxEntries walks a block file's entries in order, calling fn for each
 // until fn returns false. A damaged block ends the walk: only the validated
-// prefix is ever handed out.
-func scanIdxEntries(path, magic string, slotID int32, baseSeq uint64, entryBytes int, fn func(raw []byte) bool) error {
+// prefix is ever handed out. It reports how many body bytes it read.
+func scanIdxEntries(path, magic string, slotID int32, baseSeq uint64, entryBytes int, fn func(raw []byte) bool) (int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return 0, nil
 		}
-		return err
+		return 0, err
 	}
 	defer f.Close()
-	h := make([]byte, segIdxHeaderBytes)
-	if err := readAtFull(f, h, 0); err != nil {
-		return nil
+	return scanIdxEntriesFile(f, magic, slotID, baseSeq, entryBytes, fn)
+}
+
+// segIdxScanWindowB is the sequential read window a scan walks a block file
+// in: one pread per window instead of two per block (head, then head+body),
+// with no per-block allocation. Blocks fit in a window with room to spare
+// (a full .idx block is segIdxBlockHead+segIdxBlockMax*28 bytes), so a block
+// can only span windows by corruption and the walk re-windows at its start.
+const segIdxScanWindowB = 256 << 10
+
+// scanIdxEntriesFile is scanIdxEntries over an already-open handle — the
+// writable segment's lookup reads through the index writer's own fd.
+func scanIdxEntriesFile(f *os.File, magic string, slotID int32, baseSeq uint64, entryBytes int, fn func(raw []byte) bool) (int64, error) {
+	var h [segIdxHeaderBytes]byte
+	if err := readAtFull(f, h[:], 0); err != nil {
+		return 0, nil
 	}
-	if !checkSegIdxHeader(h, magic, slotID, baseSeq) {
-		return nil
+	if !checkSegIdxHeader(h[:], magic, slotID, baseSeq) {
+		return 0, nil
 	}
 	st, err := f.Stat()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	size := st.Size()
-	for off := int64(segIdxHeaderBytes); off < size; {
-		if size-off < int64(segIdxBlockHead) {
-			return nil
+	buf := make([]byte, segIdxScanWindowB)
+	var walked int64
+	for off := int64(segIdxHeaderBytes); off+segIdxBlockHead <= size; {
+		win := int64(len(buf))
+		if size-off < win {
+			win = size - off
 		}
-		head := make([]byte, segIdxBlockHead)
-		if err := readAtFull(f, head, off); err != nil {
-			return err
+		if err := readAtFull(f, buf[:win], off); err != nil {
+			return walked, err
 		}
-		count := int(binary.BigEndian.Uint16(head[4:6]))
-		payload := int64(count) * int64(entryBytes)
-		if count <= 0 || off+int64(segIdxBlockHead)+payload > size {
-			return nil
-		}
-		buf := make([]byte, int64(segIdxBlockHead)+payload)
-		if err := readAtFull(f, buf, off); err != nil {
-			return err
-		}
-		if crc32.Checksum(buf[4:], segIdxCRC) != binary.BigEndian.Uint32(buf[0:4]) {
-			return nil
-		}
-		for i := int64(0); i < payload; i += int64(entryBytes) {
-			if !fn(buf[segIdxBlockHead+i : segIdxBlockHead+i+int64(entryBytes)]) {
-				return nil
+		p := int64(0)
+		for p+segIdxBlockHead <= win {
+			count := int(binary.BigEndian.Uint16(buf[p+4 : p+6]))
+			payload := int64(count) * int64(entryBytes)
+			block := int64(segIdxBlockHead) + payload
+			if count <= 0 || off+p+block > size {
+				return walked, nil // torn: only the validated prefix is handed out
 			}
+			if p+block > win {
+				break // block runs past the window: walk it from a dedicated read
+			}
+			if crc32.Checksum(buf[p+4:p+block], segIdxCRC) != binary.BigEndian.Uint32(buf[p:p+4]) {
+				return walked, nil
+			}
+			for i := int64(0); i < payload; i += int64(entryBytes) {
+				if !fn(buf[p+segIdxBlockHead+i : p+segIdxBlockHead+i+int64(entryBytes)]) {
+					return walked, nil
+				}
+			}
+			walked += block
+			p += block
 		}
-		off += int64(segIdxBlockHead) + payload
+		if p == 0 {
+			// The block at this offset does not fit the window — a count
+			// field beyond what segIdxBlockMax writers produce. It may still
+			// be whole and CRC-valid; read it exactly, like the walk before
+			// the window did.
+			count := int(binary.BigEndian.Uint16(buf[4:6]))
+			payload := int64(count) * int64(entryBytes)
+			block := int64(segIdxBlockHead) + payload
+			if count <= 0 || off+block > size {
+				return walked, nil
+			}
+			big := make([]byte, block)
+			if err := readAtFull(f, big, off); err != nil {
+				return walked, err
+			}
+			if crc32.Checksum(big[4:], segIdxCRC) != binary.BigEndian.Uint32(big[0:4]) {
+				return walked, nil
+			}
+			for i := int64(0); i < payload; i += int64(entryBytes) {
+				if !fn(big[segIdxBlockHead+i : segIdxBlockHead+i+int64(entryBytes)]) {
+					return walked, nil
+				}
+			}
+			walked += block
+			off += block
+			continue
+		}
+		off += p
 	}
-	return nil
+	return walked, nil
 }
 
 // segDictEntry is one aggregate dictionary entry.

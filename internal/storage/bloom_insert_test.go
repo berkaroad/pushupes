@@ -154,7 +154,7 @@ func TestBloomChainKeepsOlderFilters(t *testing.T) {
 	// the newest filter — this is the case that kept re-placing old hashes.
 	before := set.entries()
 	for i := 0; i < 500; i++ {
-		set.insertPlaced(data.HashCommandID(fmt.Sprintf("early-%d", i)), true)
+		set.insertPlacedFrom(0, data.HashCommandID(fmt.Sprintf("early-%d", i)), true)
 	}
 	if got := set.entries(); got != before {
 		t.Errorf("replaying already-placed hashes changed entries: %d -> %d", before, got)
@@ -209,8 +209,28 @@ func TestBloomWatermarkSurvivesReopen(t *testing.T) {
 		t.Errorf("filter entries differ across restarts: %d then %d (each start re-places records)",
 			second, third)
 	}
-	if second < copies {
-		t.Errorf("filter holds %d entries for %d records: commands were dropped", second, copies)
+	// Coverage is proven on the lookup answers, not the entry count: a filter
+	// loaded from disk carries a density ESTIMATE of its placements, so the
+	// sum can sit a percent off the records it covers. Every seeded command
+	// must still resolve to its stored seq.
+	st4 := openStoreAt(t, dir)
+	sl4, err := st4.Slot(slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < copies; i++ {
+		id := fmt.Sprintf("%s-cmd-%d", agg, i)
+		rec, seq, err := sl4.RecordByCommand(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec == nil || seq != uint64(i+1) {
+			t.Fatalf("seeded command %q not resolved after reopen (found=%v seq=%d, want %d)",
+				id, rec != nil, seq, i+1)
+		}
+	}
+	if err := st4.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

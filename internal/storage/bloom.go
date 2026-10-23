@@ -121,7 +121,9 @@ func (s *bloomSet) maybe(hash uint64) bool {
 	return false
 }
 
-// insert adds a hash, growing the set when the newest filter filled up.
+// insert adds a hash to the newest filter, growing the set when it fills up
+// (standalone use; a Slot places through insertPlacedFrom, pinned to the
+// segment that owns the record).
 //
 // Repeated inserts of the SAME command must not consume capacity: the recovery
 // paths replay every record of every segment on each start, and bloomBits grows
@@ -133,21 +135,30 @@ func (s *bloomSet) maybe(hash uint64) bool {
 // ~0.8% of hashes that collide with unrelated entries, so skipping on it drops
 // those hashes from the filter entirely — and "absent" must never be reported
 // for a stored command. Exact dedup needs to know which records have already
-// been placed, which the caller does: insertPlaced takes that answer.
+// been placed, which the caller does: insertPlacedFrom takes that answer.
 func (s *bloomSet) insert(hash uint64) {
-	s.insertPlaced(hash, false)
+	s.insertPlacedFrom(0, hash, false)
 }
 
-// insertPlaced places a hash unless placed reports it is already in the set.
-// placed must be the exact answer for this record (see Slot.indexMetaLocked);
-// callers that cannot know it pass false, which places the hash. Over-placing
-// costs bytes; under-placing would make a stored command read as absent.
-func (s *bloomSet) insertPlaced(hash uint64, placed bool) {
-	if len(s.filters) == 0 {
-		s.filters = append(s.filters, newBloomBits(bloomFirstCapacity))
-	}
+// insertPlacedFrom places a hash into the segment-owned slice of filters —
+// the slice starting at start — unless placed reports it is already in the
+// set. placed must be the exact answer for this record (see
+// Slot.indexMetaLocked); callers that cannot know it pass false, which places
+// the hash. Over-placing costs bytes; under-placing would make a stored
+// command read as absent.
+//
+// Placement must not spill into a filter below start: the sealed segment
+// that owns those filters has written (or will write) its on-disk bloom from
+// its own slice, and the next reopen trusts that answer. A hash placed below
+// the seal mark is in no disk bloom and re-placed by no reopen — the stored
+// command answers "definitely not stored" and idempotency is gone.
+func (s *bloomSet) insertPlacedFrom(start int, hash uint64, placed bool) {
 	if placed {
 		return
+	}
+	if len(s.filters) <= start {
+		// The owning segment has no filter of its own yet: start one.
+		s.filters = append(s.filters, newBloomBits(bloomFirstCapacity))
 	}
 	last := s.filters[len(s.filters)-1]
 	if last.full() {

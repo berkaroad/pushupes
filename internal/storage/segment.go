@@ -132,6 +132,12 @@ type Segment struct {
 	scatterParts [][]byte // reusable segment list handed to pwritev
 
 	idx *segIndexWriter // index files (see segidx.go); nil when none
+	// cmdFilters is the segment's own bloom filters (shared pointers into the
+	// slot's chain, set when the segment seals or when startup records its
+	// placement range): when none of them holds a hash, the segment's command
+	// index cannot answer for it and a lookup skips the file. nil = no filter
+	// recorded, always search.
+	cmdFilters []*bloomBits
 
 	// aggIx caches this segment's opened aggregate index (segaidx.go). Without
 	// it a versioned read of sealed history re-opens and re-reads the directory

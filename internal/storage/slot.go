@@ -279,6 +279,9 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 			s.blms.filters = append(s.blms.filters, segIdx.Bloom().filters...)
 			segIdx.Close()
 			s.blmsSkipInsert = false
+			// The segment's filters are its disk bloom: record the range so a
+			// lookup can gate the .cidx open on it.
+			seg.cmdFilters = s.blms.filters[s.blmsMark:]
 			// The segment's whole bloom just came off disk, so every seq it
 			// covers is already placed. Advance the watermark past them or the
 			// index replay below would place each hash a second time.
@@ -290,6 +293,9 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 			// records just indexed, which is startup work; running, the set is
 			// marked incomplete so it never claims a command is absent.
 			s.blmsSkipInsert = false
+			// The replay above placed this segment's hashes into the range from
+			// the mark; record it whether or not the disk write follows.
+			seg.cmdFilters = s.blms.filters[s.blmsMark:]
 			if mode == slotOpenLoadAndRepair {
 				if err := writeSegCmdIndex(seg, s.blms.filters[s.blmsMark:]); err != nil {
 					segIndexUnusable.Add(1)
@@ -422,7 +428,7 @@ func (s *Slot) indexMetaLocked(seq uint64, m data.RecordMeta) {
 		// the filter itself cannot answer this: a bloom "maybe" is also true
 		// for colliding hashes, and skipping on it would drop a stored command
 		// from the filter for good. The watermark is exact.
-		s.blms.insertPlaced(m.CommandHash, seq <= s.blmsWatermark)
+		s.blms.insertPlacedFrom(s.blmsMark, m.CommandHash, seq <= s.blmsWatermark)
 		if seq > s.blmsWatermark {
 			s.blmsWatermark = seq
 		}
@@ -582,6 +588,10 @@ func (s *Slot) tail() (*Segment, error) {
 		if err := writeSegCmdIndex(seg, s.blms.filters[s.blmsMark:]); err != nil {
 			segIndexUnusable.Add(1)
 		}
+		// The sealed segment keeps its placement range as its lookup gate;
+		// the mark then moves past it so the next segment's placements start
+		// a filter of their own (bloomSet.insertPlacedFrom).
+		seg.cmdFilters = s.blms.filters[s.blmsMark:]
 		s.blmsMark = len(s.blms.filters)
 		// Its per-aggregate seqs move to disk: sealed seqs never change again,
 		// and they are what the in-memory arena would otherwise keep forever.
@@ -1056,11 +1066,12 @@ func (s *Slot) RecordByCommand(commandID string) (*data.EventRecord, uint64, err
 	return rec, seq, nil
 }
 
-// lookupCommandLocked finds a stored command: the sealed segments' sorted
-// command indexes (newest first), then the writable segment, whose own index is
-// still in write order and therefore scanned. Every candidate is confirmed
-// against the record it points at, so a hash collision or a damaged index can
-// only cost time. Caller holds s.mu.
+// lookupCommandLocked finds a stored command: the sealed segments' command
+// filters and sorted indexes (newest first), then the writable segment, whose
+// write-order index is scanned — but only when the writable segment's own
+// filters (the chain slice from blmsMark, pinned to it at placement) may hold
+// the hash. Every candidate is confirmed against the record it points at, so
+// a hash collision or a damaged index can only cost time. Caller holds s.mu.
 func (s *Slot) lookupCommandLocked(commandID string, hash uint64) (*data.EventRecord, uint64, bool, error) {
 	if commandID == "" {
 		return nil, 0, false, nil
@@ -1072,12 +1083,19 @@ func (s *Slot) lookupCommandLocked(commandID string, hash uint64) (*data.EventRe
 			continue
 		}
 		if seg.Writable() {
+			if !s.tailMaybeLocked(hash) {
+				continue
+			}
 			rec, seq, err := s.lookupTailCommandLocked(seg, commandID, hash, buf[:])
 			if err != nil || rec != nil {
 				return rec, seq, rec != nil, err
 			}
 			continue
 		}
+		if !s.segMaybeLocked(seg, hash) {
+			continue
+		}
+		idemSealedOpens.Add(1)
 		ix, err := openSegCmdIndex(s.Dir, s.ID, seg.BaseSeq)
 		if err != nil {
 			return nil, 0, false, err
@@ -1107,9 +1125,46 @@ func (s *Slot) lookupCommandLocked(commandID string, hash uint64) (*data.EventRe
 	return nil, 0, false, nil
 }
 
+// tailMaybeLocked reports whether the writable segment may hold a record with
+// this hash. The chain slice from blmsMark covers exactly the writable
+// segment's placements (bloomSet.insertPlacedFrom pins a hash to the filter
+// slice of the segment that owns it, and seal advances the mark), so a "no"
+// here means the tail's .idx cannot answer for this hash either. An unsafe
+// set says maybe, and so does a tail whose own slice is still empty — placing
+// and scanning are cheap compared to a wrong "absent". Caller holds s.mu.
+func (s *Slot) tailMaybeLocked(hash uint64) bool {
+	if s.blms.unsafe || len(s.blms.filters) <= s.blmsMark {
+		return true
+	}
+	for _, f := range s.blms.filters[s.blmsMark:] {
+		if f.maybe(hash) {
+			return true
+		}
+	}
+	idemTailSkips.Add(1)
+	return false
+}
+
+// segMaybeLocked reports whether a sealed segment's own filters may hold the
+// hash. No filters recorded for the segment (a bloom the slot never built or
+// loaded) always says maybe. Caller holds s.mu.
+func (s *Slot) segMaybeLocked(seg *Segment, hash uint64) bool {
+	if s.blms.unsafe || len(seg.cmdFilters) == 0 {
+		return true
+	}
+	for _, f := range seg.cmdFilters {
+		if f.maybe(hash) {
+			return true
+		}
+	}
+	idemSealedSkips.Add(1)
+	return false
+}
+
 // lookupTailCommandLocked searches the writable segment, whose command index is
 // still in write order: it flushes whatever the writer buffers, scans that
 // segment's entries and confirms each candidate against the record at its seq.
+// The scan reads through the writer's own open handle when it has one.
 // Caller holds s.mu.
 func (s *Slot) lookupTailCommandLocked(seg *Segment, commandID string, hash uint64, buf []byte) (*data.EventRecord, uint64, error) {
 	if seg.idx != nil {
@@ -1118,7 +1173,7 @@ func (s *Slot) lookupTailCommandLocked(seg *Segment, commandID string, hash uint
 	var hit *data.EventRecord
 	var hitSeq uint64
 	sawEntries := false
-	err := scanIdxEntries(segIdxPath(s.Dir, seg.BaseSeq), segIdxMagic, s.ID, seg.BaseSeq, segIdxEntryBytes, func(raw []byte) bool {
+	walk := func(raw []byte) bool {
 		sawEntries = true
 		if binary.BigEndian.Uint64(raw[0:8]) != hash {
 			return true // keep scanning
@@ -1130,7 +1185,16 @@ func (s *Slot) lookupTailCommandLocked(seg *Segment, commandID string, hash uint
 		}
 		hit, hitSeq = got, seq
 		return false
-	})
+	}
+	idemTailScans.Add(1)
+	var read int64
+	var err error
+	if seg.idx != nil {
+		read, err = scanIdxEntriesFile(seg.idx.idx, segIdxMagic, s.ID, seg.BaseSeq, segIdxEntryBytes, walk)
+	} else {
+		read, err = scanIdxEntries(segIdxPath(s.Dir, seg.BaseSeq), segIdxMagic, s.ID, seg.BaseSeq, segIdxEntryBytes, walk)
+	}
+	idemTailBytes.Add(uint64(read))
 	if err != nil {
 		return nil, 0, err
 	}
