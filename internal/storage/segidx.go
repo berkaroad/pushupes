@@ -96,6 +96,11 @@ var (
 	idemTailBytes   atomic.Uint64 // bytes read by those scans
 	idemSealedOpens atomic.Uint64 // sealed .cidx files opened by a lookup
 	idemSealedSkips atomic.Uint64 // sealed segments their own filter talked off
+	// Startup bloom self-heal: trusted disk blooms that turn out to be short
+	// (the pre-pinning leak era). Gaps are re-placed in memory at every open;
+	// only startup repair rewrites the .cidx's bloom section.
+	segBloomGaps     atomic.Uint64 // stored records whose disk bloom lacked the hash
+	segBloomRepaired atomic.Uint64 // segments gap-filled at an open
 )
 
 // segIndexEntry is one record's index entry.

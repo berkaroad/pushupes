@@ -155,6 +155,89 @@ func writeSegCmdIndex(seg *Segment, filters []*bloomBits) error {
 	return os.Rename(tmp, segCidxPath(dir, seg.BaseSeq))
 }
 
+// writeSegCidxBloom replaces ONLY the bloom section of an existing .cidx.
+// The entry blocks are copied byte-for-byte: the caller has already trusted
+// them (ix.Valid() checked every block CRC at this open), and the point of
+// this repair is to persist a bloom that a startup gap-check found short —
+// without the frame walk the full rewrite would need. Temp file + rename,
+// the same atomicity contract as writeSegCmdIndex: a half-written repair is
+// simply absent, and the next start redoes it.
+func writeSegCidxBloom(dir string, slotID int32, baseSeq uint64, filters []*bloomBits) error {
+	path := segCidxPath(dir, baseSeq)
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := make([]byte, segCidxHeaderByte)
+	if err := readAtFull(f, h, 0); err != nil {
+		return err
+	}
+	if !checkSegIdxHeader(h, segCidxMagic, slotID, baseSeq) {
+		return fmt.Errorf("%s: bad header", filepath.Base(path))
+	}
+	count := int(binary.BigEndian.Uint64(h[20:28]))
+	if count <= 0 {
+		return fmt.Errorf("%s: empty entry section", filepath.Base(path))
+	}
+	last := count % segCidxBlockMax
+	entryBytes := int64(segCidxBlocks(count)) * int64(segCidxBlockMax*segCidxEntryBytes+4)
+	if last != 0 {
+		entryBytes -= int64(segCidxBlockMax*segCidxEntryBytes + 4 - (last*segCidxEntryBytes + 4))
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if st.Size() < int64(segCidxHeaderByte)+entryBytes {
+		return fmt.Errorf("%s: entry section truncated", filepath.Base(path))
+	}
+	bloom := (&bloomSet{filters: filters}).encode()
+	binary.BigEndian.PutUint32(h[28:32], uint32(len(bloom)))
+	tmp := path + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	cleanup := func(e error) error {
+		out.Close()
+		os.Remove(tmp)
+		return e
+	}
+	if _, err := out.Write(h); err != nil {
+		return cleanup(err)
+	}
+	// Windowed copy of the validated entry bytes — re-emitted unchanged.
+	buf := make([]byte, segIdxScanWindowB)
+	end := int64(segCidxHeaderByte) + entryBytes
+	for off := int64(segCidxHeaderByte); off < end; {
+		n := int64(len(buf))
+		if end-off < n {
+			n = end - off
+		}
+		if err := readAtFull(f, buf[:n], off); err != nil {
+			return cleanup(err)
+		}
+		if _, err := out.Write(buf[:n]); err != nil {
+			return cleanup(err)
+		}
+		off += n
+	}
+	if len(bloom) > 0 {
+		if _, err := out.Write(bloom); err != nil {
+			return cleanup(err)
+		}
+	}
+	if err := out.Sync(); err != nil {
+		return cleanup(err)
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 // collectSegCmdEntries reads a segment's frame headers into sorted-ready
 // entries. Offsets travel with the entry so a lookup needs no second seek.
 func collectSegCmdEntries(seg *Segment) ([]segCmdEntry, error) {

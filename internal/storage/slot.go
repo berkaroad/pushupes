@@ -218,6 +218,22 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 				ix.Close()
 			}
 		}
+		// A trusted disk bloom answers "maybe" for every hash it placed, so
+		// any record whose hash it does NOT report is a placement that never
+		// reached the file — the shape the pre-pinning era left behind (a
+		// segment's hashes leaked into an earlier segment's already-written
+		// filter). Open re-places those gaps in memory; startup repair also
+		// rewrites the .cidx's bloom section (entry bytes re-emitted
+		// unchanged). The other direction (a bit for a hash that is not in
+		// the segment) is harmless and not counted.
+		gaps := 0
+		checkDiskBloom := func(hash uint64) {
+			if segIdx != nil && !segIdx.Bloom().maybe(hash) {
+				segIdx.blm.insert(hash)
+				segBloomGaps.Add(1)
+				gaps++
+			}
+		}
 		if seg.RecordCnt > 0 {
 			from := seg.BaseSeq
 			if load != nil {
@@ -231,6 +247,7 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 					if !ok {
 						break // openSegIndex validated every entry first
 					}
+					checkDiskBloom(e.hash)
 					s.indexMetaLocked(e.seq, data.RecordMeta{
 						AggregateID: e.aggID,
 						Version:     e.version,
@@ -252,6 +269,7 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 			// (usually nothing, at most one index block).
 			if from <= seg.LastSeq {
 				if err := seg.ScanHeaders(from, func(seq uint64, meta data.RecordMeta) bool {
+					checkDiskBloom(meta.CommandHash)
 					s.indexMetaLocked(seq, meta)
 					seg.IndexRecord(seq, meta)
 					return true
@@ -276,6 +294,16 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 		}
 		switch {
 		case segIdx != nil:
+			if gaps > 0 {
+				segBloomRepaired.Add(1)
+				if mode == slotOpenLoadAndRepair {
+					if err := writeSegCidxBloom(s.Dir, s.ID, seg.BaseSeq, segIdx.Bloom().filters); err != nil {
+						// The in-memory set is complete for this process; a
+						// failed persist is retried by the next start.
+						segIndexUnusable.Add(1)
+					}
+				}
+			}
 			s.blms.filters = append(s.blms.filters, segIdx.Bloom().filters...)
 			segIdx.Close()
 			s.blmsSkipInsert = false

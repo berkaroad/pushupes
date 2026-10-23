@@ -15,6 +15,7 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -286,5 +287,132 @@ func TestScanIdxEntriesWindowsAndTornBlocks(t *testing.T) {
 	}
 	if bn != bigCount {
 		t.Fatalf("oversized block yielded %d entries, want %d", bn, bigCount)
+	}
+}
+
+// Startup self-heal for the pre-pinning leak era on disk: a sealed .cidx
+// whose bloom validates but is MISSING hashes must be gap-filled when the
+// slot opens — in memory at every open, and persisted (bloom section only,
+// entry bytes untouched) at a startup repair. A further start then repairs
+// nothing. The doctored file below is exactly what the old placement bug
+// left behind: a valid bloom that answers "absent" for stored commands.
+func TestSealedBloomGapSelfHealsAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	const n = 300
+	rec := func(i int) *data.EventRecord {
+		return mkRec(fmt.Sprintf("a%06d", i), 1, fmt.Sprintf("c%06d", i))
+	}
+	cmd := func(i int) string { return fmt.Sprintf("c%06d", i) }
+
+	sl, err := OpenSlotRepairing(dir, 7, 1<<40, FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		mustAppend(t, sl, rec(i))
+	}
+	roll(t, sl)
+	mustAppend(t, sl, rec(n)) // seals segment 0; one record lands in the tail
+	base := sl.segments[0].BaseSeq
+	if err := sl.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	path := segCidxPath(dir, base)
+	full, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blLen := int(binary.BigEndian.Uint32(full[28:32]))
+	entries := full[segCidxHeaderByte : len(full)-blLen]
+
+	// Doctor: a bloom that only knows the FIRST command — 299 stored records
+	// would answer "definitely absent" against it.
+	df := newBloomBits(1024)
+	df.insert(data.HashCommandID(cmd(0)))
+	if err := writeSegCidxBloom(dir, 7, base, []*bloomBits{df}); err != nil {
+		t.Fatal(err)
+	}
+	doctored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lookAll := func(sl2 *Slot) {
+		t.Helper()
+		for i := 0; i < n; i++ {
+			got, seq, err := sl2.RecordByCommand(cmd(i))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == nil || seq != uint64(i+1) {
+				t.Fatalf("stored command %d: found=%v seq=%d want seq %d", i, got != nil, seq, i+1)
+			}
+		}
+	}
+
+	// A running open (load mode) heals the answer — and leaves the disk alone.
+	gap0, rep0 := segBloomGaps.Load(), segBloomRepaired.Load()
+	slL, err := OpenSlot(dir, 7, 1<<40, FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := segBloomGaps.Load() - gap0; d != uint64(n-1) {
+		t.Fatalf("load open gap-filled %d hashes, want %d", d, n-1)
+	}
+	if d := segBloomRepaired.Load() - rep0; d != 1 {
+		t.Fatalf("load open counted %d repaired segments, want 1", d)
+	}
+	lookAll(slL)
+	if err := slL.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if cur, err := os.ReadFile(path); err != nil || !bytes.Equal(cur, doctored) {
+		t.Fatalf("load mode rewrote the .cidx — persistence is startup work")
+	}
+
+	// A startup repair persists it: entry bytes unchanged, bloom section fixed.
+	gap1, rep1 := segBloomGaps.Load(), segBloomRepaired.Load()
+	sl2, err := OpenSlotRepairing(dir, 7, 1<<40, FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := segBloomGaps.Load() - gap1; d != uint64(n-1) {
+		t.Fatalf("repair open gap-filled %d hashes, want %d", d, n-1)
+	}
+	if d := segBloomRepaired.Load() - rep1; d != 1 {
+		t.Fatalf("repair open counted %d repaired segments, want 1", d)
+	}
+	lookAll(sl2)
+	if err := sl2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fixed, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fbl := int(binary.BigEndian.Uint32(fixed[28:32]))
+	if !bytes.Equal(fixed[segCidxHeaderByte:len(fixed)-fbl], entries) {
+		t.Fatalf("repair changed the entry section — only the bloom may move")
+	}
+	if bytes.Equal(fixed[segCidxHeaderByte+len(entries):], doctored[segCidxHeaderByte+len(entries):]) {
+		t.Fatalf("repair did not rewrite the bloom section")
+	}
+
+	// The next start finds nothing to repair.
+	gap2, rep2 := segBloomGaps.Load(), segBloomRepaired.Load()
+	sl3, err := OpenSlotRepairing(dir, 7, 1<<40, FlushPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := segBloomGaps.Load() - gap2; d != 0 {
+		t.Fatalf("a healed segment repaired again: %d gaps", d)
+	}
+	if d := segBloomRepaired.Load() - rep2; d != 0 {
+		t.Fatalf("a healed segment counted as repaired again")
+	}
+	lookAll(sl3)
+	if err := sl3.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
