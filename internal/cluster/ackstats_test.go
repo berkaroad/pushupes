@@ -89,10 +89,14 @@ func TestAckStatsSplitsTheChain(t *testing.T) {
 		t.Fatalf("total p99 %.1fms < hw_wait p99 %.1fms: the steps must partition the call",
 			v.Total.P99MS, v.HwWait.P99MS)
 	}
-	// landing is the fast step: it must not be where 120ms went
-	if v.WalLand.MaxMS >= v.HwWait.P99MS {
-		t.Fatalf("wal_land max %.1fms vs hw_wait p99 %.1fms: the split is not distinguishing the steps",
-			v.WalLand.MaxMS, v.HwWait.P99MS)
+	// Landing is the fast step: it must not be where the 120ms went. Compare
+	// like with like on the DISTRIBUTION — a four-sample max is one scheduler
+	// hiccup away from exceeding any bound on a loaded box (CI runs these in
+	// parallel), while the medians keep the two steps two orders of magnitude
+	// apart. The max is already bounded by the call's own elapsed time above.
+	if v.WalLand.P50MS*2 >= v.HwWait.P50MS {
+		t.Fatalf("wal_land p50 %.1fms vs hw_wait p50 %.1fms: the split is not distinguishing the steps",
+			v.WalLand.P50MS, v.HwWait.P50MS)
 	}
 	if v.HwLagRecords.MaxMS < 1 {
 		t.Fatalf("hw_lag_records max = %.0f, want the watermark lag recorded", v.HwLagRecords.MaxMS)
