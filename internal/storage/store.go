@@ -614,6 +614,25 @@ func (st *Store) VersionAtOrBeforeTime(aggregateID string, beforeOrAtUnix int64,
 	return slot.VersionAtOrBeforeTime(aggregateID, beforeOrAtUnix, uptoSeq)
 }
 
+// VersionOf reports one aggregate's claimed chain tail (0 when unknown).
+func (st *Store) VersionOf(slotID int32, aggregateID string) uint64 {
+	s, err := st.Slot(slotID)
+	if err != nil {
+		return 0
+	}
+	return uint64(s.CurrentVersion(aggregateID))
+}
+
+// StalledAggs reports the aggregates whose version chain is permanently broken
+// on one slot's WAL (nil/empty when the copy is sound; see Slot.StalledAggs).
+func (st *Store) StalledAggs(slotID int32) []string {
+	s, err := st.Slot(slotID)
+	if err != nil {
+		return nil
+	}
+	return s.StalledAggs()
+}
+
 // LastSeq returns the durable LEO for one slot (0 when the slot is unknown).
 func (st *Store) LastSeqOf(slotID int32) uint64 {
 	s, err := st.Slot(slotID)

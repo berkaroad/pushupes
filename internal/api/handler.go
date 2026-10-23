@@ -607,15 +607,28 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), cluster.AddMemberTimeout+5_000_000_000)
 	defer cancel()
-	if err := s.Engine.RemoveMember(ctx, id); err != nil {
+	status, err := s.Engine.RemoveMember(ctx, id)
+	if err != nil {
 		if refuseNotController(w, err) {
 			return
 		}
-		if errors.Is(err, cluster.ErrBadMember) || errors.Is(err, cluster.ErrOnlineMember) {
+		if errors.Is(err, cluster.ErrBadMember) {
 			writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, err.Error())
 			return
 		}
 		writeErr(w, http.StatusInternalServerError, 0, err.Error())
+		return
+	}
+	if status == "draining" {
+		// The drain-plus-removal pipeline is server-side; the operator's
+		// DELETE stays "accepted" until the node is actually out. leading
+		// tells the poller how much work is left; the same DELETE reissued
+		// later is a progress report, not a restarted command.
+		leading, inflight := s.Engine.DrainProgressOf(id)
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"node": s.Engine.Self(), "member": id, "change": "draining",
+			"leading": leading, "inflight": inflight,
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"node": s.Engine.Self(), "member": id, "change": "removed"})

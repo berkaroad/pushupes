@@ -114,6 +114,21 @@ type slotFence struct {
 	// heldSince stamps when the fence was taken, so release can log the total
 	// window a client append could be blocked behind the fence.
 	heldSince time.Time
+	// committedTo names the target of a COMMITTED leader move. The fence's
+	// release is gated on the TARGET applying the move, which says nothing
+	// about THIS node's own applied table; a writer woken by that release
+	// re-reads a table that still names this node the leader and would land
+	// the record here and acknowledge it — an ack whose seq the new leader
+	// has already spent on a different record (the client then meets 1001 at
+	// a leader that never received it, and this copy forks into a rebuild;
+	// the dg15 trace: an acknowledgement 23ms after the fence release, one
+	// round before the client's next write was refused). Writers therefore
+	// wait here for the local demotion, bounded, instead of serving.
+	committedTo string
+	// committedAt stamps when committedTo was taken: the stamp is a WAIT hint,
+	// not durable state, and expires (a rolled-back plan never applies a
+	// leader change, and a slot must not stay held for the rest of its life).
+	committedAt time.Time
 }
 
 // leave deregisters one writer; the last one out closes a pending drain.
@@ -129,6 +144,63 @@ func (f *slotFence) leave() {
 
 // fenceFor returns the (preallocated) fence of a slot, or nil when the slot is
 // outside the store's range.
+// awaitLocalDemotion blocks a writer whose slot has a COMMITTED leader move
+// that this node has not applied yet — bounded, and only while the local table
+// still names this node the leader. It never fails the write: once the
+// demotion lands (normally within one table apply) the caller's ordinary
+// routing redirects to the committed leader, and nothing was acknowledged
+// against a copy the handover had already left behind.
+func (e *Engine) awaitLocalDemotion(slot int32) {
+	f := e.fenceFor(slot)
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	pending := f.committedTo
+	stamped := f.committedAt
+	f.mu.Unlock()
+	if pending == "" {
+		return
+	}
+	if !stamped.IsZero() && time.Since(stamped) > 3*time.Second {
+		f.mu.Lock()
+		if f.committedTo == pending {
+			f.committedTo = ""
+		}
+		f.mu.Unlock()
+		return
+	}
+	// Short bound: the demotion is one table apply away, and a writer parked
+	// here still holds its fence registration — a long bound would eat into
+	// the NEXT fence's drain budget on an actively rebalanced slot.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		// Cheap one-slot read: this runs on the write path (TableSnapshot
+		// clones all 1024 placements and must not be used here).
+		p, ok := e.slotPlacement(slot)
+		// Only a moved leader clears the stamp. "still names this node the
+		// leader" covers BOTH a node that has not applied the stage yet
+		// (stable+self — indistinguishable from a rollback in the table) and
+		// one that applied the stage but not the commit; in either case an
+		// acknowledgement here is a record the new leader never inherits. The
+		// TTL above bounds the cost when a plan really was rolled back.
+		if !ok || p.Leader != e.self {
+			f.mu.Lock()
+			if f.committedTo == pending {
+				f.committedTo = ""
+			}
+			f.mu.Unlock()
+			return
+		}
+		if time.Now().After(deadline) {
+			e.logger.Warn("slot handover: local demotion has not applied yet; serving the write here",
+				"slot", slot, "committed_to", pending, "op", "handover_wait")
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 func (e *Engine) fenceFor(slot int32) *slotFence {
 	if slot < 0 || int(slot) >= len(e.fences) {
 		return nil
@@ -248,7 +320,9 @@ func (e *Engine) releaseSlotFence(slot int32) {
 // only the exact hold it was armed for, and the fence watchdog still
 // force-releases past fenceMaxHold, so a slow or lost target can never wedge
 // the slot's writes.
-func (e *Engine) holdFenceUntilTargetLeader(slot int32, target string, epoch int64) {
+func (e *Engine) holdFenceUntilTargetLeader(slot int32, from, target string, epoch int64) {
+	// from is the leader the fence is moving AWAY from; kept in the signature
+	// because the gate's proof is about BOTH homes (see the NOTE in the body).
 	f := e.fenceFor(slot)
 	if f == nil {
 		return
@@ -280,6 +354,29 @@ func (e *Engine) holdFenceUntilTargetLeader(slot int32, target string, epoch int
 				break
 			}
 			time.Sleep(fenceTargetGatePoll)
+		}
+		// NOTE (dg8 investigation): this node IS the old leader — reaching
+		// this gate means its own table already applied the move, so there
+		// is no self-demotion to wait for here. The residual hole the gate
+		// cannot close is a foreign-version frame that lands as a NEW frame
+		// on the successor's WAL during the handover window and breaks the
+		// version chain (withholds one version, strands every later claim).
+		// That shape is internally consistent per-home and invisible to the
+		// gate; it is caught by the storage-layer chain-break detector
+		// (Slot.TailStalled) on the replication apply path instead.
+		_ = from
+		// The gate proves the TARGET applied the move; it says nothing about
+		// THIS node. Releasing while the local table still names this node the
+		// leader wakes blocked writers that re-read that stale row, land the
+		// record here and acknowledge it — an ack the new leader never
+		// receives (the residual 1001, and a forked copy). So also wait for
+		// the local demotion, bounded by the same gate deadline.
+		for e.Leads(slot) && time.Now().Before(deadline) {
+			time.Sleep(fenceTargetGatePoll)
+		}
+		if e.Leads(slot) {
+			e.logger.Warn("migration write fence: local demotion has not applied; releasing anyway (write path holds each writer until it does)",
+				"slot", slot, "target", target, "op", "fence_gate")
 		}
 		f.mu.Lock()
 		stale := !f.closed || !f.heldSince.Equal(since)
@@ -352,13 +449,35 @@ func (e *Engine) fencedSlots() []int32 {
 // REMAINS HELD (the controller commits the leader move next, and the source
 // releases the fence when it applies that move or any rollback). On an error
 // the fence is released and the migration aborts.
-func (e *Engine) HandleFenceSlot(ctx context.Context, slot int32) (uint64, error) {
+func (e *Engine) HandleFenceSlot(ctx context.Context, slot int32, target string) (uint64, error) {
 	if !e.Leads(slot) {
 		return 0, fmt.Errorf("fence: not the leader of slot %d", slot)
+	}
+	// target is the controller's committed migration target. The source's
+	// own table may not have applied the stage when this RPC lands (the
+	// controller awaits only its own Raft apply), and "no target visible
+	// here" must not silently skip shipping the frozen tail — that is how
+	// handovers used to commit over a target that never received the tail
+	// the source acked after fencing (stranded writes; the tail a rebuilt
+	// copy can serve vs the LEO the gate confirmed). With the controller's
+	// instruction the fence runs on authority, not on a lagging view; an
+	// empty target falls back to the local table (the in-process commit
+	// path, where the stage applied HERE by construction).
+	if target == "" {
+		target = e.migrationTargetOf(slot)
 	}
 	start := time.Now()
 	if err := e.acquireSlotFence(ctx, slot); err != nil {
 		return 0, err
+	}
+	// From here on the move may commit: a writer woken by the fence release
+	// must wait for THIS node to apply the demotion before it may serve the
+	// slot again (see slotFence.committedTo).
+	if f := e.fenceFor(slot); f != nil && target != "" {
+		f.mu.Lock()
+		f.committedTo = target
+		f.committedAt = time.Now()
+		f.mu.Unlock()
 	}
 	ok := false
 	defer func() {
@@ -367,7 +486,23 @@ func (e *Engine) HandleFenceSlot(ctx context.Context, slot int32) (uint64, error
 		}
 	}()
 	leo := e.store.LastSeqOf(slot)
-	if err := e.pushFencedTail(ctx, slot, leo); err != nil {
+	if err := e.pushFencedTail(ctx, slot, leo, target); err != nil {
+		return 0, err
+	}
+	// Split-view guard. The fence only runs on the node that BELIEVES it leads
+	// (the guard at the top of this function), and the frozen LEO is that
+	// copy's. A peer whose own table still names IT the leader — a lagging
+	// demotion, a plan whose source id and the applied table disagreed — keeps
+	// acknowledging client writes at seqs this frozen tail does not cover, and
+	// those acks are then lost with the demoted copy: the client later hits
+	// 1001 at a leader that never received them (the dg14 class: every acks we
+	// could attribute during a handover happened while the slot was
+	// migrating_out and NOT yet fenced). Proof before commit: ask every other
+	// replica what it believes. Any peer that names itself leader at an epoch
+	// at least ours AND holds a longer log than the frozen tail means this
+	// handover would cut off acknowledged records — fail it, the controller
+	// rolls back and the next round retries once the view has converged.
+	if err := e.verifyNoCompetingLeader(ctx, slot, leo, target); err != nil {
 		return 0, err
 	}
 	ok = true
@@ -392,10 +527,25 @@ func (e *Engine) HandleFenceSlot(ctx context.Context, slot int32) (uint64, error
 // So an inconsistent target is REBUILT: its local copy is dropped and re-pulled
 // from scratch, while the source still holds the full slot and the fence keeps
 // this slot frozen. A consistent target takes the ordinary incremental path.
-func (e *Engine) pushFencedTail(ctx context.Context, slot int32, leo uint64) error {
-	to := e.migrationTargetOf(slot)
+func (e *Engine) pushFencedTail(ctx context.Context, slot int32, leo uint64, target string) error {
+	to := target
 	if to == "" {
-		return nil // no longer migrating: nothing to ship
+		to = e.migrationTargetOf(slot)
+	}
+	if to == "" {
+		// A fence RPC arrives while the source's OWN table may not yet have
+		// applied the migrating_out the controller just committed through
+		// Raft (the controller only awaits its own apply). Shipping "nothing"
+		// on that lag used to be a silent nil — the commit would then move
+		// leadership over a target that never received the frozen tail: the
+		// acked records stranded on the demoted source (the slot LEO the
+		// handover confirmed vs the 0 a rebuilt copy can serve), and the
+		// demoted source keeps accepting redirected writes no one ever
+		// fetches from it. A commit is terminal for the log handoff, so this
+		// must fail LOUD: the controller aborts, rolls the slot back to
+		// stable, and the next rebalance round fences a table that has since
+		// caught up.
+		return fmt.Errorf("fence: slot %d is not migrating in this node's table; the handover must wait for the stage to apply here (retryable)", slot)
 	}
 	addr := e.peerAddr(to)
 	if addr == "" {
@@ -411,6 +561,17 @@ func (e *Engine) pushFencedTail(ctx context.Context, slot int32, leo uint64) err
 			return err
 		}
 		if tgtLEO >= leo {
+			// The target is ABOVE the frozen source tail: it appended as a
+			// leader (or from another writer) before this fence existed, so
+			// its seqs past the frozen tail are its own records. Committing
+			// now would fork the log — the source's acknowledged records at
+			// those seqs would never be inherited, and the client would meet
+			// a leader whose copy lacks them. Fail the handover; the
+			// controller rolls back and retries once the view converges.
+			if tgtLEO > leo {
+				return fmt.Errorf("fence: target %s log end %d is above the frozen source tail %d — it wrote as a leader before the fence; committing would fork slot %d",
+					to, tgtLEO, leo, slot)
+			}
 			// Held, not yet durable: the leadership may only move once the
 			// frozen tail is ON DISK at the target (see confirmTargetDurable).
 			return e.confirmTargetDurable(ctx, addr, slot, leo, to)
@@ -436,6 +597,64 @@ func (e *Engine) pushFencedTail(ctx context.Context, slot int32, leo uint64) err
 // target's page cache: a target that then died would lose writes the cluster
 // acknowledged. It flushes, re-asks, and gives up (failing the hand-over) on the
 // bound — the retention on the source's copy is what covers the retry.
+// verifyNoCompetingLeader proves, before a handover commits, that no OTHER
+// replica of the slot still acts as its leader with a longer log than the
+// frozen tail. See the call site in HandleFenceSlot for why this is the one
+// hole the fence itself cannot close: the fence runs on the copy that
+// believes it leads, while a peer holding a stale view (a lagging demotion, a
+// plan whose source and the applied table disagreed) keeps acknowledging
+// writes at seqs the frozen tail does not cover — and those acks die with the
+// demoted copy, surfacing as a 1001 at a leader that never received them.
+//
+// Unreachable peers are not treated as competitors (a peer we cannot reach
+// may be dead, and a dead node acknowledges nothing); the guard is aimed at
+// the live split view, which is the one that loses acknowledged records.
+func (e *Engine) verifyNoCompetingLeader(ctx context.Context, slot int32, frozenLEO uint64, target string) error {
+	tbl := e.TableSnapshot()
+	p, ok := tbl.Slots[slot]
+	if !ok {
+		return nil
+	}
+	myEpoch := p.Epoch
+	for _, replica := range p.Replicas {
+		if replica == e.self || replica == target {
+			continue
+		}
+		pe, known := tbl.Peers[replica]
+		if !known || pe.Offline() {
+			continue
+		}
+		addr := e.peerAddr(replica)
+		if addr == "" {
+			continue
+		}
+		cctx, cancel := context.WithTimeout(ctx, fenceTargetGateRPCTimeout)
+		leader, epoch, err := e.peerSlotLeader(cctx, addr, slot)
+		cancel()
+		if err != nil {
+			e.logger.Warn("migration fence: competing-leader check could not reach a replica; proceeding (a dead peer acknowledges nothing)",
+				"slot", slot, "peer", replica, "err", err, "op", "fence_quorum")
+			continue
+		}
+		if leader != replica || epoch < myEpoch {
+			continue
+		}
+		cctx2, cancel2 := context.WithTimeout(ctx, fenceTargetGateRPCTimeout)
+		peerLEO, lerr := e.remoteLEO(cctx2, addr, slot)
+		cancel2()
+		if lerr != nil {
+			e.logger.Warn("migration fence: competing leader found but its log end could not be read; proceeding",
+				"slot", slot, "peer", replica, "epoch", epoch, "err", lerr, "op", "fence_quorum")
+			continue
+		}
+		if peerLEO > frozenLEO {
+			return fmt.Errorf("fence: slot %d has a competing leader %s at epoch %d whose log end %d is above the frozen tail %d — its acknowledged writes would be cut off; aborting the handover",
+				slot, replica, epoch, peerLEO, frozenLEO)
+		}
+	}
+	return nil
+}
+
 func (e *Engine) confirmTargetDurable(ctx context.Context, addr string, slot int32, leo uint64, to string) error {
 	deadline := time.Now().Add(fenceDurableTimeout)
 	var last uint64
@@ -496,9 +715,9 @@ func (e *Engine) pushFrames(ctx context.Context, toAddr string, slot int32, from
 // fenceSource asks the migration source to take the commit fence and returns
 // the frozen LEO the target has confirmed. When the controller IS the source it
 // runs in-process.
-func (e *Engine) fenceSource(ctx context.Context, from string, slot int32) (uint64, error) {
+func (e *Engine) fenceSource(ctx context.Context, from string, slot int32, target string) (uint64, error) {
 	if from == e.self {
-		return e.HandleFenceSlot(ctx, slot)
+		return e.HandleFenceSlot(ctx, slot, target)
 	}
 	addr := e.peerAddr(from)
 	if addr == "" {
@@ -506,5 +725,5 @@ func (e *Engine) fenceSource(ctx context.Context, from string, slot int32) (uint
 	}
 	fctx, cancel := context.WithTimeout(ctx, fenceRPCTimeout)
 	defer cancel()
-	return e.peerFence(fctx, addr, slot)
+	return e.peerFence(fctx, addr, slot, target)
 }

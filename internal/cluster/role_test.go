@@ -184,18 +184,17 @@ func TestRemoveLearnerGuardsAndRevokes(t *testing.T) {
 	if err := e.AddMember(ctx, "node-9", "127.0.0.1:9909", RoleLearner); err != nil {
 		t.Fatal(err)
 	}
-	// A learner that announced its client address is ONLINE: revoking it
-	// while the cluster uses its seats is refused, exactly like a voter.
+	// Registration makes it ONLINE — and being online is no longer a reason
+	// to refuse the removal: the node leads no slot in this table, so it is
+	// already drained and the revocation commits as a directory leave right
+	// away. (A node that DOES lead slots gets parked in "draining" instead
+	// — see TestRemoveMemberDrainsThenRemoves.)
 	if err := e.acceptRegistration(&Registration{ID: "node-9", AdminAddr: "127.0.0.1:9909", ClientAddr: "127.0.0.1:9909", Role: RoleLearner}); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.RemoveMember(ctx, "node-9"); !errors.Is(err, ErrOnlineMember) {
-		t.Fatalf("online learner revoked: %v", err)
-	}
-	// Marked down, the same revocation goes through as a directory leave.
-	applyCmd(t, e, &Command{Op: OpMarkDown, NodeID: "node-9"})
-	if err := e.RemoveMember(ctx, "node-9"); err != nil {
-		t.Fatal(err)
+	status, err := e.RemoveMember(ctx, "node-9")
+	if err != nil || status != "removed" {
+		t.Fatalf("RemoveMember(slot-less online learner) = (%q, %v), want removed", status, err)
 	}
 	if _, ok := e.TableSnapshot().Peers["node-9"]; ok {
 		t.Fatal("revoked learner still in the directory")

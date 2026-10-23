@@ -286,7 +286,12 @@ message SlotLeoResponse {
 
 // FenceSlotRequest freezes one migrating slot on its source leader. The reply
 // carries the frozen LEO the target has confirmed.
-message FenceSlotRequest { int32 slot = 1; }
+// target is the migration target the CONTROLLER committed to: the source
+// ships its frozen tail there on the controller's explicit instruction,
+// because the source's own table may still be catching up on the stage when
+// the fence RPC lands (the controller awaits only its own apply). Empty
+// target falls back to the source's table view.
+message FenceSlotRequest { int32 slot = 1; string target = 2; }
 message FenceSlotResponse { uint64 leo = 1; }
 
 // SlotLeaderRequest asks a peer for its local placement view of one slot.

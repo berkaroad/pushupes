@@ -89,6 +89,19 @@ type Slot struct {
 	// whole WAL on every start, and re-placing costs real bytes-per-entry.
 	blmsWatermark uint64
 
+	// Stranded-frame memory (see indexMetaLocked's close loop and
+	// stranded_chain_test.go): a frame whose version arrives before its
+	// predecessors is withheld from the directory but remembered here, and
+	// the chain closes live the moment a landing frame makes the next version
+	// reachable — open replay walks the whole WAL and does the same, so a
+	// scrumbled copy (the residue of a push that resumed across a version
+	// hole) needs no restart to serve the records it acknowledges. A true
+	// gap stops the loop at the first missing number — resolvability is never
+	// fabricated. Entries are consumed on adoption; the per-aggregate cap
+	// bounds the memory of predecessors that never arrive (a diverged copy is
+	// repaired by replication drop + refetch, not by this map).
+	stranded map[string]map[uint32]strandedFrame
+
 	segmentBytes int64
 	flush        FlushPolicy
 	pendingFlush int64
@@ -414,16 +427,143 @@ func (s *Slot) indexMetaLocked(seq uint64, m data.RecordMeta) {
 			s.blmsWatermark = seq
 		}
 	}
-	if m.Version == uint32(e.sealedN+e.n)+1 {
+	next := uint32(e.sealedN+e.n) + 1
+	if m.Version == next {
 		e.version = m.Version
 		e.lastUnix = m.UnixTime
 		e.appendSeq(seq, m.UnixTime)
+	} else if m.Version > next && len(s.stranded[m.AggregateID]) < strandedPerAgg {
+		// Out-of-order arrival: the record is on disk (this call just wrote
+		// its frame and advanced the seq counter) — only the claim must wait
+		// for its predecessors. Remember it; the close loop below takes
+		// it back the moment those predecessors land. The FIRST frame
+		// claiming a version wins (a twin chain replays the same version
+		// under a later seq — the chain must adopt each version once).
+		byVer := s.stranded[m.AggregateID]
+		if byVer == nil {
+			byVer = map[uint32]strandedFrame{}
+			if s.stranded == nil {
+				s.stranded = map[string]map[uint32]strandedFrame{}
+			}
+			s.stranded[m.AggregateID] = byVer
+		}
+		if _, dup := byVer[m.Version]; !dup {
+			byVer[m.Version] = strandedFrame{seq: seq, unix: m.UnixTime}
+		}
+	}
+	// Whatever this call claimed, more may now be reachable through stranded
+	// frames (the claim closed a gap in a chain whose head arrived earlier).
+	// The loop adopts only versions whose predecessors are now claimed, so
+	// claimed == resolvable holds at every step; it stops at the first truly
+	// missing number. Bloom bookkeeping happened above for THIS frame only —
+	// stranded frames were bloom-placed when they first landed, so adopting
+	// them here must not place them again (the seq-watermark discipline).
+	byVer := s.stranded[m.AggregateID]
+	for len(byVer) > 0 {
+		f, ok := byVer[uint32(e.sealedN+e.n)+1]
+		if !ok {
+			break
+		}
+		e.version++
+		e.lastUnix = f.unix
+		e.appendSeq(f.seq, f.unix)
+		delete(byVer, e.version)
 	}
 	s.aggs[m.AggregateID] = e
 }
 
+// strandedPerAgg bounds the memory of withheld frames per aggregate: past it
+// arrivals behave exactly as before (withhold, do not remember) — the set is
+// a salvage of realistically-scrumbled chains, not a second index.
+const strandedPerAgg = 1 << 16
+
+type strandedFrame struct {
+	seq  uint64
+	unix int64
+}
+
 // tail returns the writable segment, rolling a new one when it passed the
 // size threshold.
+// StalledAggs reports aggregates whose version chain is PERMANENTLY broken on
+// this WAL: the aggregate has stranded frames (versions parked while waiting
+// for a missing predecessor) AND the WAL holds frames that arrived after the
+// stranded ones. A WAL is a single append queue: had the predecessor existed
+// in the source's history, the seq-ordered replay would have met it BEFORE
+// the stranded frame (the source's own versions climb with its seqs). Seeing
+// the queue move on without it means the predecessor is gone for good and
+// every later claim of this aggregate is withheld forever — the directory can
+// never resolve records the file already holds (the dg8 slot-23 class: one
+// foreign-version frame landed as a NEW frame during a leader-handover
+// demotion lag, and 1968 on-disk records turned unreadable while the home
+// stayed internally consistent, so no digest check could see it). Callers
+// treat a non-empty answer as replica divergence and rebuild the copy.
+// Callers ask at end-of-seq (the replay just consumed the source's whole
+// tail): mid-stream the same shape can be an ordinary batch boundary.
+// tailMovedWithOthersLocked reports whether the WAL holds a frame of a
+// DIFFERENT aggregate above afterSeq: the queue served other streams while
+// this aggregate's strand was still waiting, sealing the chain break.
+// Callers hold s.mu. Uses the segment header scan (the directory keeps no
+// seq log), which is bounded by the segments above the strand.
+func (s *Slot) tailMovedWithOthersLocked(agg string, afterSeq uint64) bool {
+	seen := false
+	for _, seg := range s.segments {
+		if seg.LastSeq <= afterSeq {
+			continue
+		}
+		from := afterSeq + 1
+		if from < seg.BaseSeq {
+			from = seg.BaseSeq
+		}
+		if err := seg.ScanHeaders(from, func(seq uint64, m data.RecordMeta) bool {
+			if m.AggregateID != agg {
+				seen = true
+				return false
+			}
+			return true
+		}); err != nil {
+			return false // cannot read: never claim a break we cannot prove
+		}
+		if seen {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Slot) StalledAggs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.stranded) == 0 {
+		return nil
+	}
+	leo := s.seqCounter.Load()
+	var out []string
+	for agg, byVer := range s.stranded {
+		if len(byVer) == 0 {
+			continue
+		}
+		var maxStrand uint64
+		for _, f := range byVer {
+			if f.seq > maxStrand {
+				maxStrand = f.seq
+			}
+		}
+		// Only a strand AT the queue tail can still be a batch boundary,
+		// and frames of the SAME aggregate after the strand do not seal the
+		// break — a withheld predecessor of one's own chain is exactly what
+		// closeStranded heals (a re-sequenced source, the dg4 class). The
+		// queue moving on with OTHER aggregates' frames past the strand is
+		// what proves the missing predecessor never arrives: this WAL is a
+		// single append queue, and the source's own versions climb with its
+		// seqs, so had it existed, the seq-ordered replay would have met it
+		// before the stranded frame, not behind other streams' traffic.
+		if maxStrand < leo && s.tailMovedWithOthersLocked(agg, maxStrand) {
+			out = append(out, agg)
+		}
+	}
+	return out
+}
+
 func (s *Slot) tail() (*Segment, error) {
 	seg := s.segments[len(s.segments)-1]
 	if seg.SizeBytes() >= s.segmentBytes {

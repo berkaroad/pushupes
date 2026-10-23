@@ -118,6 +118,18 @@ type Table struct {
 	Topology string               `json:"topology,omitempty"`
 	Peers    map[string]Peer      `json:"peers"`
 	Slots    map[int32]*Placement `json:"slots"`
+	// CommitLEO is the per-slot COMMIT FLOOR: the frozen source log end the
+	// fence confirmed before the leadership move was committed. It travels
+	// with the leader_move command (replicated, so every node has it) and it
+	// is monotonic — a later handover of the same slot can only raise it.
+	//
+	// It exists because the fence's confirmation is about the TARGET's copy at
+	// commit time, while clients reach whichever node the table names leader
+	// at any later instant. A leader whose local copy still sits below this
+	// floor cannot answer a client for a version the previous leader already
+	// acknowledged: it must let its fetch catch up first. Serving anyway is
+	// exactly the residual 1001 (and, in the worst case, a forked copy).
+	CommitLEO map[int32]uint64 `json:"commit_leo,omitempty"`
 	// PlanMembers is the member directory the current layout was planned
 	// under. A replan that runs while it differs from the directory now grants
 	// RING seats (the ring just took the node on); one that runs under the same
@@ -136,6 +148,7 @@ func NewTable(slotCount int32, replicaFactor int) *Table {
 		Policy:    DefaultReplicaPolicy,
 		Peers:     map[string]Peer{},
 		Slots:     map[int32]*Placement{},
+		CommitLEO: map[int32]uint64{},
 	}
 }
 
@@ -153,6 +166,7 @@ func NewTableWithPolicy(slotCount int32, policy ReplicaPolicy) *Table {
 		Policy:    policy,
 		Peers:     map[string]Peer{},
 		Slots:     map[int32]*Placement{},
+		CommitLEO: map[int32]uint64{},
 	}
 }
 
@@ -190,6 +204,12 @@ func (t *Table) Clone() *Table {
 		out.Slots[s] = &p2
 	}
 	out.PlanMembers = append([]string(nil), t.PlanMembers...)
+	if len(t.CommitLEO) > 0 {
+		out.CommitLEO = make(map[int32]uint64, len(t.CommitLEO))
+		for s, leo := range t.CommitLEO {
+			out.CommitLEO[s] = leo
+		}
+	}
 	return out
 }
 
@@ -208,6 +228,28 @@ func (t *Table) PeerIDs() []string {
 // THIS set and the policy's factor derives from its size: the control plane's
 // voters keep their machine to themselves — a raft timing must never share a
 // host with a data-plane load, which is the point of splitting the planes.
+// planCandidates is the layout pool: hosting members a plan or replan may
+// spread slots over, minus the ones marked draining. A draining node stays
+// in the directory (its existing seats, read replicas and all, stay until
+// the removal or the re-admission resolves them) but no NEW seat lands on
+// it — seats added to a leaving node would only be moved out again, twice
+// the data motion for zero effect. Same all-marked fallback philosophy as
+// OnlinePeerIDs: a pool of nothing is not a plan.
+func (t *Table) planCandidates() []string {
+	pool := t.HostingIDs()
+	keep := pool[:0:0]
+	for _, id := range pool {
+		if p, ok := t.Peers[id]; ok && p.Draining {
+			continue
+		}
+		keep = append(keep, id)
+	}
+	if len(keep) == 0 {
+		return pool
+	}
+	return keep
+}
+
 func (t *Table) HostingIDs() []string {
 	ids := make([]string, 0, len(t.Peers))
 	for id, p := range t.Peers {
@@ -230,13 +272,33 @@ func (t *Table) HostingIDs() []string {
 // layout is a stable function of the table.
 func (t *Table) OnlinePeerIDs() []string {
 	ids := make([]string, 0, len(t.Peers))
+	live := make([]string, 0, len(t.Peers))
 	for id, p := range t.Peers {
 		if !p.Offline() && p.Hosts() {
-			ids = append(ids, id)
+			live = append(live, id)
+			if !p.Draining {
+				ids = append(ids, id)
+			}
 		}
+	}
+	if len(ids) == 0 {
+		ids = live // a cluster whose every reachable node is draining still
+		// needs leaders — drain marks shed nodes from the layout, they do
+		// not empty the pool out from under live traffic
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// HasDraining reports whether any directory member carries the drain mark
+// (the rebalancer spends a wider per-round budget on handovers while true).
+func (t *Table) HasDraining() bool {
+	for _, p := range t.Peers {
+		if p.Draining {
+			return true
+		}
+	}
+	return false
 }
 
 // LeaderOf returns the leader node and epoch for a slot.
@@ -391,7 +453,7 @@ func (t *Table) layoutStale() bool {
 // epoch, which is the leader change's fence.
 // Non-stable slots belong to a migration in flight and are never touched.
 func (t *Table) applyReplanSlots() bool {
-	nodes := t.HostingIDs()
+	nodes := t.planCandidates()
 	if len(nodes) == 0 {
 		return false
 	}
@@ -454,7 +516,7 @@ func (t *Table) applyReplanSlots() bool {
 		}
 	}
 	if !sameMembers(t.PlanMembers, nodes) {
-		t.PlanMembers = append([]string(nil), nodes...)
+		t.PlanMembers = append([]string(nil), t.HostingIDs()...) // full pool (see OpPlanSlots)
 		changed = true
 	}
 	return changed
@@ -537,13 +599,55 @@ type LeaderMove struct {
 // Non-stable slots are owned by a live migration — never touched.
 func PlanLeaderRebalance(t *Table) []LeaderMove {
 	nodes := t.OnlinePeerIDs()
+	// The ring half of the plan needs two live hosts to have anything to
+	// say (one candidate = it already leads what it leads). The DRAIN half
+	// does not: when the pool shrinks to "only the node being drained is
+	// online", refusing everything would strand its slots on it forever —
+	// the ring's only answer is to hand each slot to the non-draining
+	// replica anyway, and a slot whose set holds nobody else waits for the
+	// operator (replan tops it up once a peer is admitted). Same
+	// fall-back-to-the-possible philosophy as OnlinePeerIDs all-marked.
+	drainPool := false
 	if len(nodes) < 2 {
-		return nil
+		if !t.HasDraining() {
+			return nil
+		}
+		drainPool = true
 	}
 	var out []LeaderMove
 	for s, p := range t.Slots {
 		if p.State != SlotStable || p.Leader == "" {
 			continue
+		}
+		if drainPool {
+			if d, known := t.Peers[p.Leader]; !known || !d.Draining {
+				continue // no ring: only slots on the draining node move
+			}
+		}
+		if d, known := t.Peers[p.Leader]; known && d.Draining {
+			// A draining leader is deviated by definition, whatever the
+			// ring says: hand it to a live, non-draining member of the
+			// slot's own replica set (the set order is the table's, so the
+			// pick is deterministic on every node). A set with no such
+			// member waits for the operator — the ring cannot seat the
+			// slot elsewhere from here.
+			next := ""
+			for _, r := range p.Replicas {
+				if r == p.Leader {
+					continue
+				}
+				if rp, ok := t.Peers[r]; ok && !rp.Offline() && rp.Hosts() && !rp.Draining {
+					next = r
+					break
+				}
+			}
+			if next != "" {
+				out = append(out, LeaderMove{Slot: s, From: p.Leader, To: next})
+			}
+			continue
+		}
+		if drainPool {
+			continue // non-draining leader, ring has no say at pool size 1
 		}
 		want := nodes[int(s)%len(nodes)]
 		if p.Leader == want || !replicaListHas(p.Replicas, want) {
@@ -574,6 +678,11 @@ func layoutSettled(t *Table) bool {
 const (
 	OpJoinNode  = "join_node"  // add a peer to the directory
 	OpLeaveNode = "leave_node" // remove a peer (also drops it from replicas)
+	// OpDrainNode toggles a member's drain mark (c.NodeID, c.Drain).
+	// Draining is the graceful half of a scale-down: leadership flows off
+	// the node through the same handover path a rebalance move uses, so
+	// running clients keep answering while the operator prepares the stop.
+	OpDrainNode = "drain_node"
 	// OpMarkDown / OpMarkUp carry the controller's liveness verdict into the
 	// replicated directory. Down marks a peer offline WITHOUT deleting its
 	// entry (leave_node deletes it, and the raft-config directory sync then
@@ -614,6 +723,10 @@ type Command struct {
 	Peer   *Peer  `json:"peer,omitempty"`
 	NodeID string `json:"node_id,omitempty"`
 	// For OpLeaderMove / OpSlotState:
+	// CommitLEO carries the frozen source tail the commit fence confirmed for
+	// these slots (0 = unknown, e.g. an offline source with no writer to
+	// fence). It becomes Table.CommitLEO on every node that applies the move.
+	CommitLEO   uint64    `json:"commit_leo,omitempty"`
 	Slots       []int32   `json:"slots,omitempty"`
 	NewLeader   string    `json:"new_leader,omitempty"`
 	State       SlotState `json:"state,omitempty"`
@@ -625,6 +738,9 @@ type Command struct {
 	// (backupLeaderFor), so the command stays a deterministic function of the
 	// replicated state on every node that applies it.
 	NewLeaders map[int32]string `json:"new_leaders,omitempty"`
+	// For OpDrainNode:
+	Drain      bool `json:"drain,omitempty"`
+	ThenRemove bool `json:"then_remove,omitempty"` // drain mark + removal intent
 	// For OpConfig:
 	SlotCount int32 `json:"slot_count,omitempty"`
 	Replicas  int   `json:"replicas,omitempty"`
@@ -683,6 +799,15 @@ func (t *Table) Apply(c *Command) error {
 		if c.Peer == nil || c.Peer.ID == "" {
 			return fmt.Errorf("join_node: missing peer")
 		}
+		// A re-admission of a node already in the directory (the operator
+		// bringing it back, or its own startup self-admission) is the
+		// declaration that it serves again: the drain and removal marks
+		// clear with it. Addresses and role refresh from the announcement.
+		if old, existed := t.Peers[c.Peer.ID]; existed {
+			c.Peer.Draining = false
+			c.Peer.PendingRemove = false
+			_ = old
+		}
 		t.Peers[c.Peer.ID] = *c.Peer
 	case OpRegister:
 		// Self-announced data-plane addresses (single-port peer config):
@@ -705,6 +830,17 @@ func (t *Table) Apply(c *Command) error {
 			p.Role = c.Peer.Role
 		}
 		t.Peers[c.Peer.ID] = p
+	case OpDrainNode:
+		p, ok := t.Peers[c.NodeID]
+		if !ok {
+			return fmt.Errorf("drain_node: unknown node %q", c.NodeID)
+		}
+		if p.Draining == c.Drain && p.PendingRemove == c.ThenRemove {
+			return nil // idempotent toggle
+		}
+		p.Draining = c.Drain
+		p.PendingRemove = c.Drain && c.ThenRemove // the intent only rides a drain mark
+		t.Peers[c.NodeID] = p
 	case OpLeaveNode:
 		// Purge the node from the directory AND from every placement that
 		// still names it — leader, replica seat and the migration label. A
@@ -779,7 +915,7 @@ func (t *Table) Apply(c *Command) error {
 		// time loses leadership anyway (mark_down moved it, the ring gate
 		// keeps it off the leaders until it returns). The ACTIVE set is the
 		// rebalancer's and the failover pick's domain, not the layout's.
-		nodes := t.HostingIDs()
+		nodes := t.planCandidates()
 		if len(nodes) == 0 {
 			return fmt.Errorf("plan_slots: no data-plane members (every directory entry is a voter)")
 		}
@@ -787,7 +923,14 @@ func (t *Table) Apply(c *Command) error {
 		for _, p := range t.Slots {
 			stampRingGrants(p)
 		}
-		t.PlanMembers = append([]string(nil), nodes...)
+		// The directory record is the FULL pool, never the filtered spread:
+		// layoutStale/layoutSettled compare it against HostingIDs to answer
+		// "did the member set change", and recording the drain-filtered list
+		// under it would make that answer permanently "yes" — every round a
+		// new replan, every gate stuck unsettled, the drain's own handover
+		// rounds starved. Filtering changes WHO RECEIVES seats, not who the
+		// directory HOLDS.
+		t.PlanMembers = append([]string(nil), t.HostingIDs()...)
 	case OpReplanSlots:
 		// Converge the layout on the current member directory: fill in any
 		// slot that is still unassigned, and add the ring's seats to every
@@ -827,6 +970,15 @@ func (t *Table) Apply(c *Command) error {
 		if _, ok := t.Peers[c.NewLeader]; !ok {
 			return fmt.Errorf("leader_move: unknown node %q", c.NewLeader)
 		}
+		// Handovers INTO a draining node are off the table: a scale-down
+		// that moved slots out and then moved one back would ping-pong the
+		// data. Moving a slot OFF a draining node rides a different field
+		// (the slot's current leader), so this guard never blocks the
+		// drain itself — and failover picks route around draining nodes at
+		// the submit side (only-last-resort), never relying on this apply.
+		if p, ok := t.Peers[c.NewLeader]; ok && p.Draining {
+			return fmt.Errorf("leader_move: target %q is draining", c.NewLeader)
+		}
 		for _, s := range c.Slots {
 			p, ok := t.Slots[s]
 			if !ok {
@@ -849,6 +1001,14 @@ func (t *Table) Apply(c *Command) error {
 			if !found {
 				p.Replicas = append(p.Replicas, c.NewLeader)
 			}
+			if c.CommitLEO > 0 {
+				if t.CommitLEO == nil {
+					t.CommitLEO = map[int32]uint64{}
+				}
+				if c.CommitLEO > t.CommitLEO[s] {
+					t.CommitLEO[s] = c.CommitLEO
+				}
+			}
 		}
 	case OpSlotAddReplica:
 		// Join a member to a slot's replica set (the node then follows the
@@ -861,7 +1021,12 @@ func (t *Table) Apply(c *Command) error {
 		}
 		// Same invariant as leader_move: only a directory member may be
 		// seated (a staged admission whose target was removed in the
-		// meantime must not re-create a phantom member).
+		// meantime must not re-create a phantom member), and never a
+		// draining one — a migration or seat top-up pointed at a leaving
+		// node would re-fill the pool the drain is emptying.
+		if p, ok := t.Peers[c.NodeID]; ok && p.Draining {
+			return fmt.Errorf("slot_add_replica: target %q is draining", c.NodeID)
+		}
 		if _, ok := t.Peers[c.NodeID]; !ok {
 			return fmt.Errorf("slot_add_replica: unknown node %q", c.NodeID)
 		}
@@ -971,7 +1136,7 @@ func removeString(list []string, s string) []string {
 // after a leave_node raced it) still converges.
 func (t *Table) failoverLeader(p *Placement, down, preferred string) string {
 	if preferred != "" && preferred != down && replicaListHas(p.Replicas, preferred) {
-		if peer, ok := t.Peers[preferred]; ok && !peer.Offline() {
+		if peer, ok := t.Peers[preferred]; ok && !peer.Offline() && !peer.Draining {
 			return preferred
 		}
 	}
@@ -985,6 +1150,19 @@ func (t *Table) failoverLeader(p *Placement, down, preferred string) string {
 // replica list order is the same on every node (the table is replicated), so
 // Apply converges. "" when the set holds nobody else.
 func (t *Table) backupLeaderFor(p *Placement, down string) string {
+	// A draining node ranks last among LIVE candidates: it is reachable and
+	// could hold the slot, but seating leadership on a node the operator is
+	// removing re-fills the pool the drain is emptying (and every acked
+	// write it takes then has to move again). Only chosen when it is all
+	// that is alive — leadership stranded on nobody starves the slot.
+	for _, r := range p.Replicas {
+		if r == down {
+			continue
+		}
+		if peer, ok := t.Peers[r]; ok && !peer.Offline() && !peer.Draining {
+			return r
+		}
+	}
 	for _, r := range p.Replicas {
 		if r == down {
 			continue

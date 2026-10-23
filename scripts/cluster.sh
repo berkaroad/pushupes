@@ -577,57 +577,47 @@ cmd_join() {
   return 1
 }
 
-# cmd_remove N：运行时摘掉一个节点。只允许移除离线节点：node-N 进程还在跑
-# 时脚本先停掉它，再等 controller 的探活把它标成离线（连续 3 轮探测失败，
-# 约数秒），最后提交 DELETE（必须发到 controller）。数据目录不动。
+# cmd_remove N：一条 DELETE 摘掉 node-N。服务端自己走「先排干、再正式移除」：
+# 排干标记让它退出布局（不再选它当 leader/席位/迁移目标），rebalancer 的排水轮
+# 把它领导的槽按常规交接逐手移交（移交完成前它照常服务读写，运行中的客户端无
+# 中断），排干的那一刻摘 raft 配置与目录条目——是否在线/离线服务端不问。
+# 脚本只轮询同一条 DELETE 直到 200（202=排干中），**先摘后停**。数据目录不动。
 cmd_remove() {
   local n="${1:-}"
   [[ -n "$n" && "$n" =~ ^[0-9]+$ ]] || die "用法: $0 remove <节点序号>"
-  if node_pid_alive "$n"; then
-    info "node-$n 进程仍在运行：只允许移除离线节点，先停掉它的进程"
-    stop_node "$n"
-  fi
   local ctrl; ctrl="$(controller_admin)"
-  # 等该成员在 controller 视角离线（down=true；目录里没有它或它从未注册也算离线）。
-  # body 先压成一行：这个端点的 JSON 是缩进过的，逐行的 grep 只能看到条目的一部分，
-  # 于是「条目里没有 client_addr」会立刻为真 —— 脚本会在 mark_down 落地前就去 DELETE，
-  # 后端按「只允许移除离线成员」直接回 400（node 已停但还没被判离线的那 1~2 秒就是这窗口）。
-  local deadline=$((SECONDS + 30)) body entry
-  while (( SECONDS < deadline )); do
-    body="$(curl -s --max-time 3 "http://$ctrl/admin/cluster/nodes" 2>/dev/null)" || body=""
-    body="$(printf '%s' "$body" | tr -d ' \t\n')"
-    if ! printf '%s' "$body" | grep -q "\"id\":\"node-$n\""; then
-      break   # 已不在成员表：DELETE 会幂等成功
-    fi
-    entry="$(printf '%s' "$body" | grep -o "\"id\":\"node-$n\"[^}]*" | head -1)"
-    if ! printf '%s' "$entry" | grep -q '"client_addr"'; then
-      break   # 未注册过数据面地址：本就是离线
-    fi
-    if printf '%s' "$entry" | grep -q '"down":true'; then
-      break
-    fi
-    sleep 1
-  done
-  # 「member is online」不是永久失败：node 进程已停，但 controller 判它离线（探活 3 轮，
-  # 或有见证者上报）有一个 1~2s 窗口，DELETE 撞上它只是早了一步。等一拍再试，别把
-  # 「node 还在跑」的错觉丢给运维。
-  local resp code attempt=0
+  info "移除 node-$n：服务端先排干、再正式移除（客户端无中断）"
+  local deadline=$((SECONDS + 600)) resp code attempt=0
   while :; do
     attempt=$((attempt + 1))
     resp="$(curl -s -w '\n%{http_code}' -X DELETE --max-time 40 \
       "http://$ctrl/admin/cluster/nodes/node-$n" 2>/dev/null)"
     code="${resp##*$'\n'}"
     if [[ "$code" == "200" ]]; then
-      info "node-$n 已从 raft 配置移除（槽主迁移 + 副本补齐已由 controller 接管）"
+      info "node-$n 已移除（raft 配置与目录条目已摘）"
       break
     fi
-    if (( attempt < 5 )) && printf '%s' "${resp%$'\n'*}" | grep -q 'online'; then
-      info "node-$n 仍被判在线，等 controller 标记离线后重试（第 $attempt 次）"
-      sleep 1
-      continue
+    if [[ "$code" == "202" ]]; then
+      local led ifl
+      led="$(printf '%s' "${resp%$'\n'*}" | grep -o '"leading":[0-9]*' | grep -o '[0-9]*')"
+      ifl="$(printf '%s' "${resp%$'\n'*}" | grep -o '"inflight":[0-9]*' | grep -o '[0-9]*')"
+      info "node-$n 排干中：leader槽=${led:-?} 在途=${ifl:-?}（第 $attempt 次轮询）"
+    elif [[ "$code" == "000" || -z "$code" ]]; then
+      info "controller（$ctrl）无应答，换当前 controller 重试"
+      ctrl="$(controller_admin)"
+    else
+      die "移除 node-$n 失败（HTTP $code）：$(printf '%s' "${resp%$'\n'*}" | head -c 400)"
     fi
-    die "移除 node-$n 失败（HTTP $code）：$(printf '%s' "${resp%$'\n'*}" | head -c 400)"
+    if (( SECONDS >= deadline )); then
+      die "node-$n 排干超时（仍领导槽未清空）；进程保持在线，排查后可重跑 remove"
+    fi
+    sleep 2
   done
+  # 先摘后停：表里已经没有它、也没有任何槽指向它，此刻停进程对客户端无感。
+  if node_pid_alive "$n"; then
+    stop_node "$n"
+    info "node-$n 进程已停止"
+  fi
   cmd_members
 }
 

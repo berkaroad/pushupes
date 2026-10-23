@@ -74,9 +74,19 @@ const (
 	// executes: exactly one. A commit's fence freezes one slot's writes, so a
 	// strictly serial commit loop keeps the frozen-slot count at one and the
 	// write-latency noise bounded to a single slot; convergence is paced by
-	// the round interval instead (a node that led 2048 slots returns in 2048
-	// rounds, and a factor decrease reclaims one surplus seat per round).
+	// the round interval instead (a node that led 512 slots — half of the
+	// 1024-slot table, the most any one node leads under the two-replica
+	// ring — returns in 512 rounds, and a factor decrease reclaims one
+	// surplus seat per round).
 	rebalanceCommitsPerRound = 1
+	// drainCommitsPerRound widens the serial loop while any member is
+	// marked draining: the commits STILL run one by one inside the round
+	// (the fence only ever freezes one slot at a time), but a drain waits
+	// one round per hand-over instead of one tick per hand-over — even a
+	// node leading the worst-case 512 slots (half of the 1024-slot table,
+	// the most any one node leads under the two-replica ring) drains in
+	// seconds, not hours.
+	drainCommitsPerRound = 64
 	// reclaimBudget bounds one reclaim sweep. The sweep retires every surplus
 	// seat it can inside the budget and the next round continues, so a factor
 	// decrease on a large table converges in a round or two instead of one seat
@@ -100,15 +110,56 @@ func (e *Engine) rebalanceEnabled() bool {
 	return e.rebalanceInterval > 0
 }
 
+// drainTick is the pace a scale-down forces. The rebalancer normally sleeps
+// when the operator turned it off (interval 0) — but a drain mark is the
+// operator asking the cluster to MOVE data, and nobody else does that work:
+// stopping the loop here would leave every DELETE parked in "draining"
+// forever on a rebalance-off cluster. So a drain outranks the switch, and
+// outranks the configured interval when that one is slower: the rounds of a
+// handover run back to back at drainTick until the node is empty.
+const drainTick = 2 * time.Second
+
 // RunRebalancer is the leader-rebalance loop: one round every
 // rebalanceInterval while this node holds the Raft leadership. Launched from
 // Engine.Start like RunController.
 func (e *Engine) RunRebalancer(ctx context.Context) {
+	// The switch is off: this loop owes nothing — it returns until a drain
+	// marks the table, and whoever marks it (or inherits a marked table as
+	// controller) wakes the drain driver instead (wakeDrainRunner, run from
+	// the controller tick). No idle watcher here, no busy poll. An ENABLED
+	// cluster always keeps its loop: the ring-return rounds are its own job.
+	if !e.rebalanceEnabled() && !e.TableSnapshot().HasDraining() {
+		return
+	}
+	// Running while the switch is off means this loop IS the drain driver —
+	// claim the seat once so the wake path cannot start a second one
+	// alongside; release on the way out (when the drain ends this returns,
+	// and the next mark wakes a runner instead).
+	if !e.rebalanceEnabled() {
+		if !e.claimDrainDriver() {
+			return // a runner already holds the wheel for this drain
+		}
+		defer e.releaseDrainDriver()
+	}
 	for {
-		if !e.rebalanceEnabled() {
+		draining := e.TableSnapshot().HasDraining()
+		if !e.rebalanceEnabled() && !draining {
+			// The drain this loop drove is done (removed or withdrawn):
+			// hand the wheel back (the deferred release) and go dark —
+			// an operator who turned rebalancing off must not get it
+			// running forever the moment the scale-down completes.
 			return
 		}
-		timer := time.NewTimer(e.rebalanceInterval)
+		interval := e.rebalanceInterval
+		if draining && (!e.rebalanceEnabled() || interval > drainTick) {
+			// A drain outranks the configured pace: handover rounds run
+			// back to back at drainTick until the node is empty. With the
+			// switch off the configured interval is 0 — a bare `>` test
+			// against it would NewTimer(0) straight into a busy loop, so
+			// the disabled case takes drainTick unconditionally.
+			interval = drainTick
+		}
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -118,7 +169,12 @@ func (e *Engine) RunRebalancer(ctx context.Context) {
 		if e.node == nil || !e.node.IsLeader() {
 			continue
 		}
-		e.rebalanceRound(ctx, rebalanceCommitsPerRound)
+		limit := rebalanceCommitsPerRound
+		if draining {
+			limit = drainCommitsPerRound // a scale-down in progress sets the pace
+		}
+		e.rebalanceRound(ctx, limit)
+		e.finishPendingRemovals(ctx)
 		// Surplus-seat reclaim: the other half of a re-layout. A re-layout only
 		// ADDS seats (Table.applyReplanSlots), so a set left oversized by a
 		// factor change converges here, in one budgeted sweep per round and only
@@ -166,6 +222,21 @@ func (e *Engine) rebalanceRound(ctx context.Context, limit int) int {
 		if !e.alive(dstAddr) {
 			continue // the move-back target must be reachable (its liveness is
 			// also what failover is about to re-shape: do not race it)
+		}
+		// A draining node that is ALSO dead cannot be fenced or asked for
+		// its log end — and does not need either: nothing writes through a
+		// dead process. Its slots hand over by plain table command (the
+		// epoch bump is the fence, exactly as on failover), so a DELETE of
+		// a crashed node drains instead of waiting on a handover that can
+		// never get a source-side answer.
+		if pe, ok := e.TableSnapshot().Peers[m.From]; ok && pe.Draining && pe.Offline() {
+			if err := e.submit(&Command{Op: OpLeaderMove, Slots: []int32{m.Slot}, NewLeader: m.To}); err != nil {
+				continue
+			}
+			e.logger.Info("rebalance: dead drain source; slot handed over by table command",
+				"slot", m.Slot, "from", m.From, "to", m.To, "op", OpLeaderMove)
+			done++
+			continue
 		}
 		// 1) stage: a target outside the replica set has no copy to catch up
 		// from. Joining it to the set is the cheap half of the handover and it
@@ -647,4 +718,78 @@ func (e *Engine) slotStateAt(ctx context.Context, slot int32, addr string) (slot
 		return slotState{LEO: leo, Aggregates: agg, Versions: ver, Resolvable: res}, nil
 	}
 	return e.remoteSlotState(ctx, addr, slot)
+}
+
+// finishPendingRemovals closes the scale-down the moment its drain is done:
+// a node marked for removal that leads nothing and holds nothing in flight
+// is removed for real, in this same round — no second DELETE from the
+// operator, no lost intent when the controller changed hands (the intent
+// rode the replicated table). Removal failures (a raft config that refused,
+// a lost leadership) just retry next tick.
+// wakeDrainRunner starts the on-demand drain loop if one is needed and not
+// already running: the switch is off (the ordinary loop returned long ago),
+// the table carries a drain mark, and no runner is up. It paces at drainTick
+// — the same tempo a marked drain holds the enabled loop to — and exits by
+// itself once the table has no draining node left (removed, or withdrawn by
+// a re-admission). Cheap to call every controller tick: the guard reads an
+// in-memory snapshot and a running runner is a flag check.
+// claimDrainDriver / releaseDrainDriver guard the single drain driver (see
+// the Engine field comment). Claim is cheap and lock-free-adjacent: a
+// controller tick calls wake every second, and a held seat is one mutex.
+func (e *Engine) claimDrainDriver() bool {
+	e.drainRunMu.Lock()
+	defer e.drainRunMu.Unlock()
+	if e.drainDriverBusy {
+		return false
+	}
+	e.drainDriverBusy = true
+	return true
+}
+
+func (e *Engine) releaseDrainDriver() {
+	e.drainRunMu.Lock()
+	e.drainDriverBusy = false
+	e.drainRunMu.Unlock()
+}
+
+func (e *Engine) wakeDrainRunner() {
+	if e.rebalanceEnabled() || !e.TableSnapshot().HasDraining() {
+		return
+	}
+	if !e.claimDrainDriver() {
+		return // the disabled RunRebalancer loop (or an earlier wake) drives it
+	}
+	go func() {
+		defer e.releaseDrainDriver()
+		ctx := context.Background()
+		for e.TableSnapshot().HasDraining() {
+			if e.node != nil && e.node.IsLeader() {
+				e.rebalanceRound(ctx, drainCommitsPerRound)
+				e.finishPendingRemovals(ctx)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(drainTick):
+			}
+		}
+	}()
+}
+
+func (e *Engine) finishPendingRemovals(ctx context.Context) {
+	tbl := e.TableSnapshot()
+	for id, p := range tbl.Peers {
+		if !p.PendingRemove {
+			continue
+		}
+		if leading, inflight := e.drainProgress(tbl, id); leading != 0 || inflight != 0 {
+			continue // still draining: the handover rounds above own this
+		}
+		if err := e.finishRemoval(ctx, id); err != nil {
+			e.logger.Warn("rebalance: drained node could not be removed yet",
+				"node", id, "err", err)
+			continue
+		}
+		e.logger.Info("rebalance: drained node removed", "node", id)
+	}
 }

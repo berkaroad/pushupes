@@ -109,6 +109,22 @@ type Peer struct {
 	// a failed node stays visible — flagged 离线 in the console — instead of
 	// flickering between "removed" and "re-seeded without addresses".
 	Down bool `json:"down,omitempty"`
+	// Draining is the operator's scale-down mark, replicated through Raft
+	// (op drain_node): the node keeps serving every append for the slots it
+	// still leads, but the layout stops seating leadership on it — the ring
+	// spread skips it and the rebalancer hands its leading slots to the
+	// remaining members through the ordinary handover. A drained node is
+	// meant to be stopped (and then removed) once its leading count reaches
+	// zero; clearing the mark puts it back into service uneventfully.
+	Draining bool `json:"draining,omitempty"`
+	// PendingRemove is the second half of the same DELETE: the operator's
+	// removal intent rides the directory entry (replicated, survives a
+	// controller change) so the drain round that finds the node empty of
+	// leadership performs the formal removal itself — a scale-down is one
+	// command end to end, not a poll-and-reissue dance. A re-admission of
+	// the node (join_node) clears both marks: rejoining IS the declaration
+	// that the node serves again.
+	PendingRemove bool `json:"pending_remove,omitempty"`
 }
 
 // Hosts reports whether a directory entry may carry slot replicas. Two

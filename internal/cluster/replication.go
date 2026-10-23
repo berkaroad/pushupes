@@ -50,6 +50,12 @@ type epochHW struct {
 type Engine struct {
 	node  consensus
 	store *storage.Store
+	// One drain-driver seat (balance.go): the disabled RunRebalancer loop
+	// claims it when it starts over a marked table, wakeDrainRunner claims it
+	// for a drain marked after the loop returned. Whoever holds it runs the
+	// handover rounds; exactly one driver exists per drain.
+	drainRunMu      sync.Mutex
+	drainDriverBusy bool
 	// hub is this node's data-plane feed (layoutfeed.go): the subscriptions
 	// that keep role=learner nodes in step with the replicated metadata. Built
 	// on first use because it reads the consensus timing off `node`, which is
@@ -83,6 +89,9 @@ type Engine struct {
 	// scanning, so one round answers every slot the burst touched instead of
 	// the first one to land (see SetFetchSettle).
 	fetchSettle time.Duration
+	// traceAgg is the forensic ack filter (PUSHUPES_TRACE_AGG): non-empty
+	// logs every acknowledgement of a matching aggregate (see traceAck).
+	traceAgg string
 
 	// hwGates wakes the calls parked in waitForHW when a slot's watermark
 	// moves (see hwwake.go). Indexed by slot id, read-only after construction.
@@ -157,6 +166,16 @@ type Engine struct {
 	// quarantines them instead of failing the whole multiplexed session).
 	divMu    sync.Mutex
 	diverged map[int32]string
+	// rebuildTarget records the in-flight rebuild of a diverged copy: the
+	// leader's tail as of the discard (the seq a full refetch must reach
+	// before the quarantine lifts). The latch used to be permanent — a forked
+	// copy stopped reporting (silently leaving the ISR, one replica short
+	// forever); now the discard + refetch + tail-arrival closes it. Guarded
+	// by divMu with the latch it belongs to.
+	rebuildTarget map[int32]uint64
+	// rebuildAttempts counts whole-history refetches per slot (poisoned
+	// sources re-form the chain break; see rebuildDivergedCopy's cap).
+	rebuildAttempts map[int32]int
 
 	// slots this node led as of the previous table walk, so syncMigrationState
 	// can tell a leadership GAIN (drop the previous term's stale follower
@@ -497,9 +516,14 @@ const (
 	// burst to a later round: hw_wait 6.42ms at 0 vs 4.60ms at 200us against
 	// 5.70ms at 2ms), so the window earns its keep -- but 2ms is overpaid, at
 	// 37 slots per round against 29 for the same acknowledgement latency.
-	DefaultFetchSettle   = 200 * time.Microsecond
-	fetchSweepInterval   = 2 * time.Second  // stamp all positions at least this often
-	isrStaleAfter        = 10 * time.Second // must exceed fetchWait+fetchMaxBackoff
+	DefaultFetchSettle = 200 * time.Microsecond
+	fetchSweepInterval = 2 * time.Second  // stamp all positions at least this often
+	isrStaleAfter      = 10 * time.Second // must exceed fetchWait+fetchMaxBackoff
+	// commitFloorWait bounds how long a leader holds a write back while its
+	// copy catches up to the slot's commit floor (see awaitCommitFloor). The
+	// catch-up is one fetch round in the normal case; the bound only exists so
+	// a stalled fetch degrades to the old behaviour instead of wedging writes.
+	commitFloorWait      = 2 * time.Second
 	defaultHWWaitTimeout = 10 * time.Second // the write-ack watermark deadline
 
 	// fetchTailRecords is how close to a slot's head a follower counts as
@@ -539,6 +563,7 @@ var (
 // NewEngine wires the cluster to the local storage. The Raft node may be
 // attached later with SetNode (they reference each other).
 func NewEngine(node consensus, store *storage.Store, self string, logger *slog.Logger) *Engine {
+	traceAgg := os.Getenv("PUSHUPES_TRACE_AGG")
 	e := &Engine{
 		node:  node,
 		store: store,
@@ -554,19 +579,21 @@ func NewEngine(node consensus, store *storage.Store, self string, logger *slog.L
 		// long-poll fetch round plus progress/replication/leo probes —
 		// gRPC multiplexes them over the single cached conn (the old HTTP
 		// transport needed a large idle-conn pool to avoid re-dial churn).
-		peers:         newPeerClient(),
-		repl:          map[int32]*slotRepl{},
-		sessions:      map[string]*fetchSession{},
-		sessKick:      make(chan struct{}, 1),
-		storageKick:   make(chan struct{}, 1),
-		failStreak:    map[string]int{},
-		ledPrev:       map[int32]bool{},
-		fenceSet:      map[int32]bool{},
-		diverged:      map[int32]string{},
-		pendingOwners: map[int32]ownerReason{},
-		ownerKick:     make(chan struct{}, 1),
-		hwSeen:        map[int32]epochHW{},
-		migrating:     map[int32]struct{}{},
+		peers:           newPeerClient(),
+		repl:            map[int32]*slotRepl{},
+		sessions:        map[string]*fetchSession{},
+		sessKick:        make(chan struct{}, 1),
+		storageKick:     make(chan struct{}, 1),
+		failStreak:      map[string]int{},
+		ledPrev:         map[int32]bool{},
+		fenceSet:        map[int32]bool{},
+		diverged:        map[int32]string{},
+		rebuildTarget:   map[int32]uint64{},
+		rebuildAttempts: map[int32]int{},
+		pendingOwners:   map[int32]ownerReason{},
+		ownerKick:       make(chan struct{}, 1),
+		hwSeen:          map[int32]epochHW{},
+		migrating:       map[int32]struct{}{},
 		// post-migration cleanup: the former source keeps its copy for this
 		// long once it sees the hand-over committed (-drop-after).
 		dropAfter: DefaultDropRetention,
@@ -583,6 +610,7 @@ func NewEngine(node consensus, store *storage.Store, self string, logger *slog.L
 		ack:         ackDiag{slots: make([]slotAck, store.SlotCount)},
 		hwGates:     make([]hwGate, store.SlotCount),
 		fetchSettle: DefaultFetchSettle,
+		traceAgg:    traceAgg,
 	}
 	e.orderPool.New = func() any { return make([]int, 0, 64) }
 	e.parkedPool.New = func() any { return make([]parkedEntry, 0, 64) }
@@ -719,6 +747,67 @@ func (e *Engine) TableSnapshot() *Table {
 	return e.table.Clone()
 }
 
+// leaderCopyMissingWithHistory reports a leader whose local copy of the slot is
+// absent while the slot has handover history (epoch >= 2). Epoch 1 is a slot the
+// plan just created — it legitimately starts empty; anything at epoch 2 has
+// already been moved once, so an empty copy means this node is missing the
+// history, not creating it.
+func (e *Engine) leaderCopyMissingWithHistory(slot int32) bool {
+	if e.store.SlotPresent(slot) {
+		return false
+	}
+	p, ok := e.slotPlacement(slot)
+	return ok && p.Leader == e.self && p.Epoch >= 2
+}
+
+// slotPlacement reads ONE slot's placement under the table lock (TableSnapshot
+// clones the whole table and must never be called from the write path).
+func (e *Engine) slotPlacement(slot int32) (Placement, bool) {
+	e.tableMu.RLock()
+	defer e.tableMu.RUnlock()
+	p, ok := e.table.Slots[slot]
+	if !ok {
+		return Placement{}, false
+	}
+	return *p, true
+}
+
+// commitFloor is this slot's frozen-tail floor from the replicated table
+// (0 when the slot never moved through a commit fence).
+func (e *Engine) commitFloor(slot int32) uint64 {
+	e.tableMu.RLock()
+	defer e.tableMu.RUnlock()
+	return e.table.CommitLEO[slot]
+}
+
+// awaitCommitFloor holds a write back until this copy has reached the slot's
+// commit floor. The floor is the tail the fence froze and confirmed on the
+// TARGET at handover: if this node leads the slot yet its own log still sits
+// below it, the fetch has not caught up and answering the client would refuse
+// versions the previous leader already acknowledged (the residual 1001) or,
+// worse, reuse their seqs. Bounded; on timeout the write is served anyway and
+// the anomaly is logged, so a stuck fetch can never wedge the slot.
+func (e *Engine) awaitCommitFloor(slot int32) {
+	floor := e.commitFloor(slot)
+	if floor == 0 || e.store.LastSeqOf(slot) >= floor {
+		return
+	}
+	e.logger.Info("slot commit floor: holding the write until the local copy catches up",
+		"slot", slot, "floor", floor, "leo", e.store.LastSeqOf(slot), "op", "commit_floor_wait")
+	deadline := time.Now().Add(commitFloorWait)
+	for {
+		if e.store.LastSeqOf(slot) >= floor {
+			return
+		}
+		if time.Now().After(deadline) {
+			e.logger.Warn("slot commit floor: local log is still below the confirmed tail; serving the write anyway",
+				"slot", slot, "floor", floor, "leo", e.store.LastSeqOf(slot), "op", "commit_floor")
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // HandleSlotLeader answers a peer's query for THIS node's local placement view
 // of a slot: the leader it currently believes in ("" when unassigned) and the
 // placement epoch. It is the migration source's fence-release gate (fence.go):
@@ -821,7 +910,7 @@ func (e *Engine) syncMigrationState() {
 			continue
 		}
 		if pl, ok := after[s]; ok && pl.leader != "" && pl.leader != e.self {
-			e.holdFenceUntilTargetLeader(s, pl.leader, pl.epoch)
+			e.holdFenceUntilTargetLeader(s, e.self, pl.leader, pl.epoch)
 			continue
 		}
 		e.releaseSlotFence(s)
@@ -911,6 +1000,7 @@ func (e *Engine) SubmitAppend(ctx context.Context, rec *data.EventRecord) (resp 
 	slot := e.SlotOf(rec.AggregateID)
 	leave := e.enterWriteFence(slot)
 	defer leave()
+	e.awaitLocalDemotion(slot)
 	fenced := time.Now()
 	e.noteCall(start, fenced, 1, false)
 	defer func() {
@@ -984,6 +1074,7 @@ func (e *Engine) submitAppendLocked(ctx context.Context, rec *data.EventRecord, 
 		addr := e.clientAddr(pLeader)
 		return nil, &RedirectError{Kind: data.ErrIDMigrating, Slot: slot, Node: pLeader, Addr: addr}
 	case pLeader == e.self:
+		e.awaitCommitFloor(slot)
 		return e.localAppend(slot, rec)
 	default:
 		addr := e.clientAddr(pLeader)
@@ -1100,6 +1191,38 @@ func (e *Engine) localAppendThrottled(slot int32, rec *data.EventRecord) (*data.
 // append waits for its own seq, a batch waits once for the group's max —
 // see SubmitBatch). The returned response for a success carries the assigned
 // seq; exists carries the stored record; fail carries the wire error.
+// traceAck is the forensic hook the handover investigations turn on with
+// PUSHUPES_TRACE_AGG=<prefix>: every acknowledgement of a matching aggregate is
+// logged with this node, the seq it took and the version it confirmed. An
+// acknowledged version that no copy holds afterwards is provable from these
+// lines plus the survivors' WALs, without guessing at client bookkeeping.
+// Off (one map lookup on a nil string) unless the env var is set.
+func (e *Engine) traceAck(slot int32, rec *data.EventRecord, seq uint64, kind string) {
+	if e.traceAgg == "" {
+		return
+	}
+	// Volume is bounded by the HANDOVER window, not the write rate: only an
+	// acknowledgement taken while this node holds the slot's write fence, or
+	// while the slot is mid-migration in this node's applied table, can be
+	// the one a successor fails to inherit.
+	fenced := false
+	if f := e.fenceFor(slot); f != nil {
+		f.mu.Lock()
+		fenced = f.closed
+		f.mu.Unlock()
+	}
+	var state SlotState
+	if p, ok := e.slotPlacement(slot); ok {
+		state = p.State
+	}
+	if !fenced && (state == "" || state == SlotStable) {
+		return
+	}
+	e.logger.Info("append acknowledged during handover", "node", e.self, "slot", slot,
+		"agg", rec.AggregateID, "version", rec.Version, "seq", seq,
+		"kind", kind, "fenced", fenced, "state", state, "op", "ack_trace")
+}
+
 func (e *Engine) landLocalAppend(slot int32, rec *data.EventRecord) (*data.AppendResponse, error) {
 	// Owner fence (owner.go): a copy the table cannot vouch for stays out of
 	// service. Appending here would write into a seq space the client was
@@ -1114,6 +1237,24 @@ func (e *Engine) landLocalAppend(slot int32, rec *data.EventRecord) (*data.Appen
 			Slot:   slot,
 		}, nil
 	}
+	// A leader with NO local copy of a slot that has already moved (epoch >= 2)
+	// must not answer the client's version at all. Its directory starts empty,
+	// so the CAS would report "current version 0" and the client would adopt
+	// that — rewriting a slot whose history lives elsewhere into a fresh
+	// version-1 stream (the dg22 storm: hundreds of 1001s and a copy that
+	// crawled 0→6 frames while the real chain was at ~550). Answering a
+	// retryable NOT_LEADER instead keeps the client's ledger intact until the
+	// copy materializes; the move is re-planned if it never does.
+	if e.leaderCopyMissingWithHistory(slot) {
+		e.logger.Warn("append: this node leads the slot but holds no copy of it (handover history); answering retryable",
+			"slot", slot, "agg", rec.AggregateID, "op", "leader_without_copy")
+		return &data.AppendResponse{
+			Status: data.StatusFail,
+			ErrID:  data.ErrIDNotLeader,
+			Err:    "replica catching up",
+			Slot:   slot,
+		}, nil
+	}
 	out, err := e.store.Append(rec)
 	if err != nil {
 		return nil, err
@@ -1124,14 +1265,25 @@ func (e *Engine) landLocalAppend(slot int32, rec *data.EventRecord) (*data.Appen
 		if out.ErrID == data.ErrIDVersionConflict {
 			resp.CurrentVersion = out.CurrentVersion
 			resp.Err = "version conflict"
+			// Diagnostic (cheap, conflict-only): which copy refused, what it
+			// believes the chain tail is, and whether its own WAL/s directory
+			// disagree — separates a stale-but-honest tail (a migration target
+			// that has not caught the acked record) from a directory stall.
+			e.logger.Warn("append version conflict: responder's chain is short of the client's ledger",
+				"slot", slot, "agg", rec.AggregateID, "sent", rec.Version,
+				"refused_tail", out.CurrentVersion,
+				"dir_version", e.store.VersionOf(slot, rec.AggregateID),
+				"leo", e.store.LastSeqOf(slot), "op", "1001_diag")
 		} else {
 			resp.Err = "bad request"
 		}
 		return resp, nil
 	case data.StatusExists:
 		resp.Record = out.Record // stored record, raw bytes end to end
+		e.traceAck(slot, rec, out.Seq, "exists")
 		return resp, nil
 	}
+	e.traceAck(slot, rec, out.Seq, "success")
 	// Success carries status/seq only: the caller already holds the record it
 	// sent, and echoing a 100KiB body back doubled the bytes on the wire per
 	// append (see DESIGN.md §6). EXISTS still returns the stored record, which
@@ -1166,6 +1318,7 @@ func (e *Engine) SubmitBatch(ctx context.Context, slot int32, recs []*data.Event
 	start := time.Now()
 	leave := e.enterWriteFence(slot)
 	defer leave()
+	e.awaitLocalDemotion(slot)
 	fenced := time.Now()
 	e.noteCall(start, fenced, len(recs), true)
 	defer func() {
@@ -1208,6 +1361,7 @@ func (e *Engine) SubmitBatch(ctx context.Context, slot int32, recs []*data.Event
 		// A migrating slot another node leads: the commit window is theirs.
 		return nil, &RedirectError{Kind: data.ErrIDMigrating, Slot: slot, Node: pLeader, Addr: e.clientAddr(pLeader)}
 	case pLeader == e.self:
+		e.awaitCommitFloor(slot)
 		return e.batchLocal(ctx, slot, recs)
 	default:
 		addr := e.clientAddr(pLeader)
@@ -1713,7 +1867,11 @@ func (e *Engine) freshestReplicas(down string) map[int32]string {
 			if r == down {
 				continue
 			}
-			if peer, ok := tbl.Peers[r]; !ok || peer.Offline() || streak[r] > 0 {
+			// Draining candidates are out of the freshness run: a LEO pick
+			// that lands on a node the operator is removing defeats the
+			// drain. The table fallback still ranks draining last among
+			// live replicas, so a slot is never stranded by this filter.
+			if peer, ok := tbl.Peers[r]; !ok || peer.Offline() || peer.Draining || streak[r] > 0 {
 				continue
 			}
 			c := cands[r]
@@ -3584,6 +3742,31 @@ func (e *Engine) applyItem(it *FetchItem, report func(it *FetchItem, from uint64
 	dvg, err := applyFetchPayload(e.store, it.Slot, it.NextSeq, it.Payload)
 	if len(dvg) > 0 {
 		e.noteDivergence(it.Slot, dvg)
+		// The quarantine used to be the END of the story — the slot silently
+		// left the ISR forever. It is now the start of a repair: discard and
+		// refetch whole (leaderTail = this round's batch end).
+		e.rebuildDivergedCopy(it.Slot, it.NextSeq-1)
+	} else {
+		// A version-chain break is invisible to the byte-comparison above:
+		// every frame matches its slot on the source, yet the local WAL
+		// holds a frame whose version skipped a number that will never
+		// arrive (it was written as a NEW frame during a handover demotion
+		// lag — the dg8 slot-23 class, 1968 records stranded unreadable
+		// behind one misfit while the home stayed self-consistent). Ask at
+		// end-of-seq only: the fetch batch that reached the source's tail
+		// left nothing for the strand to heal against.
+		if e.store.SlotPresent(it.Slot) && it.NextSeq >= e.store.LastSeqOf(it.Slot) {
+			if stalled := e.store.StalledAggs(it.Slot); len(stalled) > 0 {
+				e.noteDivergence(it.Slot, []uint64{it.NextSeq - 1})
+				e.logger.Warn("replication: slot's version chain is permanently broken on this copy",
+					"slot", it.Slot, "stalled_aggs", len(stalled), "op", "chain_break")
+				e.rebuildDivergedCopy(it.Slot, it.NextSeq-1)
+			} else {
+				e.healRebuiltCopy(it.Slot)
+			}
+		} else {
+			e.healRebuiltCopy(it.Slot)
+		}
 	}
 	if err != nil {
 		return err
@@ -3600,6 +3783,72 @@ func (e *Engine) applyItem(it *FetchItem, report func(it *FetchItem, from uint64
 // and every OTHER slot of the same multiplexed session keeps replicating. It is
 // logged once per slot — the fence around the migration commit window is what
 // keeps this from happening at all; reaching here means that invariant broke.
+// rebuildDivergedCopy discards a forked replica copy so the fetch loop
+// refetches it whole from the leader (the same move the migration gate makes
+// on a diverged TARGET — see ensureTargetConsistent — applied to the steady
+// replication path). leaderTail is the leader's log end as this round saw it:
+// landing that seq is the rebuild's completion. Refusing to discard a slot
+// THIS node leads is the safety line (a leader's WAL holds what it
+// acknowledged — nobody can refetch a leader from below); a leader-role fork
+// stays quarantined-and-silent, and the flip-side repair belongs to the
+// migration machinery, not here.
+func (e *Engine) rebuildDivergedCopy(slot int32, leaderTail uint64) {
+	e.divMu.Lock()
+	if _, busy := e.rebuildTarget[slot]; busy {
+		e.divMu.Unlock()
+		return // a refetch is already running for this fork
+	}
+	// A chain break copied from a POISONED source re-forms in the rebuilt
+	// copy (the replay walks the same foreign frame): cap whole-history
+	// refetches so a broken slot cannot livelock the repairer. Past the cap
+	// the copy stays quarantined — it cannot gate the watermark, and the
+	// log line tells the operator which slot needs a placement intervention.
+	e.rebuildAttempts[slot]++
+	if e.rebuildAttempts[slot] > 3 {
+		e.divMu.Unlock()
+		e.logger.Error("divergence repair: rebuild budget exhausted; the copy stays quarantined (the source likely carries the broken chain — move leadership off it or restore the replica)",
+			"slot", slot, "attempts", e.rebuildAttempts[slot])
+		return
+	}
+	e.divMu.Unlock()
+	if e.Leads(slot) {
+		return // guard rail, see the comment
+	}
+	if err := e.store.DropSlot(slot); err != nil {
+		e.logger.Warn("divergence repair: could not discard the forked copy; it stays quarantined",
+			"slot", slot, "err", err)
+		return
+	}
+	e.divMu.Lock()
+	e.rebuildTarget[slot] = leaderTail
+	e.divMu.Unlock()
+	e.logger.Warn("divergence repair: forked copy discarded, refetching the slot from seq 1",
+		"slot", slot, "leader_tail", leaderTail)
+}
+
+// healRebuiltCopy lifts the quarantine once the refetched copy holds the
+// leader's tail the discard was taken at. Reporting resumes with the NEXT
+// round (applyItem re-checks isDiverged after this), and the copy re-enters
+// the leader's ISR view as a byte-identical replica.
+func (e *Engine) healRebuiltCopy(slot int32) {
+	e.divMu.Lock()
+	defer e.divMu.Unlock()
+	tgt, ok := e.rebuildTarget[slot]
+	if !ok {
+		return
+	}
+	// LEO parity alone is NOT healed: the dg8 class rebuilds a byte-faithful
+	// copy of a chain-broken source and reaches the tail while still unable
+	// to read thousands of records behind one foreign frame. Lift the latch
+	// only when the rebuilt copy is also chain-sound.
+	if e.store.LastSeqOf(slot) >= tgt && len(e.store.StalledAggs(slot)) == 0 {
+		delete(e.rebuildTarget, slot)
+		delete(e.diverged, slot)
+		e.logger.Info("divergence repair: rebuilt copy caught the leader's tail, quarantine lifted",
+			"slot", slot, "tail", tgt)
+	}
+}
+
 func (e *Engine) noteDivergence(slot int32, seqs []uint64) {
 	e.divMu.Lock()
 	_, had := e.diverged[slot]
@@ -3929,6 +4178,11 @@ func (e *Engine) RunController(ctx context.Context) {
 		if !e.node.IsLeader() {
 			continue
 		}
+		// A drain marked while the rebalancer slept (interval 0) has no
+		// loop to run its handover rounds; this leader-gated tick is the
+		// wake point that gives one — including after a controller change,
+		// where the new leader never saw the DELETE at all.
+		e.wakeDrainRunner()
 		// 1) sync directory from raft membership: every voter (including
 		// ourselves and bootstrapped-but-unregistered peers) gets a join
 		// command. PeerAddr is authoritative from the raft configuration;

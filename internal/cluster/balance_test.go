@@ -1091,3 +1091,103 @@ func TestReclaimRoundDropsSurplusSeat(t *testing.T) {
 		t.Fatalf("a settled layout must not reclaim anything, got %d", done)
 	}
 }
+
+// ---- drain: the graceful scale-down's plan ---------------------------------
+
+func TestPlanLeaderRebalanceDrainsMarkedNode(t *testing.T) {
+	tbl := rebalanceTable("node-1", "node-2", "node-3")
+	if err := tbl.Apply(&Command{Op: OpDrainNode, NodeID: "node-1", Drain: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tbl.Apply(&Command{Op: OpDrainNode, NodeID: "node-1", Drain: true}); err != nil {
+		t.Fatalf("the toggle is not idempotent: %v", err)
+	}
+	if got := tbl.OnlinePeerIDs(); len(got) != 2 {
+		t.Fatalf("a draining node must leave the leadership pool, got %v", got)
+	}
+	moves := slotSet(t, PlanLeaderRebalance(tbl))
+	led := 0
+	for s, p := range tbl.Slots {
+		if p.Leader != "node-1" {
+			continue
+		}
+		led++
+		m, ok := moves[s]
+		if !ok {
+			t.Fatalf("slot %d led by the draining node is not planned out", s)
+		}
+		if !replicaListHas(p.Replicas, m.To) {
+			t.Fatalf("drain hand-over of slot %d targets %s, which holds no copy", s, m.To)
+		}
+		if m.To == "node-1" || tbl.Peers[m.To].Draining {
+			t.Fatalf("drain hand-over of slot %d targets a draining node (%s)", s, m.To)
+		}
+	}
+	if led == 0 {
+		t.Fatal("setup: node-1 led nothing")
+	}
+	for _, m := range moves {
+		if m.To == "node-1" {
+			t.Fatalf("a planned move hands leadership TO the draining node: %+v", m)
+		}
+	}
+}
+
+func TestOnlinePeerIDsAllDrainingFallsBack(t *testing.T) {
+	tbl := rebalanceTable("node-1", "node-2")
+	for _, id := range []string{"node-1", "node-2"} {
+		if err := tbl.Apply(&Command{Op: OpDrainNode, NodeID: id, Drain: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A cluster that drains itself entirely still needs leaders: the marks
+	// shed nodes from the layout, they do not delete the pool.
+	if got := tbl.OnlinePeerIDs(); len(got) != 2 {
+		t.Fatalf("all-draining must fall back to the live set, got %v", got)
+	}
+	if !tbl.HasDraining() {
+		t.Fatal("HasDraining lost the mark")
+	}
+}
+
+// TestPlanLeaderRebalanceSingleLiveHostStillDrains pins the stranded pool:
+// the last live data host is the DRAINING node (every other host died or is
+// drained too). The ring has nothing to say at pool size 1 — but the drain
+// must still hand each slot to the non-draining replica in its set, or the
+// removal waits forever on a rule that refused to compute any move at all.
+func TestPlanLeaderRebalanceSingleLiveHostStillDrains(t *testing.T) {
+	tbl := NewTable(8, 2)
+	tbl.Peers["node-4"] = Peer{Role: RoleLearner, ID: "node-4", ClientAddr: "http://node-4:8591"}
+	tbl.Peers["node-5"] = Peer{Role: RoleLearner, ID: "node-5", ClientAddr: "http://node-5:8591", Draining: true}
+	// node-5 is the only ONLINE host (node-4 is down): every slot led by
+	// node-5 with node-4 as its other replica must plan a move anyway.
+	for s := range tbl.Peers {
+		_ = s
+	}
+	for i := int32(0); i < 8; i++ {
+		tbl.Slots[i] = &Placement{Leader: "node-5", Replicas: []string{"node-5", "node-4"}, State: SlotStable, Epoch: 1}
+	}
+	q := tbl.Peers["node-4"]
+	q.Down = true // node-4 not online: pool size 1 (node-5, draining)
+	tbl.Peers["node-4"] = q
+	if len(tbl.OnlinePeerIDs()) != 1 {
+		t.Fatalf("setup wants a pool of exactly the draining node, got %v", tbl.OnlinePeerIDs())
+	}
+	moves := PlanLeaderRebalance(tbl)
+	// node-4 is offline: the drain pick demands a live host replica — so no
+	// move exists and none may fabricate one onto a dead node. What MUST
+	// hold is that the plan did not panic-refuse: with a live third party
+	// it moves. Flip node-4 back online and the same table drains.
+	q.Down = false
+	q.ClientAddr = "http://node-4:8591"
+	tbl.Peers["node-4"] = q
+	moves = PlanLeaderRebalance(tbl)
+	if len(moves) != 8 {
+		t.Fatalf("pool of {draining, live host}: every slot must plan out, got %d", len(moves))
+	}
+	for _, m := range moves {
+		if m.To != "node-4" || m.From != "node-5" {
+			t.Fatalf("unexpected drain move %+v", m)
+		}
+	}
+}

@@ -146,7 +146,7 @@ func TestCatchUpGateAcceptsInvisibleRecords(t *testing.T) {
 	// and the fence's tail push do. The records counted by that LEO are on the
 	// target's disk; its DIRECTORY is short, which is the part an LEO-only
 	// comparison cannot see.
-	if err := src.pushFencedTail(ctx, slot, srcLEO); err != nil {
+	if err := src.pushFencedTail(ctx, slot, srcLEO, ""); err != nil {
 		t.Fatalf("pushFencedTail: %v", err)
 	}
 	if got := tgtStore.LastSeqOf(slot); got != srcLEO {

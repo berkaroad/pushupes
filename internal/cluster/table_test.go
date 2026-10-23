@@ -350,3 +350,95 @@ func TestClusterGenerationComesFromTheReplicatedState(t *testing.T) {
 		t.Fatalf("owner stamp = %+v, want the replicated generation and the seat", rec)
 	}
 }
+
+// ---- drain mark: the layout roles it forbids (scale-down semantics) --------
+
+// TestDrainMarkExcludesFromLayoutRoles pins what "a draining node takes no
+// part in rebalance" means at the table: no leadership may be MOVED ONTO it
+// and no replica seat may be staged on it, while moving a slot OFF it stays
+// legal (that is the drain working). The candidate pools agree: plan/replan
+// never seat new copies on it, but the pool is never allowed to be empty.
+func TestDrainMarkExcludesFromLayoutRoles(t *testing.T) {
+	tbl := rebalanceTable("node-1", "node-2", "node-3")
+	if err := tbl.Apply(&Command{Op: OpDrainNode, NodeID: "node-2", Drain: true, ThenRemove: true}); err != nil {
+		t.Fatal(err)
+	}
+	p := tbl.Peers["node-2"]
+	if !p.Draining || !p.PendingRemove {
+		t.Fatalf("DELETE's drain mark must carry the removal intent: %+v", p)
+	}
+	// leader_move INTO the draining node: refused.
+	if err := tbl.Apply(&Command{Op: OpLeaderMove, Slots: []int32{0}, NewLeader: "node-2"}); err == nil {
+		t.Fatal("leadership was moved onto a draining node")
+	}
+	// slot_add_replica ONTO the draining node: refused.
+	if err := tbl.Apply(&Command{Op: OpSlotAddReplica, Slots: []int32{0}, NodeID: "node-2"}); err == nil {
+		t.Fatal("a replica seat was staged on a draining node")
+	}
+	// Moving a slot OFF it: legal — that is the drain itself.
+	led := int32(-1)
+	for s, pl := range tbl.Slots {
+		if pl.Leader == "node-2" {
+			led = s
+			break
+		}
+	}
+	if led < 0 {
+		t.Fatal("setup: node-2 led nothing")
+	}
+	if err := tbl.Apply(&Command{Op: OpLeaderMove, Slots: []int32{led}, NewLeader: "node-3"}); err != nil {
+		t.Fatalf("moving leadership off the draining node must stay legal: %v", err)
+	}
+	// The plan pool excludes it; a fully-marked pool falls back rather than
+	// planning onto nothing.
+	if got := tbl.planCandidates(); containsNode(got, "node-2") {
+		t.Fatalf("planCandidates kept the draining node: %v", got)
+	}
+	for id := range tbl.Peers {
+		q := tbl.Peers[id]
+		q.Draining = true
+		tbl.Peers[id] = q
+	}
+	if got := tbl.planCandidates(); len(got) != len(tbl.Peers) {
+		t.Fatalf("all-marked pool must fall back to the directory, got %v", got)
+	}
+}
+
+// TestRejoinClearsDrainMarks pins the other half of the lifecycle: the
+// marks are a removal request, and re-admitting the node IS how an operator
+// withdraws it. join_node over an existing entry clears both.
+func TestRejoinClearsDrainMarks(t *testing.T) {
+	tbl := rebalanceTable("node-1", "node-2")
+	if err := tbl.Apply(&Command{Op: OpDrainNode, NodeID: "node-2", Drain: true, ThenRemove: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tbl.Apply(&Command{Op: OpJoinNode, Peer: &Peer{ID: "node-2", Role: RoleLearner,
+		PeerAddr: "http://node-2:8591", AdminAddr: "http://node-2:8591", ClientAddr: "http://node-2:8591"}}); err != nil {
+		t.Fatal(err)
+	}
+	p := tbl.Peers["node-2"]
+	if p.Draining || p.PendingRemove {
+		t.Fatalf("a re-admission must withdraw the drain and the removal intent: %+v", p)
+	}
+}
+
+// TestBackupLeaderRanksDrainingLast pins failover's order among live
+// replicas: a draining node can still receive leadership when it is ALL
+// that is alive (a stranded slot starves), but never while a non-draining
+// live replica exists to take it.
+func TestBackupLeaderRanksDrainingLast(t *testing.T) {
+	tbl := rebalanceTable("node-1", "node-2", "node-3")
+	pl := &Placement{Leader: "node-1", Replicas: []string{"node-1", "node-2", "node-3"}}
+	q := tbl.Peers["node-3"]
+	q.Draining = true
+	tbl.Peers["node-3"] = q
+	if got := tbl.backupLeaderFor(pl, "node-1"); got != "node-2" {
+		t.Fatalf("a live non-draining replica must win the pick, got %q", got)
+	}
+	q2 := tbl.Peers["node-2"]
+	q2.Draining = true
+	tbl.Peers["node-2"] = q2
+	if got := tbl.backupLeaderFor(pl, "node-1"); got != "node-2" {
+		t.Fatalf("with every live replica draining, one of them must still take the slot, got %q", got)
+	}
+}

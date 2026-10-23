@@ -1470,9 +1470,15 @@ func (x *SlotLeoResponse) GetDurableLeo() uint64 {
 
 // FenceSlotRequest freezes one migrating slot on its source leader. The reply
 // carries the frozen LEO the target has confirmed.
+// target is the migration target the CONTROLLER committed to: the source
+// ships its frozen tail there on the controller's explicit instruction,
+// because the source's own table may still be catching up on the stage when
+// the fence RPC lands (the controller awaits only its own apply). Empty
+// target falls back to the source's table view.
 type FenceSlotRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Slot          int32                  `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
+	Target        string                 `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1512,6 +1518,13 @@ func (x *FenceSlotRequest) GetSlot() int32 {
 		return x.Slot
 	}
 	return 0
+}
+
+func (x *FenceSlotRequest) GetTarget() string {
+	if x != nil {
+		return x.Target
+	}
+	return ""
 }
 
 type FenceSlotResponse struct {
@@ -1851,9 +1864,10 @@ const file_pushupes_v1_peer_proto_rawDesc = "" +
 	"resolvable\x18\x04 \x01(\x04R\n" +
 	"resolvable\x12\x1f\n" +
 	"\vdurable_leo\x18\x05 \x01(\x04R\n" +
-	"durableLeo\"&\n" +
+	"durableLeo\">\n" +
 	"\x10FenceSlotRequest\x12\x12\n" +
-	"\x04slot\x18\x01 \x01(\x05R\x04slot\"%\n" +
+	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x16\n" +
+	"\x06target\x18\x02 \x01(\tR\x06target\"%\n" +
 	"\x11FenceSlotResponse\x12\x10\n" +
 	"\x03leo\x18\x01 \x01(\x04R\x03leo\"'\n" +
 	"\x11SlotLeaderRequest\x12\x12\n" +

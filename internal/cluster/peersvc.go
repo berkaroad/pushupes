@@ -202,7 +202,7 @@ func (s *peerServer) SlotLeo(_ context.Context, req *pushupesv1.SlotLeoRequest) 
 }
 
 func (s *peerServer) FenceSlot(ctx context.Context, req *pushupesv1.FenceSlotRequest) (*pushupesv1.FenceSlotResponse, error) {
-	leo, err := s.e.HandleFenceSlot(ctx, req.Slot)
+	leo, err := s.e.HandleFenceSlot(ctx, req.Slot, req.GetTarget())
 	if err != nil {
 		return nil, err
 	}
@@ -405,12 +405,12 @@ func (e *Engine) remoteSlotState(ctx context.Context, addr string, slot int32) (
 
 // peerFence asks a peer (the migration source) to take the commit fence for a
 // slot and returns the frozen LEO it confirmed the target holds.
-func (e *Engine) peerFence(ctx context.Context, addr string, slot int32) (uint64, error) {
+func (e *Engine) peerFence(ctx context.Context, addr string, slot int32, target string) (uint64, error) {
 	c, err := e.peerRPC(addr)
 	if err != nil {
 		return 0, err
 	}
-	resp, err := c.FenceSlot(ctx, &pushupesv1.FenceSlotRequest{Slot: slot})
+	resp, err := c.FenceSlot(ctx, &pushupesv1.FenceSlotRequest{Slot: slot, Target: target})
 	if err != nil {
 		return 0, err
 	}

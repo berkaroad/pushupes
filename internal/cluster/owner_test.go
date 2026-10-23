@@ -334,3 +334,69 @@ func TestApplyStampsNewLeaderRecordSynchronously(t *testing.T) {
 		t.Fatalf("stamped record = %+v, wants the live placement", owner)
 	}
 }
+
+// TestCorruptOwnerRecordIsRestampedFromTheTable pins the repair rule: with
+// the placement as the proof, bytes that no longer parse are evidence of
+// nothing — a member slot in an admitted dir is stamped over from the table
+// instead of being fenced forever. (This is the shape the old concurrent
+// writeOwner race left behind: two JSON objects concatenated into one
+// owner.json by writers sharing a fixed temp name.)
+func TestCorruptOwnerRecordIsRestampedFromTheTable(t *testing.T) {
+	e, st := newTestEngine(t, "node-1")
+	join(t, e, "node-1", "127.0.0.1:1")
+	e.tableMu.Lock()
+	e.table.Slots[2] = &Placement{Leader: "node-1", Replicas: []string{"node-1"}, Epoch: 1, State: SlotStable}
+	e.tableMu.Unlock()
+	agg2 := aggForSlot(t, e, 2)
+	if err := st.AppendAtSeq(2, 1, ownerRecord(agg2, 1, "cmd-2")); err != nil {
+		t.Fatal(err)
+	}
+	e.refreshOwners()
+	if e.slotPending(2) {
+		t.Fatal("setup: fresh copy fenced")
+	}
+	// Corrupt the record the way interleaved writers used to: one whole
+	// JSON object plus the tail of a second.
+	bad := []byte(`{"topology":"x","leader":"node-1","epoch":1}{"topology":"y"`)
+	if err := os.WriteFile(ownerPath(st.SlotDir(2)), bad, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.refreshOwners()
+	if e.slotPending(2) {
+		t.Fatal("a corrupt record fenced a slot the placement proves")
+	}
+	if o, has, err := readOwner(st.SlotDir(2)); !has || err != nil || o.Topology != e.topologyID() {
+		t.Fatalf("the corrupt bytes were not replaced by the table's record: %+v has=%v err=%v", o, has, err)
+	}
+}
+
+// TestWriteOwnerConcurrentNoGarbage drives the two writers that share a
+// slot during a hand-over wave (the apply-path stamp and the fence loop)
+// and demands the record parse on EVERY round — the old fixed temp name
+// produced interleaved half-and-half files here.
+func TestWriteOwnerConcurrentNoGarbage(t *testing.T) {
+	dir := t.TempDir()
+	done := make(chan struct{}, 64)
+	for k := 0; k < 32; k++ {
+		go func(k int) {
+			defer func() { done <- struct{}{} }()
+			for r := 0; r < 20; r++ {
+				o := slotOwner{Topology: fmt.Sprintf("gen-%d-%d", k, r), Leader: "node-1", Epoch: int64(r)}
+				if err := writeOwner(dir, o); err != nil {
+					t.Errorf("writeOwner: %v", err)
+					return
+				}
+				if o2, has, err := readOwner(dir); err != nil || !has {
+					t.Errorf("record unreadable mid-race: has=%v err=%v", has, err)
+					return
+				} else if !strings.HasPrefix(o2.Topology, "gen-") {
+					t.Errorf("garbage record: %+v", o2)
+					return
+				}
+			}
+		}(k)
+	}
+	for k := 0; k < 32; k++ {
+		<-done
+	}
+}

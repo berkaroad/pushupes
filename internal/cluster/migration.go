@@ -152,11 +152,37 @@ func (e *Engine) commitMigration(ctx context.Context, slot int32, toNode string)
 	// offset. The fence stays held until the move (or a rollback) is applied and
 	// self-releases on a bound. A failure here aborts cleanly: the source stays
 	// leader and the slot returns to stable.
-	if _, err := e.fenceSource(ctx, from, slot); err != nil {
+	// A source the directory already declares OFFLINE has no writer to
+	// fence: its process is gone (or it is cut off with no client that can
+	// still reach it), so the push would just burn the full RPC timeout
+	// before aborting the commit — the drain of a crashed node would crawl
+	// at one backoff-cycle per slot. Skip the push and move on: the epoch
+	// bump on leader_move is the fence a live-but-partitioned source would
+	// have needed, and a dead one cannot write through it anyway.
+	if pe, known := e.TableSnapshot().Peers[from]; known && pe.Offline() {
+		if err := e.submit(&Command{Op: OpLeaderMove, Slots: []int32{slot}, NewLeader: toNode}); err != nil {
+			e.rollbackMigration(slot)
+			return fmt.Errorf("commit(dead source): %w", err)
+		}
+		if err := e.awaitApplied(ctx, handoverStageTimeout); err != nil {
+			return err
+		}
+		e.logger.Info("handover committed against an offline source: no writer to fence",
+			"slot", slot, "from", from, "to", toNode, "op", OpLeaderMove)
+		return nil
+	}
+	frozenLEO, err := e.fenceSource(ctx, from, slot, toNode)
+	if err != nil {
 		e.rollbackMigration(slot)
 		return fmt.Errorf("fence: %w", err)
 	}
-	if err := e.submit(&Command{Op: OpLeaderMove, Slots: []int32{slot}, NewLeader: toNode}); err != nil {
+	// The commit carries the tail the fence froze and confirmed: every node
+	// records it as the slot's commit floor (Table.CommitLEO), and the new
+	// leader refuses to serve the slot until its own copy has reached it.
+	// Without that floor a freshly promoted leader whose fetch is one record
+	// behind answers a client version conflict for a record the previous
+	// leader acknowledged — the residual 1001, and the seed of a fork.
+	if err := e.submit(&Command{Op: OpLeaderMove, Slots: []int32{slot}, NewLeader: toNode, CommitLEO: frozenLEO}); err != nil {
 		e.rollbackMigration(slot)
 		return fmt.Errorf("commit: %w", err)
 	}
@@ -190,6 +216,12 @@ func (e *Engine) commitMigration(ctx context.Context, slot int32, toNode string)
 // endpoint); the rebalance loop runs the same steps across rounds instead of
 // blocking, so a slow catch-up costs it a round rather than a request.
 func (e *Engine) MigrateSlot(ctx context.Context, slot int32, toNode string) error {
+	// A draining node never receives a handover — it is on its way out and
+	// the data would only have to move again (the table apply rejects such
+	// commands too; refusing here gives the operator a clean 400).
+	if pe, ok := e.TableSnapshot().Peers[toNode]; ok && pe.Draining {
+		return fmt.Errorf("%w: target %s is draining", ErrBadMember, toNode)
+	}
 	// Hold the in-flight mark for the whole handover. Its seat is not the ring
 	// plan's prescription for this slot (an operator may name any node), so the
 	// surplus-seat reclaim would otherwise treat the copy the handover is

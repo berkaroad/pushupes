@@ -48,15 +48,6 @@ const DefaultAdoptInterval = 3 * time.Second
 // address already in use, removing the last voter).
 var ErrBadMember = errors.New("cluster: invalid membership change")
 
-// ErrOnlineMember is a refused removal: the target still serves clients — it
-// announced its client address and the controller has not marked it down — so
-// the operator has to take it offline first. Removal is reserved for dead
-// members precisely because a live one holds slot leadership and replica seats
-// the cluster is using; evicting it through the raft configuration would move
-// clients onto whatever the reconciler picks next, instead of onto a placement
-// the operator chose.
-var ErrOnlineMember = errors.New("cluster: node is online; only offline members can be removed")
-
 // AddMember adds a node to the running cluster. It is controller-only: a
 // follower refuses with a *NotControllerError naming the controller, so the
 // caller retries there (the admin plane never forwards commands).
@@ -66,6 +57,21 @@ var ErrOnlineMember = errors.New("cluster: node is online; only offline members 
 // a member announces those itself through the ordinary registration protocol
 // once it is in the configuration.
 func (e *Engine) AddMember(ctx context.Context, id, peerAddr, role string) error {
+	return e.admitMember(ctx, id, peerAddr, role, true)
+}
+
+// AdmitSelf is the adoption path — a node offering ITSELF at startup. It is
+// the same directory admission minus one power: a self-offer never withdraws
+// a drain. The removal was the operator's call (the DELETE that marked it);
+// a node rebooting into its own scale-down must not cancel it by coming
+// back — that would make every drain racing a restart loop forever. Only
+// the operator's AddMember (admin endpoint, console button, cluster.sh join)
+// says "keep this one after all".
+func (e *Engine) AdmitSelf(ctx context.Context, id, peerAddr, role string) error {
+	return e.admitMember(ctx, id, peerAddr, role, false)
+}
+
+func (e *Engine) admitMember(ctx context.Context, id, peerAddr, role string, withdraw bool) error {
 	if e.node == nil {
 		return &NotControllerError{}
 	}
@@ -79,8 +85,34 @@ func (e *Engine) AddMember(ctx context.Context, id, peerAddr, role string) error
 		// Learner admission is a replicated DIRECTORY command: the raft
 		// configuration never names a learner, and the layout pool takes it
 		// from the entry's role (see Table.HostingIDs). Idempotent on the
-		// directory: a re-admission of the same live entry is a no-op.
+		// directory: a re-admission of the same clean entry is a no-op — but
+		// a re-admission of a DRAINING entry is the withdrawal of the
+		// scale-down itself (the DELETE pipeline has no other cancel), so it
+		// must commit: join_node over the entry, both marks cleared, the
+		// announced addresses kept (they are the node's own registration;
+		// dropping them here would blind the layout until the next
+		// heartbeat re-announces).
 		if p, ok := e.TableSnapshot().Peers[id]; ok && p.Role == RoleLearner {
+			if !p.Draining && !p.PendingRemove {
+				return nil
+			}
+			if !withdraw {
+				return nil // self-offer: the marks (and the removal riding them) stand
+			}
+			back := p
+			back.Draining = false
+			back.PendingRemove = false
+			if back.PeerAddr == "" {
+				back.PeerAddr = NormalizeAddr(peerAddr)
+			}
+			if err := e.submit(&Command{Op: OpJoinNode, Peer: &back}); err != nil {
+				if errors.Is(err, ErrNotLeader) {
+					cid, caddr := e.Controller()
+					return &NotControllerError{LeaderID: cid, AdminAddr: caddr}
+				}
+				return err
+			}
+			e.loggerf("node %s re-admitted: drain and removal marks withdrawn, it serves again", id)
 			return nil
 		}
 		if e.node.IsMember(id) {
@@ -123,33 +155,110 @@ func (e *Engine) AddMember(ctx context.Context, id, peerAddr, role string) error
 	return nil
 }
 
-// RemoveMember drops a node from the running cluster. Controller-only, like
-// AddMember. Only an offline member can go: a node the peer directory still
-// marks reachable (ErrOnlineMember) must be taken offline first, so removal is
-// the operator's cleanup of a dead member, never a way to reshuffle live
-// placements. The peer directory entry, its slots' leadership and its replica
-// seats are reconciled by the ordinary controller loop (and the rebalancer)
-// once the configuration change commits.
-func (e *Engine) RemoveMember(ctx context.Context, id string) error {
+// RemoveMember is the scale-down in ONE command, and the drain-first,
+// remove-second order runs entirely server-side. Whether the node is up or
+// dead is never asked: the directory plus the slot table is the whole truth,
+// and the removal pipeline is the same for both — DELETE starts the drain
+// (the drain mark takes the node out of every layout role: no new leader, no
+// new seat, no migration target, and no reads/writes ROUTED TO IT as such —
+// while the slots it still leads serve normally until each handover commits,
+// which is what keeps running clients uninterrupted across the whole
+// window), and the rebalancer's drain rounds — which run even when the
+// operator turned rebalancing off, because a drain is what they exist for —
+// move the leadership out. The moment the node leads nothing and holds no
+// slot mid-handover, the removal commits: its raft configuration (voters)
+// and its directory entry. The intent to remove at that point rides the
+// table (Peer.PendingRemove, second field of the same drain_node command),
+// so a controller change mid-drain resumes the job instead of losing it, and
+// a re-admission of the node (join_node) clears both marks — bringing a node
+// back is exactly how an operator cancels its removal.
+//
+// Return values: "removed" when the node is out of the cluster (this call
+// committed it), "draining" while handovers are in flight. A repeat DELETE
+// during the drain is a progress report, not a new command.
+func (e *Engine) RemoveMember(ctx context.Context, id string) (string, error) {
 	if e.node == nil {
-		return &NotControllerError{}
+		return "", &NotControllerError{}
 	}
 	if id == "" {
-		return fmt.Errorf("%w: id is required", ErrBadMember)
+		return "", fmt.Errorf("%w: id is required", ErrBadMember)
 	}
-	p, inDir := e.TableSnapshot().Peers[id]
+	tbl := e.TableSnapshot()
+	p, inDir := tbl.Peers[id]
 	if !e.node.IsMember(id) {
 		if !inDir {
-			return nil // already gone: idempotent
+			return "removed", nil // already gone: idempotent
 		}
 		if p.Role != RoleLearner {
-			return nil // in the directory only as an unseeded name: the voter sync owns it
+			return "removed", nil // an unseeded name only: the voter sync owns it
 		}
-		// A learner revocation is a directory leave (no raft configuration
-		// change). The online guard is the same rule as for voters: a live
-		// learner holds seats the cluster is using.
-		if !p.Offline() {
-			return fmt.Errorf("%w: %s", ErrOnlineMember, id)
+	}
+	leading, inflight := e.drainProgress(tbl, id)
+	if leading == 0 && inflight == 0 {
+		if err := e.finishRemoval(ctx, id); err != nil {
+			return "", err
+		}
+		return "removed", nil
+	}
+	// Still holds work: mark the drain (idempotent — a node already marked
+	// just reports progress). The mark excludes it from the layout pools;
+	// the drain rounds the rebalancer runs do the moving.
+	if p.Draining && p.PendingRemove {
+		return "draining", nil
+	}
+	if err := e.submit(&Command{Op: OpDrainNode, NodeID: id, Drain: true, ThenRemove: true}); err != nil {
+		if errors.Is(err, ErrNotLeader) {
+			cid, caddr := e.Controller()
+			return "", &NotControllerError{LeaderID: cid, AdminAddr: caddr}
+		}
+		return "", err
+	}
+	e.loggerf("node %s draining (%d leading slots, %d mid-handover) before removal; it no longer takes part in the layout",
+		id, leading, inflight)
+	return "draining", nil
+}
+
+// DrainProgressOf reports how much of the slot table still ties to a node —
+// the same count the removal pipeline and the admin DELETE read to answer
+// "drained yet?" without either re-deriving it.
+func (e *Engine) DrainProgressOf(id string) (leading, inflight int) {
+	return e.drainProgress(e.TableSnapshot(), id)
+}
+
+// drainProgress counts what still ties the slot table to a node: slots it
+// leads and slots whose migration involves it (staging, importing, backing
+// up). A handover that commits in several commands keeps the count above
+// zero between steps by design — the removal must not race the last data
+// copy it is waiting on.
+func (e *Engine) drainProgress(tbl *Table, id string) (leading, inflight int) {
+	for _, pl := range tbl.Slots {
+		if pl == nil {
+			continue
+		}
+		if pl.Leader == id {
+			if pl.State == SlotStable {
+				leading++
+			} else {
+				inflight++
+			}
+			continue
+		}
+		if pl.State != SlotStable && containsNode(pl.Replicas, id) {
+			inflight++
+		}
+	}
+	return leading, inflight
+}
+
+// finishRemoval commits the formal removal of a drained (or empty) node: the
+// raft configuration change for voters, the directory leave for everyone.
+// The online question is gone on purpose — the drain already moved whatever
+// the node held; a live process with no slots left has nothing to disrupt.
+func (e *Engine) finishRemoval(ctx context.Context, id string) error {
+	p, inDir := e.TableSnapshot().Peers[id]
+	if !e.node.IsMember(id) {
+		if !inDir || p.Role != RoleLearner {
+			return nil // nothing to do (idempotent, or a voter name the sync owns)
 		}
 		if err := e.submit(&Command{Op: OpLeaveNode, NodeID: id}); err != nil {
 			if errors.Is(err, ErrNotLeader) {
@@ -161,9 +270,6 @@ func (e *Engine) RemoveMember(ctx context.Context, id string) error {
 		e.loggerf("learner %s revoked from the directory; its seats re-plan to the remaining holders", id)
 		return nil
 	}
-	if inDir && !p.Offline() {
-		return fmt.Errorf("%w: %s", ErrOnlineMember, id)
-	}
 	if err := e.node.RemoveMember(id, AddMemberTimeout); err != nil {
 		if errors.Is(err, raft.ErrNotLeader) {
 			cid, caddr := e.Controller()
@@ -173,6 +279,15 @@ func (e *Engine) RemoveMember(ctx context.Context, id string) error {
 			return fmt.Errorf("%w: %v", ErrBadMember, err)
 		}
 		return err
+	}
+	if inDir {
+		if err := e.submit(&Command{Op: OpLeaveNode, NodeID: id}); err != nil {
+			if errors.Is(err, ErrNotLeader) {
+				cid, caddr := e.Controller()
+				return &NotControllerError{LeaderID: cid, AdminAddr: caddr}
+			}
+			return err
+		}
 	}
 	e.loggerf("member %s removed from the raft configuration; its slots fail over to live replicas", id)
 	return nil
@@ -328,9 +443,11 @@ func (e *Engine) acceptAdoption(ctx context.Context, ad *Adoption) error {
 	}
 	if e.node.IsLeader() {
 		if ad.Role == RoleLearner {
-			// Self-admission of a data-plane node: same directory command
-			// the admin endpoint posts (AddMember keeps one admission path).
-			return e.AddMember(ctx, ad.ID, ad.PeerAddr, RoleLearner)
+			// Self-admission of a data-plane node: the same directory
+			// command the admin endpoint posts, WITHOUT the withdraw power
+			// (see AdmitSelf: a rebooting node does not cancel its own
+			// scale-down).
+			return e.AdmitSelf(ctx, ad.ID, ad.PeerAddr, RoleLearner)
 		}
 		if e.node.IsMember(ad.ID) {
 			return nil

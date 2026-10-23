@@ -257,6 +257,18 @@ func (e *Engine) dropRetainedCopy(slot int32, gen uint64) {
 		e.forgetPendingDrop(slot, gen)
 		return
 	}
+	// TOCTOU: the surplus check above reads the applied table, and leadership
+	// can land on this node between that read and the drop (the callers that
+	// change the table run on other goroutines). Dropping here would destroy
+	// the copy of a slot this node now LEADS — the empty-leader state that
+	// answers version 0 to every client. Re-check under the same table lock
+	// the write path uses, immediately before the destructive call.
+	if e.Leads(slot) {
+		e.forgetPendingDrop(slot, gen)
+		e.logger.Warn("post-migration drop called off: this node leads the slot again",
+			"slot", slot, "op", "drop_race")
+		return
+	}
 	if err := e.store.DropSlot(slot); err != nil {
 		e.logger.Warn("post-migration drop failed", "slot", slot, "error", err)
 	} else {

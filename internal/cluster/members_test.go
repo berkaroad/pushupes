@@ -16,7 +16,6 @@ package cluster
 
 import (
 	"context"
-	"errors"
 	"net"
 	"testing"
 	"time"
@@ -100,9 +99,11 @@ func TestEngineAddRemoveMember(t *testing.T) {
 		t.Fatalf("repeat AddMember must be a no-op: %v", err)
 	}
 
-	// Remove it again.
-	if err := leEng.RemoveMember(ctx, "node-4"); err != nil {
-		t.Fatalf("RemoveMember: %v", err)
+	// Remove it again (a slot-less node drains trivially and is gone in one
+	// call — the drain pipeline only parks a DELETE that still has work).
+	status, err := leEng.RemoveMember(ctx, "node-4")
+	if err != nil || status != "removed" {
+		t.Fatalf("RemoveMember = (%q, %v), want removed", status, err)
 	}
 	deadline = time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -155,53 +156,147 @@ func TestAddMemberRejectsBadInput(t *testing.T) {
 		t.Fatal("AddMember reusing a member's address must be refused")
 	}
 	// A single-voter cluster cannot remove its last member.
-	if err := leEng.RemoveMember(ctx, leader); err == nil {
+	if _, err := leEng.RemoveMember(ctx, leader); err == nil {
 		t.Fatal("removing the last voter must be refused")
 	}
 }
 
-// TestRemoveMemberOnlyOffline pins the offline-only rule of the removal
-// surface: a member the peer directory still marks reachable is refused with
-// ErrOnlineMember before the raft change is even submitted, and the same
-// member becomes removable once the controller's mark_down verdict reaches
-// the table. This is the guard the console mirrors on the card button — the
-// backend is authoritative because the console's status snapshot is polled.
-func TestRemoveMemberOnlyOffline(t *testing.T) {
-	c := newTestRaftCluster(t, []string{"node-1", "node-2", "node-3"}, map[string]Applier{})
-	leader := c.waitLeader(15 * time.Second)
-	leEng, _ := newTestEngine(t, leader)
-	leEng.node = c.nodes[leader]
+// TestRemoveMemberDrainsThenRemoves pins the DELETE state machine: a node
+// that still leads slots is never evicted from under those writes — the
+// first call marks the drain (with the removal intent riding the same
+// table entry) and answers "draining"; the handovers keep serving clients
+// while they run; the moment the node is empty, finishPendingRemovals —
+// the drain rounds of the rebalancer, not a second operator call — commits
+// the removal. The online/offline question is gone from the whole path.
+func TestRemoveMemberDrainsThenRemoves(t *testing.T) {
+	e := newLeaderEngine(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	// A voter outside the three: added through the ordinary membership path
-	// (a real listener so the change commits without it).
-	added := testListenerAddr(t)
-	if err := leEng.AddMember(ctx, "node-4", added, RoleVoter); err != nil {
-		t.Fatalf("AddMember: %v", err)
+	// Two data-plane learners so the ring has somewhere to move TO.
+	for _, pair := range [][2]string{{"node-4", "127.0.0.1:9904"}, {"node-5", "127.0.0.1:9905"}} {
+		id, addr := pair[0], pair[1]
+		if err := e.AddMember(ctx, id, addr, RoleLearner); err != nil {
+			t.Fatalf("AddMember %s: %v", id, err)
+		}
+		join(t, e, id, addr)
 	}
-	// The directory learns it with a full registration (join sets all three
-	// plane addresses): online under Peer.Offline, so not removable.
-	join(t, leEng, "node-4", added)
-	err := leEng.RemoveMember(ctx, "node-4")
-	if !errors.Is(err, ErrOnlineMember) {
-		t.Fatalf("RemoveMember on an online member = %v, want ErrOnlineMember", err)
+	// Slot 0 led by node-4: this is the work the drain must move out.
+	tableWithLeaders(t, e, map[int32]string{0: "node-4"})
+
+	status, err := e.RemoveMember(ctx, "node-4")
+	if err != nil || status != "draining" {
+		t.Fatalf("RemoveMember(slots led) = (%q, %v), want draining", status, err)
+	}
+	p := e.TableSnapshot().Peers["node-4"]
+	if !p.Draining || !p.PendingRemove {
+		t.Fatalf("DELETE must mark drain+remove intent: %+v", p)
+	}
+	// A re-issued DELETE is a progress report, not a restarted pipeline.
+	if status, err = e.RemoveMember(ctx, "node-4"); err != nil || status != "draining" {
+		t.Fatalf("repeat RemoveMember = (%q, %v), want draining", status, err)
 	}
 
-	// The controller's liveness verdict flips it offline (the mark_down path
-	// keeps the directory entry and its addresses — the same state a dead
-	// node is left in). The guard now lets the removal through.
-	applyCmd(t, leEng, &Command{Op: OpMarkDown, NodeID: "node-4"})
-	if err := leEng.RemoveMember(ctx, "node-4"); err != nil {
-		t.Fatalf("RemoveMember on an offline member: %v", err)
+	// The handovers commit (what the rebalancer's drain rounds drive in
+	// production): EVERY slot the node led moves to the other data node —
+	// the drain only counts as done when the whole ledger is empty.
+	var led []int32
+	for sl, pl := range e.TableSnapshot().Slots {
+		if pl.Leader == "node-4" {
+			led = append(led, sl)
+		}
 	}
-	for _, id := range c.ids {
-		deadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(deadline) && c.nodes[id].IsMember("node-4") {
-			time.Sleep(20 * time.Millisecond)
-		}
-		if c.nodes[id].IsMember("node-4") {
-			t.Fatalf("%s still has node-4 as a member after removal", id)
-		}
+	if len(led) == 0 {
+		t.Fatal("setup: node-4 led nothing")
+	}
+	applyCmd(t, e, &Command{Op: OpLeaderMove, Slots: led, NewLeader: "node-5"})
+
+	// The removal now completes WITHOUT another DELETE: the drain round
+	// that finds the node empty executes the pending intent itself.
+	e.finishPendingRemovals(ctx)
+	if _, ok := e.TableSnapshot().Peers["node-4"]; ok {
+		t.Fatal("drained node with pending removal intent still in the directory")
+	}
+	if _, ok := e.TableSnapshot().Peers["node-5"]; !ok {
+		t.Fatal("the handover target vanished too")
+	}
+	if status, err := e.RemoveMember(ctx, "node-4"); err != nil || status != "removed" {
+		t.Fatalf("RemoveMember(gone node) = (%q, %v), want removed", status, err)
+	}
+}
+
+// TestReAdmissionWithdrawsDrain pins the cancel half of the scale-down at
+// the REAL entry point (AddMember, not a raw table apply): re-admitting a
+// draining learner must commit and clear both marks — an idempotent no-op
+// there would leave the node parked in a drain no operator asked to
+// continue. The announced addresses survive the withdrawal.
+func TestReAdmissionWithdrawsDrain(t *testing.T) {
+	e := newLeaderEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	addr := "127.0.0.1:9906"
+	if err := e.AddMember(ctx, "node-6", addr, RoleLearner); err != nil {
+		t.Fatal(err)
+	}
+	join(t, e, "node-6", addr)
+	tableWithLeaders(t, e, map[int32]string{0: "node-6"})
+	if _, err := e.RemoveMember(ctx, "node-6"); err != nil {
+		t.Fatal(err)
+	}
+	p := e.TableSnapshot().Peers["node-6"]
+	if !p.Draining || !p.PendingRemove {
+		t.Fatalf("setup: DELETE must have marked the drain: %+v", p)
+	}
+	// The operator changes their mind: the ordinary admission call IS the
+	// withdrawal.
+	if err := e.AddMember(ctx, "node-6", addr, RoleLearner); err != nil {
+		t.Fatalf("re-admission (withdrawal) failed: %v", err)
+	}
+	p = e.TableSnapshot().Peers["node-6"]
+	if p.Draining || p.PendingRemove {
+		t.Fatalf("re-admission must withdraw drain+removal: %+v", p)
+	}
+	if p.ClientAddr == "" {
+		t.Fatalf("the withdrawal must not drop the node's announced addresses: %+v", p)
+	}
+	// And a clean re-admission stays the no-op register_test pins.
+	before := commitIndexOf(t, e.node)
+	if err := e.AddMember(ctx, "node-6", addr, RoleLearner); err != nil {
+		t.Fatal(err)
+	}
+	if after := commitIndexOf(t, e.node); after != before {
+		t.Fatalf("clean re-admission must not commit: %d -> %d", before, after)
+	}
+}
+
+// TestSelfAdmissionNeverWithdrawsDrain pins the split: a node offering
+// itself (the adoption path a reboot walks) leaves the operator's drain
+// and removal marks standing — only the admin-plane admission withdraws.
+func TestSelfAdmissionNeverWithdrawsDrain(t *testing.T) {
+	e := newLeaderEngine(t)
+	ctx := context.Background()
+	addr := "127.0.0.1:9907"
+	if err := e.AddMember(ctx, "node-7", addr, RoleLearner); err != nil {
+		t.Fatal(err)
+	}
+	join(t, e, "node-7", addr)
+	tableWithLeaders(t, e, map[int32]string{0: "node-7"})
+	if _, err := e.RemoveMember(ctx, "node-7"); err != nil {
+		t.Fatal(err)
+	}
+	// The node reboots and offers itself: marks stand.
+	if err := e.AdmitSelf(ctx, "node-7", addr, RoleLearner); err != nil {
+		t.Fatal(err)
+	}
+	p := e.TableSnapshot().Peers["node-7"]
+	if !p.Draining || !p.PendingRemove {
+		t.Fatalf("self-admission must not withdraw the operator's removal: %+v", p)
+	}
+	// The operator's admission does.
+	if err := e.AddMember(ctx, "node-7", addr, RoleLearner); err != nil {
+		t.Fatal(err)
+	}
+	if p := e.TableSnapshot().Peers["node-7"]; p.Draining || p.PendingRemove {
+		t.Fatalf("admin re-admission must withdraw: %+v", p)
 	}
 }

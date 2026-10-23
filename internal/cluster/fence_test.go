@@ -158,7 +158,7 @@ func TestHandleFenceSlotPushesFrozenTailAndHoldsFence(t *testing.T) {
 		t.Fatalf("test setup: target must start empty, LEO %d", leo)
 	}
 
-	leo, err := src.HandleFenceSlot(context.Background(), 0)
+	leo, err := src.HandleFenceSlot(context.Background(), 0, "")
 	if err != nil {
 		t.Fatalf("fence: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestHandleFenceSlotAbortsOnUnreachableTarget(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := src.HandleFenceSlot(ctx, 0); err == nil {
+	if _, err := src.HandleFenceSlot(ctx, 0, ""); err == nil {
 		t.Fatal("an unreachable target must fail the fence, not report success")
 	}
 	// The failed fence must not stay held: writes must keep flowing.
@@ -331,8 +331,13 @@ func TestApplyFetchItemsQuarantinesOneSlotKeepsSession(t *testing.T) {
 	if leo := fdr.LastSeqOf(1); leo != 3 {
 		t.Fatalf("the unrelated slot must still replicate: LEO %d want 3", leo)
 	}
-	if leo := fdr.LastSeqOf(0); leo != 3 {
-		t.Fatalf("the forked slot must still land the records after the fork: LEO %d want 3", leo)
+	// The forked slot's fate changed with the repair story (see B,
+	// divergence_repair_test.go): a quarantined copy is now DISCARDED for a
+	// full refetch instead of being kept half-landed. What stays pinned here
+	// is the session-isolation property: the fork took down slot 0's copy,
+	// and slot 1's replication rode on unaffected.
+	if leo := fdr.LastSeqOf(0); leo != 0 {
+		t.Fatalf("the forked slot must be discarded for rebuild: LEO %d want 0", leo)
 	}
 }
 

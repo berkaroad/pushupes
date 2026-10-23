@@ -59,6 +59,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -222,12 +223,27 @@ func (e *Engine) stampPlacement(s int32, p *Placement) {
 	}
 	want := desiredOwner(topo, e.self, p)
 	dir := e.store.SlotDir(s)
+	// clearFence lifts this slot's local fence verdict NOW, in the apply
+	// path. The replicated table names self leader and the on-disk record
+	// is (or already was) the matching proof — both halves of what the
+	// fence loop would re-derive are in hand, and waiting for its next
+	// tick left every append to a freshly promoted slot answering 1007
+	// for up to a full tick: a 512-slot re-plan fenced whole seconds of
+	// client traffic (the err_1007 storm behind a scale-down).
+	clearFence := func() {
+		e.ownerMu.Lock()
+		delete(e.pendingOwners, s)
+		e.ownerMu.Unlock()
+	}
 	if cur, has, err := readOwner(dir); err == nil && has && cur == want {
+		clearFence()
 		return
 	}
 	if err := writeOwner(dir, want); err != nil {
 		e.logger.Warn("owner fence: apply-path stamp failed", "slot", s, "err", err)
+		return
 	}
+	clearFence()
 }
 
 // stampAppliedSlots is the ApplyCommand hook behind the apply-path promise:
@@ -302,18 +318,12 @@ func (e *Engine) strangerDir(topo string) bool {
 }
 
 func (e *Engine) writeAdmissionStamp(topo string) {
-	path := admissionPath(e.store.Dir)
 	b, err := json.Marshal(admission{Topology: topo})
 	if err != nil {
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	if err := writeFileSticky(admissionPath(e.store.Dir), b, e.store.Dir); err != nil {
 		e.logger.Warn("owner fence: admission stamp could not be written", "err", err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		e.logger.Warn("owner fence: admission stamp install failed", "err", err)
 	}
 }
 
@@ -341,14 +351,46 @@ func writeOwner(slotDir string, o slotOwner) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(slotDir, 0o755); err != nil {
+	return writeFileSticky(filepath.Join(slotDir, ownerFileName), b, slotDir)
+}
+
+// writeFileAtomic lands data at path through a uniquely named temp file in
+// dir, so concurrent writers of the same target each rename a COMPLETE file
+// (the last one wins — every reader sees one whole record, never two halves
+// of different ones). A fixed temp name would interleave: two writers, two
+// open(...TRUNC) at the same offset stream, one garbage file — and garbage
+// that reaches the target through rename fences a healthy slot forever. This
+// race was real: the apply-path stamp and the fence loop write the same
+// slots during a hand-over wave.
+func writeFileSticky(path string, b []byte, dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp := ownerPath(slotDir) + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, ownerPath(slotDir))
+	name := tmp.Name()
+	defer func() {
+		if err != nil {
+			os.Remove(name)
+		}
+	}()
+	if err = tmp.Chmod(0o644); err == nil {
+		_, err = tmp.Write(b)
+	}
+	if err == nil {
+		err = tmp.Close()
+	} else {
+		tmp.Close()
+	}
+	if err != nil {
+		return err
+	}
+	if err = os.Rename(name, path); err != nil {
+		os.Remove(name)
+	}
+	return err
 }
 
 // ---- engine wiring ----
@@ -438,6 +480,21 @@ func (e *Engine) refreshOwners() {
 		dir := e.store.SlotDir(slot)
 		owner, hasOwner, err := readOwner(dir)
 		if err != nil {
+			// A record that PARSES wrong is evidence of nothing — in a dir
+			// admitted to this generation the placement is the proof, so
+			// the corrupt bytes are re-stamped over and the slot keeps
+			// serving (the same verdict its absence would get). An I/O
+			// error says nothing about the bytes: hold the slot out of
+			// service, like the record's absence in a stranger dir would.
+			var syn *json.SyntaxError
+			var typeErr *json.UnmarshalTypeError
+			if !stranger && (errors.As(err, &syn) || errors.As(err, &typeErr)) {
+				e.logger.Warn("owner fence: corrupt record re-stamped from the table", "slot", slot, "err", err)
+				if err := writeOwner(dir, desiredOwner(topo, e.self, &p)); err != nil {
+					e.logger.Warn("owner fence: repair stamp failed", "slot", slot, "err", err)
+				}
+				continue
+			}
 			e.logger.Warn("owner fence: unreadable record; the slot stays out of service", "slot", slot, "err", err)
 			if p.Leader == e.self {
 				next[slot] = ownerReason("owner record unreadable: " + err.Error())
