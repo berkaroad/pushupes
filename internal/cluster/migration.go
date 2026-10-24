@@ -160,15 +160,31 @@ func (e *Engine) commitMigration(ctx context.Context, slot int32, toNode string)
 	// bump on leader_move is the fence a live-but-partitioned source would
 	// have needed, and a dead one cannot write through it anyway.
 	if pe, known := e.TableSnapshot().Peers[from]; known && pe.Offline() {
-		if err := e.submit(&Command{Op: OpLeaderMove, Slots: []int32{slot}, NewLeader: toNode}); err != nil {
+		// No writer to fence — but the commit is not blind: the live
+		// replicas (the target included) are asked for their durable LEO,
+		// and the best report becomes the floor. A target BELOW that bound
+		// does not get the slot: seating leadership on a copy that
+		// demonstrably lacks records only peers hold is how the empty-shell
+		// leader is born (its directory answers version 0; the fetch
+		// direction is inverted so it can never catch up from a replica).
+		// Roll the stage back and defer — the caller retries, and if the
+		// source returns the fenced path supplies its real frozen tail.
+		tail, targetLEO, ok := e.liveReplicaTail(ctx, slot, from, toNode)
+		if !ok || targetLEO < tail {
+			e.rollbackMigration(slot)
+			e.logger.Warn("handover deferred: offline-source commit would seat leadership on a copy behind the best live report",
+				"slot", slot, "from", from, "to", toNode, "target_leo", targetLEO, "live_tail", tail, "target_reached", ok, "op", "handover_deferred")
+			return fmt.Errorf("commit(dead source): target behind live copies (%d < %d)", targetLEO, tail)
+		}
+		if err := e.submit(&Command{Op: OpLeaderMove, Slots: []int32{slot}, NewLeader: toNode, CommitLEO: tail}); err != nil {
 			e.rollbackMigration(slot)
 			return fmt.Errorf("commit(dead source): %w", err)
 		}
 		if err := e.awaitApplied(ctx, handoverStageTimeout); err != nil {
 			return err
 		}
-		e.logger.Info("handover committed against an offline source: no writer to fence",
-			"slot", slot, "from", from, "to", toNode, "op", OpLeaderMove)
+		e.logger.Info("handover committed against an offline source: no writer to fence, the best live report is the floor",
+			"slot", slot, "from", from, "to", toNode, "floor", tail, "op", OpLeaderMove)
 		return nil
 	}
 	frozenLEO, err := e.fenceSource(ctx, from, slot, toNode)
@@ -548,6 +564,50 @@ func (e *Engine) awaitApplied(ctx context.Context, timeout time.Duration) error 
 // rollbackMigration returns a failed migration to stable.
 func (e *Engine) rollbackMigration(slot int32) {
 	_ = e.submit(&Command{Op: OpSlotState, Slots: []int32{slot}, State: SlotStable})
+}
+
+// liveReplicaTail asks the slot's live replicas for their durable LEO without
+// a source to fence: every replica but the dead one, the TARGET included (an
+// unreachable target answers ok=false — no evidence, no commit). Returns the
+// best report seen and the target's own; records acked past the best live
+// report died with the source and cannot be evidenced here — the bound is the
+// honest floor of what the cluster still holds.
+func (e *Engine) liveReplicaTail(ctx context.Context, slot int32, from, to string) (tail, target uint64, ok bool) {
+	tbl := e.TableSnapshot()
+	p, known := tbl.Slots[slot]
+	if !known {
+		return 0, 0, false
+	}
+	qctx, cancel := context.WithTimeout(ctx, failoverPickTimeout)
+	defer cancel()
+	ask := func(id string) (uint64, bool) {
+		if id == e.self {
+			return e.store.LastSeqOf(slot), true
+		}
+		pe, known := tbl.Peers[id]
+		if !known || pe.Offline() || pe.PeerAddr == "" {
+			return 0, false
+		}
+		leos, err := e.peerSlotLeos(qctx, pe.PeerAddr, []int32{slot})
+		if err != nil || len(leos) == 0 {
+			return 0, false
+		}
+		return leos[0], true
+	}
+	tv, ok := ask(to)
+	if !ok {
+		return 0, 0, false
+	}
+	best := tv
+	for _, r := range p.Replicas {
+		if r == from || r == to {
+			continue
+		}
+		if leo, ok := ask(r); ok && leo > best {
+			best = leo
+		}
+	}
+	return best, tv, true
 }
 
 // ---- Abandoned migrations ------------------------------------------------------

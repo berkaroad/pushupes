@@ -482,9 +482,12 @@ func TestFailoverPicksTheFreshestReplica(t *testing.T) {
 	ctrl.table.Slots[0].Replicas = []string{"node-2", "node-3", "node-4", "node-5"}
 	ctrl.tableMu.Unlock()
 
-	picks := ctrl.freshestReplicas("node-2")
+	picks, tails := ctrl.freshestReplicas("node-2")
 	if got := picks[0]; got != "node-3" {
 		t.Fatalf("freshest replica for slot 0 = %q, want node-3 (node-4 has less, node-5 is unreachable)", got)
+	}
+	if got := tails[0]; got != 5 {
+		t.Fatalf("freshness evidence for slot 0 = %d, want 5 (node-3 holds five records)", got)
 	}
 	ctrl.failoverPeer("node-2")
 	tbl := ctrl.TableSnapshot()
@@ -493,6 +496,11 @@ func TestFailoverPicksTheFreshestReplica(t *testing.T) {
 	}
 	if got := tbl.Slots[0].Leader; got != "node-3" {
 		t.Fatalf("slot 0 moved to %q, want the freshest replica node-3", got)
+	}
+	// The pick's evidence became the slot's commit floor on every node that
+	// applied the command: a later promotion of this slot is bounded there.
+	if got := tbl.CommitLEO[0]; got != 5 {
+		t.Fatalf("failover floor for slot 0 = %d, want 5 (the probe's best sighting)", got)
 	}
 }
 func TestFailoverPrefersTheControllersPick(t *testing.T) {

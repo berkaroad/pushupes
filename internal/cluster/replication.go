@@ -1922,8 +1922,9 @@ func (e *Engine) reportLeaderUnreachable(suspect string) {
 // candidate cannot be reached.
 func (e *Engine) failoverPeer(id string) {
 	cmd := &Command{Op: OpMarkDown, NodeID: id}
-	if leaders := e.freshestReplicas(id); len(leaders) > 0 {
+	if leaders, tails := e.freshestReplicas(id); len(leaders) > 0 {
 		cmd.NewLeaders = leaders
+		cmd.NewLeaderLEO = tails
 		e.loggerf("failover of %s: %d slot(s) pinned to the freshest live replica", id, len(leaders))
 	}
 	if err := e.submit(cmd); err != nil {
@@ -1942,7 +1943,7 @@ func (e *Engine) failoverPeer(id string) {
 // are on their way down and must not be handed a slot). A slot whose candidates
 // cannot be reached, or where they tie, is left to the table rule; ties resolve
 // to the replica-set order there, which is what the pick would have said anyway.
-func (e *Engine) freshestReplicas(down string) map[int32]string {
+func (e *Engine) freshestReplicas(down string) (map[int32]string, map[int32]uint64) {
 	tbl := e.TableSnapshot()
 	slots := make([]int32, 0, 64)
 	for s, p := range tbl.Slots {
@@ -1951,7 +1952,7 @@ func (e *Engine) freshestReplicas(down string) map[int32]string {
 		}
 	}
 	if len(slots) == 0 {
-		return nil
+		return nil, nil
 	}
 	sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
 
@@ -1991,7 +1992,7 @@ func (e *Engine) freshestReplicas(down string) map[int32]string {
 		}
 	}
 	if len(cands) == 0 {
-		return nil
+		return nil, nil
 	}
 	// Candidates are asked in PARALLEL and under a short deadline: the pick is a
 	// best-effort freshness probe on the failover path (a healthy peer answers in
@@ -2035,6 +2036,7 @@ func (e *Engine) freshestReplicas(down string) map[int32]string {
 		leos[a.id] = m
 	}
 	out := map[int32]string{}
+	tails := map[int32]uint64{}
 	for _, s := range slots {
 		best, bestLEO := "", uint64(0)
 		for id, c := range cands {
@@ -2048,9 +2050,13 @@ func (e *Engine) freshestReplicas(down string) map[int32]string {
 		}
 		if best != "" {
 			out[s] = best
+			// The probe's best sighting travels with the pick: failoverPeer
+			// files it as the slot's commit floor, bounding even the slots
+			// the table rule seats (replica-set order, LEO-agnostic).
+			tails[s] = bestLEO
 		}
 	}
-	return out
+	return out, tails
 }
 
 // recordUnreachable folds one observer's report into the controller's witness

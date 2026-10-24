@@ -40,11 +40,19 @@ import (
 
 const (
 	tableMagic = "PTAB"
-	// tableVer (v7) adds the cluster's consensus generation to the header
-	// (Table.Topology): a node that joins from a snapshot has to learn it, or
-	// its owner fence would compare provenance records against nothing and
-	// fence every copy it inherits.
-	tableVer = byte(7)
+	// tableVer (v8) appends the slot commit floors (Table.CommitLEO) after
+	// the planned-member directory: the floor is the bound that holds a
+	// freshly promoted leader until its copy reaches the tail the handover
+	// confirmed — if it does not survive the snapshot, every node that
+	// restarts through one loses the bound silently (live-cluster forensics
+	// read "all floors zero" on a decoded mirror: that was this gap, not a
+	// floorless history).
+	tableVer = byte(8)
+	// tableVerTopology (v7) adds the cluster's consensus generation to the
+	// header (Table.Topology): a node that joins from a snapshot has to learn
+	// it, or its owner fence would compare provenance records against nothing
+	// and fence every copy it inherits.
+	tableVerTopology = byte(7)
 	// tableVerRole (v6) adds the self-announced node role to every directory
 	// entry: the layout pool (voters host no slots) must survive a snapshot
 	// or the restored table would spread seats onto the control plane until
@@ -244,6 +252,22 @@ func (t *Table) EncodeTableBinary() []byte {
 	for _, m := range planned {
 		body.WriteByte(nodeID(m))
 	}
+	// v8: the commit floors, slot-sorted for deterministic snapshots. Only
+	// non-zero entries are written (the map is sparse by construction).
+	floorSlots := make([]int, 0, len(t.CommitLEO))
+	for s := range t.CommitLEO {
+		if t.CommitLEO[int32(s)] > 0 {
+			floorSlots = append(floorSlots, int(s))
+		}
+	}
+	sort.Ints(floorSlots)
+	n = binary.PutUvarint(tmp[:], uint64(len(floorSlots)))
+	body.Write(tmp[:n])
+	for _, s := range floorSlots {
+		putU32(&body, uint32(int32(s)))
+		n = binary.PutUvarint(tmp[:], t.CommitLEO[int32(s)])
+		body.Write(tmp[:n])
+	}
 
 	var out bytes.Buffer
 	zw := gzip.NewWriter(&out)
@@ -267,10 +291,11 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return nil, fmt.Errorf("table: short header: %w", err)
 	}
-	if string(hdr[0:4]) != tableMagic || (hdr[4] != tableVer && hdr[4] != tableVerRole && hdr[4] != tableVerNoGrant && hdr[4] != tableVerPolicy && hdr[4] != tableVerGrant) {
+	if string(hdr[0:4]) != tableMagic || hdr[4] < tableVerPolicy || hdr[4] > tableVer {
 		return nil, fmt.Errorf("table: bad snapshot magic/version")
 	}
-	withTopology := hdr[4] >= tableVer         // v7 and later carry the generation in the header
+	withTopology := hdr[4] >= tableVerTopology // v7 and later carry the generation in the header
+	withFloors := hdr[4] >= tableVer           // v8 and later carry the commit floors
 	policyInHeader := hdr[4] != tableVerPolicy // v4 and later carry the tier in the header
 	withGrants := hdr[4] >= tableVerGrant      // v5 and later carry the seat grants
 	var tmp4 [4]byte
@@ -486,6 +511,29 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 			planned = append(planned, name)
 		}
 		t.PlanMembers = planned
+	}
+	if withFloors {
+		fn, err := binary.ReadUvarint(r)
+		if err != nil {
+			return nil, err
+		}
+		if fn > 1<<20 {
+			return nil, fmt.Errorf("table: too many commit floors %d", fn)
+		}
+		for j := uint64(0); j < fn; j++ {
+			s, err := readU32()
+			if err != nil {
+				return nil, err
+			}
+			leo, err := binary.ReadUvarint(r)
+			if err != nil {
+				return nil, err
+			}
+			if t.CommitLEO == nil {
+				t.CommitLEO = map[int32]uint64{}
+			}
+			t.CommitLEO[int32(s)] = leo
+		}
 	}
 	return t, nil
 }

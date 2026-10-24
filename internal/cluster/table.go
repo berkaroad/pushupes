@@ -738,6 +738,13 @@ type Command struct {
 	// (backupLeaderFor), so the command stays a deterministic function of the
 	// replicated state on every node that applies it.
 	NewLeaders map[int32]string `json:"new_leaders,omitempty"`
+	// For OpMarkDown: per-slot the best durable LEO seen on the live
+	// freshness probe — the evidence that a promoted leader must at least
+	// hold. Recorded as the slot's commit floor when it exceeds the current
+	// one, independent of which node the pick lands on (a slot the table rule
+	// takes over still gains its bound). Slots the probe could not reach
+	// carry nothing.
+	NewLeaderLEO map[int32]uint64 `json:"new_leader_leo,omitempty"`
 	// For OpDrainNode:
 	Drain      bool `json:"drain,omitempty"`
 	ThenRemove bool `json:"then_remove,omitempty"` // drain mark + removal intent
@@ -895,6 +902,17 @@ func (t *Table) Apply(c *Command) error {
 			if next := t.failoverLeader(pl, c.NodeID, c.NewLeaders[s]); next != "" {
 				pl.Leader = next
 				pl.Epoch++
+				// The freshness evidence becomes the slot's commit floor
+				// (monotone): whoever was seated — pick or table rule — is
+				// now bounded below by the best log the live probe saw.
+				if leo := c.NewLeaderLEO[s]; leo > 0 {
+					if t.CommitLEO == nil {
+						t.CommitLEO = map[int32]uint64{}
+					}
+					if leo > t.CommitLEO[s] {
+						t.CommitLEO[s] = leo
+					}
+				}
 			}
 		}
 	case OpMarkUp:
