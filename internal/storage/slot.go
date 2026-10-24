@@ -39,6 +39,11 @@ var ErrSeqDivergence = errors.New("diverged on replay")
 type FlushPolicy struct {
 	IntervalMessages int64         // fsync after N unflushed records (0 = never)
 	Interval         time.Duration // fsync after T since last flush (0 = never)
+	// Parallelism caps how many segment fsyncs run at once (0 = 1): the flush
+	// path's parallelism. One is the historical single-fsync pipeline; more lets
+	// independent segments' fsyncs overlap on the device, which is what the p99
+	// of a deep flush queue is made of.
+	Parallelism int
 }
 
 // DefaultFlushPolicy fsyncs every 1000 records or every 5 seconds.
@@ -606,25 +611,17 @@ func (s *Slot) tail() (*Segment, error) {
 		// on that goroutine with no slot lock held, so a slow device no longer
 		// blocks the roll (or this slot's appends) behind it.
 		s.enqueueSealedLocked(seg)
-		// The sealed segment's index is complete: make it durable and stop.
-		if err := seg.indexFlushAndClose(); err != nil {
-			return nil, err
-		}
-		// Sort its commands by hash into <baseSeq>.cidx, the on-disk side of
-		// the command lookup. Best effort: a segment without it is still
-		// correct, and the next start writes it.
-		if err := writeSegCmdIndex(seg, s.blms.filters[s.blmsMark:]); err != nil {
-			segIndexUnusable.Add(1)
-		}
 		// The sealed segment keeps its placement range as its lookup gate;
 		// the mark then moves past it so the next segment's placements start
 		// a filter of their own (bloomSet.insertPlacedFrom).
 		seg.cmdFilters = s.blms.filters[s.blmsMark:]
 		s.blmsMark = len(s.blms.filters)
-		// Its per-aggregate seqs move to disk: sealed seqs never change again,
-		// and they are what the in-memory arena would otherwise keep forever.
-		if err := s.sealAggSeqsLocked(seg); err != nil {
-			segIndexUnusable.Add(1) // seqs stay in memory: correct, just heavier
+		// Its indexes (the .idx tail, the sorted .cidx and the .aidx) are
+		// materialized by the store's seal worker with no slot lock held: the
+		// walk, the sorts and the three fsyncs used to run right here, holding
+		// this slot's writers for the length of it.
+		if err := s.enqueueSealedIndexLocked(seg); err != nil {
+			return nil, err
 		}
 		next, err := CreateSegment(s.Dir, s.ID, seg.LastSeq+1)
 		if err != nil {

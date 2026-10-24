@@ -115,7 +115,7 @@ func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushP
 		dirty:            map[int32]bool{},
 		wakeBus:          make(chan struct{}),
 	}
-	st.flusher = newFlusher(st)
+	st.flusher = newFlusher(st, flush.Parallelism)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -170,6 +170,7 @@ func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushP
 		return nil, openErr
 	}
 	go st.flusher.run()
+	go st.flusher.sealWorker()
 	return st, nil
 }
 
@@ -483,6 +484,15 @@ type FlushStats struct {
 	FsyncNewBytesMax uint64  `json:"fsync_new_bytes_max"`
 	FsyncFileSizeAvg float64 `json:"fsync_file_size_avg"`
 	FsyncFileSizeMax uint64  `json:"fsync_file_size_max"`
+
+	// DrainBudget is the round bound's own view: rounds run, rounds that ran
+	// out of budget with work left, and the deepest queue seen. The bound keeps
+	// one sweep from holding the fsync pipeline for a whole deep queue.
+	// Parallelism is the configured fsync cap (invariant I2's width).
+	Parallelism       int    `json:"parallelism"`
+	DrainPasses       uint64 `json:"drain_passes"`
+	DrainBudgetRounds uint64 `json:"drain_budget_rounds"`
+	QueueHighWater    uint64 `json:"queue_high_water"`
 }
 
 // FlushStats snapshots the flush path. It never waits on a slot: a slot whose
@@ -534,6 +544,8 @@ func (st *Store) FlushStats() FlushStats {
 	out.FsyncSvcP50MS, out.FsyncSvcP99MS = d.svcP50MS, d.svcP99MS
 	out.FsyncNewBytesAvg, out.FsyncNewBytesMax = d.newBytesAvg, d.newBytesMax
 	out.FsyncFileSizeAvg, out.FsyncFileSizeMax = d.fileSizeAvg, d.fileSizeMax
+	out.DrainPasses, out.DrainBudgetRounds, out.QueueHighWater = d.passes, d.budgetRounds, d.queueHigh
+	out.Parallelism = st.flusher.parallelism
 	return out
 }
 

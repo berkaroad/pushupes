@@ -174,9 +174,17 @@ Body: Record*，每条记录：
   全存储一个刷盘 goroutine，队列单元是「（槽，段）」并按入队时间老先出；
   每次 fsync 分三相——锁内快照（`prepareFlushLocked`）→ **锁外** `File.Sync()`
   逐次计时 → 锁内按快照做减法结算（`settleFlush`，fsync 期间新写入的记录仍
-  算未刷），同时最多一个 fsync 在飞。策略触发（`IntervalMessages`/`Interval`）、
+  算未刷）。策略触发（`IntervalMessages`/`Interval`）、
   封段滚动（封段即入队）与显式 `Flush()`/`Close`（入队 + 等完成）三个入口
   都收敛到这条队列。
+- **刷盘并行度可配**（`-flush-parallelism` / `PUSHUPES_FLUSH_PARALLELISM`，
+  默认 1）：一个许可信号量给全存储的 fsync 封顶，队列由持久 worker 池执行
+  （并行度为 1 时仍由刷盘 goroutine 自己执行，保持历史单 fsync 链路），
+  显式 `Flush()`/`Close()` 的 fsync 也在调用方 goroutine 上取同一许可，
+  因而同样受这个上限约束。刷盘轮按预算切片（每轮至多 8 个单元或 200ms），
+  片与片之间让出，策略遍历不随切片重跑。深队列下把并行度提到 4 的实测
+  （aggs=10000、conns=8、batch=100、1KiB、同簇两对对照）：p99 97.6→69.0ms
+  与 188.9→69.7ms、吞吐 +18.6% 与 +70%、fsync 排队等待 p50 20ms→5ms。
 - **刷盘路径自视**：`GET /admin/stats` 的 `flush` 段给出无锁可读的
   `pending_flush_sum`（未刷记录总数）、`oldest_unflushed_age_s`（最老一条
   等待 fsync 的记录等了多久：槽从「干净」转入「有未刷」时起表，每次

@@ -100,6 +100,15 @@ func segAidxPath(dir string, baseSeq uint64) string {
 // design: a segment without one is still correct (a versioned read of it falls
 // back to reading by seq), and the next start writes it.
 func writeSegAggIndex(seg *Segment, lists []segAggList) error {
+	return writeSegAggIndexFrom(seg, lists, nil)
+}
+
+// writeSegAggIndexFrom is writeSegAggIndex with an injectable sync: the seal
+// worker passes a flushMu-guarded one so this fsync joins invariant I2.
+func writeSegAggIndexFrom(seg *Segment, lists []segAggList, syncFn func(*os.File) error) error {
+	if syncFn == nil {
+		syncFn = (*os.File).Sync
+	}
 	total := 0
 	for _, l := range lists {
 		total += len(l.pairs)
@@ -156,7 +165,7 @@ func writeSegAggIndex(seg *Segment, lists []segAggList) error {
 	if _, err := f.Write(tail[:]); err != nil {
 		return cleanup(err)
 	}
-	if err := f.Sync(); err != nil {
+	if err := syncFn(f); err != nil {
 		return cleanup(err)
 	}
 	if err := f.Close(); err != nil {

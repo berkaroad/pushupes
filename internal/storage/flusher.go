@@ -16,6 +16,7 @@ package storage
 
 import (
 	"os"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -36,6 +37,15 @@ import (
 // A unit of work is ONE segment of one slot (not a whole slot): a slow fsync
 // therefore delays a single 256MiB segment, not every segment of that slot, and
 // not the rest of the queue.
+
+// The drain round's budget: at most this many units, or this much wall clock,
+// per round. Between rounds the loop re-runs the policy pass and yields, which
+// keeps a seal storm or a threshold-crossing wave from holding the fsync
+// pipeline (and the device) for as long as the queue is deep.
+const (
+	drainRoundMaxUnits = 8
+	drainRoundMaxAge   = 200 * time.Millisecond
+)
 
 // flushUnit is one segment's outstanding fsync. Everything the syscall needs
 // was snapshotted under the slot's write lock in prepareFlushLocked, so the
@@ -59,12 +69,44 @@ type flusher struct {
 	inQ    map[*Segment]bool
 	frozen map[int32]bool // slots detached for Close/Drop: no new units
 
-	// flushMu is what makes every fsync in the process exclusive, wherever it
-	// runs: the loop holds it around a queued unit's syscall, and the forced
-	// path (explicit Flush/Close) holds it while it syncs on the caller's
-	// goroutine. There is no cross-goroutine wait for a queued item, so no
-	// shutdown or detach path can block on a loop that has stopped running.
-	flushMu sync.Mutex
+	// Seal index materialization (a freshly sealed segment's .idx tail, .cidx
+	// and .aidx) runs on its own worker instead of under the slot's write lock:
+	// the roll hands the segment over and returns. sealQ/sealBusy share mu with
+	// units/frozen so detach can drop a slot's queued jobs and pick up its
+	// in-flight one under the same lock.
+	sealQ    []*sealJob
+	sealBusy map[int32]chan struct{}
+	sealWake chan struct{}
+	sealStop chan struct{}
+	sealDone chan struct{}
+
+	// Drain budget accounting: passes counts drain rounds, budgetRounds the
+	// rounds that ran out of budget with work left, queueHigh the deepest the
+	// queue ever got. All three are read by FlushStats (and its tests).
+	passes       atomic.Uint64
+	budgetRounds atomic.Uint64
+	queueHigh    atomic.Uint64
+
+	// flushSem caps how many fsyncs run at once (I2). Its capacity is the
+	// configured flush parallelism (default 1 = the historical one-at-a-time
+	// pipeline). Queued units are executed by the persistent worker pool below;
+	// a forced flush (explicit Flush/Close) takes a permit on the caller's
+	// goroutine, so it obeys the same cap and never waits for a worker that
+	// stopped running.
+	flushSem    chan struct{}
+	parallelism int
+
+	// dispatch hands queued units to the worker pool; workers take a unit,
+	// fsync it, and settle it. Unbuffered: a send blocks until a worker is free,
+	// which is the pool's backpressure.
+	dispatch chan *flushUnit
+	poolDone sync.WaitGroup
+
+	// active counts units per slot that a worker has taken and not yet settled.
+	// detach waits on activeCond until the slot's count reaches zero, so a
+	// Close/Drop cannot delete files under an fsync that is still running.
+	active     map[int32]int
+	activeCond *sync.Cond
 
 	wake chan struct{}
 	stop chan struct{}
@@ -74,7 +116,9 @@ type flusher struct {
 	// exit instead of closing the same channel twice.
 	stopOnce sync.Once
 
-	inflight atomic.Int64 // invariant I2: 0 or 1
+	// inflight is how many fsyncs are in the syscall right now: 0..parallelism
+	// (invariant I2 with the configured cap).
+	inflight atomic.Int64
 
 	count       atomic.Uint64 // fsyncs performed
 	svcNS       atomic.Uint64 // syscall service time
@@ -89,16 +133,56 @@ type flusher struct {
 	waitBucket  [fsyncBuckets]atomic.Uint64
 }
 
-func newFlusher(st *Store) *flusher {
+func newFlusher(st *Store, parallelism int) *flusher {
+	if parallelism < 1 {
+		parallelism = 1
+	}
 	f := &flusher{
-		st:     st,
-		inQ:    map[*Segment]bool{},
-		frozen: map[int32]bool{},
-		wake:   make(chan struct{}, 1),
-		stop:   make(chan struct{}),
-		done:   make(chan struct{}),
+		st:          st,
+		parallelism: parallelism,
+		flushSem:    make(chan struct{}, parallelism),
+		dispatch:    make(chan *flushUnit),
+		active:      map[int32]int{},
+		inQ:         map[*Segment]bool{},
+		frozen:      map[int32]bool{},
+		wake:        make(chan struct{}, 1),
+		stop:        make(chan struct{}),
+		done:        make(chan struct{}),
+		sealBusy:    map[int32]chan struct{}{},
+		sealWake:    make(chan struct{}, 1),
+		sealStop:    make(chan struct{}),
+		sealDone:    make(chan struct{}),
+	}
+	f.activeCond = sync.NewCond(&f.mu)
+	for i := 0; i < parallelism; i++ {
+		f.poolDone.Add(1)
+		go f.worker()
 	}
 	return f
+}
+
+// worker executes queued units: fsync under a permit, then settle. The pool is
+// only used when the flush parallelism is above one; with the default the round
+// runs its units on the loop's own goroutine, exactly as before.
+func (f *flusher) worker() {
+	defer f.poolDone.Done()
+	for u := range f.dispatch {
+		_ = f.syncUnit(u)
+		f.decActive(u.slot)
+	}
+}
+
+// decActive clears one in-flight unit of a slot (workers and the serial round
+// both call it) and wakes any detach waiting for that slot to quiesce.
+func (f *flusher) decActive(slot int32) {
+	f.mu.Lock()
+	if f.active[slot] > 0 {
+		f.active[slot]--
+		if f.active[slot] == 0 {
+			f.activeCond.Broadcast()
+		}
+	}
+	f.mu.Unlock()
 }
 
 // kick nudges the loop: a slot became dirty, crossed its record threshold, or a
@@ -124,6 +208,9 @@ func (f *flusher) enqueue(units []*flushUnit) {
 		f.inQ[u.seg] = true
 		f.units = append(f.units, u)
 	}
+	if n := uint64(len(f.units)); n > 0 {
+		addMax(&f.queueHigh, n)
+	}
 	sort.SliceStable(f.units, func(i, j int) bool { return f.units[i].enq.Before(f.units[j].enq) })
 	f.mu.Unlock()
 	f.kick()
@@ -142,11 +229,9 @@ func (f *flusher) enqueueSealed(sl *Slot, seg *Segment) {
 
 // flushSlotNow is the explicit path (Slot.Flush / Store.Flush / Store.Close):
 // sync this slot's outstanding segments now. It runs on the caller's goroutine
-// under flushMu, so it is still one fsync at a time, and it never waits for the
+// under a flush permit, so it obeys the same parallelism cap, and it never waits for the
 // loop — a retired or busy flusher cannot make an explicit flush hang.
 func (f *flusher) flushSlotNow(sl *Slot) error {
-	f.flushMu.Lock()
-	defer f.flushMu.Unlock()
 	sl.mu.Lock()
 	units, _, _ := sl.prepareFlushLocked(time.Now(), true)
 	sl.mu.Unlock()
@@ -163,12 +248,7 @@ func (f *flusher) flushSlotNow(sl *Slot) error {
 // in flight. Callers (Slot.Close, Slot.Drop, Store.DropSlot) call it before
 // closing or deleting the segment files.
 func (f *flusher) detach(slot int32) {
-	// flushMu first: whatever fsync is running (queued or forced) finishes
-	// before the caller's files go away.
-	f.flushMu.Lock()
-	defer f.flushMu.Unlock()
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.frozen[slot] = true
 	kept := f.units[:0]
 	for _, u := range f.units {
@@ -179,6 +259,47 @@ func (f *flusher) detach(slot int32) {
 		kept = append(kept, u)
 	}
 	f.units = kept
+	// Queued seal jobs are dropped (their indexes are rebuilt at the next
+	// start); the in-flight one is waited for below.
+	jkept := f.sealQ[:0]
+	for _, j := range f.sealQ {
+		if j.sl.ID == slot {
+			continue
+		}
+		jkept = append(jkept, j)
+	}
+	f.sealQ = jkept
+	busy := f.sealBusy[slot]
+	f.mu.Unlock()
+
+	// The seal worker reads the segment and settles under the slot lock, so it
+	// must be finished before the caller closes files or takes that lock. Do
+	// this without holding a flush permit: the job's own index fsyncs take one.
+	if busy != nil {
+		<-busy
+	}
+
+	// Then wait until no unit of this slot is being fsynced (a worker may hold
+	// one it took before the freeze), and only then quiesce the device: taking
+	// every permit waits out whatever fsync is running on any slot, so the
+	// caller can close or delete the files.
+	f.mu.Lock()
+	for f.active[slot] > 0 {
+		f.activeCond.Wait()
+	}
+	f.mu.Unlock()
+	f.quiesce()
+}
+
+// quiesce blocks until no fsync is in flight, then releases the permits. Taking
+// all of them is what proves the device queue is empty at that instant.
+func (f *flusher) quiesce() {
+	for i := 0; i < f.parallelism; i++ {
+		f.flushSem <- struct{}{}
+	}
+	for i := 0; i < f.parallelism; i++ {
+		<-f.flushSem
+	}
 }
 
 // thaw re-allows work for a slot (used by tests and by a slot that came back).
@@ -195,6 +316,12 @@ func (f *flusher) run() {
 	var timer *time.Timer
 	var timerC <-chan time.Time
 	for {
+		select {
+		case <-f.stop:
+			f.drainAll()
+			return
+		default:
+		}
 		next := f.pass(time.Now())
 		// Arm (or disarm) the policy timer: only an interval-policy slot with
 		// unflushed data gives the loop a deadline.
@@ -216,13 +343,26 @@ func (f *flusher) run() {
 			}
 			timer.Reset(time.Until(next))
 		}
-		// Sync everything queued before parking: one fsync at a time, oldest
-		// dirty first. An enqueue that lands after this returns re-kicks the
-		// loop, so the wake below cannot be lost.
-		f.drain()
+		// Sync queued units before parking, one fsync at a time and at most one
+		// round's budget (drainRoundMaxUnits / drainRoundMaxAge). Budget-bound
+		// rounds yield between slices so appends, forced flushes and the seal
+		// worker get the device, but the policy pass does NOT run between them:
+		// a pass iterates every dirty slot under its lock and re-sorts the
+		// queue, and doing that per round turned a deep queue into a sweep loop
+		// that starved the appenders. The pass runs once the queue is empty (or
+		// on the next kick/timer), exactly as before the budget existed.
+		for f.drain() {
+			select {
+			case <-f.stop:
+				f.drainAll()
+				return
+			default:
+			}
+			runtime.Gosched()
+		}
 		select {
 		case <-f.stop:
-			f.drain()
+			f.drainAll()
 			return
 		case <-f.wake:
 		case <-timerC:
@@ -274,33 +414,65 @@ func (f *flusher) pass(now time.Time) time.Time {
 	return next
 }
 
-// drain performs every queued fsync, one at a time, until the queue is empty.
-func (f *flusher) drain() {
+// drain runs queued fsyncs, oldest first, for at most one round's budget
+// (drainRoundMaxUnits units or drainRoundMaxAge of wall clock) and reports
+// whether the queue still holds work. The bound exists so one sweep cannot hold
+// flush permits and the device for the whole queue: between rounds the loop yields,
+// so newly arriving units and forced flushes are not queued behind an unbounded
+// fsync chain and appends' pwrites interleave with the fsync stream.
+func (f *flusher) drain() bool {
+	start := time.Now()
+	done := 0
 	for {
 		f.mu.Lock()
 		if len(f.units) == 0 {
 			f.mu.Unlock()
-			return
+			f.passes.Add(1)
+			return false
 		}
 		u := f.units[0]
 		f.units = f.units[1:]
+		f.active[u.slot]++
 		f.mu.Unlock()
-		f.flushMu.Lock()
-		_ = f.syncUnit(u)
-		f.flushMu.Unlock()
+		if f.parallelism > 1 {
+			f.dispatch <- u // a worker fsyncs and settles it
+		} else {
+			_ = f.syncUnit(u)
+			f.decActive(u.slot)
+		}
+		done++
+		if done >= drainRoundMaxUnits || time.Since(start) >= drainRoundMaxAge {
+			f.mu.Lock()
+			more := len(f.units) > 0
+			f.mu.Unlock()
+			f.passes.Add(1)
+			if more {
+				f.budgetRounds.Add(1)
+			}
+			return more
+		}
+	}
+}
+
+// drainAll runs the queue to empty, ignoring the round budget: shutdown needs
+// every queued fsync to land before the files go away.
+func (f *flusher) drainAll() {
+	for f.drain() {
 	}
 }
 
 // syncUnit runs one segment's fsync outside every slot lock, books its cost,
-// and settles the counters the prepare phase zeroed.
-// syncUnit runs one unit's fsync and books it. Caller holds flushMu: that is
-// what makes the syscall exclusive whether it came from the loop or from an
-// explicit flush on another goroutine.
+// and settles the counters the prepare phase zeroed. The syscall itself runs
+// under a flush permit, so however many callers there are (the round, the
+// worker pool, an explicit flush elsewhere) at most `parallelism` fsyncs are in
+// the kernel at once.
 func (f *flusher) syncUnit(u *flushUnit) error {
 	f.inflight.Add(1)
 	wait := time.Since(u.enq)
 	t0 := time.Now()
+	f.flushSem <- struct{}{}
 	err := fsyncFile(u.file)
+	<-f.flushSem
 	svc := time.Since(t0)
 	f.inflight.Add(-1)
 
@@ -360,10 +532,27 @@ func bucketAdd(b *[fsyncBuckets]atomic.Uint64, d time.Duration) {
 	b[i].Add(1)
 }
 
-// shutdown stops the loop after draining the queue. Idempotent.
+// shutdown stops the loop after draining the queue, then retires the seal
+// worker (a queued seal job is dropped: its indexes rebuild at the next start).
+// Idempotent.
 func (f *flusher) shutdown() {
-	f.stopOnce.Do(func() { close(f.stop) })
-	<-f.done
+	f.stopOnce.Do(func() {
+		close(f.stop)
+		<-f.done
+		close(f.dispatch)
+		f.poolDone.Wait()
+		close(f.sealStop)
+		<-f.sealDone
+	})
+}
+
+// syncThroughMu runs one fsync under the same mutex the flush loop uses, so the
+// seal worker's index writes keep the process-wide "one fsync at a time"
+// invariant (I2) without holding any slot lock.
+func (f *flusher) syncThroughMu(file *os.File) error {
+	f.flushSem <- struct{}{}
+	defer func() { <-f.flushSem }()
+	return fsyncFile(file)
 }
 
 // flushDigest is the flusher's contribution to FlushStats.
@@ -385,6 +574,14 @@ type flushDigest struct {
 	waitP99MS   float64
 	svcBucket   []uint64
 	waitBucket  []uint64
+
+	// Drain budget: rounds run, rounds that ran out of budget with work left,
+	// and the deepest the queue got. A budgetRounds share near zero means the
+	// budget never bound; a large one says the queue is routinely deeper than
+	// one round drains.
+	passes       uint64
+	budgetRounds uint64
+	queueHigh    uint64
 }
 
 func (f *flusher) digest() flushDigest {
@@ -392,11 +589,14 @@ func (f *flusher) digest() flushDigest {
 	q := len(f.units)
 	f.mu.Unlock()
 	d := flushDigest{
-		queueUnits:  q,
-		inflight:    f.inflight.Load(),
-		count:       f.count.Load(),
-		fileSizeMax: f.fileSizeMax.Load(),
-		newBytesMax: f.newBytesMax.Load(),
+		queueUnits:   q,
+		inflight:     f.inflight.Load(),
+		count:        f.count.Load(),
+		fileSizeMax:  f.fileSizeMax.Load(),
+		newBytesMax:  f.newBytesMax.Load(),
+		passes:       f.passes.Load(),
+		budgetRounds: f.budgetRounds.Load(),
+		queueHigh:    f.queueHigh.Load(),
 	}
 	if d.count > 0 {
 		d.waitAvgMS = float64(f.waitNS.Load()) / float64(d.count) / 1e6

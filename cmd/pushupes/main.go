@@ -75,6 +75,7 @@ func main() {
 		segmentB = byteSize(envByteSizeOr("PUSHUPES_SEGMENT_BYTES", storage.DefaultSegmentBytes))
 		flushN   = flag.Int64("flush-messages", envInt64Or("PUSHUPES_FLUSH_MESSAGES", 1000), "fsync every N records (0 disables) (env PUSHUPES_FLUSH_MESSAGES)")
 		flushD   = flag.Duration("flush-interval", envDurationOr("PUSHUPES_FLUSH_INTERVAL", 5*time.Second), "fsync every interval (0 disables) (env PUSHUPES_FLUSH_INTERVAL)")
+		flushPar = flag.Int("flush-parallelism", envIntOr("PUSHUPES_FLUSH_PARALLELISM", 1), "segment fsyncs allowed in flight at once, the flush parallelism (1 = one at a time) (env PUSHUPES_FLUSH_PARALLELISM)")
 		// How long a woken fetch round waits for the rest of the write burst
 		// before answering. Every acknowledged append pays it once (the round
 		// carrying its record pays it), and it buys rounds: 0 answers as soon
@@ -109,13 +110,13 @@ func main() {
 	base := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	logger := base.With("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *role, *adoptTo, slotCount, *replicaPolicy, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *dropAfter, *fetchSettleD, *rebalanceInterval, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *role, *adoptTo, slotCount, *replicaPolicy, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *flushPar, *dropAfter, *fetchSettleD, *rebalanceInterval, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
 		logger.Error("pushupes exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, role string, adoptInterval time.Duration, slotCount int, replicaPolicy string, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD, dropAfter, fetchSettle, rebalanceInterval time.Duration, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, role string, adoptInterval time.Duration, slotCount int, replicaPolicy string, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD time.Duration, flushPar int, dropAfter, fetchSettle, rebalanceInterval time.Duration, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
 	nodeRole, err := cluster.NormalizeRole(role)
 	if err != nil {
 		return err
@@ -146,14 +147,20 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 	}
 	logger.Info("post-migration cleanup: the former source drops its local copy after this retention",
 		"drop_after", dropRetention.String())
+	if flushPar < 1 {
+		return fmt.Errorf("-flush-parallelism %d must be at least 1 (one segment fsync in flight)", flushPar)
+	}
 	store, err := storage.OpenStore(dataDir, int32(slotCount), segmentBytes, storage.FlushPolicy{
 		IntervalMessages: flushN,
 		Interval:         flushD,
+		Parallelism:      flushPar,
 	})
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer store.Close()
+	logger.Info("segment fsync parallelism", "in_flight", flushPar,
+		"note", "1 keeps one fsync at a time; more lets independent segments overlap on the device")
 
 	peers, err := parsePeers(peersCSV)
 	if err != nil {
@@ -495,6 +502,19 @@ func envDurationOr(k string, def time.Duration) time.Duration {
 // envInt64Or reads an integer sized in records from the environment,
 // falling back to def. A malformed or non-integer value is fatal rather
 // than silently defaulting: a typo in a tuning knob should be loud.
+func envIntOr(k string, def int) int {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid %s=%q: %v (want an integer like 4)\n", k, v, err)
+		os.Exit(2)
+	}
+	return n
+}
+
 func envInt64Or(k string, def int64) int64 {
 	v := os.Getenv(k)
 	if v == "" {

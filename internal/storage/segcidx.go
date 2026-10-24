@@ -85,10 +85,21 @@ func segCidxPath(dir string, baseSeq uint64) string {
 // by hash to <baseSeq>.cidx (temp file + rename, so a partial index never
 // exists). The walk is header-only and happens once per segment, at seal.
 func writeSegCmdIndex(seg *Segment, filters []*bloomBits) error {
-	dir := filepath.Dir(seg.Path)
 	sorted, err := collectSegCmdEntries(seg)
 	if err != nil {
 		return err
+	}
+	return writeSegCmdIndexFrom(seg, filters, sorted, nil)
+}
+
+// writeSegCmdIndexFrom writes an already-collected entry list. The seal worker
+// walks the segment once and feeds the same entries to the aggregate index, so
+// this form takes the collection result; sync, when set, replaces the plain
+// (*os.File).Sync (the worker routes it through flushMu).
+func writeSegCmdIndexFrom(seg *Segment, filters []*bloomBits, sorted []segCmdEntry, syncFn func(*os.File) error) error {
+	dir := filepath.Dir(seg.Path)
+	if syncFn == nil {
+		syncFn = (*os.File).Sync
 	}
 	if len(sorted) == 0 {
 		return nil
@@ -145,7 +156,7 @@ func writeSegCmdIndex(seg *Segment, filters []*bloomBits) error {
 			return cleanup(err)
 		}
 	}
-	if err := f.Sync(); err != nil {
+	if err := syncFn(f); err != nil {
 		return cleanup(err)
 	}
 	if err := f.Close(); err != nil {

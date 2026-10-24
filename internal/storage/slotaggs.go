@@ -138,7 +138,9 @@ func (e *aggEntry) dropFirst(k int) {
 			live[i] = e.seqAt(i)
 			times[i] = uint64(e.stampAt(i))
 		}
-		e.chunks, e.stamps, e.head = nil, nil, 0
+		// appendSeq counts every re-placed entry: clear n with the buffers, or
+		// the compaction doubles it (a live list of one becomes two).
+		e.chunks, e.stamps, e.head, e.n = nil, nil, 0, 0
 		for i, v := range live {
 			e.appendSeq(v, int64(times[i]))
 		}

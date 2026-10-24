@@ -221,6 +221,11 @@ type segIndexWriter struct {
 	nextDict uint32
 
 	err error // latched: stop indexing, the loader will fall back
+
+	// syncFn, when set, replaces the plain (*os.File).Sync of flush(): the
+	// flusher's seal worker points it at flushMu so the index fsyncs join the
+	// one-fsync-at-a-time invariant (I2) like every other fsync in the store.
+	syncFn func(*os.File) error
 }
 
 // openSegIndexWriter opens (or continues) the index of one segment. Torn
@@ -524,7 +529,11 @@ func (w *segIndexWriter) flush() error {
 		if f == nil {
 			continue
 		}
-		if err := f.Sync(); err != nil {
+		sync := w.syncFn
+		if sync == nil {
+			sync = (*os.File).Sync
+		}
+		if err := sync(f); err != nil {
 			return err
 		}
 	}
