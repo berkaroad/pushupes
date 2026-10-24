@@ -1505,6 +1505,23 @@ func (s *Slot) ReadRange(fromSeq, untilSeq uint64, maxBytes int64) ([]data.ByteR
 			next = nx
 			fromSeq = nx
 		}
+		if nx <= seg.LastSeq {
+			// The byte cap cut this segment short before its end. The
+			// next segment starts past a seq gap this batch never
+			// covered — and the fetch apply back-computes the batch's
+			// first seq as NextSeq - frameCount (frames carry no seq of
+			// their own), so a gapped batch misnumbers EVERY frame on
+			// the replica (live-cluster signature: an empty seat asking
+			// from seq 1 got "seq <seg2base-3800> not contiguous
+			// (counter 0)" forever, one identical gapped round after
+			// another). Stop the batch on this side of the gap; the
+			// follower re-asks from `next` on the next round. A batch
+			// that DRAINS the segment (nx > LastSeq) stays safe to
+			// continue: segments are seq-contiguous by construction, so
+			// the healthy tail crossing keeps replicating across the
+			// boundary in one round.
+			break
+		}
 		if len(rs) == 0 || next >= untilSeq || total >= maxBytes {
 			break
 		}
