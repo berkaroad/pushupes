@@ -33,7 +33,7 @@ function makeServer(id) {
       res.end(JSON.stringify({
         node: id,
         raft: { state: lead === id ? 'Leader' : 'Follower', leader: lead ?? '' },
-        peers, slots: {}, slot_count: 8, writes: [0, 0],
+        peers, slots: {}, slot_count: 8, storage_count: 0, storage_count_complete: true,
         // the new machine-readable redirect every node answers with
         controller: lead ?? '',
         controller_admin_addr: lead ? nodes[lead].admin : '',
@@ -42,7 +42,7 @@ function makeServer(id) {
     }
     if (req.url.startsWith('/admin/status')) {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
-      res.end(JSON.stringify({ node: id, slot_count: 8, writes: [1, 2], bytes: [10, 20], streams: [3, 4] }))
+      res.end(JSON.stringify({ node: id, slot_count: 8, storage_count: 3, total_writes: [1, 2], total_write_bytes: [3, 4], storage_bytes: [10, 20], streams: [3, 4] }))
       return
     }
     if (req.url.includes('migrate') || req.url.includes('remove-replica')) {

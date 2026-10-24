@@ -19,30 +19,9 @@ const NODE_RATE_POINTS = 60
 // rather than freezing mid-sample.
 const AUTO_REFRESH_MS = 2000
 
-// leaderWriteTotals sums one per-slot counter field over every slot AT ITS
-// LEADER (the arrays are indexed by slot id): replicas apply replicated
-// records into their own counters and a migrating slot advances counters on
-// both ends until it lands, so counting a slot only at its placement's
-// current leader counts each record exactly once — the same one-leader rule
-// the backend's storage gauge follows. It answers null when any ledged
-// slot's leader did not report the number (unreachable node, or an older
-// node without the field): a partial sum would misstate the absolute cards.
-function leaderWriteTotals(
-  st: ClusterStatus, perNode: Record<string, NodeStatus>,
-  field: 'writes' | 'write_bytes' | 'client_writes' | 'client_bytes',
-): number | null {
-  const idToAddr: Record<string, string> = {}
-  for (const p of Object.values(st.peers)) idToAddr[p.id] = p.admin_addr
-  let total = 0
-  for (const [slotStr, p] of Object.entries(st.slots)) {
-    if (!p.leader) continue
-    const s = Number(slotStr)
-    const arr = perNode[idToAddr[p.leader]]?.[field]
-    if (!arr || s >= arr.length) return null
-    total += arr[s]
-  }
-  return total
-}
+// (The cluster-wide 存储数量 fold moved server-side: /admin/cluster/status
+// answers storage_count directly, sampled by the same fan-out as
+// storage_bytes — the page no longer folds per-node arrays for it.)
 
 export default function ClusterPage() {
   // 菜单栏折叠（App 的 RailContext）是这一页的宽度预算信号：折叠态下
@@ -131,7 +110,7 @@ export default function ClusterPage() {
   // The write-speed cards: what CLIENTS landed cluster-wide per second, msg
   // and bytes. It rides the same light /admin/status poll — every peer
   // answers its per-slot counters — and diffs the CLIENT-origin pair
-  // (client_writes/client_bytes: grown only by the batch-append serving
+  // (client_writes/client_write_bytes: grown only by the batch-append serving
   // path; replica fetch and migration copy land through AppendAtSeq/
   // AppendFrameAtSeq, which move the lifetime counters but never these).
   // Node-to-node movement is not write speed, and the card must say so even
@@ -142,11 +121,10 @@ export default function ClusterPage() {
   const lastSlotFold = useRef<Map<number, { node: string; w: number; b: number }>>(new Map())
   const lastFoldAt = useRef(0)
 
-  // 存储数量: the records stored cluster-wide, summed at each slot's LEADER
-  // (the same one-leader fold the rate uses — the leader's durable write
-  // counter IS the seq count of that copy, replicas would double count).
-  // The card shows '-' until the poll sees one complete sample.
-  const [storedRecords, setStoredRecords] = useState<number | null>(null)
+  // 存储数量 moved to a backend fold the page reads directly:
+  // /admin/cluster/status answers storage_count (the seq ledgers of every
+  // slot's LEADER copy, sampled with storage_bytes in one fan-out), and the
+  // card renders it with the same lower-bound treatment as 存储大小.
 
   // The per-node card charts: four series per 2s window — the client pair
   // (same stable-identity diff as the cards, bucketed to the node that LED
@@ -178,7 +156,7 @@ export default function ClusterPage() {
         if (stop) return
         const perNode: Record<string, NodeStatus> = {}
         results.forEach((r, i) => {
-          if (r.status === 'fulfilled' && r.value.writes) perNode[addrs[i]] = r.value
+          if (r.status === 'fulfilled' && r.value.total_writes) perNode[addrs[i]] = r.value
         })
         // Flow-control card tags: one configured flag per node id, from the
         // config view this same poll carries. A node that did not answer
@@ -249,12 +227,12 @@ export default function ClusterPage() {
         let winBytes = 0
         for (const p of Object.values(st.peers)) {
           const m = perNode[p.admin_addr]
-          if (!m?.client_writes || !m.client_bytes) continue
+          if (!m?.client_writes || !m.client_write_bytes) continue
           for (const [slotStr, sp] of Object.entries(st.slots)) {
             if (sp.leader !== p.id) continue
             const s = Number(slotStr)
-            if (s >= m.client_writes.length || s >= m.client_bytes.length) continue
-            const cur = { node: p.id, w: m.client_writes[s], b: m.client_bytes[s] }
+            if (s >= m.client_writes.length || s >= m.client_write_bytes.length) continue
+            const cur = { node: p.id, w: m.client_writes[s], b: m.client_write_bytes[s] }
             nextFold.set(s, cur)
             const prev = prevFold.get(s)
             if (!prev || prev.node !== p.id || prevAt === 0 || nowMs <= prevAt) continue
@@ -273,10 +251,11 @@ export default function ClusterPage() {
         // The card charts (see nodeRates): one point per answered node,
         // bucketed from the same stable-identity diff; a node that led
         // writes-free slots keeps the flat zero line — the truthful picture
-        // of "no led writes". The absolute 存储数量 card still rides the
-        // LIFETIME writes sum at leaders (what a copy holds is what it
-        // holds, however it arrived) and keeps the all-slotted completeness
-        // rule, because a partial SUM misstates (a diff would only mislead).
+        // of "no led writes". The absolute 存储数量 card reads the backend's
+        // cluster-wide fold (/admin/cluster/status storage_count — the leader
+        // copies' seq ledgers, each copy seeded from its WAL at open, so the
+        // number says what the copies hold across restarts, not what landed
+        // since boot); _complete=false paints the card as a lower bound.
         const haveWindow = prevAt > 0 && nowMs > prevAt
         const dt = haveWindow ? (nowMs - prevAt) / 1000 : 0
         const nr = { ...nodeRatesRef.current }
@@ -284,19 +263,22 @@ export default function ClusterPage() {
         if (haveWindow) {
           for (const p of Object.values(st.peers)) {
             const m = perNode[p.admin_addr]
-            if (!m?.client_writes || !m.client_bytes) continue
+            if (!m?.client_writes || !m.client_write_bytes) continue
             const nd = nodeDelta[p.id] ?? { msg: 0, bytes: 0 }
             // Total = lifetime counters over the node's WHOLE slot set.
             let tw = 0
             let tb = 0
-            if (m.writes && m.write_bytes) {
-              for (const v of m.writes) tw += v
-              for (const v of m.write_bytes) tb += v
+            if (m.total_writes && m.total_write_bytes) {
+              for (const v of m.total_writes) tw += v
+              for (const v of m.total_write_bytes) tb += v
             }
             const pt = lastNodeTotals.current[p.id]
             lastNodeTotals.current[p.id] = { w: tw, b: tb }
-            // A restarted process resets its counters; clamp (same rule as
-            // the client pair, and the totals then simply re-baseline).
+            // The durable pair is seeded from the copy's WAL at open, so a
+            // restart re-baselines it to what the copy holds — at most a
+            // small crash-window difference, never a whole-history jump. The
+            // clamp stays for that window (and for the client pair, which IS
+            // process-local and does reset).
             const dm = pt ? Math.max(0, tw - pt.w) : 0
             const db = pt ? Math.max(0, tb - pt.b) : 0
             const arr = [...(nr[p.id] ?? []), {
@@ -312,8 +294,6 @@ export default function ClusterPage() {
           nodeRatesRef.current = nr
           setNodeRates(nr)
         }
-        const writes = leaderWriteTotals(st, perNode, 'writes')
-        if (writes !== null) setStoredRecords(writes)
       } catch {
         /* poll failure: keep the last rate */
       }
@@ -510,6 +490,8 @@ export default function ClusterPage() {
   const dataOnline = dataPeers.filter(isOnlinePeer).length
   // The cluster storage sample: every slot counted once, at its leader. A node
   // that does not serve the field yet (or has not sampled) renders '-'.
+  const storageCount = status.storage_count
+  const storageCountLowerBound = storageCount !== undefined && status.storage_count_complete === false
   const storageBytes = status.storage_bytes
   const storageLowerBound = storageBytes !== undefined && status.storage_bytes_complete === false
   // The write-speed cards show '-' until the poller has two complete samples.
@@ -531,7 +513,10 @@ export default function ClusterPage() {
           valueStyle={controlOnline < controlPeers.length ? { color: '#cf1322' } : undefined} /></Card></Col>
         <Col span={6}><Card><Statistic title="数据节点" value={`${dataOnline} / ${dataPeers.length}`}
           valueStyle={dataOnline < dataPeers.length ? { color: '#cf1322' } : undefined} /></Card></Col>
-        <Col span={6}><Card><Statistic title="存储数量" value={storedRecords ?? '-'} /></Card></Col>
+        <Col span={6}><Card><Statistic title="存储数量"
+          value={storageCount ?? '-'}
+          valueStyle={storageCountLowerBound ? { color: '#faad14' } : undefined}
+          suffix={storageCountLowerBound ? '（下界）' : undefined} /></Card></Col>
         <Col span={6}><Card><Statistic title="存储大小"
           value={storageBytes === undefined ? '-' : humanBytes(storageBytes)}
           valueStyle={storageLowerBound ? { color: '#faad14' } : undefined}

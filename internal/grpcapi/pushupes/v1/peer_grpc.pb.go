@@ -105,10 +105,11 @@ type PeerServiceClient interface {
 	// the replicas themselves know their LEO (the slot table carries no offsets).
 	// A slot this node does not hold reports 0.
 	SlotLeos(ctx context.Context, in *SlotLeosRequest, opts ...grpc.CallOption) (*SlotLeosResponse, error)
-	// SlotSizes answers the on-disk size of many slots at once, for the cluster
-	// storage gauge: the sum an operator watches counts each slot's LEADER copy
-	// (the copy the writes landed on), and only the holder of a copy can report
-	// its bytes. A slot this node does not hold answers 0.
+	// SlotSizes answers the on-disk size AND the seq ledger of many slots at
+	// once, for the cluster storage gauges: the sums an operator watches count
+	// each slot's LEADER copy (the copy the writes landed on), and only the
+	// holder of a copy can report its bytes and its seq. A slot this node does
+	// not hold answers 0 on both arrays.
 	SlotSizes(ctx context.Context, in *SlotSizesRequest, opts ...grpc.CallOption) (*SlotSizesResponse, error)
 	// WatchLayout is the data-plane node's feed: a node running with
 	// role=learner holds slot replicas but is not a voter (DESIGN §12), so it
@@ -350,10 +351,11 @@ type PeerServiceServer interface {
 	// the replicas themselves know their LEO (the slot table carries no offsets).
 	// A slot this node does not hold reports 0.
 	SlotLeos(context.Context, *SlotLeosRequest) (*SlotLeosResponse, error)
-	// SlotSizes answers the on-disk size of many slots at once, for the cluster
-	// storage gauge: the sum an operator watches counts each slot's LEADER copy
-	// (the copy the writes landed on), and only the holder of a copy can report
-	// its bytes. A slot this node does not hold answers 0.
+	// SlotSizes answers the on-disk size AND the seq ledger of many slots at
+	// once, for the cluster storage gauges: the sums an operator watches count
+	// each slot's LEADER copy (the copy the writes landed on), and only the
+	// holder of a copy can report its bytes and its seq. A slot this node does
+	// not hold answers 0 on both arrays.
 	SlotSizes(context.Context, *SlotSizesRequest) (*SlotSizesResponse, error)
 	// WatchLayout is the data-plane node's feed: a node running with
 	// role=learner holds slot replicas but is not a voter (DESIGN §12), so it

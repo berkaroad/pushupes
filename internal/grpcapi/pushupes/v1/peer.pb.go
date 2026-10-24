@@ -551,8 +551,9 @@ func (x *SlotLeosResponse) GetLeos() []uint64 {
 	return nil
 }
 
-// SlotSizes asks one node for the on-disk bytes of many slots (same parallel
-// array shape). Slots it does not hold answer 0.
+// SlotSizes asks one node for the on-disk bytes and the seq ledger of many
+// slots (same parallel array shape; seqs[i] is that copy's record count, the
+// same book as its durable-write counter). Slots it does not hold answer 0.
 type SlotSizesRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Slots         []int32                `protobuf:"varint,1,rep,packed,name=slots,proto3" json:"slots,omitempty"`
@@ -601,6 +602,7 @@ type SlotSizesResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Slots         []int32                `protobuf:"varint,1,rep,packed,name=slots,proto3" json:"slots,omitempty"`
 	Bytes         []uint64               `protobuf:"varint,2,rep,packed,name=bytes,proto3" json:"bytes,omitempty"`
+	Seqs          []uint64               `protobuf:"varint,3,rep,packed,name=seqs,proto3" json:"seqs,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -645,6 +647,13 @@ func (x *SlotSizesResponse) GetSlots() []int32 {
 func (x *SlotSizesResponse) GetBytes() []uint64 {
 	if x != nil {
 		return x.Bytes
+	}
+	return nil
+}
+
+func (x *SlotSizesResponse) GetSeqs() []uint64 {
+	if x != nil {
+		return x.Seqs
 	}
 	return nil
 }
@@ -1805,10 +1814,11 @@ const file_pushupes_v1_peer_proto_rawDesc = "" +
 	"\x05slots\x18\x01 \x03(\x05R\x05slots\x12\x12\n" +
 	"\x04leos\x18\x02 \x03(\x04R\x04leos\"(\n" +
 	"\x10SlotSizesRequest\x12\x14\n" +
-	"\x05slots\x18\x01 \x03(\x05R\x05slots\"?\n" +
+	"\x05slots\x18\x01 \x03(\x05R\x05slots\"S\n" +
 	"\x11SlotSizesResponse\x12\x14\n" +
 	"\x05slots\x18\x01 \x03(\x05R\x05slots\x12\x14\n" +
-	"\x05bytes\x18\x02 \x03(\x04R\x05bytes\"u\n" +
+	"\x05bytes\x18\x02 \x03(\x04R\x05bytes\x12\x12\n" +
+	"\x04seqs\x18\x03 \x03(\x04R\x04seqs\"u\n" +
 	"\x0fRegisterRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1d\n" +
 	"\n" +

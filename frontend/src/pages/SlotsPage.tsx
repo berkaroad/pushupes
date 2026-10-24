@@ -99,24 +99,25 @@ export default function SlotsPage() {
         if (stop) return
         const perNode: Record<string, NodeStatus> = {}
         results.forEach((r, i) => {
-          if (r.status === 'fulfilled' && r.value.writes) perNode[addrs[i]] = r.value
+          if (r.status === 'fulfilled' && r.value.total_writes) perNode[addrs[i]] = r.value
         })
         const idToAddr: Record<string, string> = {}
         for (const p of Object.values(st.peers)) idToAddr[p.id] = p.admin_addr
         const addrToId: Record<string, string> = {}
         for (const p of Object.values(st.peers)) if (p.admin_addr) addrToId[p.admin_addr] = p.id
 
-        // 总字节: the largest on-disk footprint reported for the slot (leader
-        // or replica, whichever has flushed more). Absent everywhere means
-        // nothing to show.
+        // 总字节: the LEADER copy's on-disk footprint. Every node's
+        // storage_bytes is masked to the slots it leads (followers answer 0),
+        // so the max across the placement is the leader's — kept as a max so a
+        // momentarily silent leader cannot zero the column.
         const g: Record<number, number> = {}
         for (const [slotStr, p] of Object.entries(st.slots)) {
           const s = Number(slotStr)
           let best = 0
           for (const addr of [idToAddr[p.leader], ...p.replicas.map((r) => idToAddr[r])]) {
             const m = addr ? perNode[addr] : undefined
-            if (!m?.bytes || s >= m.bytes.length) continue
-            if (m.bytes[s] > best) best = m.bytes[s]
+            if (!m?.storage_bytes || s >= m.storage_bytes.length) continue
+            if (m.storage_bytes[s] > best) best = m.storage_bytes[s]
           }
           if (best > 0) g[s] = best
         }
@@ -167,7 +168,7 @@ export default function SlotsPage() {
       for (const a of addrs) {
         try {
           const m = await fetchNodeStatus(a)
-          const counter = m.writes?.[slot]
+          const counter = m.total_writes?.[slot]
           if (counter === undefined) continue
           const now = Date.now()
           if (last && counter >= last.counter) {

@@ -481,13 +481,15 @@ func (s *peerServer) SlotLeos(_ context.Context, req *pushupesv1.SlotLeosRequest
 	return resp, nil
 }
 
-// SlotSizes answers the on-disk bytes of many slots (see the proto comment): the
-// cluster storage gauge counts each slot's leader copy, and only the holder can
-// report its size.
+// SlotSizes answers the on-disk bytes and the seq ledger of many slots (see
+// the proto comment): the cluster storage gauges count each slot's leader copy,
+// and only the holder can report its size and its count. The seq book is the
+// copy's LEO — the same ledger its durable-write counter advances.
 func (s *peerServer) SlotSizes(_ context.Context, req *pushupesv1.SlotSizesRequest) (*pushupesv1.SlotSizesResponse, error) {
-	resp := &pushupesv1.SlotSizesResponse{Slots: req.Slots, Bytes: make([]uint64, len(req.Slots))}
+	resp := &pushupesv1.SlotSizesResponse{Slots: req.Slots, Bytes: make([]uint64, len(req.Slots)), Seqs: make([]uint64, len(req.Slots))}
 	for i, slot := range req.Slots {
 		resp.Bytes[i] = uint64(s.e.SlotSize(slot))
+		resp.Seqs[i] = s.e.HandleLEO(slot)
 	}
 	return resp, nil
 }
@@ -535,22 +537,23 @@ func toPBFrame(f *layoutFrame) *pushupesv1.LayoutFrame {
 	return out
 }
 
-// peerSlotSizes asks a peer for the on-disk bytes of the given slots.
-func (e *Engine) peerSlotSizes(ctx context.Context, addr string, slots []int32) ([]uint64, error) {
+// peerSlotSizes asks a peer for the on-disk bytes and the seq ledger of the
+// given slots — one round trip feeds both cluster storage folds.
+func (e *Engine) peerSlotSizes(ctx context.Context, addr string, slots []int32) (bytes, seqs []uint64, err error) {
 	c, err := e.peerRPC(addr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	cctx, cancel := context.WithTimeout(ctx, storageQueryTimeout)
 	defer cancel()
 	resp, err := c.SlotSizes(cctx, &pushupesv1.SlotSizesRequest{Slots: slots})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if len(resp.Bytes) != len(slots) {
-		return nil, fmt.Errorf("slot sizes: got %d answers for %d slots", len(resp.Bytes), len(slots))
+	if len(resp.Bytes) != len(slots) || len(resp.Seqs) != len(slots) {
+		return nil, nil, fmt.Errorf("slot sizes: got %d/%d answers for %d slots", len(resp.Bytes), len(resp.Seqs), len(slots))
 	}
-	return resp.Bytes, nil
+	return resp.Bytes, resp.Seqs, nil
 }
 
 // peerSlotLeos asks a peer for the durable LEOs of the given slots.

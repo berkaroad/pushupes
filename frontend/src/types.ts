@@ -48,7 +48,14 @@ export interface ClusterStatus {
   // cluster), so this is the live cluster-wide value every node reads back.
   replica_factor?: number
   replica_policy?: string
-  writes?: number[]
+  // Cluster 存储数量: the sum of the seq ledgers of every slot's LEADER copy.
+  // It rides the same background sample as storage_bytes (one fan-out, one
+  // completeness verdict), so it lags the write path slightly;
+  // storage_count_complete=false means a slot leader did not answer and the
+  // number is a lower bound. Per-slot breakdowns live on NodeStatus
+  // (total_writes). Absent on older nodes — the card renders '-' then.
+  storage_count?: number
+  storage_count_complete?: boolean
   // Cluster storage: the sum of every slot's LEADER copy (bytes on disk). It is
   // a background sample the backend refreshes every couple of seconds, so it
   // lags the write path slightly; storage_bytes_complete=false means a slot
@@ -112,29 +119,40 @@ export interface SlotStreams {
 }
 
 // One node's per-slot poll answer: durable counters (diffed into write
-// rates) plus gauges — WAL bytes on disk and event-stream count per slot.
-// A slot this node has not loaded reads as 0 in both gauge arrays.
+// rates) plus gauges — on-disk bytes of THIS node's copy (leader or
+// follower alike) and event-stream count per slot. A slot this node has not
+// loaded reads as 0 in both gauge arrays.
 export interface NodeStatus {
   node?: string
   slot_count?: number
-  writes: number[]
+  // THIS node's 存储数量: the sum of the seq ledgers of the leader copies it
+  // holds (backend Engine.LeaderSeqTotal). The per-slot breakdown follows in
+  // total_writes.
+  storage_count?: number
+  // total_writes: durable writes per slot — what THIS copy holds (seeded from
+  // its WAL at open, advanced by every frame that lands, catch-up included).
+  // The name pairs it against client_writes: totals vs client-origin.
+  total_writes: number[]
   // Durable record bytes per slot (frame bytes on disk), index-aligned with
-  // `writes`: diffing two snapshots turns one window into a message rate and
-  // a byte rate. The cluster page's write-speed cards require both.
-  write_bytes?: number[]
-  bytes?: number[]
+  // `total_writes`: diffing two snapshots turns one window into a message rate
+  // and a byte rate. The cluster page's write-speed cards require both.
+  total_write_bytes?: number[]
+  // On-disk bytes of THIS node's LEADER copy of each slot; a slot it only
+  // replicates reports 0 — the byte twin of storage_count (Σ across slots =
+  // this node's leader-copy volume).
+  storage_bytes?: number[]
   streams?: number[]
   // Per-slot post-migration cleanup queue of THAT node: 0, or the unix second
   // at which that node drops its local copy of the slot. Per-node by nature —
   // the console marks a replica from the node that reported it.
   dropping?: number[]
-  // Client-origin counters, index-aligned with writes/write_bytes: durable
-  // records/bytes that landed HERE from the client batch-append path only.
-  // Catch-up traffic (replica fetch, migration copy — AppendAtSeq /
-  // AppendFrameAtSeq on the backend) grows writes/write_bytes but never
-  // these, so the 写入速度 cards and the node charts diff these instead.
+  // Client-origin counters, index-aligned with total_writes/total_write_bytes:
+  // durable records/bytes that landed HERE from the client batch-append path
+  // only. Catch-up traffic (replica fetch, migration copy — AppendAtSeq /
+  // AppendFrameAtSeq on the backend) grows the total pair but never these, so
+  // the 写入速度 cards and the node charts diff these instead.
   client_writes?: number[]
-  client_bytes?: number[]
+  client_write_bytes?: number[]
   // THIS node's fenced local copies — the same view GET /admin/slots/pending
   // answers, riding the same poll so the data-node card can hang the red
   // 已围栏 N tag with the per-slot reasons in its tooltip. Empty or absent

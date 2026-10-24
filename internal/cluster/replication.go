@@ -4419,15 +4419,17 @@ func (e *Engine) Start(ctx context.Context) {
 
 // ---- cluster storage gauge -----------------------------------------------------
 
-// storageGauge is one sample of the cluster's stored volume: the sum of the
-// on-disk bytes of every slot's LEADER copy. Counting leaders (not "some copy
-// somewhere") is what keeps the number meaningful across a replica-set change or
-// a migration: the writes landed on the leader, and the other copies are the
-// same data one replication round behind — so summing every copy would multiply
-// the same bytes by the replica factor.
+// storageGauge is one sample of the cluster's stored volume and stored count:
+// the sum of the on-disk bytes AND the seq ledger of every slot's LEADER copy.
+// Counting leaders (not "some copy somewhere") is what keeps both numbers
+// meaningful across a replica-set change or a migration: the writes landed on
+// the leader, and the other copies are the same data one replication round
+// behind — so summing every copy would multiply both numbers by the replica
+// factor. Both folds share one fan-out and one completeness verdict.
 type storageGauge struct {
 	bytes    uint64
-	complete bool // every slot leader answered; false makes bytes a lower bound
+	count    uint64 // sum of leader copies' seq ledgers (存储数量)
+	complete bool   // every slot leader answered; false makes both sums lower bounds
 	at       time.Time
 }
 
@@ -4441,7 +4443,7 @@ const storageSampleInterval = 2 * time.Second
 
 // runStorageSampler keeps the gauge fresh ON DEMAND: only the first sample (at
 // boot) and reader-triggered kicks refresh it. A status read older than
-// storageSampleInterval schedules the next sample (see ClusterStorageBytes),
+// storageSampleInterval schedules the next sample (see ClusterStorageStats),
 // so the gauge converges to the console's polling cadence instead of adding a
 // peer-plane round trip per other member every 2 seconds forever — which is
 // what an idle cluster was paying for a number nobody was looking at.
@@ -4474,13 +4476,14 @@ func (e *Engine) kickStorage() {
 func (e *Engine) refreshStorage() {
 	tbl := e.TableSnapshot()
 	byLeader := map[string][]int32{}
-	var total uint64
+	var total, count uint64
 	for s, p := range tbl.Slots {
 		switch {
 		case p.Leader == "":
 			continue
 		case p.Leader == e.self:
 			total += uint64(e.SlotSize(s))
+			count += e.HandleLEO(s)
 		default:
 			byLeader[p.Leader] = append(byLeader[p.Leader], s)
 		}
@@ -4490,8 +4493,9 @@ func (e *Engine) refreshStorage() {
 		ctx, cancel := context.WithTimeout(context.Background(), storageQueryTimeout)
 		defer cancel()
 		type answer struct {
-			slots []int32
-			bytes []uint64
+			slots  []int32
+			bytes  []uint64
+			seqs   []uint64
 		}
 		answers := make(chan answer, len(byLeader))
 		var wg sync.WaitGroup
@@ -4504,11 +4508,11 @@ func (e *Engine) refreshStorage() {
 			wg.Add(1)
 			go func(addr string, slots []int32) {
 				defer wg.Done()
-				got, err := e.peerSlotSizes(ctx, addr, slots)
+				gotB, gotS, err := e.peerSlotSizes(ctx, addr, slots)
 				if err != nil {
 					return
 				}
-				answers <- answer{slots, got}
+				answers <- answer{slots, gotB, gotS}
 			}(addr, slots)
 		}
 		wg.Wait()
@@ -4519,32 +4523,76 @@ func (e *Engine) refreshStorage() {
 			for _, b := range a.bytes {
 				total += b
 			}
+			for _, sq := range a.seqs {
+				count += sq
+			}
 		}
-		// Every leader that was asked and did not answer makes the sum partial.
+		// Every leader that was asked and did not answer makes both sums partial.
 		if n < len(byLeader) {
 			complete = false
 		}
 	}
 	e.storageMu.Lock()
-	e.gauge = storageGauge{bytes: total, complete: complete, at: time.Now()}
+	e.gauge = storageGauge{bytes: total, count: count, complete: complete, at: time.Now()}
 	e.storageMu.Unlock()
 }
 
-// ClusterStorageBytes reports the last storage sample: the sum of every slot's
-// leader copy, and whether every leader answered. Zero/false until the first
-// sample lands (the sampler runs one immediately on start). A read that finds
-// the sample older than the staleness window kicks the background sampler, so
-// the gauge converges on whoever is reading it and stays untouched while
-// nobody is.
-func (e *Engine) ClusterStorageBytes() (uint64, bool) {
+// ClusterStorageStats reports the last storage sample: the bytes sum and the
+// seq-ledger sum over every slot's leader copy, and whether every leader
+// answered. Zero/false until the first sample lands (the sampler runs one
+// immediately on start). A read that finds the sample older than the staleness
+// window kicks the background sampler, so the gauge converges on whoever is
+// reading it and stays untouched while nobody is.
+func (e *Engine) ClusterStorageStats() (bytes, count uint64, complete bool) {
 	e.storageMu.Lock()
-	bytes, complete, at := e.gauge.bytes, e.gauge.complete, e.gauge.at
+	bytes, count, complete, at := e.gauge.bytes, e.gauge.count, e.gauge.complete, e.gauge.at
 	stale := at.IsZero() || time.Since(at) >= storageSampleInterval
 	e.storageMu.Unlock()
 	if stale {
 		e.kickStorage()
 	}
-	return bytes, complete && !at.IsZero()
+	return bytes, count, complete && !at.IsZero()
+}
+
+// LeaderSeqTotal is THIS node's 存储数量: the sum of the seq ledgers of the
+// copies it currently leads, straight from its own view of the replicated
+// table and its own store. The fold is a plain scan (no table clone) the way
+// SyncedLeaderSlots reads it — a poll target, so O(slot_count) per read is the
+// budget. A slot this node leads always has its copy loaded (the leader lands
+// writes on it), so no cold-copy undercount exists here.
+func (e *Engine) LeaderSeqTotal() uint64 {
+	var total uint64
+	e.tableMu.RLock()
+	for s, p := range e.table.Slots {
+		if p == nil || p.Leader != e.self {
+			continue
+		}
+		total += e.HandleLEO(s)
+	}
+	e.tableMu.RUnlock()
+	return total
+}
+
+// LeaderSlotBytes narrows a per-slot byte gauge to the copies this node LEADS:
+// a slot it merely replicates answers 0. The array is the byte twin of
+// storage_count — summed it is this node's leader-copy volume, the same
+// one-leader rule the cluster storage gauge follows, so a per-node total and
+// its seq total always talk about the same copies. Same table lock and O(slot
+// count) scan as LeaderSeqTotal.
+func (e *Engine) LeaderSlotBytes(bytes []int64) []int64 {
+	out := make([]int64, len(bytes))
+	e.tableMu.RLock()
+	for s, p := range e.table.Slots {
+		if p == nil || p.Leader != e.self {
+			continue
+		}
+		if s < 0 || int(s) >= len(bytes) {
+			continue
+		}
+		out[s] = bytes[s]
+	}
+	e.tableMu.RUnlock()
+	return out
 }
 
 // SlotSize is a slot's local on-disk footprint (see storage.Store.SlotDiskBytes):

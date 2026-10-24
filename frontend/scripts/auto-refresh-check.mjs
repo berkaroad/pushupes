@@ -38,7 +38,7 @@ function makeServer(id) {
         raft: { state: id === 'node-1' ? 'Leader' : 'Follower', leader: 'node-1' },
         peers: Object.fromEntries(Object.entries(nodes).map(([pid, n]) => [pid, { id: pid, admin_addr: n.admin }])),
         slots: {}, slot_count: 8,
-        writes: [statusHits], // changes on every request
+        storage_count: statusHits, // changes on every request
         controller: 'node-1', controller_admin_addr: nodes['node-1'].admin,
       }))
       return
@@ -82,8 +82,8 @@ assert('a tick issues a fresh status read', statusHits > bootHits,
   `hits stayed at ${bootHits} — ensureLeader served a cached result`)
 assert('a tick returns a NEW object (React re-renders on a changed reference)', tick !== boot,
   'the same object came back, so setStatus() is a no-op and the page freezes')
-assert('a tick carries the fresh value', tick.writes?.[0] !== boot.writes?.[0],
-  `writes ${JSON.stringify(boot.writes)} -> ${JSON.stringify(tick.writes)}`)
+assert('a tick carries the fresh value', tick.storage_count !== boot.storage_count,
+  `storage_count ${boot.storage_count} -> ${tick.storage_count}`)
 
 // --- and the pin survives the polls ----------------------------------------
 assert('polls stay pinned to the leader', tick.node === 'node-1', tick.node)

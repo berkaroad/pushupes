@@ -62,8 +62,8 @@ func TestStorageGaugeSumsLeaderCopies(t *testing.T) {
 	}
 
 	// Before any sample the gauge is empty (not "0 bytes of storage").
-	if bytes, complete := self.ClusterStorageBytes(); bytes != 0 || complete {
-		t.Fatalf("unsampled gauge = %d/%v, want 0/false", bytes, complete)
+	if bytes, count, complete := self.ClusterStorageStats(); bytes != 0 || count != 0 || complete {
+		t.Fatalf("unsampled gauge = %d/%d/%v, want 0/0/false", bytes, count, complete)
 	}
 
 	// Table: slot 0 led by this node, slot 1 by the peer; both replicate the
@@ -77,19 +77,31 @@ func TestStorageGaugeSumsLeaderCopies(t *testing.T) {
 	self.table.Slots[1] = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-1"}, Epoch: 1, State: SlotStable}
 	self.tableMu.Unlock()
 
+	// The per-node 存储数量 fold answers only THIS node's leader copies:
+	// slot 0 here, never the follower copy of the peer-led slot 1.
+	if got, want := self.LeaderSeqTotal(), self.HandleLEO(0); got != want {
+		t.Fatalf("LeaderSeqTotal %d, want the locally led slot's seq %d", got, want)
+	}
+
 	self.refreshStorage()
 	local := uint64(self.SlotSize(0))
 	remote := uint64(peer.SlotSize(1))
 	if local == 0 || remote == 0 {
 		t.Fatalf("setup produced no bytes (local=%d remote=%d)", local, remote)
 	}
-	bytes, complete := self.ClusterStorageBytes()
+	bytes, count, complete := self.ClusterStorageStats()
 	if !complete {
 		t.Fatal("every slot leader answered; the sample must be complete")
 	}
 	if bytes != local+remote {
 		t.Fatalf("gauge %d, want the two leader copies %d+%d=%d (the peer's copy of slot 0 must not count)",
 			bytes, local, remote, local+remote)
+	}
+	// The count fold rides the same fan-out: the seq ledgers of the same two
+	// leader copies, and nothing from the follower copies.
+	if wantCount := self.HandleLEO(0) + peer.HandleLEO(1); count != wantCount {
+		t.Fatalf("count gauge %d, want the two leader seqs %d (follower copies must not count)",
+			count, wantCount)
 	}
 
 	// A leader that cannot be reached leaves the sample partial instead of
@@ -98,11 +110,56 @@ func TestStorageGaugeSumsLeaderCopies(t *testing.T) {
 	self.table.Peers["node-2"] = Peer{Role: RoleLearner, ID: "node-2", PeerAddr: "127.0.0.1:1"}
 	self.tableMu.Unlock()
 	self.refreshStorage()
-	bytes, complete = self.ClusterStorageBytes()
+	bytes, count, complete = self.ClusterStorageStats()
 	if complete {
 		t.Fatal("a slot leader did not answer; the sample must be marked incomplete")
 	}
 	if bytes != local {
 		t.Fatalf("partial gauge %d, want the local leader copy only (%d)", bytes, local)
+	}
+	if wantLocal := self.HandleLEO(0); count != wantLocal {
+		t.Fatalf("partial count gauge %d, want the local leader seq only (%d)", count, wantLocal)
+	}
+}
+
+// TestLeaderSlotBytesMasksToLedSlots pins the per-node byte gauge to the same
+// one-leader rule as storage_count: a slot this node only replicates answers 0,
+// so summing the array is exactly this node's leader-copy volume — the byte
+// twin of LeaderSeqTotal, never "everything that landed on this disk".
+func TestLeaderSlotBytesMasksToLedSlots(t *testing.T) {
+	self, selfStore := newTestEngine(t, "node-1")
+
+	// slot 0 is this node's to lead; slot 1 is led by the peer while this node
+	// holds a copy of it too — the shape the console polls every 2s.
+	for _, s := range []int32{0, 1} {
+		agg := aggInSlot(t, self, s)
+		for v := 1; v <= 3; v++ {
+			if _, err := selfStore.Append(makeRecord(agg, uint32(v), fmt.Sprintf("m-%d-%d", s, v))); err != nil {
+				t.Fatalf("append slot %d: %v", s, err)
+			}
+		}
+	}
+	self.tableMu.Lock()
+	self.table.Slots[0] = &Placement{Leader: "node-1", Replicas: []string{"node-1", "node-2"}, Epoch: 1, State: SlotStable}
+	self.table.Slots[1] = &Placement{Leader: "node-2", Replicas: []string{"node-2", "node-1"}, Epoch: 1, State: SlotStable}
+	self.tableMu.Unlock()
+
+	bytes, _ := selfStore.SlotGauges()
+	if bytes[0] == 0 || bytes[1] == 0 {
+		t.Fatalf("setup produced no bytes (slot0=%d slot1=%d)", bytes[0], bytes[1])
+	}
+	got := self.LeaderSlotBytes(bytes)
+	if got[0] != bytes[0] {
+		t.Fatalf("led slot 0: got %d, want the local copy's bytes %d", got[0], bytes[0])
+	}
+	if got[1] != 0 {
+		t.Fatalf("replicated slot 1: got %d, want 0 (only leader copies count)", got[1])
+	}
+	var sum int64
+	for _, v := range got {
+		sum += v
+	}
+	if sum != bytes[0] {
+		t.Fatalf("sum %d, want the leader-copy bytes %d", sum, bytes[0])
 	}
 }

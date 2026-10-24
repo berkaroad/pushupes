@@ -116,11 +116,13 @@ assert('storage card reads storage_bytes', pageSrc.includes('storage_bytes'))
 assert('storage card flags a lower bound', pageSrc.includes('storage_bytes_complete'))
 // The stat row's slot card merged the old 迁移中槽位 into 槽位（迁移中 / 总数）
 // ("1 / 1680") — that card is now the 存储数量 card: the records stored
-// cluster-wide, the durable writes counter summed at each slot's LEADER from
-// the same /admin/status poll the write-speed cards use ('-' until a complete
-// sample lands). The two write-speed cards stay on their own row.
+// cluster-wide, folded SERVER-side by /admin/cluster/status storage_count
+// (the leader copies' seq ledgers, sampled with storage_bytes in one fan-out;
+// _complete=false renders it as a lower bound). The two write-speed cards
+// stay on their own row.
 assert('storage-count card replaced the slot card',
-  pageSrc.includes('"存储数量"') && !pageSrc.includes('槽位（迁移中 / 总数）')
+  pageSrc.includes('"存储数量"') && pageSrc.includes('storage_count')
+  && !pageSrc.includes('槽位（迁移中 / 总数）')
   && !pageSrc.includes('"迁移中槽位"') && !pageSrc.includes('"槽位总数"'))
 // The node cards say 控制节点 / 数据节点 — the （在线 / 总数） suffix is gone,
 // the value line ("2 / 3") carries the counts.
@@ -160,7 +162,12 @@ assert('client write-speed is two cards, named for the client path',
   && pageSrc.includes('title: "客户端写入速度（大小）"')
   && !pageSrc.includes('title: "写入速度（数量）"')
   && !pageSrc.includes('写入速度（数量 / 大小）'))
-assert('write-speed sums at slot leaders', pageSrc.includes('leaderWriteTotals'))
+// 存储数量 moved server-side: the cluster status answers storage_count (the
+// leader-copy seq fold shared with storage_bytes), so the page must NOT carry
+// its own per-node leader fold any more — a re-introduced client-side fold
+// would be a second, divergent source for the same card.
+assert('storage count reads the cluster-side fold (no client-side leader fold)',
+  pageSrc.includes('storage_count') && !pageSrc.includes('leaderWriteTotals'))
 // The 同步状态 card rides the same 2s writes poll: the page reads each node's
 // synced_slots pair and names the three states (pinning the compiled forms
 // of both the state strings and the remaining-slots template).
@@ -197,7 +204,7 @@ assert('both pollers share the 2s auto-refresh cadence and the switch gates them
   && pageSrc.includes('auto ? setInterval(tick, AUTO_REFRESH_MS) : null')
   && !pageSrc.includes('WRITES_POLL_MS') && !pageSrc.includes('5000'))
 assert('write-speed polls the light counters endpoint', pageSrc.includes('fetchNodeStatus') && !pageSrc.includes('fetchNodeWrites'))
-assert('write-speed reads the byte counters', pageSrc.includes('write_bytes'))
+assert('write-speed reads the byte counters', pageSrc.includes('total_write_bytes'))
 const { humanBytes, humanBytesPerSec, utcStamp } = await vite.ssrLoadModule('/src/format.ts')
 assert('byte formatter renders sizes', humanBytes(0) === '0 B' && humanBytes(1536) === '1.5 KiB' && humanBytes(70496329) === '67.2 MiB')
 assert('byte formatter renders rates', humanBytesPerSec(0) === '0 B/s' && humanBytesPerSec(1536) === '1.5 KiB/s')
@@ -248,12 +255,31 @@ if (liveAdmin) {
     // more converged slots than it leads).
     const w = await (await fetch(`${liveAdmin}/admin/status`)).json()
     // The client-origin pair the rate cards diff must exist and align with
-    // the lifetime arrays it replaced (same slot per index).
-    assert('live writes carries client_writes/client_bytes aligned with writes',
-      Array.isArray(w.client_writes) && Array.isArray(w.client_bytes)
-      && w.client_writes.length === w.writes.length
-      && w.client_bytes.length === w.writes.length
-      && w.client_writes.every((v, i) => v <= w.writes[i]))
+    // the total arrays it pairs against (same slot per index).
+    assert('live status carries client_writes/client_write_bytes aligned with total_writes',
+      Array.isArray(w.client_writes) && Array.isArray(w.client_write_bytes)
+      && w.client_writes.length === w.total_writes.length
+      && w.client_write_bytes.length === w.total_writes.length
+      && w.client_writes.every((v, i) => v <= w.total_writes[i]))
+    // The per-node 存储数量 scalar: a non-negative integer, and it must equal
+    // the sum of total_writes at the slots THIS node leads — the client can
+    // always re-derive the backend fold from the same answer.
+    assert('live status carries storage_count as a non-negative int',
+      Number.isInteger(w.storage_count) && w.storage_count >= 0)
+    // …and it is re-derivable from the same answer: the node's own
+    // total_writes summed at the slots the table says IT leads. storage_bytes
+    // is the byte twin — a slot this node only replicates must answer 0
+    // (leader-only rule), so the console's per-node footer and the cluster
+    // cards talk about the same copies.
+    let ledSeq = 0
+    let strayBytes = 0
+    for (const [slot, pl] of Object.entries(st.slots)) {
+      const i = Number(slot)
+      if (pl.leader === st.node) ledSeq += w.total_writes[i]
+      else if ((w.storage_bytes?.[i] ?? 0) !== 0) strayBytes++
+    }
+    assert('live storage_count equals total_writes summed at led slots', w.storage_count === ledSeq)
+    assert('live storage_bytes is leader-only (replicated slots answer 0)', strayBytes === 0)
     const pair = w.synced_slots
     assert('live writes carries synced_slots as [led, synced]',
       Array.isArray(pair) && pair.length === 2
@@ -270,7 +296,9 @@ if (liveAdmin) {
     console.log(`  (live sync gauge: led=${pair[0]} synced=${pair[1]} of slot_count=${st.slot_count})`)
     assert('live status carries storage_bytes', typeof st.storage_bytes === 'number')
     assert('live status carries storage_bytes_complete', typeof st.storage_bytes_complete === 'boolean')
-    console.log(`  (live probe: storage_bytes=${st.storage_bytes} → ${humanBytes(st.storage_bytes)}, complete=${st.storage_bytes_complete})`)
+    assert('live status carries storage_count', typeof st.storage_count === 'number' && st.storage_count >= 0)
+    assert('live status carries storage_count_complete', typeof st.storage_count_complete === 'boolean')
+    console.log(`  (live probe: storage_bytes=${st.storage_bytes} → ${humanBytes(st.storage_bytes)}, storage_count=${st.storage_count}, complete=${st.storage_bytes_complete})`)
   } catch (e) {
     assert('live status reachable', false)
     console.log(`  (live probe failed: ${e?.message ?? e})`)

@@ -77,8 +77,8 @@ func New(eng *cluster.Engine, store *storage.Store) *Server {
 }
 
 // ServeHTTP makes Server an http.Handler. CORS is permissive: the API is
-// unauthenticated and the console must poll per-node counters (status
-// "writes") from any browser origin to derive live slot write rates.
+// unauthenticated and the console must poll per-node counters (/admin/status)
+// from any browser origin to derive live slot write rates.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
@@ -236,7 +236,7 @@ func (s *Server) handleSlotStreams(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	tbl := s.Engine.TableSnapshot()
 	leaderID, leaderAdmin := s.Engine.Controller()
-	storageBytes, storageComplete := s.Engine.ClusterStorageBytes()
+	storageBytes, storageCount, storageComplete := s.Engine.ClusterStorageStats()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"node":       s.Engine.Self(),
 		"raft":       s.Engine.RaftStats(),
@@ -259,9 +259,14 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 		"replica_policy":        string(tbl.Policy),
 		"controller":            leaderID,
 		"controller_admin_addr": leaderAdmin,
-		// durable writes per slot since this process started; clients diff
-		// successive snapshots to derive write rates (msg/sec).
-		"writes": s.Engine.WriteCounts(),
+		// storage_count is the cluster's stored record count: the seq ledgers
+		// of every slot's LEADER copy (the copy the writes landed on), folded
+		// by the same background sample as storage_bytes — one fan-out, one
+		// completeness verdict; storage_count_complete=false means a slot
+		// leader did not answer, i.e. the number is a lower bound. Per-slot
+		// counters live on the node-local GET /admin/status (total_writes).
+		"storage_count":          storageCount,
+		"storage_count_complete": storageComplete,
 		// storage_bytes is the cluster's stored volume: the sum of the on-disk
 		// size of every slot's LEADER copy (the copy the writes landed on — see
 		// cluster.Engine.refreshStorage). It is a background sample, so it lags
@@ -286,29 +291,42 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"node":       s.Engine.Self(),
 		"slot_count": s.Store.SlotCount,
-		"writes":     s.Engine.WriteCounts(),
+		// storage_count is THIS node's stored record count: the sum of the
+		// seq ledgers of the leader copies it holds (Engine.LeaderSeqTotal —
+		// its own view of the replicated table, so no fold belongs to the
+		// client). total_writes below answers the per-slot breakdown.
+		"storage_count": s.Engine.LeaderSeqTotal(),
+		// total_writes: durable writes per slot — what THIS copy holds,
+		// seeded from its WAL at open and advanced by every frame that lands
+		// (client appends and catch-up alike). The name pairs it against
+		// client_writes below: totals vs client-origin. Clients diff
+		// successive snapshots to derive write rates.
+		"total_writes": s.Engine.WriteCounts(),
 		// Durable record bytes per slot (frame bytes on disk), index-aligned
-		// with `writes`: clients diff the two arrays against their last
+		// with `total_writes`: clients diff the two arrays against their last
 		// snapshot to get a message rate and a byte rate for one window.
-		"write_bytes": s.Engine.WriteByteCounts(),
-		// Client-origin counters (see Engine.ClientWriteCounts): the writes
+		"total_write_bytes": s.Engine.WriteByteCounts(),
+		// Client-origin counters (see Engine.ClientWriteCounts): the total
 		// pair above also grows when the catch-up paths land a leader's
 		// records here — node-to-node movement, not client write speed — so
 		// the console diffs THESE for the 写入速度 cards and the node charts.
-		// Index-aligned with `writes`; read at each slot's leader.
-		"client_writes": s.Engine.ClientWriteCounts(),
-		"client_bytes":  s.Engine.ClientWriteByteCounts(),
-		// Console gauges, one entry per slot id: WAL bytes on disk and event
-		// stream count. A slot this node has not loaded reads as zero instead
-		// of being opened (that would scan every segment of it) — the console
-		// takes the answer from whichever node holds the slot.
-		"bytes":   bytesOnDisk,
-		"streams": streams,
+		// Index-aligned with `total_writes`; read at each slot's leader.
+		"client_writes":      s.Engine.ClientWriteCounts(),
+		"client_write_bytes": s.Engine.ClientWriteByteCounts(),
+		// Console gauges, one entry per slot id: on-disk bytes of THIS
+		// node's copy when it LEADS that slot (a slot it only replicates
+		// reports 0 — the byte twin of storage_count, so summing the array
+		// gives this node's leader-copy volume), and event stream count. A
+		// slot this node has not loaded reads as zero instead of being
+		// opened (that would scan every segment of it) — the console takes
+		// the answer from whichever node holds the slot.
+		"storage_bytes": s.Engine.LeaderSlotBytes(bytesOnDisk),
+		"streams":       streams,
 		// Post-migration cleanup queue of THIS node: 0, or the unix second at
 		// which this node's local copy of the slot is due to be dropped. It is
 		// per-node by nature (only the node holding the copy knows), so the
 		// console asks every node and marks the replica whose copy is on its
-		// way out. Same shape as bytes/streams.
+		// way out. Same shape as storage_bytes/streams.
 		"dropping": s.Engine.PendingDrops(),
 		// Sync gauge for the console's 同步状态 card: [slots this node leads
 		// whose placement is complete, of those ones converged on the table's
@@ -329,7 +347,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"pending_slots": s.Engine.PendingSlots(),
 		// Flow control (node-level throttle of this node's slot leaders):
 		// the config currently in force, and the per-slot cumulative
-		// rejection counts index-aligned with writes. The console diffs
+		// rejection counts index-aligned with total_writes. The console diffs
 		// successive hit arrays to mark the slots whose throttle FIRED in
 		// the last window; the config (not the hits) drives the node card's
 		// 流控 tag, which says "this node is configured to throttle".
