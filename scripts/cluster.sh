@@ -226,7 +226,11 @@ start_node() {
   dir="$(node_dir "$n")"
   mkdir -p "$dir"
   peers="$(peers_csv)"
-  : > "$dir/node.log"
+  # 日志跨重启保留：start/restart 只动进程，绝不截断上一世的 node.log——
+  # 排障要看的正是「宕机前最后写了什么」，截断会把证据抹掉（实测踩过：
+  # 节点宕机后 restart，宕机现场日志荡然无存）。进程本身以 >> 追加，
+  # 这里只打一行世代分隔符便于翻查。真正清日志的入口只有 clean。
+  printf '\n===== cluster.sh start node-%s @ %s =====\n' "$n" "$(date '+%Y-%m-%d %H:%M:%S %z')" >> "$dir/node.log"
   local extra=()
   # 每个节点的角色由 ROLE_<n> 指定（voter/learner，默认 node-1=voter、其余=
   # learner，见 node_n_role）。learner 不报名 raft、由控制面准入目录后分发布局。
