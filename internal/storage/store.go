@@ -56,15 +56,19 @@ type Store struct {
 	wakeBus chan struct{}
 
 	// per-slot counters of records made durable locally (both client
-	// appends and replica/migration applies); the basis for write-rate
-	// reporting in the admin API.
+	// appends and replica/migration applies). An open seeds them from the
+	// copy's loaded ledger (seedDurableCounters), so a counter answers
+	// "what does this copy hold" across restarts, not "what landed since
+	// boot"; the basis for write-rate and stored-volume reporting in the
+	// admin API.
 	writes []atomic.Uint64
 
 	// per-slot counters of the record bytes those durable writes landed
 	// (frame bytes on disk, matching what the segments account in
-	// commitFrame); index-aligned with `writes` — every site that adds a
-	// write adds its bytes — so the admin API diffs both into a message
-	// rate and a byte rate for the same window.
+	// commitFrame — and what the seed uses, so both books are one book);
+	// index-aligned with `writes` — every site that adds a write adds its
+	// bytes — so the admin API diffs both into a message rate and a byte
+	// rate for the same window.
 	writeBytes []atomic.Uint64
 
 	// per-slot counters of the CLIENT writes only — the record path a batch
@@ -152,6 +156,7 @@ func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushP
 					continue
 				}
 				slot.store = st
+				st.seedDurableCounters(slot)
 				st.slots[t.id].Store(slot)
 			}
 		}()
@@ -213,6 +218,13 @@ func (st *Store) DropSlot(slotID int32) error {
 		s.Close()
 		st.slots[slotID].Store(nil)
 	}
+	// The counters report what this copy holds; a dropped copy holds
+	// nothing, so its whole ledger — durable pair and client pair — is
+	// retired with it. A later re-entry seeds fresh from whatever lands.
+	st.writes[slotID].Store(0)
+	st.writeBytes[slotID].Store(0)
+	st.clientWrites[slotID].Store(0)
+	st.clientWriteBytes[slotID].Store(0)
 	st.clearDirty(slotID)
 	return os.RemoveAll(st.slotDir(slotID))
 }
@@ -280,8 +292,22 @@ func (st *Store) ReloadSlot(slotID int32) error {
 		return err
 	}
 	slot.store = st
+	st.seedDurableCounters(slot)
 	st.slots[slotID].Store(slot)
 	return nil
+}
+
+// seedDurableCounters re-derives a slot's durable-write counters from the
+// copy just opened: every open path runs it before publishing the slot, so
+// `writes`/`writeBytes` always answer "what does this copy hold" — the
+// records loaded from disk at open plus everything that lands afterwards —
+// and a restart neither zeroes them nor double-counts (the seed is a Store,
+// not an Add). The client-origin pair stays process-local by definition: a
+// restart did not serve those writes, so it is never seeded.
+func (st *Store) seedDurableCounters(s *Slot) {
+	records, frameBytes := s.copyLedger()
+	st.writes[s.ID].Store(records)
+	st.writeBytes[s.ID].Store(frameBytes)
 }
 
 // SlotOf routes an aggregate ID to its slot.
@@ -306,6 +332,7 @@ func (st *Store) Slot(i int32) (*Slot, error) {
 			return nil, err
 		}
 		slot.store = st
+		st.seedDurableCounters(slot)
 		st.slots[i].Store(slot)
 		return slot, nil
 	}
@@ -510,8 +537,9 @@ func (st *Store) FlushStats() FlushStats {
 	return out
 }
 
-// WriteCount returns the number of records made durable in one slot since
-// the process started.
+// WriteCount returns the number of records durable in one slot's local copy:
+// seeded from the WAL when the slot opens, advanced by every frame that
+// lands after it (client appends and catch-up alike).
 func (st *Store) WriteCount(slotID int32) uint64 {
 	if slotID < 0 || int(slotID) >= len(st.writes) {
 		return 0

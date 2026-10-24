@@ -1037,6 +1037,24 @@ func (s *Slot) LastSeq() uint64 {
 	return s.seqCounter.Load()
 }
 
+// copyLedger is the durable-total view of this copy as its segments were
+// loaded: the record count the slot's seq ledger reaches (segments start at
+// seq 1 and the loader enforces baseSeq continuity, so the LEO IS the count)
+// and the frame bytes the segments account — the exact per-frame bytes
+// commitFrame adds on every live append, so a counter seeded from here and one
+// grown by appends use the same book. Callers run it before publishing the
+// slot (startup open, lazy open, reload), when the segment slice is stable.
+func (s *Slot) copyLedger() (records, frameBytes uint64) {
+	var frames int64
+	for _, seg := range s.segments {
+		frames += seg.sizeBytes - seg.dataStart
+	}
+	if frames < 0 {
+		frames = 0
+	}
+	return s.seqCounter.Load(), uint64(frames)
+}
+
 // advanceNotifyLocked fires the store-level wake signal for this slot and
 // wakes single-slot Cond waiters: close the current wake handle (waiters
 // holding it observe the advance) and install a fresh one for the next.

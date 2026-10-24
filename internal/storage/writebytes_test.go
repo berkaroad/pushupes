@@ -15,6 +15,7 @@
 package storage
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/berkaroad/pushupes/internal/data"
@@ -175,5 +176,114 @@ func TestClientWriteCountsOnlyClientPath(t *testing.T) {
 	if st.ClientWriteCounts()[slot] != 1 || st.ClientWriteByteCounts()[slot] != uint64(rec.EncodedSize()) {
 		t.Fatalf("after conflict: client=%d/%d, want 1/%d (unchanged)",
 			st.ClientWriteCounts()[slot], st.ClientWriteByteCounts()[slot], rec.EncodedSize())
+	}
+}
+
+// zzFreshSlot returns an aggregate name routing to a slot outside `taken`.
+func zzFreshSlot(st *Store, taken ...int32) string {
+	for i := 0; ; i++ {
+		name := fmt.Sprintf("zz-seed-agg-%d", i)
+		s := st.SlotOf(name)
+		clash := false
+		for _, t := range taken {
+			if t == s {
+				clash = true
+			}
+		}
+		if !clash {
+			return name
+		}
+	}
+}
+
+// TestDurableCountersSeededFromCopy pins the counters' restart story: an
+// open seeds `writes`/`writeBytes` from the copy's loaded ledger, so the
+// number answers "what does this copy hold" — not "what landed since boot".
+// The seed must equal the counter the previous process held (same books:
+// seq ledger and commitFrame bytes), must be a Store not an Add (a reload
+// mid-process does not double), must leave the client pair process-local,
+// and must keep advancing as frames land afterwards. Dropping the copy
+// retires the whole ledger with it.
+func TestDurableCountersSeededFromCopy(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStore(dir, 64, DefaultSegmentBytes, FlushPolicy{})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	rec := recFor(zzFreshSlot(st), 1, "cmd-r1")
+	s1 := st.SlotOf(rec.AggregateID)
+	if _, err := st.Append(rec); err != nil {
+		t.Fatalf("client append: %v", err)
+	}
+	rec2 := recFor(zzFreshSlot(st, s1), 1, "cmd-r2")
+	s2 := st.SlotOf(rec2.AggregateID)
+	if err := st.AppendAtSeq(s2, 1, rec2); err != nil {
+		t.Fatalf("append at seq: %v", err)
+	}
+	rec3 := recFor(zzFreshSlot(st, s1, s2), 1, "cmd-r3")
+	s3 := st.SlotOf(rec3.AggregateID)
+	if err := st.AppendFrameAtSeq(s3, 1, rec3.EncodeBinary(nil)); err != nil {
+		t.Fatalf("append frame at seq: %v", err)
+	}
+	beforeW, beforeB := st.WriteCounts(), st.WriteByteCounts()
+
+	// A reload re-derives the same truth: Store, not Add.
+	if err := st.ReloadSlot(s1); err != nil {
+		t.Fatalf("reload slot: %v", err)
+	}
+	if got := st.WriteCounts()[s1]; got != beforeW[s1] {
+		t.Fatalf("after ReloadSlot: writes=%d, want %d (seed must not double)", got, beforeW[s1])
+	}
+	if got := st.WriteByteCounts()[s1]; got != beforeB[s1] {
+		t.Fatalf("after ReloadSlot: bytes=%d, want %d", got, beforeB[s1])
+	}
+
+	// Drop retires the whole ledger with the copy.
+	if err := st.DropSlot(s2); err != nil {
+		t.Fatalf("drop slot: %v", err)
+	}
+	if st.WriteCounts()[s2] != 0 || st.WriteByteCounts()[s2] != 0 ||
+		st.ClientWriteCounts()[s2] != 0 || st.ClientWriteByteCounts()[s2] != 0 {
+		t.Fatalf("after DropSlot: counters=%d/%d/%d/%d, want all zero",
+			st.WriteCounts()[s2], st.WriteByteCounts()[s2],
+			st.ClientWriteCounts()[s2], st.ClientWriteByteCounts()[s2])
+	}
+	beforeW, beforeB = st.WriteCounts(), st.WriteByteCounts()
+	st.Close()
+
+	st2, err := OpenStore(dir, 64, DefaultSegmentBytes, FlushPolicy{})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer st2.Close()
+	for _, s := range []int32{s1, s3} {
+		if got := st2.WriteCounts()[s]; got != beforeW[s] {
+			t.Fatalf("reopen slot %d: writes=%d, want %d (seeded from copy)", s, got, beforeW[s])
+		}
+		if got := st2.WriteByteCounts()[s]; got != beforeB[s] {
+			t.Fatalf("reopen slot %d: bytes=%d, want %d", s, got, beforeB[s])
+		}
+	}
+	if st2.WriteCounts()[s2] != 0 {
+		t.Fatalf("reopen dropped slot: writes=%d, want 0", st2.WriteCounts()[s2])
+	}
+	// The client pair stays process-local: a restart served none of those.
+	for _, s := range []int32{s1, s3} {
+		if st2.ClientWriteCounts()[s] != 0 || st2.ClientWriteByteCounts()[s] != 0 {
+			t.Fatalf("reopen slot %d: client pair=%d/%d, want 0/0",
+				s, st2.ClientWriteCounts()[s], st2.ClientWriteByteCounts()[s])
+		}
+	}
+	// And new frames advance FROM the seed, not beside it.
+	next := recFor(rec.AggregateID, 2, "cmd-r4")
+	if _, err := st2.Append(next); err != nil {
+		t.Fatalf("append after reopen: %v", err)
+	}
+	if got := st2.WriteCounts()[s1]; got != beforeW[s1]+1 {
+		t.Fatalf("append after reopen: writes=%d, want %d", got, beforeW[s1]+1)
+	}
+	if got := st2.WriteByteCounts()[s1]; got != beforeB[s1]+uint64(next.EncodedSize()) {
+		t.Fatalf("append after reopen: bytes=%d, want %d", got, beforeB[s1]+uint64(next.EncodedSize()))
 	}
 }
