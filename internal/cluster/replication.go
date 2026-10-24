@@ -131,9 +131,15 @@ type Engine struct {
 	// divSeen holds the last diverged reading of a copy a round has not acted
 	// on yet (see confirmDiverged). rebMu in balance.go guards it with the
 	// retry maps.
-	divSeen          map[int32]rebalanceAttempt
-	divergedConfirm  time.Duration // window before a diverged reading may drop a copy
-	fetchScratchPool sync.Pool     // *fetchScratch (per-round positions + report)
+	divSeen         map[int32]rebalanceAttempt
+	divergedConfirm time.Duration // window before a diverged reading may drop a copy
+	// emptySeen holds the first sightings of an empty-shell leader reading
+	// (see leaderEmptyShellWithHistory); rebMu guards it with divSeen.
+	// Once past the window the entry STAYS (the refusal is steady-state, not
+	// one-shot); clearing happens when the shell fills or the evidence goes.
+	emptySeen          map[int32]time.Time
+	emptyLeaderConfirm time.Duration // window before an empty-shell reading may refuse
+	fetchScratchPool   sync.Pool     // *fetchScratch (per-round positions + report)
 
 	// ownership bitmap: which slots this node leads, rebuilt only when
 	// the Raft table version advances. Per-item map lookups under the
@@ -618,6 +624,7 @@ func NewEngine(node consensus, store *storage.Store, self string, logger *slog.L
 	e.scanPool.New = func() any { return &fetchScan{} }
 	e.fetchBudget = maxPayloadBytes
 	e.divergedConfirm = divergedConfirmWindow
+	e.emptyLeaderConfirm = emptyLeaderConfirmWindow
 	e.fetchScratchPool.New = func() any { return &fetchScratch{} }
 	e.fences = make([]slotFence, store.SlotCount)
 	if e.logger == nil {
@@ -758,6 +765,91 @@ func (e *Engine) leaderCopyMissingWithHistory(slot int32) bool {
 	}
 	p, ok := e.slotPlacement(slot)
 	return ok && p.Leader == e.self && p.Epoch >= 2
+}
+
+// emptyLeaderConfirmWindow is how long a slot must keep reading as an
+// empty-shell leader before writes are refused: a copy being (re)built can
+// briefly read empty while its seats still report the previous holder's
+// history — the same transient that confirmDiverged guards against.
+const emptyLeaderConfirmWindow = 2 * time.Second
+
+// leaderEmptyShellWithHistory reports the empty-shell sibling of
+// leaderCopyMissingWithHistory: this node leads a slot that has moved before
+// (epoch >= 2), its local copy EXISTS but holds zero records, and a seat in
+// the CURRENT replica set has reported history (LEO > 0) on the leader-side
+// progress ledger. That is the live-cluster Oct-24 shape: a former migration
+// source whose copy was dropped mid-run, re-granted as a fresh empty seat,
+// then handed leadership by a floorless commit (offline-source leader_move
+// or a failover pin) — SlotPresent is true so the missing-copy guard never
+// fires, and the empty directory answers "current version 0" to every client,
+// the adopt-and-rewrite storm the missing-copy guard exists to refuse.
+// The evidence is the seat ledger every fetch round already feeds: no new
+// RPC, no new protocol. The reading must be confirmed across
+// emptyLeaderConfirmWindow before it refuses; it holds until the shell fills
+// or the seat evidence clears.
+func (e *Engine) leaderEmptyShellWithHistory(slot int32) bool {
+	if !e.store.SlotPresent(slot) || e.store.LastSeqOf(slot) != 0 {
+		e.clearEmptyShell(slot) // the shell filled (or vanished): keep no verdict
+		return false
+	}
+	p, ok := e.slotPlacement(slot)
+	if !ok || p.Leader != e.self || p.Epoch < 2 {
+		return false // not ours to vouch for, or a plan-new slot starting empty
+	}
+	if !e.seatHasLedHistory(slot, p.Replicas) {
+		e.clearEmptyShell(slot) // nobody reports history: an empty start is legitimate
+		return false
+	}
+	return e.confirmEmptyShell(slot, time.Now())
+}
+
+// seatHasLedHistory reports whether any CURRENT replica (not this node) has
+// reported a durable LEO above zero on the leader-side progress ledger.
+func (e *Engine) seatHasLedHistory(slot int32, replicas []string) bool {
+	e.replMu.Lock()
+	defer e.replMu.Unlock()
+	sr := e.repl[slot]
+	if sr == nil {
+		return false
+	}
+	for j, n := range sr.node {
+		if n == e.self || sr.leo[j] == 0 {
+			continue
+		}
+		for _, r := range replicas {
+			if r == n {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// confirmEmptyShell records this sighting and reports whether the reading has
+// held across the window. Unlike confirmDiverged (one-shot, it ends by
+// dropping the copy) a confirmed verdict STAYS: every later write asks again
+// and gets the same answer until clearEmptyShell forgets the sighting.
+func (e *Engine) confirmEmptyShell(slot int32, now time.Time) bool {
+	e.rebMu.Lock()
+	defer e.rebMu.Unlock()
+	if e.emptySeen == nil {
+		e.emptySeen = map[int32]time.Time{}
+	}
+	first, ok := e.emptySeen[slot]
+	if !ok {
+		e.emptySeen[slot] = now
+		return false
+	}
+	return now.Sub(first) >= e.emptyLeaderConfirm
+}
+
+// clearEmptyShell forgets an empty-shell sighting (the copy holds records
+// again, or no seat contests the empty): a later emptying confirms afresh.
+// Cheap no-op on the hot path: the map holds only currently-contested slots.
+func (e *Engine) clearEmptyShell(slot int32) {
+	e.rebMu.Lock()
+	delete(e.emptySeen, slot)
+	e.rebMu.Unlock()
 }
 
 // slotPlacement reads ONE slot's placement under the table lock (TableSnapshot
@@ -1248,6 +1340,21 @@ func (e *Engine) landLocalAppend(slot int32, rec *data.EventRecord) (*data.Appen
 	if e.leaderCopyMissingWithHistory(slot) {
 		e.logger.Warn("append: this node leads the slot but holds no copy of it (handover history); answering retryable",
 			"slot", slot, "agg", rec.AggregateID, "op", "leader_without_copy")
+		return &data.AppendResponse{
+			Status: data.StatusFail,
+			ErrID:  data.ErrIDNotLeader,
+			Err:    "replica catching up",
+			Slot:   slot,
+		}, nil
+	}
+	// The empty-shell sibling: the copy exists but holds nothing while an
+	// in-set seat reports history this leader never saw (a floorless handover
+	// pinned leadership onto a re-granted empty seat). Answering "current
+	// version 0" from the shell invites the same adopt-and-rewrite the
+	// missing-copy guard refuses, so the refusal shape is shared.
+	if e.leaderEmptyShellWithHistory(slot) {
+		e.logger.Warn("append: this node leads the slot but its copy is empty while a seat reports history; answering retryable",
+			"slot", slot, "agg", rec.AggregateID, "op", "leader_empty_shell")
 		return &data.AppendResponse{
 			Status: data.StatusFail,
 			ErrID:  data.ErrIDNotLeader,
@@ -4493,9 +4600,9 @@ func (e *Engine) refreshStorage() {
 		ctx, cancel := context.WithTimeout(context.Background(), storageQueryTimeout)
 		defer cancel()
 		type answer struct {
-			slots  []int32
-			bytes  []uint64
-			seqs   []uint64
+			slots []int32
+			bytes []uint64
+			seqs  []uint64
 		}
 		answers := make(chan answer, len(byLeader))
 		var wg sync.WaitGroup
