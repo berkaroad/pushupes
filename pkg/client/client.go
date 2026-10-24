@@ -595,8 +595,8 @@ func (c *Client) ReadStream(ctx context.Context, aggID string,
 }
 
 // ReadTailsFanout caps how many destinations one ReadTails round drives
-// concurrently — the client-side twin of the server's
-// -batch-slot-parallelism cap on BatchAppend: a resume scan over a large
+// concurrently — the client-side twin of the server's BatchAppend
+// slot cap: a resume scan over a large
 // id list fans out to one sub-call per holding node, and the cap keeps a
 // wide batch from opening them all at once.
 const ReadTailsFanout = 16

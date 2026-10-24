@@ -43,7 +43,7 @@ func newPrefetchClient(t *testing.T) (pushupesv1.EventServiceClient, *cluster.En
 
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer()
-	NewServer(eng, st, nil, 0, "http://127.0.0.1:18591").Register(gs)
+	NewServer(eng, st, nil, "http://127.0.0.1:18591").Register(gs)
 	go gs.Serve(lis)
 	t.Cleanup(gs.Stop)
 

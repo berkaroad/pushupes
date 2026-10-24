@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime"
 	"sync"
 	"time"
 
@@ -53,33 +54,78 @@ type Server struct {
 	// client address yet) — the same local-serve rule SubmitBatch applies.
 	selfClientAddr string
 
-	// batchParallelism caps how many slots one BatchAppend executes
-	// concurrently (see BatchAppend).
-	batchParallelism int
+	// batchJobs feeds the persistent slot-worker pool that executes every
+	// BatchAppend's slot groups (see BatchAppend).
+	batchJobs chan *batchJob
 }
 
-// DefaultBatchSlotParallelism is the concurrent-slot cap one BatchAppend
-// fans out to; -batch-slot-parallelism raises or lowers it per node.
-const DefaultBatchSlotParallelism = 100
+// batchPoolWorkers sizes the persistent slot-worker pool that executes
+// every BatchAppend's slot groups: sixteen times the process CPU width
+// (16 × runtime.GOMAXPROCS(0)), so the fan-out follows the machine the
+// node runs on. A worker holds its slot for the whole SubmitBatch —
+// mostly parked on the merged watermark wait, holding no CPU — so a pool
+// the width of the CPU would queue waits that previously ran overlapped.
+// Measured under multi-writer batch load, sixteen CPUs' worth of workers
+// keeps the pool from throttling the load while still bounding concurrent
+// WAL writers process-wide, and the
+// long-lived workers keep their grown execution stacks warm across
+// batches.
+var batchPoolWorkers = 16 * runtime.GOMAXPROCS(0)
 
-// NewServer wires the gRPC facade onto the engine + store. A
-// batchParallelism of zero or less means "the default cap" (callers that do
-// not tune the knob pass 0). selfClientAddr is this node's client-plane
-// address (scheme-free "host:port"), used by PrefetchRoutes' fallback.
-func NewServer(eng *cluster.Engine, store *storage.Store, logger *slog.Logger, batchParallelism int, selfClientAddr string) *Server {
+// batchJob is one slot group handed to the pool: the worker executes
+// batchSlot over the group's record positions, fills their results, and
+// signals the waiting BatchAppend handler.
+type batchJob struct {
+	s    *Server
+	ctx  context.Context
+	req  *pushupesv1.BatchAppendRequest
+	out  []*pushupesv1.BatchAppendResult
+	slot int32
+	idx  []int
+	done *sync.WaitGroup
+}
+
+func (j *batchJob) run() {
+	defer j.done.Done()
+	sub := make([]*pushupesv1.AppendRequest, len(j.idx))
+	for k, i := range j.idx {
+		sub[k] = j.req.Records[i]
+	}
+	resps := j.s.batchSlot(j.ctx, j.slot, sub)
+	for k, i := range j.idx {
+		j.out[i] = &pushupesv1.BatchAppendResult{
+			AggregateId: j.req.Records[i].AggregateId,
+			Response:    resps[k],
+		}
+	}
+}
+
+// batchWorker is one pool worker: it takes slot groups until the process
+// ends (the pool is per-server and lives as long as the node).
+func (s *Server) batchWorker() {
+	for job := range s.batchJobs {
+		job.run()
+	}
+}
+
+// NewServer wires the gRPC facade onto the engine + store. selfClientAddr is
+// this node's client-plane address (scheme-free "host:port"), used by
+// PrefetchRoutes' fallback.
+func NewServer(eng *cluster.Engine, store *storage.Store, logger *slog.Logger, selfClientAddr string) *Server {
 	// A nil logger must not panic a handler half-way through: startup
 	// validation here keeps the field safe for any handler that grows a
 	// log line later.
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
 	}
-	if batchParallelism <= 0 {
-		batchParallelism = DefaultBatchSlotParallelism
+	s := &Server{engine: eng, store: store, logger: logger,
+		selfClientAddr: cluster.HostPort(selfClientAddr),
+		batchJobs:      make(chan *batchJob),
 	}
-	return &Server{engine: eng, store: store, logger: logger,
-		selfClientAddr:   cluster.HostPort(selfClientAddr),
-		batchParallelism: batchParallelism,
+	for i := 0; i < batchPoolWorkers; i++ {
+		go s.batchWorker()
 	}
+	return s
 }
 
 // Register adds the service to a grpc.Server.
@@ -192,8 +238,12 @@ func (s *Server) batchSlot(ctx context.Context, slot int32, reqs []*pushupesv1.A
 // routing slot, one worker per slot runs them in request order through the
 // same write path as the engine's single append (write fence, routing,
 // idempotency, version check, HW wait), and distinct
-// slots run concurrently under the server's shared cap
-// (-batch-slot-parallelism, default DefaultBatchSlotParallelism). The slot WAL lock already
+// slots run concurrently under the server's shared worker pool of
+// batchPoolWorkers workers (16 × runtime.GOMAXPROCS(0): workers spend most
+// of a slot group parked on the merged watermark wait, so the pool is
+// wider than the CPU to keep waits overlapped; it bounds concurrent WAL
+// writers process-wide and keeps its stacks warm across batches). The
+// slot WAL lock already
 // serialises appends to one slot; keeping the HW waits serial per slot as
 // well is what stops two batch records from racing to observe a watermark
 // for the other's seq.
@@ -244,29 +294,15 @@ func (s *Server) BatchAppend(ctx context.Context, req *pushupesv1.BatchAppendReq
 		g.idx = append(g.idx, i)
 	}
 
-	// Fan out per slot; the semaphore caps concurrent slots across the
-	// batch. Each slot group executes as ONE SubmitBatch: serial land in
-	// request order + one merged watermark wait for the group.
-	sem := make(chan struct{}, s.batchParallelism)
+	// Hand each slot group to the worker pool. A group executes as ONE
+	// SubmitBatch: serial land in request order + one merged watermark wait
+	// for the group. The blocking send queues groups in request order;
+	// concurrent in-flight slots across all batches are exactly the pool
+	// size.
 	var wg sync.WaitGroup
+	wg.Add(len(groups))
 	for _, g := range groups {
-		wg.Add(1)
-		go func(g *slotGroup) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			sub := make([]*pushupesv1.AppendRequest, len(g.idx))
-			for k, i := range g.idx {
-				sub[k] = req.Records[i]
-			}
-			resps := s.batchSlot(ctx, g.slot, sub)
-			for k, i := range g.idx {
-				out.Results[i] = &pushupesv1.BatchAppendResult{
-					AggregateId: req.Records[i].AggregateId,
-					Response:    resps[k],
-				}
-			}
-		}(g)
+		s.batchJobs <- &batchJob{s: s, ctx: ctx, req: req, out: out.Results, slot: g.slot, idx: g.idx, done: &wg}
 	}
 	wg.Wait()
 	return out, nil
@@ -447,7 +483,7 @@ func (s *Server) ReadTails(ctx context.Context, req *pushupesv1.ReadTailsRequest
 		serve      bool
 		bound      uint64 // local visibility ceiling (0 = the leader's own LEO)
 		serveEmpty bool
-		redirect      string
+		redirect   string
 		slot       int32
 	}
 	seen := map[int32]*verdict{}

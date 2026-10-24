@@ -89,9 +89,7 @@ func main() {
 		// BatchAppend asks for one batch to fit inside the cap, so the
 		// operator raises it together with typical batch size (a 4MiB cap
 		// carries roughly 4000 records of 1KiB bodies).
-		grpcMaxMsg = byteSize(envByteSizeOr("PUSHUPES_GRPC_MAX_MSG_SIZE", defaultGrpcMaxMsgBytes))
-		batchPar   = flag.Int("batch-slot-parallelism", envIntOr("PUSHUPES_BATCH_SLOT_PARALLELISM", grpcapi.DefaultBatchSlotParallelism),
-			"max slots one BatchAppend executes concurrently (different slots take independent fences and WALs; a wide batch spanning the ring lands at most this many concurrent WAL writers — env PUSHUPES_BATCH_SLOT_PARALLELISM)")
+		grpcMaxMsg    = byteSize(envByteSizeOr("PUSHUPES_GRPC_MAX_MSG_SIZE", defaultGrpcMaxMsgBytes))
 		bootstrap     = flag.Bool("bootstrap", false, "write this cluster's initial configuration from this node. By default the node whose id leads -peers does that and every other configured node starts as a seed that offers itself through the running cluster (env PUSHUPES_BOOTSTRAP not read: this is a startup decision, not a tunable)")
 		role          = flag.String("role", envOr("PUSHUPES_ROLE", ""), "this node's place in the cluster, required: voter (control plane — votes in the consensus group and hosts NO slot replicas) or learner (data plane — receives the replicated layout from the control plane without voting). The smallest deployment is one control node plus one data node (env PUSHUPES_ROLE)")
 		raftHeartbeat = flag.Duration("raft-heartbeat-timeout", envDurationOr("PUSHUPES_RAFT_HEARTBEAT_TIMEOUT", raft.DefaultHeartbeatTimeout),
@@ -111,13 +109,13 @@ func main() {
 	base := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	logger := base.With("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *role, *adoptTo, slotCount, *replicaPolicy, int64(segmentB), int64(grpcMaxMsg), *batchPar, *flushN, *flushD, *dropAfter, *fetchSettleD, *rebalanceInterval, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *role, *adoptTo, slotCount, *replicaPolicy, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *dropAfter, *fetchSettleD, *rebalanceInterval, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
 		logger.Error("pushupes exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, role string, adoptInterval time.Duration, slotCount int, replicaPolicy string, segmentBytes, grpcMaxMsgBytes int64, batchParallelism int, flushN int64, flushD, dropAfter, fetchSettle, rebalanceInterval time.Duration, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, role string, adoptInterval time.Duration, slotCount int, replicaPolicy string, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD, dropAfter, fetchSettle, rebalanceInterval time.Duration, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
 	nodeRole, err := cluster.NormalizeRole(role)
 	if err != nil {
 		return err
@@ -134,12 +132,6 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 
 	if err := storage.ValidateSegmentBytes(segmentBytes); err != nil {
 		return err
-	}
-	// The batch slot cap sizes a semaphore; a zero/negative value would make
-	// every BatchAppend block forever (fail fast at startup; the default is
-	// grpcapi.DefaultBatchSlotParallelism).
-	if batchParallelism <= 0 {
-		return fmt.Errorf("-batch-slot-parallelism %d must be positive", batchParallelism)
 	}
 	// The client-plane message cap must be positive; a zero/negative value
 	// would break every gRPC call on the data plane (fail fast at startup).
@@ -309,7 +301,7 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 		}),
 	}
 	grpcSrv := grpc.NewServer(grpcOpts...)
-	grpcapi.NewServer(eng, store, logger, batchParallelism, clientAddr).Register(grpcSrv)
+	grpcapi.NewServer(eng, store, logger, clientAddr).Register(grpcSrv)
 	grpcLis, err := net.Listen("tcp", cluster.HostPort(clientAddr))
 	if err != nil {
 		return fmt.Errorf("client listen %s: %w", clientAddr, err)
@@ -483,22 +475,6 @@ func envOr(k, def string) string {
 	return def
 }
 
-// envIntOr reads an integer from the environment, falling back to def. A
-// malformed or non-integer value is fatal rather than silently defaulting:
-// a typo in a tuning knob should be loud.
-func envIntOr(k string, def int) int {
-	v := os.Getenv(k)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid %s=%q: %v (want an integer like 8, or 0 to disable)\n", k, v, err)
-		os.Exit(2)
-	}
-	return n
-}
-
 // envDurationOr reads a Go duration (30s, 2m, 1h) from the environment,
 // falling back to def. A malformed value is fatal instead of silently falling
 // back to the default: an operator typo in a knob that decides when data gets
@@ -516,7 +492,9 @@ func envDurationOr(k string, def time.Duration) time.Duration {
 	return d
 }
 
-// envInt64Or is envIntOr for the knobs sized in records (-flush-messages).
+// envInt64Or reads an integer sized in records from the environment,
+// falling back to def. A malformed or non-integer value is fatal rather
+// than silently defaulting: a typo in a tuning knob should be loud.
 func envInt64Or(k string, def int64) int64 {
 	v := os.Getenv(k)
 	if v == "" {

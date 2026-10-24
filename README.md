@@ -194,7 +194,6 @@ medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(�
 | `-drop-after` | `PUSHUPES_DROP_AFTER` | 30s | 迁移后前源副本保留期；0=默认，负数启动即报错，不可关闭 |
 | `-rebalance-interval` | `PUSHUPES_REBALANCE_INTERVAL` | 2s | controller 每隔多久检查一次 leader 布局并执行回切（节点宕机恢复后把槽 leader 迁回环上预期节点）；**每轮只提交一次**（提交严格串行，任一时刻只有一个槽在交接栅栏上），所以收敛时间由这个间隔决定；0=关闭，负数启动即报错 |
 | `-grpc-max-msg-size` | `PUSHUPES_GRPC_MAX_MSG_SIZE` | 4MiB | client 面 gRPC 消息上限（recv/send 同值）；`BatchAppend` 单批要装进它，可写 `16MiB` 等带单位形式（env 同样接受）；≤0 启动即报错 |
-| `-batch-slot-parallelism` | `PUSHUPES_BATCH_SLOT_PARALLELISM` | 100 | `BatchAppend` 一批最多同时执行几个槽（异槽并行、同槽串行；铺满 1024 槽的宽批也不会瞬间压上等量并发 WAL 写者）；≤0 启动即报错 |
 | `-raft-heartbeat-timeout` | `PUSHUPES_RAFT_HEARTBEAT_TIMEOUT` | 100ms | 共识心跳间隔。leader 的心跳没按时到达就会被投票换掉，所以宿主机可能拖住共识事件循环时要与 `-raft-election-timeout` 一起放大 |
 | `-raft-election-timeout` | `PUSHUPES_RAFT_ELECTION_TIMEOUT` | 500ms | follower 多久收不到心跳就发起选举。必须 ≥ 2× 心跳，否则一次迟到的心跳就会掀掉 leader（启动即报错）；与心跳是一对比例，一起放大而不是只收窄其中一个 |
 | `-raft-flush-interval` | `PUSHUPES_RAFT_FLUSH_INTERVAL` | 200µs | 共识 WAL 组提交窗口：窗口内到达的追加共用一次 fsync |
@@ -210,7 +209,7 @@ medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(�
   `aggregate_id`），槽不在本节点时以响应字段返回重定向：`err_id=1003/1004`
   （MOVED/ASK）+ `node`（槽 leader 的 client 地址），客户端据此重连。批内
   `aggregate_id` 必须各不相同，重复的那组整组 `fail/1002` 且不执行。服务端
-  同槽串行、异槽并行（并发上限 `-batch-slot-parallelism`，默认 100）。单批
+  同槽串行、异槽并行（并发上限为进程级 worker 池，`16 × runtime.GOMAXPROCS(0)`）。单批
   必须装进 client 面 gRPC 消息上限（`-grpc-max-msg-size`，默认 4MiB）。
 - `EventService/ReadStream`：按聚合读取事件流（≤HW 语义）。
 - `EventService/ReadTails`：一次查询多个聚合的最新版本（resume 扫描用）。
