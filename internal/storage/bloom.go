@@ -20,7 +20,7 @@ package storage
 // The table held 32 B per record (measured: 992 MiB of a 1353 MiB heap at
 // 31 GiB) to answer "is this command id already stored?". That question needs a
 // definite *no* far more often than an exact yes — a yes is followed by reading
-// the record anyway. A bloom filter gives the definite no in ~1.25 B per record,
+// the record anyway. A bloom filter gives the definite no in 2 B per record,
 // and its answers are always safe in the direction that matters:
 //
 //   - "absent" is only reported when the filter is sure, so a lookup that skips
@@ -45,7 +45,7 @@ import (
 
 const (
 	bloomK              = 3  // hash probes per entry
-	bloomBitsPerEntry   = 10 // ~0.8% false positives at k=3
+	bloomBitsPerEntry   = 16 // ~0.5% false positives at k=3 (full filter)
 	bloomFirstCapacity  = 1 << 10
 	bloomFilterMaxBytes = 1 << 24
 )
@@ -128,11 +128,11 @@ func (s *bloomSet) maybe(hash uint64) bool {
 // Repeated inserts of the SAME command must not consume capacity: the recovery
 // paths replay every record of every segment on each start, and bloomBits grows
 // by doubling with b.entries driving full(), so a hash placed twice costs a slot
-// twice — measured as bytes-per-entry climbing above the 1.25 B/entry that one
+// twice — measured as bytes-per-entry climbing above the 2 B/entry that one
 // placement per command gives, with the false-positive rate rising alongside it.
 //
 // Dedup cannot be inferred from maybe(): a bloom "maybe" is also true for the
-// ~0.8% of hashes that collide with unrelated entries, so skipping on it drops
+// ~0.5% of hashes that collide with unrelated entries, so skipping on it drops
 // those hashes from the filter entirely — and "absent" must never be reported
 // for a stored command. Exact dedup needs to know which records have already
 // been placed, which the caller does: insertPlacedFrom takes that answer.

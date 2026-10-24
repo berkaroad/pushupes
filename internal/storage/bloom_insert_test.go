@@ -27,10 +27,10 @@ import (
 // recovery paths replay every record of every segment on every start, and the
 // filter grows by doubling with its entry count driving full(), so placing the
 // same hash twice costs real bytes-per-entry and raises the false-positive rate
-// (1.25 B/entry measured when each command is placed exactly once).
+// (2 B/entry measured when each command is placed exactly once).
 //
 // The exact "already placed" answer cannot come from the filter itself: a bloom
-// "maybe" is also true for the ~0.8% of hashes that collide with unrelated
+// "maybe" is also true for the ~0.5% of hashes that collide with unrelated
 // entries, and skipping on it would drop a stored command from the filter for
 // good. It comes from the record's slot seq instead — indexMetaLocked runs in
 // ascending seq order and the slot tracks a watermark of what it has placed.
