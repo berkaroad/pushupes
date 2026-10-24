@@ -70,6 +70,30 @@ export interface ClusterStatus {
   // raft.leader + peers[leader].admin_addr.
   controller?: string
   controller_admin_addr?: string
+  // slot_health is the cached outcome of the on-demand slot-copy walk
+  // (POST /admin/slots/health-scan; the same standard cmd/slotcheck prints).
+  // It rides this poll so the page never starts a second clock: state is
+  // idle | scanning | done | error, the four counts and scanned_at appear
+  // once any round has finished, and a failed round keeps the previous
+  // numbers next to its error. Absent on older nodes — the card renders '-'
+  // then.
+  slot_health?: SlotHealth
+}
+
+// The 槽位健康 card's payload, one-to-one with the backend's slot_health
+// object. Counts are (slot, holder) pairs — the walk classifies every
+// non-leader copy against its leader; compared is the number of slots asked
+// about. behind is transient (a catch-up in flight); diverged is damage no
+// fetch repairs.
+export interface SlotHealth {
+  state: 'idle' | 'scanning' | 'done' | 'error'
+  compared?: number
+  diverged?: number
+  behind?: number
+  not_loaded?: number
+  unreachable?: number
+  scanned_at?: string
+  error?: string
 }
 
 

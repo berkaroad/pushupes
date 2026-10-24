@@ -41,11 +41,16 @@ type Server struct {
 	Engine *cluster.Engine
 	Store  *storage.Store
 	mux    *http.ServeMux
+	// health backs the slot_health field of /admin/cluster/status: an
+	// on-demand, idempotent walk the console's 槽位健康 card triggers and
+	// reads through the poll it already runs.
+	health *healthTracker
 }
 
 // New builds the HTTP handler tree.
 func New(eng *cluster.Engine, store *storage.Store) *Server {
-	s := &Server{Engine: eng, Store: store, mux: http.NewServeMux()}
+	s := &Server{Engine: eng, Store: store, mux: http.NewServeMux(), health: &healthTracker{}}
+	s.health.scan = s.engineScan
 
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 
@@ -61,6 +66,7 @@ func New(eng *cluster.Engine, store *storage.Store) *Server {
 	s.mux.HandleFunc("GET /admin/slots/{slot}/describe", s.handleSlotDescribe)
 	s.mux.HandleFunc("GET /admin/slots/pending", s.handlePendingSlots)
 	s.mux.HandleFunc("POST /admin/slots/pending/adopt", s.handleAdoptPending)
+	s.mux.HandleFunc("POST /admin/slots/health-scan", s.handleHealthScan)
 	s.mux.HandleFunc("GET /admin/slots/{slot}/streams", s.handleSlotStreams)
 	s.mux.HandleFunc("POST /admin/slots/{slot}/migrate", s.handleMigrate)
 	s.mux.HandleFunc("POST /admin/slots/{slot}/remove-replica", s.handleRemoveReplica)
@@ -275,6 +281,12 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 		// the number is a lower bound.
 		"storage_bytes":          storageBytes,
 		"storage_bytes_complete": storageComplete,
+		// slot_health is the cached outcome of the on-demand slot-copy walk
+		// (the same standard cmd/slotcheck prints, via internal/health):
+		// state idle|scanning|done|error, the four counts, the compared slot
+		// total and scanned_at. It rides this poll so the page keeps its one
+		// refresh clock.
+		"slot_health": s.health.snapshot(),
 	})
 }
 

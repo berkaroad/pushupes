@@ -122,6 +122,15 @@ export async function getClusterStatus(): Promise<ClusterStatus> {
   }
 }
 
+// triggerHealthScan asks the ANSWERING node (not the controller — the walk is
+// read-only fan-out GETs any member can run) to start the slot-copy walk
+// behind the 槽位健康 card. It is idempotent while a scan runs, so the page
+// fires it whenever the cached result is missing or older than a minute and
+// lets the guard absorb the races; the outcome rides back on the status poll.
+export async function triggerHealthScan(): Promise<void> {
+  await axios.post(`${currentBase}/admin/slots/health-scan`, {}, { timeout: 4000 })
+}
+
 // ensureLeader pins the client to the Raft leader BEFORE the first page render,
 // so pages never paint against a follower. It is a ONE-SHOT: the first call
 // runs the pool probe, every later call is an ordinary status poll (which is

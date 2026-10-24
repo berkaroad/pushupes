@@ -656,12 +656,19 @@ GET  /admin/cluster/status                     # 分配表/epoch/ISR 视图（�
                                                #   status 读缓存值；storage_bytes_complete /
                                                #   storage_count_complete=false 表示有 slot leader
                                                #   没应答，此时两个数都是下界。逐槽计数数组不在本接口
-                                               #   （见 /admin/status 的 total_writes）
+                                               #   （见 /admin/status 的 total_writes）；顶层 slot_health =
+                                               #   槽副本全比对的缓存结果 {state: idle|scanning|done|error,
+                                               #   compared, diverged, behind, not_loaded, unreachable,
+                                               #   scanned_at, error?}（口径与 cmd/slotcheck 同源，见
+                                               #   internal/health；由 POST /admin/slots/health-scan 触发，
+                                               #   失败轮保留上一轮数字并附 error）——控制台集群页「槽位健康」
+                                               #   卡随本轮询取数，不自开第二个时钟
 GET  /admin/status                             # storage_count = 本节点 leader 副本 seq 之和（标量，Engine.LeaderSeqTotal）+ 每槽 durable 计数 total_writes + 每槽落盘字节 total_write_bytes（与计数同下标；打开槽时按该副本盘上 WAL 播种——等于副本持有的记录数与帧字节，重启不清零也不重计；两条落盘路径共用：batch append 与追平路径 AppendAtSeq/AppendFrameAtSeq——副本拉取、迁移搬运都会计入，所以它们是「本节点落了什么」的总量口径，不是客户端写入口径）+ client_writes/client_write_bytes（与计数同下标的**仅客户端**口径：只有 batch append 落盘才增长，追平路径不碰；控制台的「客户端写入速度」卡片与折线图的实线对它按槽做「leader 身份两拍相同」的稳定作差——换主的槽该窗不计，节点间流量不进速率，折线图的虚线「总写入速度」才按 total_writes/total_write_bytes 全槽求和作差）+ storage_bytes = 本节点 **leader** 副本的逐槽落盘字节数组（非本节点领导的槽与未加载的槽都报 0；与 storage_count 同一条 leader 规则，逐槽求和 = 本节点 leader 副本容量，Engine.LeaderSlotBytes）/ streams = 事件流数量 + 本节点待清理副本 + 本节点流控（flow_control = 生效配置视图 {tokens, period_ms, configured}；flow_control_hits = 每槽累计流控拒绝数——桶是节点的、计数归槽——与计数同下标）+ 同步计量 synced_slots = [本节点领导且**副本集已到位**的槽数, 其中已按副本因子收敛的槽数] + pending_seats = 本节点领导的槽里副本集仍短于因子的数量（扩容后布局重排尚未补齐席位——「待就位」，不进 led/synced 的账）——「收敛」= 副本集与 in-sync 副本（leader 计入，follower 用 ISR 同口径）都达到表里的因子（Engine.SyncedLeaderSlots）；控制台按「slot_count − Σsynced」给出构建中剩余数（前端轮询）；pending_slots = 本节点被围栏的本地副本数组（与 `GET /admin/slots/pending` 同一视图 PendingSlotView：槽号 + 围栏判词 reason + 表 leader/epoch + owner 现场），采纳（adopt）前拒写；控制台搭同一轮询在数据节点卡上打红色「已围栏 N」tag（tooltip 逐槽列槽号+判词，超 10 行截断计数）——本接口原名 `/admin/writes`，字段早已超出写计数口径，2026-10-21 更名
 GET  /admin/stats[?worst=N]                    # 三个「等在哪里」自视合一：flush = 待刷记录数/最老未刷记录年龄/刷盘队列长度与在飞数/fsync 排队等待与 syscall 服务时间分位/每次新覆盖字节与覆盖的段文件大小；repl = `hw < LEO` 的槽数与最老等待时长（?worst=N 列出最久的槽）/每副本上报新鲜度与 LEO 落后/fetch 轮次与「按数据唤醒 vs 按等待预算到期」计数；ack = 每条写入的确认链路四段耗时（栅栏+路由 / 本地 WAL 落地 / 等 ISR 高水位 / 整调用）与结果、失败原因分布、正在等待的调用数、水位落后条数（?worst=N 列出等得最久的槽）
 GET  /admin/slots/{slot}/streams?after=&limit=  # 事件流列表（聚合id+最新版本+最新记录 unix_time，仅内存索引，不读 WAL）
 GET  /admin/slots/pending                      # 本节点被 owner 围栏拦下的槽（slot/原因/表与记录的 leader-epoch-世代；节点本地）
 POST /admin/slots/pending/adopt                # 采纳被围副本（节点本地，见 §3.1；{}=全部 pending 槽，{"slots":[...]}=点名且仅限 pending，非 pending 回 skipped）
+POST /admin/slots/health-scan                  # 启动一轮逐槽「副本 vs leader」目录三元组全比对（读侧扇出 GET /admin/slots/{n}/describe，任何应答节点都能跑；internal/health 与 cmd/slotcheck 共用同一口径实现；在跑时幂等忽略，回 202 {started}；结果经 status 的 slot_health 带回。控制台的「槽位健康」卡按 1 分钟新鲜度预算事件驱动地重触发，逐槽明细留在 CLI）
 POST /admin/slots/{slot}/migrate  {to_node}    # 发起热迁移（控制器专属，必须发到 Raft leader 的 admin 地址）
 POST /admin/slots/{slot}/remove-replica {node} # 回收副本集里的一个成员（控制器专属，同上）
 POST /admin/cluster/plan                       # 触发重新规划（控制器专属，同上）

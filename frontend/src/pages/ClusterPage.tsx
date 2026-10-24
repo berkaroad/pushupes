@@ -3,8 +3,9 @@ import { Alert, App, Button, Card, Col, Form, Input, InputNumber, Modal, Row, Se
 import { EditOutlined } from '@ant-design/icons'
 import type { ClusterStatus, FlowControlDetail, NodeStatus, PendingSlotView } from '../types'
 import { humanBytes, humanBytesPerSec } from '../format'
-import { clearFlowControl, ensureLeader, fetchFlowControl, fetchNodeStatus, setReplicaPolicy, setFlowControl, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
+import { clearFlowControl, ensureLeader, fetchFlowControl, fetchNodeStatus, setReplicaPolicy, setFlowControl, triggerHealthScan, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
 import { PeerCard, isOnlinePeer } from '../PeerCard'
+import { SlotHealthCard } from '../SlotHealthCard'
 import type { NodeRatePoint } from '../NodeRateChart'
 import { RailContext } from '../rail'
 
@@ -18,6 +19,14 @@ const NODE_RATE_POINTS = 60
 // gates both. Off means nothing refreshes; the charts hold their last curve
 // rather than freezing mid-sample.
 const AUTO_REFRESH_MS = 2000
+
+// The 槽位健康 card's freshness budget: the page re-triggers the walk when
+// the cached result is older than this (operator call, 2026-10-24: one
+// minute; the backend's idempotent in-flight guard absorbs any race the
+// poll ticks have with a scan that outlives the interval). The trigger is
+// event-driven — it rides the status object of the EXISTING 2s poll, so this
+// is a staleness bound, not a second clock.
+const HEALTH_MAX_AGE_MS = 60_000
 
 // (The cluster-wide 存储数量 fold moved server-side: /admin/cluster/status
 // answers storage_count directly, sampled by the same fan-out as
@@ -482,6 +491,27 @@ export default function ClusterPage() {
     return m
   }, [status])
 
+  // 槽位健康: the trigger lives BEFORE the early returns below — hooks after
+  // a conditional return change the hook order between renders (React detects
+  // and dies on it, and SSR never runs this path, so no offline check catches
+  // it). It is event-driven off the status object of the EXISTING 2s poll:
+  // no interval, no second clock, gated by the same switch as everything
+  // else (off means the poll stops, so this simply never sees a new answer).
+  const healthAttemptedAt = useRef(0)
+  useEffect(() => {
+    const h = status?.slot_health
+    if (!h || h.state === 'scanning') return
+    const stale = h.state !== 'done'
+      || (h.scanned_at ? Date.now() - new Date(h.scanned_at).getTime() >= HEALTH_MAX_AGE_MS : true)
+    if (!stale) return
+    // Throttle re-triggers on the same budget: a persistently failing walk
+    // must not turn the 2s poll into a drumbeat of scans. The backend's
+    // idempotent guard is the other half of the backstop.
+    if (Date.now() - healthAttemptedAt.current < HEALTH_MAX_AGE_MS) return
+    healthAttemptedAt.current = Date.now()
+    triggerHealthScan().catch(() => { /* the next poll tick re-evaluates */ })
+  }, [status])
+
   if (err && !status) return <Alert type="error" message="无法连接后端" description={err} />
   if (!status) return null
 
@@ -513,6 +543,15 @@ export default function ClusterPage() {
   const storageCountLowerBound = storageCount !== undefined && status.storage_count_complete === false
   const storageBytes = status.storage_bytes
   const storageLowerBound = storageBytes !== undefined && status.storage_bytes_complete === false
+  // 槽位健康: the slotcheck walk's verdict, counted — the per-slot detail
+  // stays in the CLI by operator call. (The trigger hook lives above the
+  // early returns; what remains here is plain derivation.)
+  const health = status.slot_health
+  const recheckHealth = () => {
+    healthAttemptedAt.current = Date.now()
+    triggerHealthScan().catch(() => { /* the card reports the failure next poll */ })
+  }
+
   // The write-speed cards show '-' until the poller has two complete samples.
   const writeSpeedMsg = writeRate ? `${Math.round(writeRate.msg)} msg/s` : '-'
   const writeSpeedBytes = writeRate ? humanBytesPerSec(writeRate.bytes) : '-'
@@ -545,6 +584,11 @@ export default function ClusterPage() {
         <Col span={12}><Card><Statistic title="客户端写入速度（数量）" value={writeSpeedMsg} /></Card></Col>
         <Col span={12}><Card><Statistic title="客户端写入速度（大小）" value={writeSpeedBytes} /></Card></Col>
       </Row>
+      {/* 槽位健康 sits directly above the replica policy (operator call,
+          2026-10-24): both cards answer "is the fleet settled", the health
+          walk first because a diverged count changes what the policy page
+          means. */}
+      <SlotHealthCard health={health} onRecheck={recheckHealth} />
       {/* The replica policy, its own card above the node block. The tier and
           the factor it derives are cluster state (replicated through the slot
           table), and changing it moves every slot's replica set — too large

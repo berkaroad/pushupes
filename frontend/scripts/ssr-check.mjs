@@ -205,6 +205,41 @@ assert('both pollers share the 2s auto-refresh cadence and the switch gates them
   && !pageSrc.includes('WRITES_POLL_MS') && !pageSrc.includes('5000'))
 assert('write-speed polls the light counters endpoint', pageSrc.includes('fetchNodeStatus') && !pageSrc.includes('fetchNodeWrites'))
 assert('write-speed reads the byte counters', pageSrc.includes('total_write_bytes'))
+// The 槽位健康 card: the counted slotcheck verdict (operator call 2026-10-24:
+// labels Chinese, behind amber, one-minute re-trigger budget, NO per-slot
+// drill-down — detail stays in the CLI). The result rides the existing status
+// poll and the trigger is event-driven, so the page must still carry exactly
+// its two AUTO_REFRESH_MS intervals and nothing else. SSR text interpolation
+// is comment-split, so count phrases are matched across the seam, not as
+// literals.
+const { SlotHealthCard } = await vite.ssrLoadModule('/src/SlotHealthCard.tsx')
+const sh = (health) => renderToString(
+  React.createElement(ConfigProvider, { theme: { algorithm: theme.defaultAlgorithm } },
+    React.createElement(SlotHealthCard, { health, onRecheck: () => {} })),
+)
+const AT = '2026-10-24T07:41:00Z'
+const healthOk = sh({ state: 'done', compared: 1024, diverged: 0, behind: 0, not_loaded: 0, unreachable: 0, scanned_at: AT })
+assert('an all-zero round collapses to a green 健康 check and hides every kind line',
+  healthOk.includes('槽位健康') && /健康<\/div/.test(healthOk) && /anticon-check-circle/.test(healthOk)
+  && !/anticon-close-circle/.test(healthOk) && /1024<!-- --> 槽已对比/.test(healthOk)
+  && !/分叉|落后|未加载|不可达/.test(healthOk))
+const healthD82 = sh({ state: 'done', compared: 1024, diverged: 82, behind: 0, not_loaded: 0, unreachable: 0, scanned_at: AT })
+assert('a diverged round shows only its crossed red line, zero kinds absent',
+  /分叉<!-- --> <!-- -->82/.test(healthD82) && healthD82.includes('#ff4d4f')
+  && /anticon-close-circle/.test(healthD82) && !/anticon-check-circle/.test(healthD82)
+  && !/落后|未加载|不可达/.test(healthD82))
+const healthMixed = sh({ state: 'done', compared: 1024, diverged: 1, behind: 3, not_loaded: 0, unreachable: 2, scanned_at: AT })
+assert('behind keeps the amber while the damaging kinds keep the red',
+  healthMixed.includes('#faad14') && healthMixed.includes('#ff4d4f') && /落后<!-- --> <!-- -->3/.test(healthMixed))
+const healthScan = sh({ state: 'scanning' })
+assert('a first scan in flight says 检测中', healthScan.includes('检测中') && /anticon-loading/.test(healthScan))
+const healthErr = sh({ state: 'error', error: 'dial tcp: no node answered', compared: 1024, diverged: 2, behind: 0, not_loaded: 0, unreachable: 0, scanned_at: AT })
+assert('a failed round keeps the last numbers next to its error',
+  /分叉<!-- --> <!-- -->2/.test(healthErr) && healthErr.includes('检测失败')
+  && healthErr.includes('dial tcp: no node answered'))
+assert('the health card rides the status poll; the page adds no new clock',
+  pageSrc.includes('slot_health') && pageSrc.includes('triggerHealthScan')
+  && pageSrc.includes('HEALTH_MAX_AGE_MS') && (pageSrc.match(/setInterval/g) ?? []).length === 2)
 const { humanBytes, humanBytesPerSec, utcStamp } = await vite.ssrLoadModule('/src/format.ts')
 assert('byte formatter renders sizes', humanBytes(0) === '0 B' && humanBytes(1536) === '1.5 KiB' && humanBytes(70496329) === '67.2 MiB')
 assert('byte formatter renders rates', humanBytesPerSec(0) === '0 B/s' && humanBytesPerSec(1536) === '1.5 KiB/s')

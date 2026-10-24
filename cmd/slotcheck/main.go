@@ -57,8 +57,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/berkaroad/pushupes/internal/health"
 )
 
 var (
@@ -89,31 +90,8 @@ type status struct {
 	Slots map[string]placement `json:"slots"`
 }
 
-type describe struct {
-	Slot       int64  `json:"slot"`
-	Node       string `json:"node"`
-	Role       string `json:"role"`
-	Loaded     bool   `json:"loaded"`
-	LastSeq    int64  `json:"last_seq"`
-	Aggregates int64  `json:"aggregates"`
-	Versions   int64  `json:"versions"`
-	Resolvable int64  `json:"resolvable"`
-}
-
-// divergence is one slot holding a copy that disagrees with its leader's.
-type divergence struct {
-	Slot       int64  `json:"slot"`
-	Node       string `json:"node"`
-	Kind       string `json:"kind"` // diverged | behind | not-loaded | unreachable
-	LastSeq    int64  `json:"last_seq,omitempty"`
-	Aggregates int64  `json:"aggregates,omitempty"`
-	Versions   int64  `json:"versions,omitempty"`
-	Resolvable int64  `json:"resolvable,omitempty"`
-	LeaderSeq  int64  `json:"leader_last_seq,omitempty"`
-	LeaderAgg  int64  `json:"leader_aggregates,omitempty"`
-	LeaderVer  int64  `json:"leader_versions,omitempty"`
-	LeaderRes  int64  `json:"leader_resolvable,omitempty"`
-}
+// The comparison itself lives in internal/health — one standard shared with
+// the console's 槽位健康 card, so the CLI and the page cannot drift apart.
 
 func main() {
 	flag.Parse()
@@ -128,15 +106,15 @@ func main() {
 		adminOf[id] = p.AdminAddr
 	}
 
-	slots := make([]int, 0, len(st.Slots))
+	slots := make([]int64, 0, len(st.Slots))
 	for k := range st.Slots {
 		s, err := strconv.Atoi(k)
 		if err != nil {
 			continue
 		}
-		slots = append(slots, s)
+		slots = append(slots, int64(s))
 	}
-	sort.Ints(slots)
+	sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
 	if *limit > 0 && len(slots) > *limit {
 		slots = slots[:*limit]
 	}
@@ -144,37 +122,16 @@ func main() {
 		fmt.Printf("answered by %s — comparing %d slots across %d nodes\n", st.Node, len(slots), len(st.Peers))
 	}
 
-	var (
-		mu   sync.Mutex
-		bad  = []divergence{} // empty, not nil: -json must print [] rather than null
-		wg   sync.WaitGroup
-		sem  = make(chan struct{}, *jobs)
-		seen = map[string]int{} // kind -> count
-	)
+	placements := make(map[int64]health.SlotPlacement, len(slots))
 	for _, s := range slots {
-		p := st.Slots[strconv.Itoa(s)]
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(slot int, p placement) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			found := compare(hc, adminOf, slot, p)
-			mu.Lock()
-			defer mu.Unlock()
-			for _, d := range found {
-				seen[d.Kind]++
-			}
-			bad = append(bad, found...)
-		}(s, p)
+		p := st.Slots[strconv.FormatInt(s, 10)]
+		placements[s] = health.SlotPlacement{Leader: p.Leader, Replicas: p.Replicas}
 	}
-	wg.Wait()
-
-	sort.Slice(bad, func(i, j int) bool {
-		if bad[i].Kind != bad[j].Kind {
-			return bad[i].Kind < bad[j].Kind
-		}
-		return bad[i].Slot < bad[j].Slot
-	})
+	bad := health.Scan(nil, adminOf, placements, *jobs)
+	if bad == nil {
+		bad = health.Result{} // empty, not nil: -json must print [] rather than null
+	}
+	seen := bad.Summary(len(slots)).Counts
 
 	if *asJSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -200,65 +157,6 @@ func main() {
 	if seen["diverged"] > 0 {
 		os.Exit(1)
 	}
-}
-
-// compare asks one slot's leader and every replica for their local view and
-// reports the holders that disagree with the leader. A node that has not opened
-// the slot is reported as not-loaded rather than as a mismatch: it holds no
-// copy to be wrong about, and the fetch loop will open it.
-func compare(hc *http.Client, adminOf map[string]string, slot int, p placement) []divergence {
-	ld, ok := getDescribe(hc, adminOf[p.Leader], slot)
-	if !ok || !ld.Loaded {
-		return nil // no reference to compare against
-	}
-	holders := append([]string{p.Leader}, p.Replicas...)
-	var out []divergence
-	for _, h := range holders {
-		if h == p.Leader {
-			continue
-		}
-		rd, ok := getDescribe(hc, adminOf[h], slot)
-		if !ok {
-			out = append(out, divergence{Slot: int64(slot), Node: h, Kind: "unreachable"})
-			continue
-		}
-		if !rd.Loaded {
-			out = append(out, divergence{Slot: int64(slot), Node: h, Kind: "not-loaded"})
-			continue
-		}
-		if rd.Aggregates == ld.Aggregates && rd.Versions == ld.Versions && rd.Resolvable == ld.Resolvable {
-			continue
-		}
-		kind := "behind" // still catching up: the LEO says so
-		if rd.LastSeq >= ld.LastSeq {
-			kind = "diverged" // same LEO, different directory: fetching cannot fix it
-		}
-		out = append(out, divergence{
-			Slot: int64(slot), Node: h, Kind: kind,
-			LastSeq: rd.LastSeq, Aggregates: rd.Aggregates, Versions: rd.Versions, Resolvable: rd.Resolvable,
-			LeaderSeq: ld.LastSeq, LeaderAgg: ld.Aggregates, LeaderVer: ld.Versions, LeaderRes: ld.Resolvable,
-		})
-	}
-	return out
-}
-
-func getDescribe(hc *http.Client, admin string, slot int) (describe, bool) {
-	var d describe
-	if admin == "" {
-		return d, false
-	}
-	resp, err := hc.Get(urlOr(admin, fmt.Sprintf("/admin/slots/%d/describe", slot)))
-	if err != nil {
-		return d, false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return d, false
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&d); err != nil {
-		return d, false
-	}
-	return d, true
 }
 
 func fetchStatus(hc *http.Client, admins []string) (*status, error) {
