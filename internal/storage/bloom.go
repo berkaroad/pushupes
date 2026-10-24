@@ -41,6 +41,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"math"
+	"math/bits"
 )
 
 const (
@@ -60,6 +61,11 @@ func newBloomBits(capacity int) *bloomBits {
 	if capacity < bloomFirstCapacity {
 		capacity = bloomFirstCapacity
 	}
+	// bloomProbe maps bits with a mask (bits-1), so every filter's bit count
+	// must be a power of two. The growth path doubles from 1<<10 and already
+	// satisfies that; rounding here keeps any future caller from silently
+	// breaking the placement rule.
+	capacity = 1 << bits.Len(uint(capacity-1))
 	words := (capacity*bloomBitsPerEntry + 63) / 64
 	return &bloomBits{bits: make([]uint64, words)}
 }
@@ -71,7 +77,7 @@ func (b *bloomBits) full() bool { return b.entries >= b.capacity() }
 func bloomProbe(hash uint64, i int, words int) int {
 	h1 := hash
 	h2 := (hash >> 32) | 1
-	bit := (h1 + uint64(i)*h2) % uint64(words*64)
+	bit := (h1 + uint64(i)*h2) & uint64(words*64-1)
 	return int(bit)
 }
 
@@ -231,7 +237,12 @@ func decodeBloomSet(buf []byte) *bloomSet {
 		}
 		words := int(binary.BigEndian.Uint64(buf[off+4 : off+12]))
 		off += 12
-		if words <= 0 || off+words*8 > payload {
+		// A filter's bit count must be a power of two (bloomProbe masks with
+		// bits-1; the placements it guards were made under the same rule).
+		// Anything else cannot address this file's bits — refuse the whole
+		// set so the slot degrades to the "always maybe" path rather than
+		// probing a filter with the wrong placement.
+		if words <= 0 || words&(words-1) != 0 || off+words*8 > payload {
 			return nil
 		}
 		f := &bloomBits{bits: make([]uint64, words)}
