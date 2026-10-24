@@ -72,6 +72,11 @@ export default function ClusterPage() {
   // 已围栏 tag with the per-slot verdicts in its tooltip. A node that did not
   // answer simply gets no entry — no tag, no claim either way.
   const [fencedByNode, setFencedByNode] = useState<Record<string, PendingSlotView[]>>({})
+  // Per-node storage footprint for the data cards' footer: the node's leader
+  // copies only — storage_count (seq total) and Σ storage_bytes (the byte
+  // twin). Same leader-only rule as the cluster cards, fed by the same 2s
+  // poll; a node that did not answer has no entry and its card renders '-'.
+  const [nodeStorage, setNodeStorage] = useState<Record<string, { count: number; bytes: number }>>({})
   const fireFlow = (id: string) => {
     setFlowFiring((m) => (m[id] ? m : { ...m, [id]: true }))
     clearTimeout(flowFiringTimers.current[id])
@@ -204,6 +209,20 @@ export default function ClusterPage() {
           if (Array.isArray(pair) && pair.length === 2) nextSyncing[p.id] = Math.max(0, pair[0] - pair[1])
         }
         setSyncingByNode(nextSyncing)
+        // Per-node storage footprint for the data cards' footer: the node's
+        // LEADER copies only — storage_count (seq total) and Σ storage_bytes
+        // (the byte twin; followers answer 0), the same rule the cluster cards
+        // use. A node that did not answer keeps no entry and its card renders
+        // '-', never a stale number from the previous poll.
+        const nextStorage: Record<string, { count: number; bytes: number }> = {}
+        for (const p of Object.values(st.peers)) {
+          const m = perNode[p.admin_addr]
+          if (!m || typeof m.storage_count !== 'number') continue
+          let bytes = 0
+          for (const v of m.storage_bytes ?? []) bytes += v
+          nextStorage[p.id] = { count: m.storage_count, bytes }
+        }
+        setNodeStorage(nextStorage)
         const nextFenced: Record<string, PendingSlotView[]> = {}
         for (const p of Object.values(st.peers)) {
           const ps = perNode[p.admin_addr]?.pending_slots
@@ -605,6 +624,8 @@ export default function ClusterPage() {
                 flowControlConfigured={flowConfigured[p.id] ?? false}
                 flowControlFiring={!!flowFiring[p.id]}
                 ratePoints={nodeRates[p.id]}
+                storageCount={nodeStorage[p.id]?.count}
+                storageBytes={nodeStorage[p.id]?.bytes}
                 onFlowControl={isOnlinePeer(p) ? openFlowControl : undefined} />
             </Col>
           ))}

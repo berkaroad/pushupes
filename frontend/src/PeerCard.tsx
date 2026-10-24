@@ -1,7 +1,8 @@
-import { Button, Card, Descriptions, Space, Tag, Tooltip } from 'antd'
+import { Button, Card, Descriptions, Space, Statistic, Tag, Tooltip } from 'antd'
 import { ControlOutlined } from '@ant-design/icons'
 import type { Peer, PendingSlotView } from './types'
 import { NodeRateChart, type NodeRatePoint } from './NodeRateChart'
+import { humanBytes } from './format'
 
 // isOnlinePeer mirrors the cluster's own offline rule (Peer.Offline, the
 // basis of Table.OnlinePeerIDs): a peer counts as reachable by clients only
@@ -29,7 +30,7 @@ export function isOnlinePeer(p: Pick<Peer, 'client_addr' | 'down'>): boolean {
 // small-button 24px line) with an invisible placeholder per absent button,
 // so all data cards in the grid stay the same height. A plain (control-
 // plane) card has neither action, so it renders no row at all.
-export function PeerCard({ peer, current, slots, syncing, fenced, flowControlConfigured, flowControlFiring, onFlowControl, ratePoints, plain }: {
+export function PeerCard({ peer, current, slots, syncing, fenced, flowControlConfigured, flowControlFiring, onFlowControl, ratePoints, storageCount, storageBytes, plain }: {
   peer: Peer
   current?: boolean
   slots: number
@@ -50,6 +51,14 @@ export function PeerCard({ peer, current, slots, syncing, fenced, flowControlCon
   flowControlFiring?: boolean
   onFlowControl?: (id: string) => void
   ratePoints?: NodeRatePoint[]
+  // storageCount / storageBytes are THIS node's leader-copy footprint, off the
+  // same 2s /admin/status poll: the seq total of the slots it leads
+  // (storage_count) and the on-disk bytes of those same copies (Σ
+  // storage_bytes — the byte twin, followers answer 0). The card footer shows
+  // both, the per-card mirror of the cluster's 存储数量/存储大小 cards. A node
+  // that has not answered yet passes nothing and renders '-' for both.
+  storageCount?: number
+  storageBytes?: number
   plain?: boolean
 }) {
   const online = isOnlinePeer(peer)
@@ -80,6 +89,18 @@ export function PeerCard({ peer, current, slots, syncing, fenced, flowControlCon
       {!plain && (
         <div style={{ marginTop: 12 }}>
           <NodeRateChart points={ratePoints ?? []} />
+        </div>
+      )}
+      {/* The card footer: what THIS node stores as a leader — 存储数量 (the
+          seq total of the slots it leads) and 存储大小 (the on-disk bytes of
+          those same leader copies). Same leader-only rule as the cluster cards
+          above, so the per-node numbers add up to the cluster's; a node that
+          has not answered (or a control-plane card, which leads nothing)
+          renders '-' / nothing. */}
+      {!plain && (
+        <div style={{ marginTop: 12, display: 'flex', gap: 24 }}>
+          <Statistic title="存储数量" value={storageCount ?? '-'} valueStyle={{ fontSize: 16 }} />
+          <Statistic title="存储大小" value={storageBytes === undefined ? '-' : humanBytes(storageBytes)} valueStyle={{ fontSize: 16 }} />
         </div>
       )}
     </Card>

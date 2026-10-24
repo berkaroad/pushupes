@@ -138,14 +138,19 @@ export function NodeRateChart({ points }: { points: NodeRatePoint[] }) {
           </text>
         ))}
       </svg>
-      {/* One metric per line (operator's call): the four rates stack in the
-          line's colour, solid-first then dashed, mirroring the plot. */}
-      <Space direction="vertical" size={2}>
-        <Typography.Text style={{ color: MSG }}>{`客户端写入速度（数量）${fmtRate(last.msg)} msg/s`}</Typography.Text>
-        <Typography.Text style={{ color: MSG, opacity: 0.75 }}>{`总写入速度（数量）${fmtRate(last.totalMsg)} msg/s`}</Typography.Text>
-        <Typography.Text style={{ color: KIB }}>{`客户端写入速度（大小）${fmtRate(last.kib)} KiB/s`}</Typography.Text>
-        <Typography.Text style={{ color: KIB, opacity: 0.75 }}>{`总写入速度（大小）${fmtRate(last.totalKib)} KiB/s`}</Typography.Text>
-      </Space>
+      {/* The legend: TWO columns (operator's call) — 数量 on the left, 大小 on
+          the right, one metric per line inside each column: solid (client)
+          above dashed (total), in the line's colour, mirroring the plot. */}
+      <div style={{ display: 'flex', gap: 24, width: '100%' }}>
+        <Space direction="vertical" size={2} style={{ flex: 1 }}>
+          <Typography.Text style={{ color: MSG }}>{`客户端写入速度（数量）${fmtRate(last.msg)} msg/s`}</Typography.Text>
+          <Typography.Text style={{ color: MSG, opacity: 0.75 }}>{`总写入速度（数量）${fmtRate(last.totalMsg)} msg/s`}</Typography.Text>
+        </Space>
+        <Space direction="vertical" size={2} style={{ flex: 1 }}>
+          <Typography.Text style={{ color: KIB }}>{`客户端写入速度（大小）${fmtRate(last.kib)} KiB/s`}</Typography.Text>
+          <Typography.Text style={{ color: KIB, opacity: 0.75 }}>{`总写入速度（大小）${fmtRate(last.totalKib)} KiB/s`}</Typography.Text>
+        </Space>
+      </div>
     </Space>
   )
 }

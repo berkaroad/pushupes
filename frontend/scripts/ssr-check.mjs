@@ -543,6 +543,19 @@ const pcardSrc = String(pc && (await vite.ssrLoadModule('/src/PeerCard.tsx')).Pe
 assert('the fenced tooltip lists slot + reason, capped at ten rows with a total line',
   pcardSrc.includes('slice(0, 10)') && pcardSrc.includes('共 ') && pcardSrc.includes('个槽')
   && pcardSrc.includes('槽 ') && pcardSrc.includes('reason'))
+// The data card's FOOTER carries this node's leader-copy footprint — the
+// per-card mirror of the cluster 存储数量/存储大小 cards: storage_count (the
+// seq total of the slots it leads) and Σ storage_bytes (the byte twin,
+// followers answer 0). '-'-filled until the node answers, and never on a
+// plain control-plane card (it leads nothing, so the row is not rendered).
+const storageCard = pc({ peer: plainPeer, slots: 3, storageCount: 1920, storageBytes: 2069533 })
+assert('a data card shows its storage count and size at the bottom',
+  storageCard.includes('存储数量') && /1,?920/.test(storageCard)
+  && storageCard.includes('存储大小') && storageCard.includes('2.0 MiB'))
+assert('the storage footer renders - until the node answers',
+  pc({ peer: plainPeer, slots: 3 }).includes('存储数量') && /储数量[\s\S]{0,400}?-/.test(pc({ peer: plainPeer, slots: 3 })))
+assert('a control-plane card carries no storage footer',
+  !plainCard.includes('存储数量') && !plainCard.includes('存储大小'))
 
 // The node-card dual-axis chart: FOUR polylines over one time axis — solid
 // client lines and dashed total lines per unit — with a same-timestamp
@@ -565,10 +578,16 @@ assert('node chart labels both y axes', nrChart.includes('msg/s') && nrChart.inc
 assert('node chart legend names all four lines with latest values',
   nrChart.includes('客户端写入速度（数量）300') && nrChart.includes('客户端写入速度（大小）30')
   && nrChart.includes('总写入速度（数量）450') && nrChart.includes('总写入速度（大小）75'))
-// …one metric PER LINE: the legend is the chart's second vertical Space
-// (the plot wrapper is the first) — exactly two in the rendered HTML.
-assert('node chart legend stacks the four metrics one per line',
-  (nrChart.match(/ant-space-vertical/g) ?? []).length === 2)
+// The legend is TWO columns (operator's call): 数量 on the left, 大小 on the
+// right, one metric per line inside each column — so the document order is
+// 数量 ×2 then 大小 ×2, inside the chart's outer vertical stack (three
+// ant-space-vertical in the rendered HTML: outer + two columns).
+const legendOrder = ['客户端写入速度（数量）', '总写入速度（数量）', '客户端写入速度（大小）', '总写入速度（大小）']
+  .map((s) => nrChart.indexOf(s))
+assert('node chart legend splits into 数量 (left) / 大小 (right) columns, one metric per line',
+  legendOrder.every((i) => i >= 0)
+  && legendOrder.every((v, i) => i === 0 || legendOrder[i - 1] < v)
+  && (nrChart.match(/ant-space-vertical/g) ?? []).length === 3)
 // The hover box cannot be exercised by SSR (no mouse), so pin its wiring in
 // the compiled function text: pointer handlers + the same-timestamp rows.
 const nrSrc = String(NodeRateChart)
