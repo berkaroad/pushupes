@@ -237,6 +237,11 @@ type Engine struct {
 	startupSeen  map[string]bool
 	gracePool    map[string]bool
 	graceLogged  map[string]bool
+	// refusedSince is when a peer's peer port started REFUSING connections
+	// (nothing listening) — the clock the "the process is gone" verdict has to
+	// run out (see refusedConfirmWindow). A process that just restarted refuses
+	// for a moment too, so one refused probe is not a verdict. Guarded by failMu.
+	refusedSince map[string]time.Time
 	// graceHeld records that the window actually held at least one verdict (so
 	// the end of the window is worth a log line) and graceEnded that it has
 	// been reported once. Both guarded by failMu.
@@ -650,6 +655,7 @@ func NewEngine(node consensus, store *storage.Store, self string, logger *slog.L
 		startupGrace: DefaultStartupGrace,
 		startupSeen:  map[string]bool{},
 		graceLogged:  map[string]bool{},
+		refusedSince: map[string]time.Time{},
 	}
 	e.orderPool.New = func() any { return make([]int, 0, 64) }
 	e.parkedPool.New = func() any { return make([]parkedEntry, 0, 64) }
@@ -4259,6 +4265,17 @@ func (e *Engine) applyHwLedger(leader string, slots []int32, values []uint64) {
 
 // ---- Controller: membership + failover ---------------------------------------
 
+// refusedConfirmWindow is how long a peer's peer port must keep REFUSING
+// connections before the controller calls the process gone. A refused connect is
+// the strongest liveness signal there is — nothing is listening — but a process
+// that just restarted refuses too while it binds its port (measured: under a
+// second), so a single refusal must not be a verdict: the whole first
+// whole-cluster wave that made every lagging data node look dead came from
+// acting one probe too early. Past the window the verdict is kept by wall clock
+// rather than by the strike count, so a round that runs long (a slow peer's
+// probe timeout) does not stretch it.
+const refusedConfirmWindow = 3 * time.Second
+
 // livenessFailThreshold is the number of consecutive failed health probes
 // before the controller fails a peer's slots over (~3s of outage given the
 // 1s reconcile tick and 2s probe timeout; well beyond a node's boot time).
@@ -4509,20 +4526,42 @@ func (e *Engine) livenessSweep(tbl *Table) {
 			// stay routed to a dead leader, which a batch workload sees as
 			// seconds of 0 msg/s.
 			// One dial answers both questions the verdict needs: is anything
-			// listening there (refused = nothing is), and is our cached
-			// connection the stale half (the port accepts while the RPC fails —
-			// a ClientConn keeps the backoff it built up during the outage, up to
-			// two minutes, so a recovered peer would read as dead until that
-			// backoff elapses). Dropping the connection there makes the next
-			// round probe over a fresh one.
-			if peerPortListening(p.PeerAddr) {
+			// listening there, and is our cached connection the stale half (the
+			// port accepts while the RPC fails — a ClientConn keeps the backoff it
+			// built up during the outage, up to two minutes, so a recovered peer
+			// would read as dead until that backoff elapses). Dropping the
+			// connection there makes the next round probe over a fresh one.
+			listening, refused := dialPeerPort(p.PeerAddr)
+			if listening {
 				e.resetPeerConn(p.PeerAddr)
 			}
-			refused := dialRefused(p.PeerAddr)
-			markDown := (e.failStreak[id] >= livenessFailThreshold || refused) && !p.Down
+			at := time.Now()
+			markDown := false
+			reason := ""
+			if refused {
+				// Nothing is listening there — but a process that just restarted
+				// refuses connections too, for as long as it takes to bind its
+				// peer port (measured: under a second). One refused probe is
+				// therefore not a verdict: the port has to keep refusing for the
+				// whole confirmation window, and then the verdict no longer waits
+				// for the strike count — it is kept by wall clock, so a round that
+				// runs long does not stretch it.
+				since, seen := e.refusedSince[id]
+				if !seen {
+					since = at
+					e.refusedSince[id] = since
+				}
+				markDown = at.Sub(since) >= refusedConfirmWindow && !p.Down
+				reason = fmt.Sprintf("nothing has been listening on its peer port for %s", at.Sub(since).Round(time.Millisecond))
+			} else {
+				// A black-holed or a merely slow peer: not the "nothing
+				// listening" signal, so the strike count decides.
+				delete(e.refusedSince, id)
+				markDown = e.failStreak[id] >= livenessFailThreshold && !p.Down
+				reason = fmt.Sprintf("%d consecutive probes", e.failStreak[id])
+			}
 			if markDown {
-				e.loggerf("peer %s unreachable (%d consecutive probes, refused connection: %t), marking it down",
-					id, e.failStreak[id], refused)
+				e.loggerf("peer %s unreachable (%s), marking it down", id, reason)
 			}
 			e.failMu.Unlock()
 			if markDown {
@@ -4534,6 +4573,7 @@ func (e *Engine) livenessSweep(tbl *Table) {
 			continue
 		}
 		e.failStreak[id] = 0
+		delete(e.refusedSince, id)
 		// This peer has started: from here on its liveness verdict is the
 		// ordinary one — the grace covers a node that never answered, never a
 		// node that answered and then stopped.
@@ -4638,31 +4678,19 @@ func (e *Engine) alive(addr string) bool {
 // dropping SYN) waits this long.
 const dialRefusedTimeout = 300 * time.Millisecond
 
-// peerPortListening reports whether something accepts connections on the peer
-// port at addr. The directory stores addresses with their scheme, so the dial
-// strips it (a raw "http://host:port" is not a dialable address).
-func peerPortListening(addr string) bool {
+// dialPeerPort reports what one TCP connect to the peer port at addr says:
+// listening when the connect completes (something accepts there), refused when
+// the port actively rejects it (ECONNREFUSED — nothing is listening), and
+// neither for a black-holed address (a firewall dropping SYN) or a slow one.
+// The directory stores addresses with their scheme, so the dial strips it (a raw
+// "http://host:port" is not a dialable address).
+func dialPeerPort(addr string) (listening, refused bool) {
 	c, err := net.DialTimeout("tcp", HostPort(addr), dialRefusedTimeout)
-	if err != nil {
-		return false
-	}
-	c.Close()
-	return true
-}
-
-// dialRefused reports whether the peer's port actively REFUSES connections —
-// ECONNREFUSED, i.e. nothing is listening there. That is the unambiguous "the
-// process is gone" signal the liveness sweep can act on within one round: the
-// app-level probe (and its strike threshold) exists to tell a dead node from a
-// slow one, and a refused connect answers that question outright. A timeout, a
-// reset from a half-open socket or any other error is NOT this signal.
-func dialRefused(addr string) bool {
-	c, err := net.DialTimeout("tcp", addr, dialRefusedTimeout)
 	if err == nil {
 		c.Close()
-		return false
+		return true, false
 	}
-	return errors.Is(err, syscall.ECONNREFUSED)
+	return false, errors.Is(err, syscall.ECONNREFUSED)
 }
 
 // submit commits a command through Raft. Every command submission funnels

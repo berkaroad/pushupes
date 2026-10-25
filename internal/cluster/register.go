@@ -124,16 +124,17 @@ func (e *Engine) acceptRegistration(reg *Registration) error {
 // cannot reach it would be marked up here and down again three probes later,
 // flapping leadership every announcement — so the reachability dial stays the
 // authority on "can this node serve". Either way the announcement clears the
-// accumulated probe strikes and drops the stale connection, so the next probe
-// judges the node on its merits instead of on the outage.
+// accumulated probe strikes and the refusal clock, and drops the stale
+// connection, so the next probe judges the node on its merits.
 func (e *Engine) noteRecovery(reg *Registration) {
 	p, ok := e.TableSnapshot().Peers[reg.ID]
 	if !ok || !p.Down || p.PeerAddr == "" {
 		return
 	}
-	listening := peerPortListening(p.PeerAddr)
+	listening, _ := dialPeerPort(p.PeerAddr)
 	e.failMu.Lock()
 	e.failStreak[reg.ID] = 0
+	delete(e.refusedSince, reg.ID) // it is listening (or at least announcing): the refusal clock starts over
 	e.failMu.Unlock()
 	if !listening {
 		return

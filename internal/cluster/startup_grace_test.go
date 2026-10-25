@@ -27,6 +27,26 @@ import (
 // node that has not bound its port yet.
 func deadPeerAddr(id string) string { return "127.0.0.1:1" }
 
+// judgeDead drives the sweep to a "dead" verdict for the given peers: with the
+// refusal confirmation window in place, a port that stops listening is judged on
+// the wall clock (refusedConfirmWindow) rather than on the first probe — so a test
+// that wants the verdict backdates that clock instead of sleeping through it.
+func judgeDead(t *testing.T, e *Engine, ids ...string) {
+	t.Helper()
+	backdate := func() {
+		e.failMu.Lock()
+		for _, id := range ids {
+			if e.refusedSince == nil {
+				e.refusedSince = map[string]time.Time{}
+			}
+			e.refusedSince[id] = time.Now().Add(-refusedConfirmWindow - time.Second)
+		}
+		e.failMu.Unlock()
+	}
+	backdate()
+	e.livenessSweep(e.TableSnapshot())
+}
+
 // startupGraceEngine builds a control node engine whose replicated directory
 // already names two learner peers, with nothing listening on either peer
 // address — the state a control node wakes up in the middle of a whole-cluster
@@ -81,7 +101,7 @@ func TestStartupGraceHoldsVerdictsForDataNodesThatHaveNotStarted(t *testing.T) {
 func TestStartupGraceExpiresIntoTheOrdinaryVerdict(t *testing.T) {
 	e := startupGraceEngine(t)
 	e.startedAt = time.Now().Add(-DefaultStartupGrace - time.Second)
-	e.livenessSweep(e.TableSnapshot())
+	judgeDead(t, e, "node-2", "node-3")
 	tbl := e.TableSnapshot()
 	for _, id := range []string{"node-2", "node-3"} {
 		if !tbl.Peers[id].Down {
@@ -98,9 +118,9 @@ func TestStartupGraceExpiresIntoTheOrdinaryVerdict(t *testing.T) {
 func TestStartupGraceOffRendersTheVerdictAtOnce(t *testing.T) {
 	e := startupGraceEngine(t)
 	e.SetStartupGrace(0)
-	e.livenessSweep(e.TableSnapshot())
+	judgeDead(t, e, "node-2")
 	if !e.TableSnapshot().Peers["node-2"].Down {
-		t.Fatal("with the grace off a silent peer must be marked down on the first sweep")
+		t.Fatal("with the grace off a silent peer is judged by the ordinary rules, with no start-up window in the way")
 	}
 }
 
@@ -111,10 +131,10 @@ func TestStartupGraceCoversTheDataPlaneOnly(t *testing.T) {
 	applyCmd(t, e, &Command{Op: OpJoinNode, Peer: &Peer{
 		ID: "node-9", Role: RoleVoter, PeerAddr: deadPeerAddr("node-9"), ClientAddr: deadPeerAddr("node-9"),
 	}})
-	e.livenessSweep(e.TableSnapshot())
+	judgeDead(t, e, "node-9")
 	tbl := e.TableSnapshot()
 	if !tbl.Peers["node-9"].Down {
-		t.Fatal("a voter is outside the grace: its verdict renders at once")
+		t.Fatal("a voter is outside the grace: the ordinary verdict applies to it")
 	}
 	if tbl.Peers["node-2"].Down {
 		t.Fatal("data nodes keep their verdict held in the same sweep")
@@ -148,7 +168,7 @@ func TestStartupGraceRecordsAProbeAnswer(t *testing.T) {
 func TestStartupGraceDoesNotCoverANodeThatAnsweredAndThenStopped(t *testing.T) {
 	e := startupGraceEngine(t)
 	e.startupSeen["node-2"] = true // what a successful probe leaves behind (see the test above)
-	e.livenessSweep(e.TableSnapshot())
+	judgeDead(t, e, "node-2")
 	tbl := e.TableSnapshot()
 	if !tbl.Peers["node-2"].Down {
 		t.Fatal("a node that answered and then stopped must be marked down at once")
@@ -210,8 +230,8 @@ func TestStartupGracePoolIsCapturedOnce(t *testing.T) {
 	if e.startupAwaiting(tbl, time.Now())["node-4"] {
 		t.Fatal("a node that joined after start-up is not part of the grace window")
 	}
-	e.livenessSweep(tbl)
+	judgeDead(t, e, "node-4")
 	if !e.TableSnapshot().Peers["node-4"].Down {
-		t.Fatal("a node that joined after start-up is judged at once")
+		t.Fatal("a node that joined after start-up is judged by the ordinary rules")
 	}
 }

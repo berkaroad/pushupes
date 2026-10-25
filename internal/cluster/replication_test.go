@@ -700,13 +700,19 @@ func TestDialRefusedDistinguishesDeadFromSlow(t *testing.T) {
 		}
 	}()
 
-	if dialRefused(ln.Addr().String()) {
+	if _, refused := dialPeerPort(ln.Addr().String()); refused {
 		t.Fatalf("a listening port must not read as refused (%s)", ln.Addr())
+	}
+	// The directory stores addresses WITH their scheme: the dial has to strip it,
+	// or every peer reads as "neither listening nor refused" and the refusal
+	// signal never fires at all (that is how it behaved before).
+	if listening, _ := dialPeerPort("http://" + ln.Addr().String()); !listening {
+		t.Fatalf("a scheme-carrying address must still read as listening (%s)", ln.Addr())
 	}
 	dead := ln.Addr().String()
 	ln.Close() // nothing listens there any more
-	if !dialRefused(dead) {
-		t.Fatalf("a closed port must read as refused (%s): the sweep is what turns that into an immediate mark_down", dead)
+	if _, refused := dialPeerPort(dead); !refused {
+		t.Fatalf("a closed port must read as refused (%s): that is the clock the liveness verdict runs on", dead)
 	}
 }
 
