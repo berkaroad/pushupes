@@ -405,6 +405,16 @@ Body: Record*，每条记录：
   按这个退避重试，所以一个修不好的目标不会每轮被丢一次。0=关闭再平衡；负数启动即报错。
   每一轮先做 leader 交接、再做**席位回收**（`reclaimRound`，见下面「副本集重排」）：
   两件事共用同一个 cadence 与让路门禁，且各自每轮推进一次提交。
+- **初次启动的宽限期（`-startup-grace`，默认 90s）**：控制节点刚起来时，复制目录里
+  已经是上一世留下的完整布局（peer 的 `clientAddr` 与 `down` 都随快照持久化），而数据
+  节点本身还在启动——这段时间里的探活失败说明不了「死了」。窗口内对「目录里已注册、
+  本进程启动以来从未应答过探活」的数据节点**不落存活判定**（不 `mark_down`、不做
+  故障切换），首次再平衡也等在这段窗口之外；被覆盖的节点全部应答过一次即提前关窗，
+  到点仍无应答的按常规判定（故障切换因此最多推迟这一段，边界就是窗口本身）。覆盖集合
+  在控制节点第一次扫描时定下，此后新加入的节点属于运行期变化、按常规判定。实测依据：
+  错峰 10s 的整簇重启，旧行为在 t=3.1s 把 1024 槽全压到一个数据节点（同一轮里两条
+  `mark_down` 互相把对方的槽交给存活副本），随后按每轮一次的串行回切要 ~34 分钟才摊平；
+  带窗口时分布全程保持重启前的 512/512。`0` = 不等，负数启动即报错。
 - **默认拓扑**：`slot_count=1024`（固定）。每槽副本数由**副本策略**（replica
   policy）分档决定，策略值存放在 Raft 复制的槽表里、全集群一份：
   `low` = 每槽 1 份、`medium` = 2 份（**默认**）、`high` = 3 份（leader 加两个
@@ -955,6 +965,10 @@ fetch-settle    = 200µs（fetch 轮被数据唤醒后的合并窗口：一轮�
 drop_after      = 30s          # 迁移后前源节点本地副本的保留期，到期自动 DropSlot
                               # -drop-after / PUSHUPES_DROP_AFTER：正数=该时长，0=默认 30s，
                               # 负数启动即报错；没有关闭选项（留着会把节点写满）
+startup_grace   = 90s          # 控制节点初次启动的宽限期：目录里已注册、本进程启动以来还没应答过探活的
+                              # 数据节点在窗口内不判宕机（不 mark_down、不故障切换），首次再平衡也等在这段
+                              # 窗口之外；被覆盖的节点全部应答即提前关窗，到点仍无应答按常规判定
+                              # -startup-grace / PUSHUPES_STARTUP_GRACE：0=不等，负数启动即报错
 raft_heartbeat_timeout = 100ms # -raft-heartbeat-timeout / PUSHUPES_RAFT_HEARTBEAT_TIMEOUT
                               # （启动脚本里 RAFT_HEARTBEAT_TIMEOUT）：leader 发心跳的间隔
 raft_election_timeout  = 500ms # -raft-election-timeout / PUSHUPES_RAFT_ELECTION_TIMEOUT

@@ -69,6 +69,9 @@ Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分
 - controller 周期（`-rebalance-interval`，默认 2s，可关闭）把各槽 leader 交接
   回环上的归属位置，槽主归属在数据节点间均摊；故障切换留下的失衡自动回切。
 - 交接逐个进行，写扰动恒定限于单个槽，节点重启后无切换风暴；再平衡全程不停写。
+- 整簇重启（控制节点先起、数据节点随后起来）时槽主分布保持重启前的位置：控制节点初次
+  启动的宽限期（`-startup-grace`，默认 90s）内，目录里已注册但还没启动的数据节点不被
+  判为宕机，首次再平衡也等在这段窗口之外；这些节点全部应答后立即回到常规判定。
 
 ### 节点级流控（令牌桶）
 
@@ -221,6 +224,7 @@ medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(�
 | `-fetch-settle` | `PUSHUPES_FETCH_SETTLE` | 200µs | fetch 轮被数据唤醒后的合并窗口：一轮覆盖整批写入涉及的多个槽；每次 ack 都要付它一次，换的是轮次与上报次数；0=首个槽有数据就答（轮次更多） |
 | `-drop-after` | `PUSHUPES_DROP_AFTER` | 30s | 迁移后前源副本保留期；0=默认，负数启动即报错，不可关闭 |
 | `-rebalance-interval` | `PUSHUPES_REBALANCE_INTERVAL` | 2s | controller 每隔多久检查一次 leader 布局并执行回切（节点宕机恢复后把槽 leader 迁回环上预期节点）；**每轮只提交一次**（提交严格串行，任一时刻只有一个槽在交接栅栏上），所以收敛时间由这个间隔决定；0=关闭，负数启动即报错 |
+| `-startup-grace` | `PUSHUPES_STARTUP_GRACE` | 90s | 控制节点初次启动的宽限期：目录里已注册、本进程启动以来还没应答过探活的数据节点在窗口内不被判为宕机（也就不会触发故障切换把它们的槽挪走），首次再平衡也等在这段窗口之外；这些节点全部应答即提前结束，到点仍无应答的按常规判定（故障切换最多推迟这一段）；0=不等，负数启动即报错 |
 | `-grpc-max-msg-size` | `PUSHUPES_GRPC_MAX_MSG_SIZE` | 4MiB | client 面 gRPC 消息上限（recv/send 同值）；`BatchAppend` 单批要装进它，可写 `16MiB` 等带单位形式（env 同样接受）；≤0 启动即报错 |
 | `-raft-heartbeat-timeout` | `PUSHUPES_RAFT_HEARTBEAT_TIMEOUT` | 100ms | 共识心跳间隔。leader 的心跳没按时到达就会被投票换掉，所以宿主机可能拖住共识事件循环时要与 `-raft-election-timeout` 一起放大 |
 | `-raft-election-timeout` | `PUSHUPES_RAFT_ELECTION_TIMEOUT` | 500ms | follower 多久收不到心跳就发起选举。必须 ≥ 2× 心跳，否则一次迟到的心跳就会掀掉 leader（启动即报错）；与心跳是一对比例，一起放大而不是只收窄其中一个 |

@@ -86,6 +86,8 @@ func main() {
 			"post-migration retention: how long the FORMER SOURCE keeps its local copy of a migrated slot before dropping it (positive = that window, 0 = the default 30s; negative is rejected; the cleanup cannot be disabled — env PUSHUPES_DROP_AFTER)")
 		rebalanceInterval = flag.Duration("rebalance-interval", envDurationOr("PUSHUPES_REBALANCE_INTERVAL", cluster.DefaultRebalanceInterval),
 			"how often the controller checks the leader layout against the slot ring and hands deviated slots back (a node that died returns to its own slots after failover; 0 disables the rebalancer; negative is rejected — env PUSHUPES_REBALANCE_INTERVAL)")
+		startupGrace = flag.Duration("startup-grace", envDurationOr("PUSHUPES_STARTUP_GRACE", cluster.DefaultStartupGrace),
+			"how long a control node's first start waits for the data nodes the directory already knows to come up before it starts treating an unanswered peer as failed, and keeps the first rebalance rounds out of that window (a whole-cluster restart whose data nodes start a few seconds late keeps its leader layout instead of piling every slot onto the first node that answers; 0 = render verdicts from the first round; negative is rejected — env PUSHUPES_STARTUP_GRACE)")
 		// The client plane keeps gRPC's stock 4MiB message cap by default.
 		// BatchAppend asks for one batch to fit inside the cap, so the
 		// operator raises it together with typical batch size (a 4MiB cap
@@ -110,13 +112,13 @@ func main() {
 	base := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	logger := base.With("node", *nodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *role, *adoptTo, slotCount, *replicaPolicy, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *flushPar, *dropAfter, *fetchSettleD, *rebalanceInterval, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
+	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *role, *adoptTo, slotCount, *replicaPolicy, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *flushPar, *dropAfter, *fetchSettleD, *rebalanceInterval, *startupGrace, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
 		logger.Error("pushupes exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, role string, adoptInterval time.Duration, slotCount int, replicaPolicy string, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD time.Duration, flushPar int, dropAfter, fetchSettle, rebalanceInterval time.Duration, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
+func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, role string, adoptInterval time.Duration, slotCount int, replicaPolicy string, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD time.Duration, flushPar int, dropAfter, fetchSettle, rebalanceInterval, startupGrace time.Duration, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
 	nodeRole, err := cluster.NormalizeRole(role)
 	if err != nil {
 		return err
@@ -201,6 +203,16 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 		return fmt.Errorf("-rebalance-interval %s must not be negative (positive = the check cadence, 0 = the rebalancer is off)", rebalanceInterval)
 	}
 	eng.SetRebalanceConfig(rebalanceInterval)
+	if startupGrace < 0 {
+		return fmt.Errorf("-startup-grace %s must not be negative (positive = how long the first rebalance waits for the registered data nodes to come up, 0 = no wait)", startupGrace)
+	}
+	eng.SetStartupGrace(startupGrace)
+	if startupGrace > 0 {
+		logger.Info("start-up grace: a control node's first start holds its liveness verdict for the data nodes the directory already knows until they answer once, and keeps the first rebalance rounds out of that window",
+			"grace", startupGrace.String())
+	} else {
+		logger.Info("start-up grace disabled (-startup-grace is 0): liveness verdicts render from the first round")
+	}
 	if fetchSettle < 0 {
 		return fmt.Errorf("-fetch-settle %s must not be negative", fetchSettle)
 	}
