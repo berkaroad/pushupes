@@ -82,11 +82,13 @@ Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分
 ### 管理控制台（frontend/）
 
 React 管理台：集群页（存储数量/大小、客户端写入速度、副本策略与同步状态、
-按面分组的节点卡片与写入速率折线图、流控入口）、槽位页（分配表、槽详情与
-迁移发起）、事件流页；light/dark 主题，2s 自动刷新可开关。
+按面分组的节点卡片与写入速率折线图、流控入口、处于缩容标记的节点卡片带
+「取消缩容」）、槽位页（分配表、槽详情与迁移发起）、事件流页；light/dark
+主题，2s 自动刷新可开关。
 
-成员管理（加入/移除节点）与副本策略档位等运维命令的完整形态见 DESIGN.md；
-以上各机制的设计推导同样以 DESIGN.md 为准。
+**加节点没有控制台或管理面入口**：新进程带 `-join` 启动即自报入群；控制台只提供
+「取消缩容」（撤销误发的 DELETE），移除走 `DELETE /admin/cluster/nodes/{id}` /
+`cluster.sh remove N`。完整形态见 DESIGN §12.3；以上各机制的设计推导同样以 DESIGN.md 为准。
 
 ## 部署与启动
 
@@ -105,11 +107,12 @@ go build ./... && go vet ./... && go test ./... -count=1   # 全量门禁
 cd frontend && npm install && npm run build
 ```
 
-### 一键起 3 节点集群（推荐）
+### 一键起集群（用于本地开发）
 
 ```bash
 REPLICAS=5 VOTERS=3 scripts/cluster.sh start   # 一条命令建整簇：3 控制节点 + 2 数据节点
-scripts/cluster.sh restart   # 裸跑即可：节点数、每节点角色、端口都读自 $RUN_DIR/cluster.env
+scripts/cluster.sh restart   # 重启（保留数据，验证 WAL/Raft 崩溃恢复）；裸跑即可，
+                             #   节点数、每节点角色、端口都读自 $RUN_DIR/cluster.env
 scripts/cluster.sh status    # 各节点 Raft 角色、leader 槽数、迁移中槽数
 scripts/cluster.sh smoke     # 端到端冒烟：MOVED → v1/v2 写入 → 幂等 exists
                              #           → 版本冲突 fail/1001 → 回读
@@ -117,7 +120,10 @@ scripts/cluster.sh slotcheck # 副本一致性体检：逐槽比较 leader 与�
                              #   报出「LEO 相同但目录偏短」的发散副本（有则退出码 1）
                              #   可加 -quiet / -json / -list=N 透传给 bin/slotcheck
 scripts/cluster.sh logs 1    # 跟踪 node-1 日志
-scripts/cluster.sh restart   # 重启（保留数据，验证 WAL/Raft 崩溃恢复）
+scripts/cluster.sh members   # 列出当前 Raft 成员（GET /admin/cluster/nodes）
+scripts/cluster.sh join 6    # 运行时扩 node-6（-join 自报；角色按 VOTERS/ROLE_<n> 推导）
+scripts/cluster.sh remove 6  # 运行时缩 node-6（只允许离线节点：进程在跑会先停，
+                             #   等探活标离线后提交配置删除，槽主迁到存活副本）
 scripts/cluster.sh stop      # 停止（只杀 pid 文件记录的进程）
 scripts/cluster.sh clean     # stop 并删除运行目录（含数据，慎用）
 ```
@@ -126,51 +132,72 @@ scripts/cluster.sh clean     # stop 并删除运行目录（含数据，慎用�
 pid 分别放在 `$RUN_DIR/node-i/`（默认在仓库根的 `.cluster/`）。可用环境变量覆盖：
 `REPLICAS`（节点数）、`VOTERS`（控制面节点数：node-1..VOTERS=voter，其余=learner；
 也可用 `ROLE_<n>=voter|learner` 逐个点名）、`HOST`、`ADMIN_BASE`、`PEER_BASE`、
-`CLIENT_BASE`、`SEGMENT_BYTES`、`RUN_DIR`、`READY_TIMEOUT`、`BUILD`。`start`/`join`
+`CLIENT_BASE`、`SEGMENT_BYTES`、`RAFT_HEARTBEAT_TIMEOUT`、`RAFT_ELECTION_TIMEOUT`、
+`RUN_DIR`、`READY_TIMEOUT`、`BUILD`（两个 raft 时间旋钮是成对的：选举超时须 ≥ 2×
+心跳，宿主机/容器 CPU 紧张时一起放大，而不是只收窄其中一个）。`start`/`join`
 会把生效形态（节点数、每节点角色、端口）写进 `$RUN_DIR/cluster.env`，之后裸跑
 `restart`/`stop`/`status`/`smoke` 都按它执行，命令行显式传的变量仍优先；运行目录里
 只有节点目录而没有 `cluster.env`（老目录）时脚本按最大 `node-N` 推断节点数并提示补传
 角色。每槽副本数由副本策略分档（`PUSHUPES_REPLICA_POLICY`=low/medium/high，默认
 medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(数据节点数, 策略要求份数)）：该值只为新集群种初始值，策略存放在 Raft 复制的
 槽表里，之后改档位走 `POST /admin/cluster/replica-policy`（控制台集群页的「副本策略」
-卡片即可操作）。扩节点两种做法等价：`REPLICAS=<新总数> cluster.sh start`（集群已存在
-时，缺的节点自动报名加入）或逐个 `cluster.sh join N`。
+卡片即可操作）。**扩容分两种，别混**：`REPLICAS` 只决定节点总数，角色由 `VOTERS`
+区间推导（`node-1..VOTERS` = voter，其余 = learner）——`REPLICAS=7 cluster.sh start`
+在 `VOTERS=3` 下新增的 node-4..7 **全是数据节点（learner）**；扩**控制节点**必须同时
+抬 `VOTERS`（如 `VOTERS=5 REPLICAS=7 start`）或用 `ROLE_<n>=voter` 点名。两个方向
+都等价于逐个 `cluster.sh join N`（角色同样按 `VOTERS`/`ROLE_<n>` 推导）。方向不可逆：
+成员身份以 raft 配置为准，调低 `VOTERS` 只是让脚本把既有 voter 按 learner 拉起——
+它的 `-join` 自报会因「已是 raft voter」被拒、进程启动即退（成员身份不变，集群不受
+影响）。缩控制面只能走 `cluster.sh remove N`。
 
-集群配置只由**一个**节点写下（`-peers` 里 id 最小的那个，或用 `-bootstrap` 指定的
-那个）；其余配置了 `-peers` 的节点一律以「种子」身份启动、向这些成员报名加入，自己
-不写配置。所以「把新节点用更大的 `-peers` 列表拉起来」就是扩容，它不会和现有集群
-各写一份配置而分裂成多个各自能提交的 raft 组。
+集群配置只由**一个**节点写下：带 `-peers` 且 id 最小的那个（或用 `-bootstrap` 点名的
+那个）——`-peers` 只是**撰写者的初始配置文档**，必须点名撰写者自己。其余所有节点
+一视同仁（新增 voter 与 learner 同一条路）：带 `-join`（控制面地址列表，按
+`-adopt-interval` 轮转自报）加入，voter 进 raft 配置、learner 进复制目录，全部由
+节点在启动时自己声明。`-join` 与 `-peers` 互斥（同时设置启动即报错），被明确拒绝
+（id 已属于另一种角色、地址已属于别的成员）也启动即退出。这样新节点各写一份配置、
+把集群劈成多个各自能提交的 raft 组的情况不会发生。
 
-### 手工启动单个节点
+### 手动启动节点
 
 ```bash
-# 最小部署 = 1 个控制节点（voter）+ 1 个数据节点（learner）。-role 必填，
-# 只能是这两个值：voter 投票但不承载槽副本，learner 承载副本但不投票。
-# -peers 只列控制面（voter）节点：它既是 voter 的初始配置种子，也是 learner
-# 连控制面的投递点（注册与布局分发都走 peer 端口）。
-# learner 要先进目录（控制面 POST /admin/cluster/nodes {"role":"learner"}）
-# 再启动进程；准入与拉起顺序见 scripts/cluster.sh。
+# 入群声明二选一（互斥）：初始配置撰写者用 -peers（文档必须点名自己），
+# 其余所有节点——新增 voter 与 learner 一样——用 -join 指向控制面成员自报。
+# 多个 -join 地址按 -adopt-interval 轮转（个别成员重启不耽误加入）。
+# -role 必填：voter 投票但不承载槽副本，learner 承载副本但不投票。
+# 最小部署 = 1 voter + 1 learner；下面是本地开发的完整形态——3 控制 + 2 数据。
+
+# --- 撰写者 node-1：写下 3 个控制节点的初始配置 ---
 ./bin/pushupes -node node-1 -role voter \
   -peer 127.0.0.1:8391 -admin 127.0.0.1:8091 -client 127.0.0.1:8591 \
   -data ./node-1 \
-  -peers 'node-1=127.0.0.1:8391'
+  -peers 'node-1=127.0.0.1:8391,node-2=127.0.0.1:8392,node-3=127.0.0.1:8393'
 
-./bin/pushupes -node node-2 -role learner \
+# --- 其余控制节点：-join 自报，配置由 leader 的日志带过来 ---
+./bin/pushupes -node node-2 -role voter \
   -peer 127.0.0.1:8392 -admin 127.0.0.1:8092 -client 127.0.0.1:8592 \
   -data ./node-2 \
-  -peers 'node-1=127.0.0.1:8391'
+  -join '127.0.0.1:8391,127.0.0.1:8393'
 
-# 再加一个控制成员：它不在配置里，按 -peers 里的成员报名进 raft（无需 -join
-# 也能轮转报名；-join 只用于点名某一个成员）。
 ./bin/pushupes -node node-3 -role voter \
   -peer 127.0.0.1:8393 -admin 127.0.0.1:8093 -client 127.0.0.1:8593 \
   -data ./node-3 \
-  -peers 'node-1=127.0.0.1:8391' \
-  -join 127.0.0.1:8391
+  -join '127.0.0.1:8391,127.0.0.1:8392'
+
+# --- 追加数据节点：同样只有 -join，没有 admin 准入这一步 ---
+./bin/pushupes -node node-4 -role learner \
+  -peer 127.0.0.1:8394 -admin 127.0.0.1:8094 -client 127.0.0.1:8594 \
+  -data ./node-4 \
+  -join '127.0.0.1:8391,127.0.0.1:8392,127.0.0.1:8393'
+
+./bin/pushupes -node node-5 -role learner \
+  -peer 127.0.0.1:8395 -admin 127.0.0.1:8095 -client 127.0.0.1:8595 \
+  -data ./node-5 \
+  -join '127.0.0.1:8391,127.0.0.1:8392,127.0.0.1:8393'
 ```
 
-地址规范：地址统一带 scheme 存储，未写协议时默认补 `http://`；`-peers`
-也接受裸 `host:peerport`（此时地址兼作节点 id）。
+地址规范：地址统一带 scheme 存储，未写协议时默认补 `http://`；`-peers` 与 `-join`
+都接受裸 `host:peerport`（此时地址兼作节点 id）。
 
 ### 启动参数
 
@@ -182,13 +209,14 @@ medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(�
 | `-admin` | `PUSHUPES_ADMIN` | `http://127.0.0.1:8091` | admin 面：HTTP 管理 API + pprof |
 | `-client` | `PUSHUPES_CLIENT` | `http://127.0.0.1:8591` | client 面：gRPC 事件读写唯一入口 |
 | `-data` | `PUSHUPES_DATA` | `./data` | 数据目录 |
-| `-peers` | `PUSHUPES_PEERS` | 空 | 集群种子 `id=host:peerport,...` |
-| `-join` | `PUSHUPES_JOIN` | 空 | 启动时向指定成员（`host:peerport`）报名。可选：不写时，非 `-peers` 首位的节点也会按配置成员轮转报名，`-join` 用于指定其中一个 |
-| `-adopt-interval` | `PUSHUPES_ADOPT_INTERVAL` | 3s | 尚未成为集群成员的节点每隔多久重试一次报名 |
-| `-bootstrap` | — | false | 由本节点写下集群的初始配置。默认由 `-peers` 里 id 最小的节点写；其余配置了 `-peers` 的节点以种子身份启动、向这些成员报名加入，自己不写配置 |
+| `-peers` | `PUSHUPES_PEERS` | 空 | **初始配置撰写者的文档**：`id=host:peerport,...`（裸 `host:peerport` 亦可），必须包含本节点；只有 id 最小的成员（或 `-bootstrap` 点名者）能带它。与 `-join` 互斥，同时设置启动即报错 |
+| `-join` | `PUSHUPES_JOIN` | 空 | **加入现有集群的唯一入口**：控制面成员的 peer 地址列表（`host:peerport` 或 `id=host:peerport`，逗号分隔），按 `-adopt-interval` 轮转自报直到被 leader 接纳——voter 进 raft 配置、learner 进复制目录。被明确拒绝（`ErrBadMember`）启动即退出；与 `-peers` 互斥 |
+| `-adopt-interval` | `PUSHUPES_ADOPT_INTERVAL` | 3s | 尚未成为集群成员的节点每隔多久向 `-join` 目标重试一次自报（多地址轮转，个别成员不可达不影响加入） |
+| `-bootstrap` | — | false | 由本节点撰写集群的初始配置：配合 `-peers` 用于点名非最小 id 的作者；单独使用（无 `-peers`）时撰写只有自己的单 voter 配置，后续 voter 用 `-join` 加入。learner 不能撰写，与 `-join` 同用启动即报错 |
 | `-replica-policy` | `PUSHUPES_REPLICA_POLICY` | medium | 副本策略档位：`low`=每槽 1 份、`medium`=2 份（默认）、`high`=每槽 3 份（容忍失去 2 个数据节点），或**正整数直接指定副本因子**。**只用于新集群的初始值**：策略存放在 Raft 复制的槽表里，之后只能经 `POST /admin/cluster/replica-policy` 修改，重启不会重刷；副本因子 = MIN(数据节点数（布局池 `HostingIDs()`）, 策略要求份数)。`GET /admin/cluster/status` 的 `replica_policy` / `replica_factor` 读回当前值；非法值启动即报错 |
 | `-flush-messages` | `PUSHUPES_FLUSH_MESSAGES` | 1000 | 每 N 条 fsync（0 关闭） |
 | `-flush-interval` | `PUSHUPES_FLUSH_INTERVAL` | 5s | 每周期 fsync（0 关闭） |
+| `-flush-parallelism` | `PUSHUPES_FLUSH_PARALLELISM` | 1 | 全存储同时在飞的段 fsync 上限（1=一次刷一个，即历史单刷盘链路）：一个许可信号量给所有 fsync 封顶，刷盘队列由持久 worker 池执行；显式 `Flush()`/`Close` 的 fsync 也在调用方 goroutine 上取同一许可、同受上限约束。刷盘轮按预算切片（每轮至多 8 个单元或 200ms）。<1 启动即报错；生效值可从 `/admin/stats` 的 `parallelism` 字段读回（机制见 DESIGN §3） |
 | `-segment-bytes` | `PUSHUPES_SEGMENT_BYTES` | 64MiB | WAL 段滚动大小：64MiB 整数倍，≤2GiB；可写字节数或带单位（`64MiB`/`1GiB`），env 同样接受带单位形式 |
 | `-fetch-settle` | `PUSHUPES_FETCH_SETTLE` | 200µs | fetch 轮被数据唤醒后的合并窗口：一轮覆盖整批写入涉及的多个槽；每次 ack 都要付它一次，换的是轮次与上报次数；0=首个槽有数据就答（轮次更多） |
 | `-drop-after` | `PUSHUPES_DROP_AFTER` | 30s | 迁移后前源副本保留期；0=默认，负数启动即报错，不可关闭 |
@@ -238,12 +266,14 @@ admin 面 HTTP（仅管理）：`GET /admin/cluster/status`、`GET /admin/status
 `POST /admin/slots/{slot}/migrate`、`POST /admin/slots/{slot}/remove-replica`、
 `POST /admin/cluster/plan`、`POST /admin/cluster/replica-policy`、
 `DELETE /admin/cluster/nodes/{id}`（摘成员：服务端先排干再正式移除，在线与否不问，客户端无中断）、
+`POST /admin/cluster/nodes/{id}/cancel-drain`（取消缩容：清 drain / 待移除标记，节点重新参与
+布局；未标记条目回 `change:"none"`。**加成员没有 admin 接口**——新节点带 `-join` 启动即自报入群）、
 `POST/GET/DELETE /admin/flow-control`（节点本地：收到请求的节点就是被设置/查询/
 恢复的节点）、`GET /admin/slots/pending`、`POST /admin/slots/pending/adopt`
 （owner 围栏：查看被拦副本并采纳「属于当前世代」，同样节点本地；丢弃走运维
 手工删除槽目录，见 DESIGN §3.1）、`GET /healthz`、`/debug/pprof/`。
-**控制器专属写命令（migrate/remove-replica/plan/replica-policy）必须直接发到 Raft leader 的
-admin 地址**，follower 一律拒绝（425 + 1005），不做转发。
+**控制器专属写命令（migrate / remove-replica / plan / replica-policy / 摘成员 / 取消缩容）
+必须直接发到 Raft leader 的 admin 地址**，follower 一律拒绝（425 + 1005），不做转发。
 
 仓库自带工具：
 
