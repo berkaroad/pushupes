@@ -418,6 +418,9 @@ type consensus interface {
 	Stats() map[string]any
 	AddMember(id, addr string, timeout time.Duration) error
 	RemoveMember(id string, timeout time.Duration) error
+	// UpdatePeer rewrites a voter's configured peer address (the arrival
+	// self-report's correction path, see members.go acceptAdoption).
+	UpdatePeer(id, addr string, timeout time.Duration) error
 	Cfg() Config
 	TopologyID() string
 	WaitForLeader(timeout time.Duration) (string, error)
@@ -538,6 +541,15 @@ func (n *Node) RemoveMember(id string, timeout time.Duration) error {
 		return n.learner.RemoveMember(id, timeout)
 	}
 	return n.raft.RemoveMember(id, timeout)
+}
+
+// UpdatePeer rewrites a voter's configured peer address at runtime (leader
+// only): the arrival self-report's correction of a stale placeholder.
+func (n *Node) UpdatePeer(id, addr string, timeout time.Duration) error {
+	if n.learner != nil {
+		return n.learner.UpdatePeer(id, addr, timeout)
+	}
+	return n.raft.UpdatePeer(id, addr, timeout)
 }
 
 // Voters reports whether id currently counts towards quorum.

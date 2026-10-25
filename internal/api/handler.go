@@ -76,7 +76,7 @@ func New(eng *cluster.Engine, store *storage.Store) *Server {
 	s.mux.HandleFunc("GET /admin/flow-control", s.handleGetFlowControl)
 	s.mux.HandleFunc("DELETE /admin/flow-control", s.handleSetFlowControl)
 	s.mux.HandleFunc("GET /admin/cluster/nodes", s.handleMembers)
-	s.mux.HandleFunc("POST /admin/cluster/nodes", s.handleAddMember)
+	s.mux.HandleFunc("POST /admin/cluster/nodes/{id}/cancel-drain", s.handleCancelDrain)
 	s.mux.HandleFunc("DELETE /admin/cluster/nodes/{id}", s.handleRemoveMember)
 
 	return s
@@ -577,36 +577,24 @@ func (s *Server) handleMembers(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleAddMember adds a node to the running cluster. Controller-only: a
-// follower refuses with the controller's node id and admin address (the client
-// retries there) — nothing is forwarded, exactly like the other cluster
-// commands.
+// handleCancelDrain clears the scale-down marks the operator posted with the
+// DELETE, putting the node back into the layout pools. Controller-only like
+// every directory command: a follower refuses with the controller's node id
+// and admin address (the client retries there) — nothing is forwarded.
+// There is no "add member" endpoint any more: a node joins by OFFERING
+// itself — start it with -join and the right -role (DESIGN §12.3).
 //
-//	POST /admin/cluster/nodes  {"id":"node-4","peer_addr":"10.0.0.4:8394"}
-//
-// Only the peer (consensus) address is given: the node announces its admin and
-// client addresses itself once it is a member.
-func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ID       string `json:"id"`
-		PeerAddr string `json:"peer_addr"`
-		// Role admits the member with, and it must be stated: "learner"
-		// (data plane, no vote — a replicated directory entry) or "voter"
-		// (the raft-configuration admission).
-		Role string `json:"role"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" || req.PeerAddr == "" {
-		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "id and peer_addr required")
-		return
-	}
-	role, err := cluster.NormalizeRole(req.Role)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, err.Error())
+//	POST /admin/cluster/nodes/node-4/cancel-drain
+func (s *Server) handleCancelDrain(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "id required")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), cluster.AddMemberTimeout+5_000_000_000)
 	defer cancel()
-	if err := s.Engine.AddMember(ctx, req.ID, req.PeerAddr, role); err != nil {
+	status, err := s.Engine.CancelDrain(ctx, id)
+	if err != nil {
 		if refuseNotController(w, err) {
 			return
 		}
@@ -617,11 +605,11 @@ func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, 0, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"node": s.Engine.Self(), "member": req.ID, "change": "added"})
+	writeJSON(w, http.StatusOK, map[string]any{"node": s.Engine.Self(), "member": id, "change": status})
 }
 
-// handleRemoveMember drops a node from the running cluster. Controller-only,
-// like handleAddMember. Only an offline member can be removed: the engine
+// handleRemoveMember drops a node from the running cluster. Controller-only.
+// Only an offline member can be removed: the engine
 // refuses a node the cluster can still reach (see Engine.RemoveMember), and
 // that refusal surfaces here as a bad request. The node keeps serving its
 // slots until the configuration change reaches it (the consensus layer waits

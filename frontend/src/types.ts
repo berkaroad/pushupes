@@ -14,6 +14,13 @@ export interface Peer {
   // down-mark — only leadership moves off it — so the console can show the
   // node as 离线 instead of watching it flicker in and out of the list.
   down?: boolean
+  // The operator's scale-down marks (posted by DELETE /admin/cluster/nodes/{id}
+  // and carried through Raft): draining keeps the node out of every layout
+  // role while its slots hand over; pending_remove commits the removal once
+  // it leads nothing. While either is set the card offers 取消缩容, the
+  // operator's exit from a scale-down issued in error.
+  draining?: boolean
+  pending_remove?: boolean
 }
 
 export interface Placement {

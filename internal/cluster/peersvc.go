@@ -29,14 +29,17 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 
 	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 	"github.com/berkaroad/pushupes/internal/lease"
@@ -106,6 +109,13 @@ func (s *peerServer) Register(_ context.Context, req *pushupesv1.RegisterRequest
 
 func (s *peerServer) Adopt(ctx context.Context, req *pushupesv1.AdoptRequest) (*pushupesv1.AdoptResponse, error) {
 	if err := s.e.acceptAdoption(ctx, &Adoption{ID: req.Id, PeerAddr: req.PeerAddr, Role: req.GetRole()}); err != nil {
+		// A clear refusal travels as InvalidArgument: the offering node's
+		// joiner loop treats it as fatal (exit) instead of rotating to the
+		// next seed. Everything else — no leader yet, relay unreachable —
+		// stays retryable.
+		if errors.Is(err, ErrBadMember) {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
 		return nil, err
 	}
 	return &pushupesv1.AdoptResponse{}, nil

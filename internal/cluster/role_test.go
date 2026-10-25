@@ -155,7 +155,7 @@ func TestAddMemberLearnerAdmission(t *testing.T) {
 	e := newLeaderEngine(t)
 	ctx := context.Background()
 	before := settledCommit(t, e.node)
-	if err := e.AddMember(ctx, "node-9", "127.0.0.1:9909", RoleLearner); err != nil {
+	if err := e.AdmitSelf(ctx, "node-9", "127.0.0.1:9909", RoleLearner); err != nil {
 		t.Fatal(err)
 	}
 	p := e.TableSnapshot().Peers["node-9"]
@@ -165,15 +165,15 @@ func TestAddMemberLearnerAdmission(t *testing.T) {
 	if e.node.IsMember("node-9") {
 		t.Fatal("a learner admission joined the raft configuration — it must not")
 	}
-	// Idempotent: re-admitting the same live learner commits nothing new.
-	if err := e.AddMember(ctx, "node-9", "127.0.0.1:9909", RoleLearner); err != nil {
+	// Idempotent: re-offering the same live learner commits nothing new.
+	if err := e.AdmitSelf(ctx, "node-9", "127.0.0.1:9909", RoleLearner); err != nil {
 		t.Fatal(err)
 	}
 	if after := commitIndexOf(t, e.node); after != before+1 {
 		t.Fatalf("commit index %d -> %d, want exactly the one admission entry", before, after)
 	}
 	// A name that already votes cannot also be admitted as a learner.
-	if err := e.AddMember(ctx, "node-1", "127.0.0.1:9901", RoleLearner); !errors.Is(err, ErrBadMember) {
+	if err := e.AdmitSelf(ctx, "node-1", "127.0.0.1:9901", RoleLearner); !errors.Is(err, ErrBadMember) {
 		t.Fatalf("voter-name collision admitted as learner: %v", err)
 	}
 }
@@ -181,7 +181,7 @@ func TestAddMemberLearnerAdmission(t *testing.T) {
 func TestRemoveLearnerGuardsAndRevokes(t *testing.T) {
 	e := newLeaderEngine(t)
 	ctx := context.Background()
-	if err := e.AddMember(ctx, "node-9", "127.0.0.1:9909", RoleLearner); err != nil {
+	if err := e.AdmitSelf(ctx, "node-9", "127.0.0.1:9909", RoleLearner); err != nil {
 		t.Fatal(err)
 	}
 	// Registration makes it ONLINE — and being online is no longer a reason
@@ -203,7 +203,7 @@ func TestRemoveLearnerGuardsAndRevokes(t *testing.T) {
 
 func TestMembersViewListsBothPlanes(t *testing.T) {
 	e := newLeaderEngine(t)
-	if err := e.AddMember(context.Background(), "node-9", "127.0.0.1:9909", RoleLearner); err != nil {
+	if err := e.AdmitSelf(context.Background(), "node-9", "127.0.0.1:9909", RoleLearner); err != nil {
 		t.Fatal(err)
 	}
 	views := e.Members()
@@ -291,11 +291,11 @@ func TestRolesAreRequired(t *testing.T) {
 
 	e := newLeaderEngine(t)
 	ctx := context.Background()
-	if err := e.AddMember(ctx, "node-8", "127.0.0.1:9908", ""); !errors.Is(err, ErrBadMember) {
-		t.Fatalf("AddMember without a role: %v, want ErrBadMember", err)
+	if err := e.AdmitSelf(ctx, "node-8", "127.0.0.1:9908", ""); !errors.Is(err, ErrBadMember) {
+		t.Fatalf("self-admission without a role: %v, want ErrBadMember", err)
 	}
-	if err := e.AddMember(ctx, "node-8", "127.0.0.1:9908", "both"); !errors.Is(err, ErrBadMember) {
-		t.Fatalf("AddMember with the removed both role: %v, want ErrBadMember", err)
+	if err := e.AdmitSelf(ctx, "node-8", "127.0.0.1:9908", "both"); !errors.Is(err, ErrBadMember) {
+		t.Fatalf("self-admission with the removed both role: %v, want ErrBadMember", err)
 	}
 	// An adoption offer must name its shape too.
 	if err := e.acceptAdoption(ctx, &Adoption{ID: "node-8", PeerAddr: "127.0.0.1:9908"}); err == nil {

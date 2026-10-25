@@ -250,11 +250,11 @@ Body: Record*，每条记录：
   **自研分段 WAL**（`internal/raft/wal.go`，组提交 + CRC + 崩溃截断恢复）。
   集群配置在**首次启动**时由 `-peers` 写进 WAL
   首条，且**只由一个节点写**：`-peers` 里 id 最小的那个（`-bootstrap` 可显式指定
-  别的节点）。其余配置了 `-peers` 的节点一律以种子身份启动、向这些成员**报名加入**
-  （`Adopt`），配置由 leader 的日志/快照带过来 —— 因此「新节点带更大的 `-peers`
-  列表启动」就是扩容，不会与现有集群各写一份 index 1 配置而分裂。有 conf 记录的
-  节点一律以记录为准（`-peers` 只当种子）；之后增删成员走运行时变更（admin 加删成员，
-  见下文 §运行时成员变更）。不支持 PreVote/ReadIndex。
+  别的节点）。其余所有节点一律带 `-join`（控制面地址列表）向这些成员**报名加入**
+  （`Adopt`），配置由 leader 的日志/快照带过来；`-peers` 只是撰写者一次性的文档，
+  与 `-join` 互斥，不会出现每个新节点各写一份 index 1 配置而分裂的情形。有 conf
+  记录的节点一律以记录为准；之后增删成员走运行时变更（节点 `-join` 自报加入、
+  operator `DELETE` 缩容，见下文 §运行时成员变更）。不支持 PreVote/ReadIndex。
   它只复制元数据——
   slot 分配表（`slot → {leader, replicas[], epoch, state, seat_grant[]}`）、集群成员、
   节点数据面地址（`OpRegister`，见 §6 peer 面）。FSM 模型：
@@ -685,7 +685,7 @@ POST /admin/flow-control {tokens,period}      # 设置本节点流控（**节点
 GET  /admin/flow-control                       # 本节点流控配置与累计拒绝数（节点级 total_hits + 每槽列表；同样节点本地）
 DELETE /admin/flow-control                     # 恢复本节点不限流（节点本地，同上）
 GET  /admin/cluster/nodes                      # 列出当前 raft 成员（本节点视角：id/peer/admin/client/down）
-POST /admin/cluster/nodes {id,peer_addr,role}  # 运行时加成员（控制器专属，同上；role 必填 voter|learner；admin/client 地址由新节点自报）
+POST /admin/cluster/nodes/{id}/cancel-drain    # 取消缩容：清 drain / 待移除标记（控制器专属，同上；未标记条目回 change:"none"。加成员没有 admin 入口——新节点自己带 -join 启动）
 DELETE /admin/cluster/nodes/{id}               # 运行时摘成员（控制器专属，同上；一条命令 = 先排干再正式移除：在线未排干回 202 draining{leading,inflight}，排干完成由服务端自动摘除，幂等重发=查进度）
 GET  /healthz
 ```
@@ -696,8 +696,9 @@ Raft 配置（谁投票）与复制的成员目录（槽表里的成员列表）
 绑在一起。**接口只在 admin 面，且只有 controller（Raft leader）能执行**：follower
 拒绝并回 `controller`/`controller_admin_addr`（客户端改投），admin 面从不转发。
 
-- **加成员 `POST /admin/cluster/nodes {"id":"node-4","peer_addr":"10.0.0.4:8394","role":"voter"}`**：
-  只给 peer（共识）地址，`role` 必填（见 §12.1）。加 `voter` 时 leader 先把新节点当
+- **加成员 = 新节点自己的 `-join` 声明**（`PeerService/Adopt`，非 leader 转递；
+  admin 面没有加成员接口）：只给 peer（共识）地址，`role` 必填（见 §12.1），
+  地址权威在节点自己（占位地址由 `UpdatePeer` 修正，见 §12.3）。加 `voter` 时 leader 先把新节点当
   **raft 追赶者**（只收日志、不计入 quorum）复制，追到 leader 当时的 commit index
   后才把 `add_member` 配置项写进日志
   （20s 追不上也放行，避免死节点卡住操作）——否则新成员可能空日志就参与 quorum，
@@ -731,21 +732,24 @@ Raft 配置（谁投票）与复制的成员目录（槽表里的成员列表）
   复制（否则被摘方留着未提交的尾巴，仍信旧配置、可能对幸存者发起竞选；共识层
   同时拒绝非成员的共识流量）。之后 `replan_slots` 把它的席位补还剩余池。若全池
   都被打排水标记，布局回退到含排水成员的旧池——标记是移出布局的手段，不是把池
-  掏空的手段（没有候选可选时总得有人领导）。**撤销 = 运维重新准入**：`join_node`（POST
-  /admin/cluster/nodes / 控制台 / `cluster.sh join`）遇同 id 带标记条目即清两
-  个标记，布局角色当场恢复。**节点自己的启动自注册（adoption/`AdmitSelf`）
+  掏空的手段（没有候选可选时总得有人领导）。**撤销 = 运维的 `cancel-drain`**：`POST
+  /admin/cluster/nodes/{id}/cancel-drain`（控制台成员卡的「取消缩容」）对带标记
+  条目提交一次 `join_node` 即清两个标记，布局角色当场恢复；未标记的条目答
+  `change:"none"`（幂等）。**节点自己的启动自注册（adoption/`AdmitSelf`）
   没有这个权力**——移除是运维发起的决定，正在被移除的节点重启归队不能把自己
   的移除取消掉（否则排水永远在和一个重生的节点拉锯）；register 心跳同样不碰
   标记，被摘节点的回连由「register 拒绝非成员」封死。`scripts/cluster.sh remove` 轮询同一条 DELETE 直到
   200，**先摘后停**（表里已经没有它、没有任何槽指向它，此刻停进程对客户端无感）。
   幂等；仍拒绝摘掉最后一个成员（否则集群会把自己配没了）。
-- **开局节点 `-join`**：**不是配置作者的节点**（即 id 不等于 `-peers` 最小值、且没有
-  `-bootstrap`）以种子身份启动：`-peers` 只当成员地址列表，它向其中之一（或 `-join`
-  指定的那个）发 `Adopt` 报名，leader 走上面的加成员流程。因此「把新节点用更大的
-  `-peers` 列表拉起来」自动完成扩容，`-join` 仅用于指定报名对象；`-bootstrap` 只用于
-  让「非 id 最小」的节点单独充当配置作者。**有 conf 记录的节点永远以记录为准**
-  （`-peers` 只当种子，不再拒绝启动），因此扩过容的集群重启不需要改每个成员的
-  `-peers`。替代做法：运维直接 POST 加成员，再拉起新节点。
+- **开局与扩容只有两种声明**：`-peers` 是**初始配置撰写者的文档**（必须点名撰写者
+  自己；只有 id 最小的成员或 `-bootstrap` 点名者能带），`-join` 是**其余所有节点的
+  入群声明**——控制面 peer 地址列表，按 `-adopt-interval` 轮转发 `Adopt`，voter 进
+  raft 配置、learner 进复制目录，leader 走上面的加成员流程。两者互斥，同时设置启动
+  即报错；学习者没有 `-join` 目标、作者文档不含自己、非作者带 `-peers`、被明确拒绝
+  （`ErrBadMember`，经 `InvalidArgument` 返回）——全部启动即退出。**有 conf 记录的
+  节点永远以记录为准**（`-join` 只用于它尚未入群的那一次），因此扩过容的集群重启不
+  需要改每个成员的参数。没有「运维 POST 加成员再拉起进程」这条路：加节点的唯一
+  表达就是那个进程自己的命令行。
 - **`scripts/cluster.sh start` 与二进制同一套判断**：集群已经存在（有节点在跑，或
   数据目录里已有 raft 日志）时，缺的、且没有本地 raft 日志的节点由脚本显式用 `-join`
   指向现有成员启动（冷启动则按 id 最小的节点写配置、其余报名）。**这条区分必须有**：
@@ -966,8 +970,8 @@ peer_addr       = http://127.0.0.1:8391   # -peer / PUSHUPES_PEER（Raft + 注�
 # 地址规范：缺协议默认 http://，显式协议以传入为准；TCP 层使用前剥 scheme
 ```
 
-`-peers` 只要求可达的 peer 地址（`node-id=http://host:peerport`），admin/client
-不需要配置——节点启动后经注册协议自报（见 §6）。
+`-peers`/`-join` 只要求可达的 peer 地址（`node-id=http://host:peerport` 或裸
+`host:peerport`），admin/client 不需要配置——节点启动后经注册协议自报（见 §6）。
 
 ## 9. 包结构
 
@@ -1314,7 +1318,7 @@ Raft 的 API 面很窄，只有 4 个文件与它打交道（`cluster.go`、`fsm
    崩溃可恢复）。
 3. 对外接口面小而稳：`Node.Apply / IsLeader / LeaderID / Peers /
    PeerAddrs / Stats / Close`；peer 端口一个端口同时承载共识与 peer gRPC；
-   `-peers` 是唯一的成员配置入口。
+   `-peers`（撰写者文档）与 `-join`（入群声明）是成员配置仅有的两个入口，互斥。
 
 #### 11.1.3 明确不做（简化版边界）
 
@@ -1613,14 +1617,23 @@ Wait(lsn)            → 阻塞到自己的 LSN 落盘
 
 ### 12.3 准入与撤销
 
-- 加数据面节点：`POST /admin/cluster/nodes {"id":..,"peer_addr":..,"role":"learner"}`
-  ——提交一条**目录命令**（`join_node` + role），不改 raft 配置：learner 不进投票集，
-  其席位由 replan 铺开；节点进程随后自报地址与角色。
-- 加投票成员：同接口 `{"role":"voter"}`（必填，与 learner 一样点名角色）——走原有
-  两阶段（learner 追平后晋升），语义不变。
-- 撤销：`DELETE /admin/cluster/nodes/{id}` 对 learner 提交目录 `leave_node`，对 voter
-  仍是 raft 配置变更；两者都只允许撤销**已下线**的成员（在线成员持有的席位正在被
-  集群使用）。
+- **加入由节点自己声明**：新进程带 `-join`（控制面 peer 地址列表，多地址轮转）与
+  目标 `-role` 启动，Joiner 按 `-adopt-interval` 发 `Adopt`，非 leader 自动转递。
+  leader 收到后按角色走两条路：`voter` 走 raft 配置（`AddMember`，learner 追平后
+  晋升）；`learner` 提交一条**目录命令**（`join_node` + role），不改 raft 配置——
+  它不进投票集，席位由 replan 铺开。节点随后自报 admin/client 地址与角色（register）。
+  Joiner 的完成判据按角色区分：voter 看 raft 配置是否点到自己，learner 看目录里是否
+  有自己 id 的 learner 条目。**一次明确拒绝（id 已属于另一种角色、地址已属于别的
+  成员）经 gRPC `InvalidArgument` 返回，Joiner 把它当作致命错误，进程启动即退出**
+  ——配置错误不该用重试掩盖。
+- **地址权威**：节点自己的 `-peer` 是权威。配置里为「尚未到场」的成员写下的占位
+  地址，在它首次自报时被 `UpdatePeer`（conf 变更 `confUpdate`）改写入账；已经注册
+  过地址的成员若以不同 peer 地址自报，视为身份冲突，拒绝。
+- **没有 operator 的「加节点」入口**：admin 面不存在 `POST /admin/cluster/nodes`，
+  控制台也没有加节点卡片——加节点的唯一表达是那个进程的命令行。operator 保留两项
+  权力：`DELETE /admin/cluster/nodes/{id}`（缩容：先 drain 再摘除，见上）与
+  `POST /admin/cluster/nodes/{id}/cancel-drain`（取消缩容：清 drain / 待移除标记，
+  节点重新参与布局）。节点自己的重启自报（`AdmitSelf`）永远保留这两个标记。
 - 控制器对账的目录同步因此是双源：投票集来自 raft 配置（`PeerAddrs`），learner 来自
   目录条目本身——反向清理只删「既不是 voter、角色也不是 learner」的条目。
 

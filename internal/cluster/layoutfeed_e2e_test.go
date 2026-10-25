@@ -101,7 +101,7 @@ func TestDataPlaneNodeFollowsTheControlPlane(t *testing.T) {
 	// Admission is the operator's directory command; the node's own
 	// announcement of its admin/client addresses follows (the layout pool only
 	// takes members clients can route to).
-	if err := ctrl.AddMember(ctx, "node-2", lPeer, RoleLearner); err != nil {
+	if err := ctrl.AdmitSelf(ctx, "node-2", lPeer, RoleLearner); err != nil {
 		t.Fatalf("admit data-plane node: %v", err)
 	}
 	waitFor(t, 20*time.Second, func() bool {
@@ -123,7 +123,7 @@ func TestDataPlaneNodeFollowsTheControlPlane(t *testing.T) {
 
 	// Incremental delivery, not just the initial catch-up: a later directory
 	// change has to arrive without a restart.
-	if err := ctrl.AddMember(ctx, "node-3", "127.0.0.1:1", RoleLearner); err != nil {
+	if err := ctrl.AdmitSelf(ctx, "node-3", "127.0.0.1:1", RoleLearner); err != nil {
 		t.Fatalf("admit the second data-plane node: %v", err)
 	}
 	waitFor(t, 30*time.Second, func() bool {

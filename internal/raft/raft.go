@@ -48,6 +48,14 @@ func (n *Node) RemoveMember(id string, timeout time.Duration) error {
 	return n.changeMembership(confRemove, Voter{ID: id}, timeout)
 }
 
+// UpdatePeer rewrites the peer address of an existing voter. It is the
+// arrival self-report's correction path: a member configured under one
+// address that actually answers at another gets the configuration fixed
+// (no barrier, no membership churn — the id keeps its place in the set).
+func (n *Node) UpdatePeer(id, addr string, timeout time.Duration) error {
+	return n.changeMembership(confUpdate, Voter{ID: id, Addr: addr}, timeout)
+}
+
 // Members returns the current membership. A node that has not learned a
 // configuration yet (it was started to be joined into a running cluster)
 // reports its configured seed instead — minus this node itself, which is by
@@ -139,7 +147,7 @@ func (n *Node) onConfRequest(req *confReq) {
 			return
 		}
 		if other, ok := n.conflictFor(cc.v); ok {
-			req.resp <- fmt.Errorf("%w: %s is already the peer address of member %q; a node that is not a member yet must be started with the -peers list of the running cluster",
+			req.resp <- fmt.Errorf("%w: %s is already the peer address of member %q; a node that is not a member yet must be started with -join naming the running cluster's members",
 				ErrBadChange, cc.v.Addr, other.ID)
 			return
 		}
@@ -156,16 +164,39 @@ func (n *Node) onConfRequest(req *confReq) {
 			req.resp <- fmt.Errorf("%w: refusing to remove %s: it is the last voter", ErrBadChange, cc.v.ID)
 			return
 		}
+	case confUpdate:
+		if cc.v.ID == "" || cc.v.Addr == "" {
+			req.resp <- fmt.Errorf("%w: update peer needs an id and an address", ErrBadChange)
+			return
+		}
+		if !n.isVoter(cc.v.ID) {
+			req.resp <- fmt.Errorf("%w: %s is not a voter; its peer address cannot be updated", ErrBadChange, cc.v.ID)
+			return
+		}
+		if cur, ok := n.voterByID(cc.v.ID); ok && cur.Addr == cc.v.Addr {
+			req.resp <- nil // idempotent: the configuration already says this
+			return
+		}
+		if other, ok := n.conflictFor(cc.v); ok {
+			req.resp <- fmt.Errorf("%w: %s is already the peer address of member %q",
+				ErrBadChange, cc.v.Addr, other.ID)
+			return
+		}
 	default:
 		req.resp <- fmt.Errorf("%w: %d is not an operator-issued membership change", ErrBadChange, cc.op)
 		return
 	}
 
-	if cc.op == confAdd {
+	switch cc.op {
+	case confAdd:
 		n.startAdd(cc, req)
-		return
+	case confUpdate:
+		// A plain address rewrite: no learner barrier, no closing handoff —
+		// the entry commits like any other and every node applies it.
+		n.waitConf(cc, req, time.Now().Add(req.timeout))
+	default:
+		n.startRemove(cc, req)
 	}
-	n.startRemove(cc, req)
 }
 
 // conflictFor reports an existing member reachable at the address a new node
@@ -343,6 +374,8 @@ func (n *Node) onConfCommitted(e Entry, index uint64) {
 			n.logger.Infof("raft: %s joined the cluster as a voter (%d voters, %d learners)", cc.v.ID, len(n.voters), n.learnerCount())
 		case confRemove:
 			n.logger.Infof("raft: %s left the cluster (%d voters)", cc.v.ID, len(n.voters))
+		case confUpdate:
+			n.logger.Infof("raft: %s peer address updated to %s", cc.v.ID, cc.v.Addr)
 		}
 	}
 	if w, ok := n.confWaiters[index]; ok {
@@ -381,6 +414,26 @@ func (n *Node) applyConfLocally(cc confChange, index uint64) {
 		n.rebuildClients(n.closing)
 		n.forgetLearner(cc.v.ID)
 		n.clearPending(cc)
+	case confUpdate:
+		// The arrival self-report correcting a stale address: rewrite the
+		// one voter's addr and nothing else. Unknown id: the entry lands
+		// around a remove on some replay path — the deterministic order has
+		// already settled the membership, so apply nothing.
+		for i := range n.voters {
+			if n.voters[i].ID != cc.v.ID {
+				continue
+			}
+			if n.voters[i].Addr != cc.v.Addr {
+				moved := append([]Voter(nil), n.voters...)
+				moved[i].Addr = cc.v.Addr
+				n.publishVoters(moved)
+				n.rebuildClients(n.closing)
+			}
+			if n.pendingAdd == cc.v.ID {
+				n.pendingAddrs[cc.v.ID] = cc.v.Addr
+			}
+			return
+		}
 	case confRemove:
 		out := make([]Voter, 0, len(n.voters))
 		for _, v := range n.voters {

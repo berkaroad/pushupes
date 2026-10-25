@@ -56,10 +56,10 @@ func main() {
 		clientAddr = flag.String("client", envOr("PUSHUPES_CLIENT", "http://127.0.0.1:8591"), "gRPC data-plane listen address: event writes and queries (env PUSHUPES_CLIENT)")
 		peerAddr   = flag.String("peer", envOr("PUSHUPES_PEER", "http://127.0.0.1:8391"), "Raft transport + peer gRPC listen address: all node-to-node traffic (env PUSHUPES_PEER)")
 		dataDir    = flag.String("data", envOr("PUSHUPES_DATA", "./data"), "data directory (env PUSHUPES_DATA)")
-		peers      = flag.String("peers", envOr("PUSHUPES_PEERS", ""), "comma list (env PUSHUPES_PEERS) of id=http://host:peerport (admin/client addrs are self-registered; legacy id:peerport:adminport:clientport also accepted)")
-		joinAddr   = flag.String("join", envOr("PUSHUPES_JOIN", ""), "peer address of one specific cluster member (host:peerport) to offer this node to on start. Optional: a node that does not lead its -peers list joins automatically and offers itself through the configured members in rotation — pass -join to name one instead (env PUSHUPES_JOIN)")
+		peers      = flag.String("peers", envOr("PUSHUPES_PEERS", ""), "the cluster AUTHOR's initial Raft configuration document, nothing else: comma list of id=http://host:peerport (bare host:peerport and the legacy id:peerport:adminport:clientport also accepted; admin/client addrs are self-registered). Passing it makes THIS node the author, and it must name itself in the list; every other node joins through -join (mutually exclusive) (env PUSHUPES_PEERS)")
+		joinAddr   = flag.String("join", envOr("PUSHUPES_JOIN", ""), "comma list of one or more running cluster members (host:peerport, optional id=) this node offers ITSELF to until admitted — the only way a node joins: -join plus the intended -role. Voter joiners land in the raft configuration, learners in the directory; the node's own -peer is the address authority. Mutually exclusive with -peers (env PUSHUPES_JOIN)")
 		adoptTo    = flag.Duration("adopt-interval", envDurationOr("PUSHUPES_ADOPT_INTERVAL", cluster.DefaultAdoptInterval),
-			"how often a node that is not a cluster member yet retries offering itself through the members it was configured with (-join when given, else -peers) (env PUSHUPES_ADOPT_INTERVAL)")
+			"how often a node that is not a cluster member yet retries offering itself through the -join targets, tried in rotation (env PUSHUPES_ADOPT_INTERVAL)")
 		// The slot count is a permanent layout decision (routing, placement,
 		// migration granularity), so it is not a runtime knob — it is fixed at
 		// data.DefaultSlotCount. See DESIGN §7.2.
@@ -91,7 +91,7 @@ func main() {
 		// operator raises it together with typical batch size (a 4MiB cap
 		// carries roughly 4000 records of 1KiB bodies).
 		grpcMaxMsg    = byteSize(envByteSizeOr("PUSHUPES_GRPC_MAX_MSG_SIZE", defaultGrpcMaxMsgBytes))
-		bootstrap     = flag.Bool("bootstrap", false, "write this cluster's initial configuration from this node. By default the node whose id leads -peers does that and every other configured node starts as a seed that offers itself through the running cluster (env PUSHUPES_BOOTSTRAP not read: this is a startup decision, not a tunable)")
+		bootstrap     = flag.Bool("bootstrap", false, "author this cluster's initial configuration from this node. With -peers the author is the node whose id leads the list unless -bootstrap names another; -bootstrap alone (no -peers) authors a single-voter configuration this node can grow with -join voters later. A learner never authors, and -bootstrap is refused together with -join (env PUSHUPES_BOOTSTRAP not read: this is a startup decision, not a tunable)")
 		role          = flag.String("role", envOr("PUSHUPES_ROLE", ""), "this node's place in the cluster, required: voter (control plane — votes in the consensus group and hosts NO slot replicas) or learner (data plane — receives the replicated layout from the control plane without voting). The smallest deployment is one control node plus one data node (env PUSHUPES_ROLE)")
 		raftHeartbeat = flag.Duration("raft-heartbeat-timeout", envDurationOr("PUSHUPES_RAFT_HEARTBEAT_TIMEOUT", raft.DefaultHeartbeatTimeout),
 			"consensus heartbeat interval (env PUSHUPES_RAFT_HEARTBEAT_TIMEOUT). A leader whose heartbeats do not arrive in time is voted out, so on a host that can delay the consensus event loop raise this together with -raft-election-timeout")
@@ -162,39 +162,17 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 	logger.Info("segment fsync parallelism", "in_flight", flushPar,
 		"note", "1 keeps one fsync at a time; more lets independent segments overlap on the device")
 
-	peers, err := parsePeers(peersCSV)
+	// Membership comes first: authorship is a startup decision, and every
+	// wrong combination fails the process before any port is bound.
+	selfPeer := cluster.Peer{ID: nodeID, PeerAddr: peerAddr, AdminAddr: adminAddr, ClientAddr: clientAddr}
+	author, peers, targets, err := membershipPlan(nodeID, peersCSV, joinAddr, nodeRole, bootstrap, selfPeer)
 	if err != nil {
 		return err
 	}
-	selfPeer := cluster.Peer{ID: nodeID, PeerAddr: peerAddr, AdminAddr: adminAddr, ClientAddr: clientAddr}
-	if !containsPeer(peers, nodeID) {
-		peers = append(peers, selfPeer)
-	}
-	// Who authors the cluster's configuration, and who offers itself?
-	//
-	// Membership is written on first start, so exactly ONE node may write it:
-	// the node that leads the configured list (the operator's -bootstrap
-	// overrides that). Every other configured node starts as a SEED — its
-	// -peers is only the list of members it offers itself through, and its
-	// configuration arrives from the cluster it joins.
-	//
-	// The rule matters because a node that bootstraps its own copy writes an
-	// entry at index 1 that competes with the running cluster's (same index,
-	// same term, different content), and the nodes holding each version form
-	// their own raft group, each able to commit on its own — a cluster grown by
-	// starting the new member with the bigger -peers list used to split exactly
-	// that way. With this rule, "start the new node with -peers naming the
-	// existing members" is all an operator has to do: it joins, and -join is
-	// only needed to point at one specific member.
-	seeding := !bootstrapEligible(nodeID, peers, bootstrap)
-	targets := joinTargets(nodeID, peers, joinAddr)
+	seeding := !author
 	if seeding {
-		if strings.TrimSpace(joinAddr) == "" {
-			logger.Warn(fmt.Sprintf("%s does not lead -peers: starting as a joiner (offering itself through the configured members) instead of writing an initial configuration. To author a brand-new cluster from this node, pass -bootstrap", nodeID),
-				"seeds", targets, "first_id", canonicalFirstPeer(peers))
-		} else {
-			logger.Info("starting as a joiner: offering itself through the configured members", "targets", targets)
-		}
+		logger.Info("starting as a joiner: offering itself through the -join members",
+			"role", nodeRole, "node", nodeID, "targets", targets)
 	}
 
 	// The engine is the Applier the FSM calls into; it also needs the Raft
@@ -269,16 +247,15 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 	defer peerSrv.Stop()
 	go eng.NewRegisterAnnouncer().Run(ctx)
 
-	// Runtime join: a node that does not author the cluster's configuration
-	// (see above) keeps offering itself through the configured members until
-	// the leader has added it. A node that is already a member — the author
-	// itself, or a joiner that has caught up — sends nothing.
-	if seeding && nodeRole != cluster.RoleLearner {
-		// A data-plane node never offers itself for membership: it is not a
-		// voter, and its admission is a directory command the operator posts
-		// (DESIGN §12.3). Running the joiner here would have it asking to be
-		// added to the Raft configuration it must never join.
-		go eng.NewJoiner(targets, adoptInterval).Run(ctx)
+	// Runtime join: every non-author node — voter joiner AND learner alike —
+	// offers itself through the -join list until the leader admits it (into
+	// the raft configuration or the directory, by its own -role). A clear
+	// refusal is fatal: the id or the address belongs to somebody else and
+	// no retry fixes that, so the process exits (fail-fast).
+	var joinErr chan error
+	if seeding {
+		joinErr = make(chan error, 1)
+		go func() { joinErr <- eng.NewJoiner(targets, adoptInterval, nodeRole).Run(ctx) }()
 	}
 
 	srv := api.NewServer(cluster.HostPort(adminAddr), api.New(eng, store), logger)
@@ -320,12 +297,26 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 	logger.Info("pushupes node started",
 		"admin", adminAddr, "client", clientAddr, "peer", peerAddr, "slots", slotCount)
 
-	select {
-	case <-ctx.Done():
-		logger.Info("shutdown signal received")
-	case err := <-errCh:
-		if err != nil {
-			return fmt.Errorf("admin server: %w", err)
+	// Serve until a signal, a server error, or a fatal join refusal. The join
+	// answer arrives ONCE: the admitted (nil) case clears the channel and the
+	// loop keeps serving — only a refusal ends the process.
+serve:
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("shutdown signal received")
+			break serve
+		case err := <-errCh:
+			if err != nil {
+				return fmt.Errorf("admin server: %w", err)
+			}
+			break serve
+		case err := <-joinErr:
+			if err != nil {
+				return err
+			}
+			logger.Info("join admitted; serving as a cluster member")
+			joinErr = nil
 		}
 	}
 
@@ -334,6 +325,82 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 	defer cancel()
 	grpcSrv.GracefulStop()
 	return srv.Shutdown(shutdownCtx)
+}
+
+// membershipPlan turns the two membership flags into the node's place at
+// startup: it AUTHORS the cluster's initial raft configuration (-peers is its
+// document; nothing else may carry it), or it is a JOINER offering itself
+// through the -join list until a leader admits it (DESIGN §12.3: a voter into
+// the raft configuration, a learner into the directory — the single CLI
+// expression of "add a node"). Every mismatch is a startup error, fail-fast:
+//
+//   - -peers and -join are mutually exclusive; -peers must name this node and
+//     only the list's leading id (or an explicit -bootstrap) may author;
+//   - a learner must have -join targets (it offers itself to the control
+//     plane and the list doubles as its layout-feed targets);
+//   - a voter with neither flag is a mistake unless -bootstrap names it the
+//     author of a single-voter configuration.
+func membershipPlan(nodeID, peersCSV, joinCSV, role string, bootstrap bool, self cluster.Peer) (author bool, peers []cluster.Peer, targets []string, err error) {
+	peers, err = parsePeers(peersCSV)
+	if err != nil {
+		return
+	}
+	joinList, err := parsePeers(joinCSV)
+	if err != nil {
+		return
+	}
+	if len(peers) > 0 && len(joinList) > 0 {
+		err = fmt.Errorf("-join and -peers are mutually exclusive: -peers is the document of the node that AUTHORS the initial configuration; every other node — voter joiner or learner — joins by offering itself through -join")
+		return
+	}
+	for _, p := range joinList {
+		if p.ID == nodeID {
+			err = fmt.Errorf("-join names this node itself (%s); a join target must be a member of the cluster being joined", nodeID)
+			return
+		}
+		targets = append(targets, p.PeerAddr)
+	}
+	switch role {
+	case cluster.RoleLearner:
+		if bootstrap {
+			err = fmt.Errorf("-bootstrap authors a raft configuration; a learner never votes and cannot author one")
+			return
+		}
+		if len(targets) == 0 {
+			err = fmt.Errorf("-role learner needs -join naming the control plane (comma list of host:peerport) to offer itself to")
+			return
+		}
+		// The learner's -join list doubles as its feed target list: the
+		// layout subscription dials them until a leader is known (see
+		// learnernode.go dialTargets).
+		peers = joinList
+	case cluster.RoleVoter:
+		switch {
+		case len(peers) > 0:
+			if !containsPeer(peers, nodeID) {
+				err = fmt.Errorf("-peers must name this node (%s): only a member of the authored configuration can author it; a node that is not a voter yet joins with -join", nodeID)
+				return
+			}
+			if !bootstrapEligible(nodeID, peers, bootstrap) {
+				err = fmt.Errorf("only the author passes -peers: this node (%s) does not lead the list (leading id %s); start it with -join naming the cluster it joins, or pass -bootstrap if it is meant to author", nodeID, canonicalFirstPeer(peers))
+				return
+			}
+			author = true
+		case bootstrap:
+			peers = []cluster.Peer{self}
+			author = true
+		}
+		// A voter JOINER carries NO seed list: the raft node starts as a seed
+		// with an empty membership and accepts the leader's messages until the
+		// configuration arrives from the leader's log (an id-less -join entry
+		// must not become a pretended voter set — the ids would not even match
+		// the leader's own id, and its vote requests would be refused).
+	}
+	if !author && len(targets) == 0 {
+		err = fmt.Errorf("a voter authors a cluster (-peers naming itself, or -bootstrap alone) or joins one (-join naming its members); this node was given neither")
+		return
+	}
+	return
 }
 
 // parsePeers parses the bootstrap/join peer directory. Token grammar:
@@ -456,23 +523,6 @@ func bootstrapEligible(nodeID string, peers []cluster.Peer, explicit bool) bool 
 		return true
 	}
 	return canonicalFirstPeer(peers) == nodeID
-}
-
-// joinTargets lists the member addresses this node offers itself through: an
-// explicit -join address when given, otherwise the configured members (never
-// itself). Empty means the node has nobody to ask.
-func joinTargets(nodeID string, peers []cluster.Peer, joinAddr string) []string {
-	if a := strings.TrimSpace(joinAddr); a != "" {
-		return []string{a}
-	}
-	out := make([]string, 0, len(peers))
-	for _, p := range peers {
-		if p.ID == nodeID || p.PeerAddr == "" {
-			continue
-		}
-		out = append(out, p.PeerAddr)
-	}
-	return out
 }
 
 func envOr(k, def string) string {

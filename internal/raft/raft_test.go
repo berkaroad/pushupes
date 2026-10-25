@@ -16,6 +16,7 @@ package raft
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -643,5 +644,71 @@ func TestWALDetectsCorruption(t *testing.T) {
 func TestHandshakeMagicIsNotGRPCPreface(t *testing.T) {
 	if wireMagic == 'P' {
 		t.Fatalf("handshake magic collides with the HTTP/2 preface byte")
+	}
+}
+
+// TestUpdatePeerRewritesVoterAddress pins the arrival self-report's
+// correction path: the leader rewrites one voter's configured address, every
+// node applies it through the committed entry, and the refusals (an unknown
+// id, an address that another member already owns) answer as bad changes.
+func TestUpdatePeerRewritesVoterAddress(t *testing.T) {
+	c := startCluster(t, 3)
+	defer c.stopAll()
+	leader := c.leader(10 * time.Second)
+	ln := c.nodes[leader].node
+
+	if err := ln.UpdatePeer("node-9", "10.9.9.9:1", 5*time.Second); err == nil {
+		t.Fatal("updating an id that is not a voter must be refused")
+	} else if !errors.Is(err, ErrBadChange) {
+		t.Fatalf("unknown id: %v, want ErrBadChange", err)
+	}
+	// The address of another live member is not free.
+	if err := ln.UpdatePeer("node-3", c.nodes["node-2"].net.addr, 5*time.Second); err == nil || !errors.Is(err, ErrBadChange) {
+		t.Fatalf("address collision: %v, want ErrBadChange", err)
+	}
+
+	const moved = "10.9.9.9:1"
+	if err := ln.UpdatePeer("node-3", moved, 5*time.Second); err != nil {
+		t.Fatalf("UpdatePeer: %v", err)
+	}
+	// Every node that the corrected address can still reach applies the
+	// entry (the moved node itself only converges once it really listens at
+	// the corrected address — exactly what the production flow promises,
+	// because it is that live listener the offer came from).
+	deadline := time.Now().Add(10 * time.Second)
+	rest := []string{"node-1", "node-2"}
+	for time.Now().Before(deadline) {
+		ok := true
+		for _, id := range rest {
+			got := false
+			for _, v := range c.nodes[id].node.Members() {
+				if v.ID == "node-3" && v.Addr == moved {
+					got = true
+				}
+			}
+			if !got {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, id := range rest {
+		for _, v := range c.nodes[id].node.Members() {
+			if v.ID == "node-3" && v.Addr != moved {
+				t.Fatalf("%s still carries the stale address for node-3: %v", id, v)
+			}
+		}
+	}
+	// Idempotent: the address already says this — no error, no new entry.
+	before := ln.CommitIndex()
+	if err := ln.UpdatePeer("node-3", moved, 5*time.Second); err != nil {
+		t.Fatalf("repeat UpdatePeer must be a no-op: %v", err)
+	}
+	if after := ln.CommitIndex(); after != before {
+		t.Fatalf("idempotent UpdatePeer committed %d -> %d", before, after)
 	}
 }

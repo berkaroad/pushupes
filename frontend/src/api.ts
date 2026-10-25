@@ -313,6 +313,23 @@ export async function migrateSlot(
   )
 }
 
+// cancelDrain clears the scale-down marks a DELETE posted, putting the node
+// back into the layout pools untouched. Controller-only like every directory
+// command; an unmarked node answers change:"none" (idempotent). Adding a node
+// needs no console or admin call at all: the new process joins by itself
+// through its own -join.
+export async function cancelDrain(id: string, status: ClusterStatus | null = null): Promise<string> {
+  const { data } = await withController(
+    (addr) => axios.post(
+      `${normalizeAdminBase(addr)}/admin/cluster/nodes/${encodeURIComponent(id)}/cancel-drain`,
+      {},
+      { timeout: 8000 },
+    ),
+    status,
+  )
+  return String(data?.change ?? '')
+}
+
 // removeSlotReplica reclaims one member from a slot's replica set (the
 // operator's fallback when an automatic post-migration reclaim could not run),
 // addressed to the controller for the same reason as migrateSlot.

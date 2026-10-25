@@ -3,7 +3,7 @@ import { Alert, App, Button, Card, Col, Form, Input, InputNumber, Modal, Row, Se
 import { EditOutlined } from '@ant-design/icons'
 import type { ClusterStatus, FlowControlDetail, NodeStatus, PendingSlotView } from '../types'
 import { humanBytes, humanBytesPerSec } from '../format'
-import { clearFlowControl, ensureLeader, fetchFlowControl, fetchNodeStatus, setReplicaPolicy, setFlowControl, triggerHealthScan, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
+import { cancelDrain, clearFlowControl, ensureLeader, fetchFlowControl, fetchNodeStatus, setReplicaPolicy, setFlowControl, triggerHealthScan, REPLICA_POLICY_LABELS, type ReplicaPolicy } from '../api'
 import { PeerCard, isOnlinePeer } from '../PeerCard'
 import { SlotHealthCard } from '../SlotHealthCard'
 import type { NodeRatePoint } from '../NodeRateChart'
@@ -41,11 +41,13 @@ export default function ClusterPage() {
   const [err, setErr] = useState<string | null>(null)
   const [auto, setAuto] = useState(true)
 
-  // Membership changes — adds AND removals — are operator CLI actions
-  // (POST / DELETE /admin/cluster/nodes, see DESIGN.md): the console
-  // deliberately offers no membership buttons. statusRef keeps the newest
-  // table for the policy command the console DOES own, the same pattern the
-  // slots page uses for migrations.
+  // ADDING a node never goes through the console or the admin plane: the new
+  // process joins by itself (-join plus its -role), and the controller admits
+  // it. The console owns exactly one membership action — 取消缩容 on a node
+  // that carries the scale-down marks of an over-eager DELETE
+  // (POST /admin/cluster/nodes/{id}/cancel-drain). statusRef keeps the newest
+  // table for that command and the replica-policy command, the same pattern
+  // the slots page uses for migrations.
   const statusRef = useRef<ClusterStatus | null>(null)
 
   const { modal, message } = App.useApp()
@@ -419,6 +421,32 @@ export default function ClusterPage() {
     })
   }
 
+  // doCancelDrain clears a node's scale-down marks — the operator's exit from
+  // a DELETE posted in error. Controller-addressed (the engine refuses a
+  // follower), so it goes through the shared withController path.
+  const doCancelDrain = (id: string) => {
+    modal.confirm({
+      title: `取消 ${id} 的缩容？`,
+      content: '清掉 drain / 待移除标记，该节点重新参与布局（它的槽与副本按常规回切）。',
+      okText: '取消缩容',
+      cancelText: '算了',
+      onOk: async () => {
+        try {
+          const change = await cancelDrain(id, statusRef.current)
+          if (change === 'none') {
+            message.info(`节点 ${id} 本来就没有缩容标记`)
+          } else {
+            message.success(`节点 ${id} 已恢复：缩容标记已清除`)
+          }
+          await refresh()
+        } catch (e: any) {
+          const msg = e?.response?.data?.error ?? e?.message ?? String(e)
+          message.error(`取消 ${id} 的缩容失败：${msg}`)
+        }
+      },
+    })
+  }
+
   // openFlowControl opens the per-node modal prefilled from the node's own
   // GET /admin/flow-control: the poll's config view carries the numbers but
   // not the duration STRING the POST body round-trips, so one detail read
@@ -670,7 +698,8 @@ export default function ClusterPage() {
                 ratePoints={nodeRates[p.id]}
                 storageCount={nodeStorage[p.id]?.count}
                 storageBytes={nodeStorage[p.id]?.bytes}
-                onFlowControl={isOnlinePeer(p) ? openFlowControl : undefined} />
+                onFlowControl={isOnlinePeer(p) ? openFlowControl : undefined}
+                onCancelDrain={doCancelDrain} />
             </Col>
           ))}
         </Row>

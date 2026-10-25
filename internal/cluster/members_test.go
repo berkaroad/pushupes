@@ -35,9 +35,10 @@ func testListenerAddr(t *testing.T) string {
 	return addr
 }
 
-// TestEngineAddRemoveMember exercises the engine-level runtime membership API:
-// a follower refuses (with the controller named), the leader commits, and every
-// node converges on the new configuration.
+// TestEngineAddRemoveMember exercises the engine-level runtime membership: a
+// follower refuses a controller-only command (naming the controller), a voter
+// adoption on the leader commits, and every node converges on the new
+// configuration.
 func TestEngineAddRemoveMember(t *testing.T) {
 	c := newTestRaftCluster(t, []string{"node-1", "node-2", "node-3"}, map[string]Applier{})
 	leader := c.waitLeader(15 * time.Second)
@@ -60,18 +61,18 @@ func TestEngineAddRemoveMember(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	if err := fEng.AddMember(ctx, "node-4", "127.0.0.1:9999", RoleVoter); err == nil {
-		t.Fatal("AddMember on a follower must be refused")
+	if _, err := fEng.CancelDrain(ctx, "node-4"); err == nil {
+		t.Fatal("CancelDrain on a follower must be refused")
 	} else if _, ok := err.(*NotControllerError); !ok {
-		t.Fatalf("AddMember on a follower returned %T (%v), want *NotControllerError", err, err)
+		t.Fatalf("CancelDrain on a follower returned %T (%v), want *NotControllerError", err, err)
 	}
 
 	// The new node's address must be a real listener so the replicator can dial
 	// it (the node itself is not run here: the change must still commit — the
 	// cluster keeps a quorum without it).
 	added := testListenerAddr(t)
-	if err := leEng.AddMember(ctx, "node-4", added, RoleVoter); err != nil {
-		t.Fatalf("AddMember: %v", err)
+	if err := leEng.acceptAdoption(ctx, &Adoption{ID: "node-4", PeerAddr: added, Role: RoleVoter}); err != nil {
+		t.Fatalf("voter adoption: %v", err)
 	}
 
 	deadline := time.Now().Add(10 * time.Second)
@@ -94,9 +95,9 @@ func TestEngineAddRemoveMember(t *testing.T) {
 		}
 	}
 
-	// Idempotent re-add.
-	if err := leEng.AddMember(ctx, "node-4", added, RoleVoter); err != nil {
-		t.Fatalf("repeat AddMember must be a no-op: %v", err)
+	// Idempotent re-offer: already a voter with the same address, nothing commits.
+	if err := leEng.acceptAdoption(ctx, &Adoption{ID: "node-4", PeerAddr: added, Role: RoleVoter}); err != nil {
+		t.Fatalf("repeat adoption must be a no-op: %v", err)
 	}
 
 	// Remove it again (a slot-less node drains trivially and is gone in one
@@ -134,9 +135,9 @@ func TestEngineAddRemoveMember(t *testing.T) {
 	}
 }
 
-// TestAddMemberRejectsBadInput pins the operator mistakes that must be refused
+// TestAdoptionRejectsBadInput pins the joiner mistakes that must be refused
 // with a clear error rather than a half-applied change.
-func TestAddMemberRejectsBadInput(t *testing.T) {
+func TestAdoptionRejectsBadInput(t *testing.T) {
 	c := newTestRaftCluster(t, []string{"node-1"}, map[string]Applier{})
 	leader := c.waitLeader(10 * time.Second)
 	leEng, _ := newTestEngine(t, leader)
@@ -144,16 +145,16 @@ func TestAddMemberRejectsBadInput(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := leEng.AddMember(ctx, "", "127.0.0.1:1", RoleVoter); err == nil {
-		t.Fatal("AddMember without an id must be refused")
+	if err := leEng.acceptAdoption(ctx, &Adoption{ID: "", PeerAddr: "127.0.0.1:1", Role: RoleVoter}); err == nil {
+		t.Fatal("adoption without an id must be refused")
 	}
-	if err := leEng.AddMember(ctx, "node-9", "", RoleVoter); err == nil {
-		t.Fatal("AddMember without a peer address must be refused")
+	if err := leEng.acceptAdoption(ctx, &Adoption{ID: "node-9", PeerAddr: "", Role: RoleVoter}); err == nil {
+		t.Fatal("adoption without a peer address must be refused")
 	}
 	// An address that already belongs to a member under another id is a
 	// misconfigured joining node, not a new member.
-	if err := leEng.AddMember(ctx, "node-9", c.peerOf(leader).PeerAddr, RoleVoter); err == nil {
-		t.Fatal("AddMember reusing a member's address must be refused")
+	if err := leEng.acceptAdoption(ctx, &Adoption{ID: "node-9", PeerAddr: c.peerOf(leader).PeerAddr, Role: RoleVoter}); err == nil {
+		t.Fatal("adoption reusing a member's address must be refused")
 	}
 	// A single-voter cluster cannot remove its last member.
 	if _, err := leEng.RemoveMember(ctx, leader); err == nil {
@@ -176,8 +177,8 @@ func TestRemoveMemberDrainsThenRemoves(t *testing.T) {
 	// Two data-plane learners so the ring has somewhere to move TO.
 	for _, pair := range [][2]string{{"node-4", "127.0.0.1:9904"}, {"node-5", "127.0.0.1:9905"}} {
 		id, addr := pair[0], pair[1]
-		if err := e.AddMember(ctx, id, addr, RoleLearner); err != nil {
-			t.Fatalf("AddMember %s: %v", id, err)
+		if err := e.acceptAdoption(ctx, &Adoption{ID: id, PeerAddr: addr, Role: RoleLearner}); err != nil {
+			t.Fatalf("learner admission %s: %v", id, err)
 		}
 		join(t, e, id, addr)
 	}
@@ -225,17 +226,18 @@ func TestRemoveMemberDrainsThenRemoves(t *testing.T) {
 	}
 }
 
-// TestReAdmissionWithdrawsDrain pins the cancel half of the scale-down at
-// the REAL entry point (AddMember, not a raw table apply): re-admitting a
+// TestCancelDrainWithdrawsDrain pins the operator's cancel half of the
+// scale-down at the engine entry point (not a raw table apply): cancelling a
 // draining learner must commit and clear both marks — an idempotent no-op
 // there would leave the node parked in a drain no operator asked to
-// continue. The announced addresses survive the withdrawal.
+// continue. The announced addresses survive the withdrawal; a second cancel
+// on the clean entry is the no-op.
 func TestReAdmissionWithdrawsDrain(t *testing.T) {
 	e := newLeaderEngine(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	addr := "127.0.0.1:9906"
-	if err := e.AddMember(ctx, "node-6", addr, RoleLearner); err != nil {
+	if err := e.acceptAdoption(ctx, &Adoption{ID: "node-6", PeerAddr: addr, Role: RoleLearner}); err != nil {
 		t.Fatal(err)
 	}
 	join(t, e, "node-6", addr)
@@ -247,36 +249,35 @@ func TestReAdmissionWithdrawsDrain(t *testing.T) {
 	if !p.Draining || !p.PendingRemove {
 		t.Fatalf("setup: DELETE must have marked the drain: %+v", p)
 	}
-	// The operator changes their mind: the ordinary admission call IS the
-	// withdrawal.
-	if err := e.AddMember(ctx, "node-6", addr, RoleLearner); err != nil {
-		t.Fatalf("re-admission (withdrawal) failed: %v", err)
+	// The operator changes their mind: CancelDrain is the withdrawal.
+	if ch, err := e.CancelDrain(ctx, "node-6"); err != nil || ch != "restored" {
+		t.Fatalf("CancelDrain (withdrawal) = (%q, %v), want restored", ch, err)
 	}
 	p = e.TableSnapshot().Peers["node-6"]
 	if p.Draining || p.PendingRemove {
-		t.Fatalf("re-admission must withdraw drain+removal: %+v", p)
+		t.Fatalf("CancelDrain must withdraw drain+removal: %+v", p)
 	}
 	if p.ClientAddr == "" {
 		t.Fatalf("the withdrawal must not drop the node's announced addresses: %+v", p)
 	}
-	// And a clean re-admission stays the no-op register_test pins.
+	// And a clean entry stays the no-op: cancel there is "none", no commit.
 	before := commitIndexOf(t, e.node)
-	if err := e.AddMember(ctx, "node-6", addr, RoleLearner); err != nil {
-		t.Fatal(err)
+	if ch, err := e.CancelDrain(ctx, "node-6"); err != nil || ch != "none" {
+		t.Fatalf("CancelDrain(clean entry) = (%q, %v), want none", ch, err)
 	}
 	if after := commitIndexOf(t, e.node); after != before {
-		t.Fatalf("clean re-admission must not commit: %d -> %d", before, after)
+		t.Fatalf("clean CancelDrain must not commit: %d -> %d", before, after)
 	}
 }
 
 // TestSelfAdmissionNeverWithdrawsDrain pins the split: a node offering
 // itself (the adoption path a reboot walks) leaves the operator's drain
-// and removal marks standing — only the admin-plane admission withdraws.
+// and removal marks standing — only the operator's CancelDrain withdraws.
 func TestSelfAdmissionNeverWithdrawsDrain(t *testing.T) {
 	e := newLeaderEngine(t)
 	ctx := context.Background()
 	addr := "127.0.0.1:9907"
-	if err := e.AddMember(ctx, "node-7", addr, RoleLearner); err != nil {
+	if err := e.acceptAdoption(ctx, &Adoption{ID: "node-7", PeerAddr: addr, Role: RoleLearner}); err != nil {
 		t.Fatal(err)
 	}
 	join(t, e, "node-7", addr)
@@ -292,11 +293,11 @@ func TestSelfAdmissionNeverWithdrawsDrain(t *testing.T) {
 	if !p.Draining || !p.PendingRemove {
 		t.Fatalf("self-admission must not withdraw the operator's removal: %+v", p)
 	}
-	// The operator's admission does.
-	if err := e.AddMember(ctx, "node-7", addr, RoleLearner); err != nil {
-		t.Fatal(err)
+	// The operator's CancelDrain does.
+	if ch, err := e.CancelDrain(ctx, "node-7"); err != nil || ch != "restored" {
+		t.Fatalf("CancelDrain = (%q, %v), want restored", ch, err)
 	}
 	if p := e.TableSnapshot().Peers["node-7"]; p.Draining || p.PendingRemove {
-		t.Fatalf("admin re-admission must withdraw: %+v", p)
+		t.Fatalf("CancelDrain must withdraw: %+v", p)
 	}
 }

@@ -134,7 +134,10 @@ func (c *Config) withDefaults() error {
 	if c.DataDir == "" {
 		return errors.New("raft: data dir is required")
 	}
-	if len(c.Voters) == 0 {
+	// An empty voter list is legal for a SEED only: that node holds no
+	// configuration at all and waits for the leader it joins to replicate
+	// one. A non-seed start IS a configuration — it needs voters.
+	if len(c.Voters) == 0 && !c.Seed {
 		return errors.New("raft: at least one voter is required")
 	}
 	found := false

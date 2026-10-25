@@ -645,6 +645,10 @@ func (l *learnerNode) RemoveMember(id string, timeout time.Duration) error {
 	return ErrNotLeader
 }
 
+func (l *learnerNode) UpdatePeer(id, addr string, timeout time.Duration) error {
+	return ErrNotLeader
+}
+
 func (l *learnerNode) Cfg() Config { return l.cfg }
 
 // TopologyID is the generation this node's replicated metadata belongs to: the

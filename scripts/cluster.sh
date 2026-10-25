@@ -6,7 +6,9 @@
 #   REPLICAS=5 VOTERS=3 scripts/cluster.sh start
 #       → node-1..3 = voter（控制面，投票、不承载槽副本）
 #       → node-4..5 = learner（数据面，承载槽副本、不投票）
-#       冷启动顺序：先拉起 voter 等选主，再把 learner 逐个准入目录并启动，
+#       冷启动顺序：先起撰写初始配置的 voter（-peers），其余 voter 与 learner
+#       一律带 -join（控制面地址列表，轮转自报）加入；没有「先准入再启动」的
+#       两步式——节点的命令行就是它的入群声明。
 #       最后等槽规划收敛。**就绪 = 连数据面也镜像完布局**（leader 规划完不等于
 #       learner 追平，此刻冒烟会读到 learner 上的空槽）。创建时的形态（节点数、
 #       每节点角色、端口）会写进 $RUN_DIR/cluster.env —— 之后 **裸跑
@@ -15,11 +17,11 @@
 #
 #   scripts/cluster.sh start     启动集群（编译、按角色两段拉起、等待就绪；形态写入 cluster.env）
 #   scripts/cluster.sh status    查看各节点 Raft 角色、Leader 槽数、迁移中槽数
-#   scripts/cluster.sh join N    运行时扩一个节点：先拉起 node-N（voter 用 -join 指向现有成员，
-#                                learner 先准入目录），扩出的序号与角色记回 cluster.env
+#   scripts/cluster.sh join N    运行时扩一个节点：拉起 node-N 时带上 -join（现有控制面地址
+#                               列表，按 adopt 周期轮转自报），voter 进 raft 配置、learner
+#                               进目录，扩出的序号与角色记回 cluster.env
 #   scripts/cluster.sh remove N  运行时摘掉 node-N（只允许离线节点：进程在跑会先停，等探活标离线后再
 #                                DELETE 到 controller；槽主自动迁到存活副本，副本集按新成员数重排）
-#   scripts/cluster.sh admit N [learner]  把 node-N 准入目录（数据面节点：不投票、只承载槽副本）
 #   scripts/cluster.sh members   列出当前 raft 成员（GET /admin/cluster/nodes）
 #   scripts/cluster.sh smoke     端到端冒烟：MOVED 重定向 → v1/v2 写入 → 幂等 exists → 版本冲突 fail/1001 → 回读
 #   scripts/cluster.sh slotcheck 副本一致性体检：逐槽比较 leader 与各副本摘要（有发散副本时退出码 1）
@@ -30,11 +32,15 @@
 #
 # 脚本可用环境变量覆盖（显式传入的值优先于 $RUN_DIR/cluster.env 的记录值）：
 #   REPLICAS=3             节点总数。start 在集群已经存在时只拉起缺的，并把它们
-#                          -join 进现有集群（REPLICAS=7 start 就是扩容）。未显式
+#                          -join 进现有集群。它只决定总数，不决定角色：VOTERS 不变
+#                          时新节点一律是 learner（扩数据节点）；扩控制节点要同时
+#                          抬 VOTERS。未显式
 #                          传入且没有记录值时，取运行目录里已有的最大 node-N 序号，
 #                          保证裸 restart 不会漏掉上次拉起的节点
 #   VOTERS=1               控制面节点数：node-1..VOTERS = voter，其余 = learner。
-#                          最小部署 = 1 个 voter + 1 个 learner（默认值即如此）
+#                          最小部署 = 1 个 voter + 1 个 learner（默认值即如此）。
+#                          抬它（配合 REPLICAS）才新增控制节点；调低不会把既有
+#                          voter 降级，缩控制面走 remove
 #   ROLE_<n>=voter|learner  点名节点 n 的角色（优先于 VOTERS 的区间推导）。
 #                          voter 只投票、不承载槽副本；learner 只承载副本、不投票，
 #                          槽表由控制面经 WatchLayout 分发，不参与选举
@@ -57,10 +63,16 @@
 # 地址，smoke 里演示了跟随重定向）。
 #
 # 运行时成员变更（不重启、不丢数据）：
-#   扩：REPLICAS=7 scripts/cluster.sh start   或   scripts/cluster.sh join 6
-#       集群已经存在（有节点在跑，或数据目录里已有 raft 日志）时，缺的节点
-#       自己报名加入（voter 按 -peers 成员轮转报名，learner 先准入目录）。
-#       扩容后的序号与角色会记回 cluster.env。
+#   扩数据节点：REPLICAS=7 scripts/cluster.sh start   或   scripts/cluster.sh join 6
+#       角色由 VOTERS 区间推导（node-1..VOTERS = voter，其余 = learner），
+#       VOTERS 不变时新增的 node-4..7 全是 learner（数据节点）。集群已经存在
+#       （有节点在跑，或数据目录里已有 raft 日志）时，缺的节点自己带 -join
+#       轮转自报加入（voter 与 learner 同一条路）。序号与角色记回 cluster.env。
+#   扩控制节点：必须同时抬 VOTERS，如 VOTERS=5 REPLICAS=7 start（node-4/5 成为
+#       voter，node-6/7 仍是 learner）；也可用 ROLE_<n>=voter 逐个点名。
+#       方向不可逆：成员身份以 raft 配置为准，调低 VOTERS 只是让脚本把既有 voter
+#       按 learner 拉起——它的 -join 自报会因「已是 raft voter」被拒、进程启动即退
+#       （成员身份本身不变，集群不受影响）。缩控制面只能 scripts/cluster.sh remove N。
 #   缩：scripts/cluster.sh remove 2
 #       只允许移除离线节点（与后端同规则）：node-2 进程还在跑时脚本先停掉它，
 #       等 controller 探活把它标离线后提交 raft 配置删除；该节点收到配置项后才
@@ -171,7 +183,7 @@ stop_node() {
 
 # 节点是否已经持有本地 raft 日志（＝它已经属于某个集群：启动时按自己记录的
 # 配置起来，不会再写一份初始配置）。用于区分「全新冷启动」与「往现有集群里
-# 加节点」：只有前者能让节点按 -peers 写初始 voter 集，后者必须用 -join 报名，
+# 加节点」：只有前者允许节点按 -peers 写初始 voter 集，后者一律 -join 自报，
 # 否则每个新节点写一份内容不同的 index 1 配置，集群会劈成多个互不隶属的 raft 组。
 node_has_raft_data() {
   local f
@@ -205,24 +217,34 @@ build_binary() {
   fi
 }
 
-# 全集群共享的 peers 表：node-id=host:peerport（单端口形式）。
+# 初始配置文档：node-id=host:peerport（单端口形式），只由撰写者（-peers）携带。
 # admin/client 地址不配置——各节点通过 peer 端口上的注册协议自报。
-# SEED_MAX 限定种子范围：运行时加入的节点（join N，N > REPLICAS）只把
-# 已存在的成员（1..REPLICAS）当种子，绝不含自己——否则它一启动就以为自己是
-# 成员，不会去报名。
 peers_csv() {
-  local list="" i max="${SEED_MAX:-$REPLICAS}"
-  # -peers 是 raft 种子集：只列控制面（voter）节点。learner 不进共识组，
-  # 同一份列表对它是「连控制面的投递点」（注册与布局分发都走 peer 端口）。
-  for i in $(seq 1 "$max"); do
+  local list="" i
+  for i in $(seq 1 "$REPLICAS"); do
     [[ "$(node_n_role "$i")" == "voter" ]] || continue
     list+="${list:+,}node-$i=http://$HOST:$(peer_port "$i")"
   done
   printf '%s' "$list"
 }
 
+# 报名地址列表（-join）：现有控制面（voter）节点的 peer 地址，逗号分隔。
+# 新起的 voter 与 learner 都带它；连不上就按 -adopt-interval 轮转重试，
+# 所以「先起谁、后起谁」不再决定成败。
+join_csv() {
+  local list="" i
+  for i in $(seq 1 "$VOTERS"); do
+    [[ "$(node_n_role "$i")" == "voter" ]] || continue
+    list+="${list:+,}$HOST:$(peer_port "$i")"
+  done
+  [[ -n "$list" ]] || die "没有可报名的控制面节点（VOTERS=0？）"
+  printf '%s' "$list"
+}
+
 start_node() {
-  local n="$1" dir peers pid
+  # pid 必须显式初始化：bash 的 `local a=1 b` 只把 a 绑定，b 在 set -u 下
+  # 一读就报 unbound（旧代码每轮无条件赋值所以没暴露）。
+  local n="$1" dir peers pid=""
   dir="$(node_dir "$n")"
   mkdir -p "$dir"
   peers="$(peers_csv)"
@@ -233,17 +255,18 @@ start_node() {
   printf '\n===== cluster.sh start node-%s @ %s =====\n' "$n" "$(date '+%Y-%m-%d %H:%M:%S %z')" >> "$dir/node.log"
   local extra=()
   # 每个节点的角色由 ROLE_<n> 指定（voter/learner，默认 node-1=voter、其余=
-  # learner，见 node_n_role）。learner 不报名 raft、由控制面准入目录后分发布局。
+  # learner，见 node_n_role）。
   local node_role
   node_role="$(node_n_role "$n")"
   extra+=(-role "$node_role")
-  # 运行时加入的节点（join N）不是初始成员：它用 -peers 当种子、用 -join
-  # 指向现有成员报名。start_node 只负责拉起进程，成员变更由 cmd_join 提交。
-  if [[ -n "${JOIN_TARGET:-}" ]]; then
-    extra+=(-join "$JOIN_TARGET")
+  # 入群声明二选一（pushupes 自身强制互斥）：AUTHOR=1 的节点是初始配置撰写者，
+  # 带 -peers 文档；其余所有节点（voter joiner 与 learner）带 -join 控制面地址
+  # 列表，按 adopt 周期轮转自报——加入数据面节点不需要任何 admin 调用。
+  if [[ "${AUTHOR:-0}" == "1" ]]; then
+    extra+=(-peers "$peers")
+  else
+    extra+=(-join "${JOIN_LIST:?非撰写者必须给 JOIN_LIST}")
   fi
-  # -bootstrap 已废弃：成员集合静态，每个节点启动时按 -peers 写入同一 voter 集，
-  # 不再有「先 bootstrap 再 join」的差异。
 
   cd "$dir" || die "无法进入 $dir"
   # pid 文件必须由节点进程自己写。setsid 在调用方已是进程组长时会 fork，于是
@@ -254,7 +277,7 @@ start_node() {
   local launch=(node.pid "$BIN" -node "node-$n" \
     -admin "$HOST:$(admin_port "$n")" -peer "$HOST:$(peer_port "$n")" \
     -client "$HOST:$(client_port "$n")" \
-    -data ./data -peers "$peers" \
+    -data ./data \
     "${seg_args[@]}" "${raft_timing_args[@]}" "${extra[@]}")
   # fd 全部重定向，否则管道调用永不返回
   if command -v setsid >/dev/null 2>&1; then
@@ -268,7 +291,9 @@ start_node() {
   cd "$ROOT"
   # 等节点自己写下 pid（毫秒级）：这样紧接着的启动/停止就不会读到空文件
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    pid="$(tr -d '[:space:]' < "$(pid_file "$n")" 2>/dev/null)"
+    # 文件还没被节点创建时，重定向失败是 shell 自己报的错（2>/dev/null 只压 tr 的
+    # stderr）——先测存在，否则启动日志里会冒一行无害但吓人的「No such file」。
+    [[ -f "$(pid_file "$n")" ]] && pid="$(tr -d '[:space:]' < "$(pid_file "$n")")"
     [[ -n "$pid" ]] && break
     sleep 0.1
   done
@@ -375,7 +400,7 @@ cmd_start() {
   fi
 
   # 冷启动还是往现有集群里加节点？判据：有没有节点在跑、有没有节点已经持有
-  # raft 日志。两者皆无 = 全新冷启动，各节点按 -peers 写下同一份初始配置；
+  # raft 日志。两者皆无 = 全新冷启动，由配置撰写者按 -peers 写下初始配置；
   # 否则本次要拉起、且没有本地 raft 日志的节点必须用 -join 报名加入 ——
   # 让它自己 bootstrap 会用它那份 -peers 写出内容不同的 index 1 配置，和现有
   # 集群分裂成各自成多数派的 raft 组（实测 REPLICAS 1->3->5->7 依次 start 会
@@ -385,24 +410,10 @@ cmd_start() {
     node_pid_alive "$i" && cold=0
     node_has_raft_data "$i" && cold=0
   done
-  local join_to=""
-  if (( cold == 0 )); then
-    # 报名入口：优先一个已在运行的成员；都在停机但数据还在时，取序号最小、
-    # 持有 raft 日志的那个（它在本次启动里会起来，先报名的节点会按 adopt
-    # 周期重试到它可连为止）。
-    for i in $(seq 1 "$REPLICAS"); do
-      node_pid_alive "$i" && { join_to="$HOST:$(peer_port "$i")"; break; }
-    done
-    if [[ -z "$join_to" ]]; then
-      for i in $(seq 1 "$REPLICAS"); do
-        node_has_raft_data "$i" && { join_to="$HOST:$(peer_port "$i")"; break; }
-      done
-    fi
-  fi
-
-  # 两段启动：先控制面（voter），等它选出 controller，再把数据面（learner）
-  # 逐个准入目录并拉起 —— OpRegister 不新增成员，learner 必须先在目录里有
-  # 条目，它的注册心跳才落得进去。
+  # 两段启动：先控制面（voter），再数据面（learner）。入群声明只有两种：
+  #   - 撰写者：冷启动时序号最小的 voter，带 -peers 写下初始配置；
+  #   - 其余所有节点：带 -join（控制面地址列表）自报加入——voter 进 raft
+  #     配置或被配置里的占位认领，learner 进复制目录，都由节点自己声明。
   local voters=() learners=()
   for i in "${to_start[@]}"; do
     if [[ "$(node_n_role "$i")" == "voter" ]]; then voters+=("$i"); else learners+=("$i"); fi
@@ -410,42 +421,22 @@ cmd_start() {
   if (( cold == 1 )) && (( ${#voters[@]} == 0 )); then
     die "冷启动至少需要一个 voter（控制面）：最小部署是 1 个 voter + 1 个 learner"
   fi
+  JOIN_LIST="$(join_csv)"
+  local author_set=0
   for i in "${voters[@]}"; do
-    if (( cold == 1 )) || node_has_raft_data "$i"; then
-      # 冷启动：按 -peers 写同一份初始配置；已有日志：按它记录的配置起来。
-      start_node "$i"
+    if (( cold == 1 )) && (( author_set == 0 )) && ! node_has_raft_data "$i"; then
+      info "node-$i 撰写初始配置（-peers）"
+      AUTHOR=1 start_node "$i"
+      author_set=1
       continue
     fi
-    info "node-$i 没有本地 raft 日志：以 -join $join_to 报名加入现有集群（不写初始配置）"
-    JOIN_TARGET="$join_to" start_node "$i"
-  done
-  # 两段启动：先控制面（voter），再数据面（learner）。数据面分两种：
-  # 已在目录里注册过的（共识目录旁有 layout-feed 缓存；目录条目本身经 Raft
-  # 持久化，重启不需要重新准入）跟着 voter 一并拉起——若也排队等 controller，
-  # restart 窗口里数据面缺席数秒，探活就会把它名下所有槽的 leader 迁到环邻居
-  # （实测形态，当时槽数 4096：重启后一个数据节点全部槽领走、另一个 0，回切要按每轮一次
-  # 交接慢慢爬）。全新 learner 才需要「等 controller → 准入目录 → 启动」。
-  local known=() fresh=()
-  for i in "${learners[@]}"; do
-    if [[ -s "$(node_dir "$i")/data/layout-feed.json" ]]; then known+=("$i"); else fresh+=("$i"); fi
-  done
-  for i in "${known[@]}"; do
+    info "node-$i 以 -join 自报加入"
     start_node "$i"
   done
-  if (( ${#fresh[@]} > 0 )); then
-    # 等 controller 就绪（选出 leader、controller_admin_addr 落表）。
-    local deadline=$((SECONDS + READY_TIMEOUT)) ctrl=""
-    while (( SECONDS < deadline )); do
-      ctrl="$(controller_admin 2>/dev/null)" || ctrl=""
-      [[ -n "$ctrl" ]] && break
-      sleep 1
-    done
-    [[ -n "$ctrl" ]] || die "${READY_TIMEOUT}s 内没有选出 controller，无法准入数据面节点"
-    for i in "${fresh[@]}"; do
-      cmd_admit "$i" learner
-      start_node "$i"
-    done
-  fi
+  for i in "${learners[@]}"; do
+    info "node-$i（$([[ -s "$(node_dir "$i")/data/layout-feed.json" ]] && echo 已在目录 || echo 首次加入)）以 -join 自报加入"
+    start_node "$i"
+  done
   wait_ready || exit 1
   info ""
   local admin_list="" i
@@ -523,44 +514,23 @@ join_record() {
   save_cluster_env
 }
 
-# cmd_admit N [role]：把 node-N 准入复制目录。数据面节点（role=learner）的准入
-# 是一条目录命令，不碰 raft 配置 —— 它不投票。控制面只接受「目录里已有」的节点
-# 自报地址（OpRegister 不新增成员），所以准入必须先于进程启动。
-cmd_admit() {
-  local n="${1:-}" role="${2:-learner}" resp
-  [[ -n "$n" && "$n" =~ ^[0-9]+$ ]] || die "用法: $0 admit <节点序号> [voter|learner]"
-  [[ "$role" == "voter" || "$role" == "learner" ]] || die "role 只能是 voter 或 learner"
-  resp="$(curl -s --max-time 5 -X POST "http://$(controller_admin)/admin/cluster/nodes" \
-    -d "{\"id\":\"node-$n\",\"peer_addr\":\"$HOST:$(peer_port "$n")\",\"role\":\"$role\"}")" \
-    || die "准入 node-$n 失败（controller 是否在跑？）"
-  info "node-$n 准入：$resp"
-}
-
 cmd_join() {
   local n="${1:-}"
   [[ -n "$n" && "$n" =~ ^[0-9]+$ ]] || die "用法: $0 join <节点序号>"
   build_binary
-  local node_role="$(node_n_role "$n")"
   if node_pid_alive "$n"; then
     info "node-$n 已在运行，跳过启动"
   else
     rm -f "$(pid_file "$n")"
-    if [[ "$node_role" == "learner" ]]; then
-      # 数据面节点：先准入（目录命令），再启动。它不报名 raft（不投票），
-      # 槽表由控制面经 WatchLayout 分发；自己的 admin/client 地址由注册心跳公告。
-      cmd_admit "$n" learner
-      start_node "$n"
-    else
-      # 报名入口：指向 node-1 的 peer 端口（启动时至少 node-1 已在跑）。
-      JOIN_TARGET="$HOST:$(peer_port 1)" start_node "$n"
-    fi
+    # voter 与 learner 同一条路：-join 指向现有控制面，节点自己声明入群。
+    JOIN_LIST="$(join_csv)" start_node "$n"
   fi
   local deadline=$((SECONDS + READY_TIMEOUT))
   while (( SECONDS < deadline )); do
     local members
     members="$(curl -s --max-time 3 "$(base_url 1)/admin/cluster/nodes" 2>/dev/null)" || members=""
     if [[ "$node_role" == "learner" ]]; then
-      # 数据面节点的判定是「它自报了 client 地址」：准入只是目录里多一条，
+      # 数据面节点的判定是「它自报了 client 地址」：入群声明只让目录里多一条，
       # 进程起来并注册之后才真的能收数据。
       if printf '%s' "$members" | grep -o "{\"id\":\"node-$n\"[^}]*}" | grep -q '"client_addr":"http'; then
         info "node-$n 已作为数据面节点上线（不投票；槽表由控制面分发）"
@@ -643,8 +613,8 @@ cmd_members() {
 # 进来的节点在 status/smoke/slotcheck 里凭空消失。
 cluster_node_indexes() {
   local extra=""
-  # 只收「已自报 client 地址」的成员：没有 client 地址的条目（刚准入、进程还没起的
-  # learner）不该被算出一个并不存在的 client 端口——按端口推算的前提是那个进程在跑。
+  # 只收「已自报 client 地址」的成员：没有 client 地址的条目（自报已进目录、注册
+  # 还没到的 learner）不该被算出一个并不存在的 client 端口——按端口推算的前提是那个进程在跑。
   extra="$(curl -s --max-time 3 "$(base_url 1)/admin/cluster/nodes" 2>/dev/null \
     | grep -o '{"id":"node-[0-9]*"[^}]*}' | grep '"client_addr":"http' \
     | grep -o '"id":"node-[0-9]*"' | grep -o '[0-9]*')" || extra=""
@@ -745,7 +715,6 @@ case "${1:-}" in
   start)   cmd_start ;;
   stop)    cmd_stop ;;
   status)  cmd_status ;;
-  admit)   shift; cmd_admit "$@" ;;
   join)    shift; cmd_join "$@" ;;
   remove)  shift; cmd_remove "$@" ;;
   members) cmd_members ;;

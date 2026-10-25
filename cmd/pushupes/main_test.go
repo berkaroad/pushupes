@@ -154,31 +154,66 @@ func TestBootstrapEligible(t *testing.T) {
 	}
 }
 
-func TestJoinTargets(t *testing.T) {
-	peers := []cluster.Peer{
-		{ID: "node-1", PeerAddr: "127.0.0.1:8391"},
-		{ID: "node-2", PeerAddr: "127.0.0.1:8392"},
-		{ID: "node-3", PeerAddr: ""}, // not yet addressed: nothing to dial
-		{ID: "node-4", PeerAddr: "127.0.0.1:8394"},
+// membershipPlan is the whole startup contract of the two membership flags;
+// every refused shape here is a process that exits before binding anything.
+func TestMembershipPlan(t *testing.T) {
+	doc := "node-1=http://127.0.0.1:8391,node-2=http://127.0.0.1:8392,node-3=http://127.0.0.1:8393"
+	self1 := cluster.Peer{ID: "node-1", PeerAddr: "http://127.0.0.1:8391"}
+
+	// The leading id with its document authors; targets are none.
+	author, peers, targets, err := membershipPlan("node-1", doc, "", "voter", false, self1)
+	if err != nil || !author || len(peers) != 3 || len(targets) != 0 {
+		t.Fatalf("author: %v %+v %v %v", author, peers, targets, err)
 	}
-	// No -join: offer through the configured members, never through ourselves.
-	got := joinTargets("node-2", peers, "")
-	want := []string{"127.0.0.1:8391", "127.0.0.1:8394"}
-	if len(got) != len(want) {
-		t.Fatalf("targets = %v, want %v", got, want)
+
+	// A non-leading id carrying the document is a mistake (unless -bootstrap
+	// names it).
+	if _, _, _, err := membershipPlan("node-2", doc, "", "voter", false, self1); err == nil {
+		t.Fatal("a non-leading id must not author with -peers")
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("targets = %v, want %v", got, want)
-		}
+	if author, _, _, err := membershipPlan("node-2", doc, "", "voter", true, self1); err != nil || !author {
+		t.Fatalf("-bootstrap names the author: %v %v", author, err)
 	}
-	// An explicit -join names one member and nothing else.
-	if got := joinTargets("node-2", peers, " node-1:8391 "); len(got) != 1 || got[0] != "node-1:8391" {
-		t.Fatalf("-join targets = %v", got)
+	// The document must name the author itself.
+	if _, _, _, err := membershipPlan("node-9", doc, "", "voter", true, self1); err == nil {
+		t.Fatal("-peers that does not name the author must be refused")
 	}
-	// Nobody to ask.
-	if got := joinTargets("node-1", []cluster.Peer{{ID: "node-1", PeerAddr: "127.0.0.1:8391"}}, ""); len(got) != 0 {
-		t.Fatalf("targets = %v, want none", got)
+
+	// -join and -peers are mutually exclusive. A voter joiner carries NO seed
+	// list: the configuration arrives from the leader; its -join list is a
+	// delivery channel only.
+	author, peers, _, err = membershipPlan("node-2", "", "127.0.0.1:8391", "voter", false, self1)
+	if err != nil || author || len(peers) != 0 {
+		t.Fatalf("plain joiner: %v %v %+v", author, err, peers)
+	}
+	if _, _, _, err := membershipPlan("node-1", doc, "127.0.0.1:8392", "voter", false, self1); err == nil {
+		t.Fatal("-join with -peers must be refused")
+	}
+
+	// A learner needs -join, takes the list as feed targets, and never authors.
+	author, peers, targets, err = membershipPlan("node-4", "", "127.0.0.1:8391,127.0.0.1:8392", "learner", false,
+		cluster.Peer{ID: "node-4", PeerAddr: "http://127.0.0.1:8394"})
+	if err != nil || author || len(peers) != 2 || len(targets) != 2 {
+		t.Fatalf("learner joiner: %v %v %+v %v", author, err, peers, targets)
+	}
+	if _, _, _, err := membershipPlan("node-4", "", "", "learner", false, self1); err == nil {
+		t.Fatal("a learner without -join must be refused")
+	}
+	if _, _, _, err := membershipPlan("node-4", "", "127.0.0.1:8391", "learner", true, self1); err == nil {
+		t.Fatal("a learner cannot author with -bootstrap")
+	}
+	if _, _, _, err := membershipPlan("node-4", "", "node-4=http://127.0.0.1:8394", "learner", false, self1); err == nil {
+		t.Fatal("-join naming the node itself must be refused")
+	}
+
+	// A voter with neither flag is a mistake; -bootstrap alone authors a
+	// single-voter configuration of itself.
+	if _, _, _, err := membershipPlan("node-1", "", "", "voter", false, self1); err == nil {
+		t.Fatal("a voter needs -peers, -join, or -bootstrap")
+	}
+	author, peers, _, err = membershipPlan("node-1", "", "", "voter", true, self1)
+	if err != nil || !author || len(peers) != 1 || peers[0].ID != "node-1" {
+		t.Fatalf("-bootstrap alone authors itself: %v %+v %v", author, peers, err)
 	}
 }
 

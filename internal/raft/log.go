@@ -561,7 +561,7 @@ func decodeVotersRest(b []byte) ([]Voter, []byte, error) {
 // Unknown op bytes are rejected rather than ignored: silently skipping a
 // membership change would leave the node with the wrong quorum.
 //
-// confAdd/confRemove are the operator's changes. confSet installs a whole voter
+// confAdd/confRemove/confUpdate are the operator's changes. confSet installs a whole voter
 // list and is never issued by an operator: it is how the configuration enters
 // the log at bootstrap, and how a snapshot carries the configuration of the
 // point it was taken at. The initial configuration has to be in the log — the
@@ -574,6 +574,11 @@ const (
 	confAdd    byte = 1
 	confRemove byte = 2
 	confSet    byte = 3
+	// confUpdate rewrites the peer address of an EXISTING voter. It is the
+	// self-report authority: a voter that arrives announcing a -peer other
+	// than the one its id was authored or added with corrects the
+	// configuration instead of staying unreachable under a stale address.
+	confUpdate byte = 4
 )
 
 type confChange struct {
@@ -608,7 +613,7 @@ func decodeConfChange(b []byte) (confChange, error) {
 			return confChange{}, fmt.Errorf("raft: empty voter set in conf change")
 		}
 		return confChange{op: op, voters: vs}, nil
-	case confAdd, confRemove:
+	case confAdd, confRemove, confUpdate:
 	default:
 		return confChange{}, fmt.Errorf("raft: unknown conf change op %d", op)
 	}

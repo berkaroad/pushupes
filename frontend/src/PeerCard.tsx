@@ -21,16 +21,18 @@ export function isOnlinePeer(p: Pick<Peer, 'client_addr' | 'down'>): boolean {
 // answers "governed" versus "actively throttling". Both flags come from the
 // per-node /admin/status poll the page already runs.
 //
-// The footer row inside the card body carries the one node action the
-// console offers: 流控 (open this node's flow-control modal). Membership
-// actions live on the operator's command line (POST / DELETE
-// /admin/cluster/nodes, see DESIGN.md), never on a card. 流控 is node-local
+// The footer row inside the card body carries the node actions the console
+// offers: 流控 (open this node's flow-control modal) and, on a node carrying
+// the scale-down marks, 取消缩容 (the operator's exit from a DELETE posted in
+// error — POST /admin/cluster/nodes/{id}/cancel-drain). ADDING a node has no
+// console or admin plane at all: the new process joins by itself (-join).
+// 流控 is node-local
 // and harmless to open on any live node, so it appears whenever
 // onFlowControl is passed; the row is rendered at a fixed height (the
 // small-button 24px line) with an invisible placeholder per absent button,
 // so all data cards in the grid stay the same height. A plain (control-
 // plane) card has neither action, so it renders no row at all.
-export function PeerCard({ peer, current, slots, syncing, fenced, flowControlConfigured, flowControlFiring, onFlowControl, ratePoints, storageCount, storageBytes, plain }: {
+export function PeerCard({ peer, current, slots, syncing, fenced, flowControlConfigured, flowControlFiring, onFlowControl, onCancelDrain, ratePoints, storageCount, storageBytes, plain }: {
   peer: Peer
   current?: boolean
   slots: number
@@ -50,6 +52,9 @@ export function PeerCard({ peer, current, slots, syncing, fenced, flowControlCon
   flowControlConfigured?: boolean
   flowControlFiring?: boolean
   onFlowControl?: (id: string) => void
+  // onCancelDrain is passed on a node whose entry carries the scale-down
+  // marks: the card then shows 取消缩容 next to 流控.
+  onCancelDrain?: (id: string) => void
   ratePoints?: NodeRatePoint[]
   // storageCount / storageBytes are THIS node's leader-copy footprint, off the
   // same 2s /admin/status poll: the seq total of the slots it leads
@@ -67,7 +72,7 @@ export function PeerCard({ peer, current, slots, syncing, fenced, flowControlCon
   // read as a different (broken) frame style instead of a state.
   return (
     <Card size="small"
-      title={<Space>{peer.id}{current ? <Tag color="blue">当前</Tag> : null}{online ? null : <Tag color="red">离线</Tag>}{!plain && flowControlConfigured ? <Tag color="orange" className={flowControlFiring ? 'flow-blink' : undefined}>流控</Tag> : null}{!plain && syncing ? <Tooltip title={`作为 leader 有 ${syncing} 个槽的副本尚未同步到位（加节点 / 重排 / 追平期间），追平后消失`}><Tag color="orange">同步中 {syncing}</Tag></Tooltip> : null}{!plain && fenced && fenced.length > 0 ? <Tooltip title={<div>{fenced.slice(0, 10).map((v) => <div key={v.slot}>槽 {v.slot}：{v.reason}</div>)}{fenced.length > 10 ? <div>… 共 {fenced.length} 个槽</div> : null}</div>}><Tag color="red">已围栏 {fenced.length}</Tag></Tooltip> : null}</Space>}
+      title={<Space>{peer.id}{current ? <Tag color="blue">当前</Tag> : null}{online ? null : <Tag color="red">离线</Tag>}{!plain && flowControlConfigured ? <Tag color="orange" className={flowControlFiring ? 'flow-blink' : undefined}>流控</Tag> : null}{!plain && (peer.draining || peer.pending_remove) ? <Tag color="volcano">缩容中</Tag> : null}{!plain && syncing ? <Tooltip title={`作为 leader 有 ${syncing} 个槽的副本尚未同步到位（加节点 / 重排 / 追平期间），追平后消失`}><Tag color="orange">同步中 {syncing}</Tag></Tooltip> : null}{!plain && fenced && fenced.length > 0 ? <Tooltip title={<div>{fenced.slice(0, 10).map((v) => <div key={v.slot}>槽 {v.slot}：{v.reason}</div>)}{fenced.length > 10 ? <div>… 共 {fenced.length} 个槽</div> : null}</div>}><Tag color="red">已围栏 {fenced.length}</Tag></Tooltip> : null}</Space>}
       extra={plain ? null : <Tag>{slots} slots</Tag>}>
       <Descriptions column={1} size="small">
         <Descriptions.Item label="Admin">{peer.admin_addr || '-'}</Descriptions.Item>
@@ -79,6 +84,11 @@ export function PeerCard({ peer, current, slots, syncing, fenced, flowControlCon
           {onFlowControl
             ? <Button size="small" icon={<ControlOutlined />} onClick={() => onFlowControl(peer.id)}>流控</Button>
             : <span style={{ visibility: 'hidden' }} aria-hidden><Button size="small">流控</Button></span>}
+          {peer.draining || peer.pending_remove
+            ? (onCancelDrain
+              ? <Button size="small" danger onClick={() => onCancelDrain(peer.id)}>取消缩容</Button>
+              : <span style={{ visibility: 'hidden' }} aria-hidden><Button size="small" danger>取消缩容</Button></span>)
+            : <span style={{ visibility: 'hidden' }} aria-hidden><Button size="small" danger>取消缩容</Button></span>}
         </div>
       )}
       {/* The node's own write-rate history (msg/s + KiB/s, dual axis): what

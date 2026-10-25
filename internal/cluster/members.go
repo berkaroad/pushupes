@@ -16,10 +16,13 @@
 //
 // The Raft configuration (which nodes vote) and the replicated peer directory
 // (the slot table's member list) are two different things, and this file keeps
-// them in step. Adding a node is: make it a voter in the consensus layer, then
-// let the ordinary controller reconcile pick it up (the directory sync turns
-// every voter into a join_node entry, registration fills in its data-plane
-// addresses, and replan_slots tops the replica sets up to the factor).
+// them in step. Adding a node is the node's OWN act: it offers itself through
+// the members it was started with -join to (an Adoption on the peer plane)
+// and the controller admits it — into the raft configuration (a voter, whose
+// directory entry the ordinary reconcile then writes), or straight into the
+// directory (a learner). Registration fills in data-plane addresses, and
+// replan_slots tops the replica sets up to the factor. There is no operator
+// "add" command: presence is declared by the process itself.
 //
 // Removing a node reverses it, with one extra rule: only an offline member can
 // be removed. The consensus layer keeps talking to the removed member until it
@@ -32,6 +35,9 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 	"github.com/berkaroad/pushupes/internal/raft"
@@ -48,111 +54,87 @@ const DefaultAdoptInterval = 3 * time.Second
 // address already in use, removing the last voter).
 var ErrBadMember = errors.New("cluster: invalid membership change")
 
-// AddMember adds a node to the running cluster. It is controller-only: a
-// follower refuses with a *NotControllerError naming the controller, so the
-// caller retries there (the admin plane never forwards commands).
-//
-// The address is the new node's peer-plane address — the raft/gossip endpoint,
-// the only one membership needs. Its admin and client addresses are NOT passed:
-// a member announces those itself through the ordinary registration protocol
-// once it is in the configuration.
-func (e *Engine) AddMember(ctx context.Context, id, peerAddr, role string) error {
-	return e.admitMember(ctx, id, peerAddr, role, true)
-}
-
-// AdmitSelf is the adoption path — a node offering ITSELF at startup. It is
-// the same directory admission minus one power: a self-offer never withdraws
-// a drain. The removal was the operator's call (the DELETE that marked it);
-// a node rebooting into its own scale-down must not cancel it by coming
-// back — that would make every drain racing a restart loop forever. Only
-// the operator's AddMember (admin endpoint, console button, cluster.sh join)
-// says "keep this one after all".
+// AdmitSelf is the adoption path — a node offering ITSELF at startup. A
+// learner's admission is a replicated DIRECTORY command: the raft
+// configuration never names a learner, and the layout pool takes it from the
+// entry's role (see Table.HostingIDs). Idempotent on the directory: a
+// re-admission of a clean entry is a no-op; a re-admission of a DRAINING or
+// removal-marked entry keeps the marks — a node rebooting into its own
+// scale-down must not cancel it by coming back (the removal was the
+// operator's call; CancelDrain is the operator's answer).
 func (e *Engine) AdmitSelf(ctx context.Context, id, peerAddr, role string) error {
-	return e.admitMember(ctx, id, peerAddr, role, false)
-}
-
-func (e *Engine) admitMember(ctx context.Context, id, peerAddr, role string, withdraw bool) error {
 	if e.node == nil {
 		return &NotControllerError{}
 	}
 	if id == "" || peerAddr == "" {
 		return fmt.Errorf("%w: id and peer addr are required", ErrBadMember)
 	}
-	if role != RoleVoter && role != RoleLearner {
-		return fmt.Errorf("%w: role must be %s or %s", ErrBadMember, RoleVoter, RoleLearner)
+	if role != RoleLearner {
+		return fmt.Errorf("%w: a voter's self-offer goes through the raft configuration, not the directory", ErrBadMember)
 	}
-	if role == RoleLearner {
-		// Learner admission is a replicated DIRECTORY command: the raft
-		// configuration never names a learner, and the layout pool takes it
-		// from the entry's role (see Table.HostingIDs). Idempotent on the
-		// directory: a re-admission of the same clean entry is a no-op — but
-		// a re-admission of a DRAINING entry is the withdrawal of the
-		// scale-down itself (the DELETE pipeline has no other cancel), so it
-		// must commit: join_node over the entry, both marks cleared, the
-		// announced addresses kept (they are the node's own registration;
-		// dropping them here would blind the layout until the next
-		// heartbeat re-announces).
-		if p, ok := e.TableSnapshot().Peers[id]; ok && p.Role == RoleLearner {
-			if !p.Draining && !p.PendingRemove {
-				return nil
-			}
-			if !withdraw {
-				return nil // self-offer: the marks (and the removal riding them) stand
-			}
-			back := p
-			back.Draining = false
-			back.PendingRemove = false
-			if back.PeerAddr == "" {
-				back.PeerAddr = NormalizeAddr(peerAddr)
-			}
-			if err := e.submit(&Command{Op: OpJoinNode, Peer: &back}); err != nil {
-				if errors.Is(err, ErrNotLeader) {
-					cid, caddr := e.Controller()
-					return &NotControllerError{LeaderID: cid, AdminAddr: caddr}
-				}
-				return err
-			}
-			e.loggerf("node %s re-admitted: drain and removal marks withdrawn, it serves again", id)
-			return nil
-		}
-		if e.node.IsMember(id) {
-			return fmt.Errorf("%w: %s is already a raft voter; it cannot also be admitted as a learner", ErrBadMember, id)
-		}
-		if err := e.submit(&Command{Op: OpJoinNode, Peer: &Peer{
-			ID: id, PeerAddr: NormalizeAddr(peerAddr), Role: RoleLearner,
-		}}); err != nil {
-			if errors.Is(err, ErrNotLeader) {
-				cid, caddr := e.Controller()
-				return &NotControllerError{LeaderID: cid, AdminAddr: caddr}
-			}
-			return err
-		}
-		e.loggerf("learner %s admitted to the directory (peer addr %s); it registers its admin/client addresses itself", id, HostPort(NormalizeAddr(peerAddr)))
+	if p, ok := e.TableSnapshot().Peers[id]; ok && p.Role == RoleLearner {
+		// Clean or marked, the entry already says this node belongs: there is
+		// nothing the offer itself may change.
 		return nil
 	}
 	if e.node.IsMember(id) {
-		return nil // already a member: idempotent
+		return fmt.Errorf("%w: %s is already a raft voter; it cannot also be admitted as a learner", ErrBadMember, id)
 	}
-	if p, ok := e.TableSnapshot().Peers[id]; ok && p.Role == RoleLearner {
-		return fmt.Errorf("%w: %s is already a directory learner; it cannot also be admitted as a voter", ErrBadMember, id)
-	}
-	addr := HostPort(NormalizeAddr(peerAddr))
-	err := e.node.AddMember(id, addr, AddMemberTimeout)
-	if err != nil {
-		if errors.Is(err, raft.ErrNotLeader) {
+	if err := e.submit(&Command{Op: OpJoinNode, Peer: &Peer{
+		ID: id, PeerAddr: NormalizeAddr(peerAddr), Role: RoleLearner,
+	}}); err != nil {
+		if errors.Is(err, ErrNotLeader) {
 			cid, caddr := e.Controller()
 			return &NotControllerError{LeaderID: cid, AdminAddr: caddr}
 		}
-		if errors.Is(err, raft.ErrBadChange) {
-			// An operator mistake (an address another member already owns, a
-			// node with no membership to add into): report it as a bad
-			// request, not as a server failure.
-			return fmt.Errorf("%w: %v", ErrBadMember, err)
-		}
 		return err
 	}
-	e.loggerf("member %s added to the raft configuration (peer addr %s); it registers its admin/client addresses itself", id, addr)
+	e.loggerf("learner %s admitted to the directory by its own offer (peer addr %s); it registers its admin/client addresses itself", id, HostPort(NormalizeAddr(peerAddr)))
 	return nil
+}
+
+// CancelDrain is the operator's exit from a scale-down issued in error: it
+// clears the drain and pending-removal marks on a directory entry, putting
+// the node back into the layout pools untouched (its announced addresses
+// stand — they are the node's own registration). A returning node's offer
+// deliberately keeps the marks (see AdmitSelf): only the operator who posted
+// the DELETE may cancel it. The endpoint is controller-only, like every
+// directory command; adding a node needs no operator action at all.
+func (e *Engine) CancelDrain(ctx context.Context, id string) (string, error) {
+	if e.node == nil {
+		return "", &NotControllerError{}
+	}
+	// Controller-only, refused up front: a follower names the controller
+	// rather than guessing at the (replicated, but possibly stale) table.
+	if !e.node.IsLeader() {
+		cid, caddr := e.Controller()
+		return "", &NotControllerError{LeaderID: cid, AdminAddr: caddr}
+	}
+	if id == "" {
+		return "", fmt.Errorf("%w: id is required", ErrBadMember)
+	}
+	p, ok := e.TableSnapshot().Peers[id]
+	if !ok {
+		if e.node.IsMember(id) {
+			return "none", nil // a voter the sync has not entered yet: nothing is marked
+		}
+		return "", fmt.Errorf("%w: %s is not a member of this cluster", ErrBadMember, id)
+	}
+	if !p.Draining && !p.PendingRemove {
+		return "none", nil // idempotent: the node already serves
+	}
+	back := p
+	back.Draining = false
+	back.PendingRemove = false
+	if err := e.submit(&Command{Op: OpJoinNode, Peer: &back}); err != nil {
+		if errors.Is(err, ErrNotLeader) {
+			cid, caddr := e.Controller()
+			return "", &NotControllerError{LeaderID: cid, AdminAddr: caddr}
+		}
+		return "", err
+	}
+	e.loggerf("node %s drain cancelled: marks cleared, it takes part in the layout again", id)
+	return "restored", nil
 }
 
 // RemoveMember is the scale-down in ONE command, and the drain-first,
@@ -170,8 +152,9 @@ func (e *Engine) admitMember(ctx context.Context, id, peerAddr, role string, wit
 // and its directory entry. The intent to remove at that point rides the
 // table (Peer.PendingRemove, second field of the same drain_node command),
 // so a controller change mid-drain resumes the job instead of losing it, and
-// a re-admission of the node (join_node) clears both marks — bringing a node
-// back is exactly how an operator cancels its removal.
+// the marks ride the entry until the removal
+// commits or the operator calls CancelDrain (a returning node's own offer
+// keeps them, see AdmitSelf).
 //
 // Return values: "removed" when the node is out of the cluster (this call
 // committed it), "draining" while handovers are in flight. A repeat DELETE
@@ -306,6 +289,8 @@ func (e *Engine) Members() []MemberView {
 			mv.AdminAddr = p.AdminAddr
 			mv.ClientAddr = p.ClientAddr
 			mv.Down = p.Down
+			mv.Draining = p.Draining
+			mv.PendingRemove = p.PendingRemove
 			// The self-announced role wins over the config-derived voter: an
 			// announced voter says voter either way, and a directory learner
 			// never enters the raft configuration (see AddMember), so the two
@@ -324,7 +309,8 @@ func (e *Engine) Members() []MemberView {
 			continue
 		}
 		out = append(out, MemberView{ID: id, PeerAddr: p.PeerAddr,
-			AdminAddr: p.AdminAddr, ClientAddr: p.ClientAddr, Role: p.Role, Down: p.Down})
+			AdminAddr: p.AdminAddr, ClientAddr: p.ClientAddr, Role: p.Role, Down: p.Down,
+			Draining: p.Draining, PendingRemove: p.PendingRemove})
 	}
 	return out
 }
@@ -337,6 +323,10 @@ type MemberView struct {
 	ClientAddr string `json:"client_addr,omitempty"`
 	Role       string `json:"role,omitempty"`
 	Down       bool   `json:"down,omitempty"`
+	// The scale-down marks ride through so the console can offer the
+	// operator's cancel-drain on exactly the entries that carry them.
+	Draining      bool `json:"draining,omitempty"`
+	PendingRemove bool `json:"pending_remove,omitempty"`
 }
 
 // Adoption is a node offering itself to the cluster.
@@ -348,6 +338,15 @@ type Adoption struct {
 	// required — an offer without a role is refused.
 	Role string
 }
+
+// refusedError is a refusal relayed from the cluster: it IS an ErrBadMember
+// for classification, but its message is the one the admitting node produced.
+type refusedError struct{ msg string }
+
+func (e *refusedError) Error() string { return e.msg }
+
+// Unwrap makes errors.Is(err, ErrBadMember) true without adding a prefix.
+func (e *refusedError) Unwrap() error { return ErrBadMember }
 
 // sendAdoption delivers an offer to a peer's peer-plane address; a non-leader
 // relays it onward. offerAddr is the JOINING node's peer address (what the
@@ -362,28 +361,34 @@ func (e *Engine) sendAdoption(ctx context.Context, id, offerAddr, targetAddr, ro
 	_, err = c.Adopt(cctx, &pushupesv1.AdoptRequest{
 		Id: id, PeerAddr: HostPort(NormalizeAddr(offerAddr)), Role: role,
 	})
+	if st, ok := status.FromError(err); ok && st.Code() == codes.InvalidArgument {
+		// A clear refusal travels back as InvalidArgument: classify it so the
+		// joiner loop treats it as fatal instead of rotating to the next seed.
+		// The message already carries the ErrBadMember text (the leader built
+		// it), so wrap it as-is — no second sentinel prefix.
+		return &refusedError{msg: st.Message()}
+	}
 	return err
 }
 
-// Joiner is the joining node's loop: offer yourself through one of the cluster
-// members until the leader has put you into the configuration.
+// Joiner is the joining node's loop: offer yourself through one of the
+// cluster members until the leader has admitted you — into the raft
+// configuration (a voter) or into the directory (a learner).
 type Joiner struct {
 	e        *Engine
 	targets  []string // members to offer through, tried in rotation
 	selfAddr string   // this node's own peer address (what it announces)
+	role     string   // the shape this node offers itself as (voter or learner)
 	interval time.Duration
 }
 
 // NewJoiner builds the joining node's offer loop. targets are the peer
-// addresses of running members: an explicit -join address, or — for a node
-// that is simply not the author of the cluster's configuration — the -peers
-// list it was configured with. None of them is announced as this node's
-// address; the node announces its own peer address.
-//
-// Several targets are the norm now: a joiner comes up while the cluster it is
+// addresses of running cluster members — the -join list. None of them is
+// announced as this node's address; the node announces its own peer address.
+// Several targets are the norm: a joiner comes up while the cluster it is
 // joining may still be starting, so one unreachable seed must not stop the
 // offer.
-func (e *Engine) NewJoiner(targets []string, interval time.Duration) *Joiner {
+func (e *Engine) NewJoiner(targets []string, interval time.Duration, role string) *Joiner {
 	if interval <= 0 {
 		interval = DefaultAdoptInterval
 	}
@@ -401,30 +406,54 @@ func (e *Engine) NewJoiner(targets []string, interval time.Duration) *Joiner {
 		e:        e,
 		targets:  cleaned,
 		selfAddr: HostPort(NormalizeAddr(e.node.Cfg().PeerAddr)),
+		role:     role,
 		interval: interval,
 	}
 }
 
-// Run offers this node to the cluster until it is a member, or ctx closes. The
-// targets are tried in rotation: a member that is mid-restart costs one round,
-// not the join.
-func (j *Joiner) Run(ctx context.Context) {
+// admitted reports whether this node's own offer has landed: a voter is in
+// once the raft configuration names it, a learner once the directory carries
+// its entry (its addresses and the layout follow on their own streams).
+func (j *Joiner) admitted() bool {
+	if j.role == RoleLearner {
+		p, ok := j.e.TableSnapshot().Peers[j.e.self]
+		return ok && p.Role == RoleLearner
+	}
+	return j.e.node != nil && j.e.node.IsMember(j.e.self)
+}
+
+// Run offers this node to the cluster until it is admitted, ctx closes, or a
+// member REFUSES the offer outright. A refusal (ErrBadMember: the id belongs
+// to the other shape, the address to another member) is a configuration
+// mistake no retry can fix, so it surfaces as an error and the process exits
+// (fail-fast, the same rule as every startup validation). An unreachable or
+// not-yet-elected target is just a round: the loop rotates.
+func (j *Joiner) Run(ctx context.Context) error {
 	if len(j.targets) == 0 {
-		j.e.loggerf("join: no member address to offer through (empty -peers and no -join); this node stays out of the cluster")
-		return
+		return fmt.Errorf("%w: join: no member address to offer through (empty -join)", ErrBadMember)
 	}
 	for i := 0; ; i++ {
-		if j.e.node != nil && j.e.node.IsMember(j.e.self) {
-			j.e.loggerf("joined the cluster: %s is now a raft voter", j.e.self)
-			return
+		if j.admitted() {
+			if j.role == RoleLearner {
+				j.e.loggerf("joined the cluster: %s is now a directory learner", j.e.self)
+			} else {
+				j.e.loggerf("joined the cluster: %s is now a raft voter", j.e.self)
+			}
+			return nil
 		}
 		target := j.targets[i%len(j.targets)]
-		if err := j.e.sendAdoption(ctx, j.e.self, j.selfAddr, target, j.e.node.Cfg().Role); err != nil {
+		if err := j.e.sendAdoption(ctx, j.e.self, j.selfAddr, target, j.role); err != nil {
+			if errors.Is(err, ErrBadMember) {
+				return fmt.Errorf("join offer refused: %w", err)
+			}
+			if ctx.Err() != nil {
+				return nil // the loop is closing: not a refusal, a shutdown
+			}
 			j.e.loggerf("join offer to %s failed: %v", target, err)
 		}
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-time.After(j.interval):
 		}
 	}
@@ -449,13 +478,49 @@ func (e *Engine) acceptAdoption(ctx context.Context, ad *Adoption) error {
 			// scale-down).
 			return e.AdmitSelf(ctx, ad.ID, ad.PeerAddr, RoleLearner)
 		}
+		if p, ok := e.TableSnapshot().Peers[ad.ID]; ok && p.Role == RoleLearner {
+			return fmt.Errorf("%w: %s is already a directory learner; it cannot be adopted as a voter", ErrBadMember, ad.ID)
+		}
+		addr := HostPort(NormalizeAddr(ad.PeerAddr))
 		if e.node.IsMember(ad.ID) {
+			// The configuration already names this id. Its own -peer is the
+			// authority over an unverified placeholder: while the node has
+			// never registered, a different address is the author's typo —
+			// correct it (UpdatePeer). Once the node HAS announced its
+			// addresses, a different peer address is a different process
+			// wearing this id: refuse.
+			for _, v := range e.node.Members() {
+				if v.ID != ad.ID || v.Addr == addr {
+					continue
+				}
+				if p, ok := e.TableSnapshot().Peers[ad.ID]; ok && p.AdminAddr != "" {
+					return fmt.Errorf("%w: %s already serves as a voter at %s; it now announces %s", ErrBadMember, ad.ID, v.Addr, addr)
+				}
+				if err := e.node.UpdatePeer(ad.ID, addr, AddMemberTimeout); err != nil {
+					if errors.Is(err, raft.ErrNotLeader) {
+						cid, caddr := e.Controller()
+						return &NotControllerError{LeaderID: cid, AdminAddr: caddr}
+					}
+					if errors.Is(err, raft.ErrBadChange) {
+						return fmt.Errorf("%w: %v", ErrBadMember, err)
+					}
+					return err
+				}
+				e.loggerf("voter %s corrected its configuration address to %s by self-report", ad.ID, addr)
+			}
 			return nil
 		}
-		if err := e.node.AddMember(ad.ID, HostPort(NormalizeAddr(ad.PeerAddr)), AddMemberTimeout); err != nil {
+		if err := e.node.AddMember(ad.ID, addr, AddMemberTimeout); err != nil {
+			if errors.Is(err, raft.ErrNotLeader) {
+				cid, caddr := e.Controller()
+				return &NotControllerError{LeaderID: cid, AdminAddr: caddr}
+			}
+			if errors.Is(err, raft.ErrBadChange) {
+				return fmt.Errorf("%w: %v", ErrBadMember, err)
+			}
 			return err
 		}
-		e.loggerf("adopted %s (%s) into the raft configuration", ad.ID, ad.PeerAddr)
+		e.loggerf("adopted %s (%s) into the raft configuration", ad.ID, addr)
 		return nil
 	}
 	if addr := e.leaderPeerAddr(); addr != "" {

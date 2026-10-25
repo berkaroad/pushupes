@@ -233,7 +233,7 @@ func NewNode(cfg Config, fsm FSM, tr Transport) (*Node, error) {
 	if !n.hasVoter(cfg.NodeID) {
 		if !cfg.Seed {
 			lg.close()
-			return nil, fmt.Errorf("raft: this node (%s) is not in the recorded membership; start it with -peers as a bootstrap seed and join it through the admin endpoint", cfg.NodeID)
+			return nil, fmt.Errorf("raft: this node (%s) is not in the recorded membership; start the cluster's author with -peers and this node with -join", cfg.NodeID)
 		}
 		n.logger.Infof("raft: %s is not a member yet; start the cluster and add it at runtime (id=%s)", cfg.NodeID, cfg.NodeID)
 	}
