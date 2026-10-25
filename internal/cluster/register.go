@@ -88,6 +88,10 @@ func (e *Engine) acceptRegistration(reg *Registration) error {
 		return err
 	}
 	if e.node.IsLeader() {
+		// An announcement is also recovery evidence (see noteRecovery): the
+		// peer it comes from is running, whatever the probe's cached
+		// connection says.
+		e.noteRecovery(reg)
 		// Registrations are retried on a steady heartbeat (registerRetrySteady,
 		// every 10s), so an announcement that matches what the table already
 		// holds is the common case — and committing it would only advance the
@@ -106,6 +110,40 @@ func (e *Engine) acceptRegistration(reg *Registration) error {
 		return e.sendRegistration(context.Background(), addr, reg)
 	}
 	return fmt.Errorf("register: leader unknown yet")
+}
+
+// noteRecovery treats a self-announcement from a peer the directory holds as
+// down as recovery evidence and marks it up. This event, not the liveness probe,
+// is what bounds how long a restarted node stays out of the layout: the probe
+// reads a cached connection that carries the backoff it built up during the
+// outage (up to gRPC's two-minute ceiling), so on its own it can keep calling a
+// recovered node dead for a minute.
+//
+// The announcement alone does not seat the node back in the layout: the
+// controller must also reach its peer port. A node that can talk to us while we
+// cannot reach it would be marked up here and down again three probes later,
+// flapping leadership every announcement — so the reachability dial stays the
+// authority on "can this node serve". Either way the announcement clears the
+// accumulated probe strikes and drops the stale connection, so the next probe
+// judges the node on its merits instead of on the outage.
+func (e *Engine) noteRecovery(reg *Registration) {
+	p, ok := e.TableSnapshot().Peers[reg.ID]
+	if !ok || !p.Down || p.PeerAddr == "" {
+		return
+	}
+	listening := peerPortListening(p.PeerAddr)
+	e.failMu.Lock()
+	e.failStreak[reg.ID] = 0
+	e.failMu.Unlock()
+	if !listening {
+		return
+	}
+	e.resetPeerConn(p.PeerAddr)
+	if err := e.submit(&Command{Op: OpMarkUp, NodeID: reg.ID}); err != nil {
+		e.loggerf("register: %s announced itself but the mark_up did not commit: %v (the sweep retries)", reg.ID, err)
+		return
+	}
+	e.loggerf("peer %s announced itself and answers on its peer port again; marking it up", reg.ID)
 }
 
 // registrationMatches reports whether the routing table already carries

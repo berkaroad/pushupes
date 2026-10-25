@@ -4508,6 +4508,16 @@ func (e *Engine) livenessSweep(tbl *Table) {
 			// pins the watermark of every slot it replicated and its slots
 			// stay routed to a dead leader, which a batch workload sees as
 			// seconds of 0 msg/s.
+			// One dial answers both questions the verdict needs: is anything
+			// listening there (refused = nothing is), and is our cached
+			// connection the stale half (the port accepts while the RPC fails —
+			// a ClientConn keeps the backoff it built up during the outage, up to
+			// two minutes, so a recovered peer would read as dead until that
+			// backoff elapses). Dropping the connection there makes the next
+			// round probe over a fresh one.
+			if peerPortListening(p.PeerAddr) {
+				e.resetPeerConn(p.PeerAddr)
+			}
 			refused := dialRefused(p.PeerAddr)
 			markDown := (e.failStreak[id] >= livenessFailThreshold || refused) && !p.Down
 			if markDown {
@@ -4627,6 +4637,18 @@ func (e *Engine) alive(addr string) bool {
 // connection comes back immediately; only a black-holed address (a firewall
 // dropping SYN) waits this long.
 const dialRefusedTimeout = 300 * time.Millisecond
+
+// peerPortListening reports whether something accepts connections on the peer
+// port at addr. The directory stores addresses with their scheme, so the dial
+// strips it (a raw "http://host:port" is not a dialable address).
+func peerPortListening(addr string) bool {
+	c, err := net.DialTimeout("tcp", HostPort(addr), dialRefusedTimeout)
+	if err != nil {
+		return false
+	}
+	c.Close()
+	return true
+}
 
 // dialRefused reports whether the peer's port actively REFUSES connections —
 // ECONNREFUSED, i.e. nothing is listening there. That is the unambiguous "the

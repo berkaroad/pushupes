@@ -295,6 +295,22 @@ func (pc *peerClient) client(addr string) (pushupesv1.PeerServiceClient, error) 
 	return pushupesv1.NewPeerServiceClient(conn), nil
 }
 
+// reset drops the cached connection to addr. A ClientConn carries the backoff
+// it accumulated while the peer was gone — gRPC retries a failed transport with
+// exponential backoff up to its two-minute ceiling — so the first RPC after a
+// long outage can keep failing for a minute after the peer is back. Callers that
+// have fresh evidence the peer is up again (a self-announcement, a listening
+// peer port) drop the connection here so the next RPC redials instead of
+// waiting out that backoff.
+func (pc *peerClient) reset(addr string) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	if c, ok := pc.conns[addr]; ok {
+		_ = c.Close()
+		delete(pc.conns, addr)
+	}
+}
+
 func (pc *peerClient) close() {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
@@ -322,6 +338,15 @@ func (e *Engine) peerRPC(addr string) (pushupesv1.PeerServiceClient, error) {
 		return nil, fmt.Errorf("peer plane: no address for target")
 	}
 	return e.peers.client(addr)
+}
+
+// resetPeerConn forgets the cached connection to addr (see peerClient.reset):
+// the next peer-plane call dials fresh. Used where the caller has evidence the
+// peer just came back, so a stale connection carries nothing but old backoff.
+func (e *Engine) resetPeerConn(addr string) {
+	if addr != "" {
+		e.peers.reset(addr)
+	}
 }
 
 func (e *Engine) peerMFetch(ctx context.Context, addr string, req *MFetchRequest) (*MFetchResponse, func(), error) {
