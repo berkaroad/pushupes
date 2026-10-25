@@ -70,6 +70,17 @@ const (
 	// late-joined replica catches up; a fast tick matters because the batch
 	// (not the tick) is the throughput knob the operator thinks about.
 	DefaultRebalanceInterval = 2 * time.Second
+	// DefaultStartupGrace is how long a control node's first start holds the
+	// liveness verdict for registered data nodes that have not answered a probe
+	// yet (-startup-grace). On a whole-cluster restart the layout on disk is
+	// already the intended one while the data nodes themselves are still coming
+	// up; without the wait the sweep marks every lagging node down within
+	// seconds and the failover piles its slots onto the first node that answers
+	// — measured on a staged restart: 1024 slots on one data node 3.1s in, then
+	// ~34 minutes of serial hand-backs to undo. The wait ends early as soon as
+	// every covered node has answered; a node that stays silent past it is
+	// judged exactly as before.
+	DefaultStartupGrace = 90 * time.Second
 	// rebalanceCommitsPerRound is how many layout commits one controller round
 	// executes: exactly one. A commit's fence freezes one slot's writes, so a
 	// strictly serial commit loop keeps the frozen-slot count at one and the
@@ -104,6 +115,19 @@ const (
 // the operator's "off" switch.
 func (e *Engine) SetRebalanceConfig(interval time.Duration) {
 	e.rebalanceInterval = interval
+}
+
+// rebalanceMayRun reports whether a controller round may start a hand-over now.
+// The start-up grace window keeps the round off the layout while the data nodes
+// are still coming up: the layout has not moved (liveness verdicts are held for
+// those nodes), and staying out of that window means no commit fence lands
+// before the cluster is whole. A drain is the operator asking for motion, so it
+// outranks the wait.
+func (e *Engine) rebalanceMayRun(tbl *Table, draining bool) bool {
+	if draining {
+		return true
+	}
+	return len(e.startupAwaiting(tbl, time.Now())) == 0
 }
 
 func (e *Engine) rebalanceEnabled() bool {
@@ -173,7 +197,14 @@ func (e *Engine) RunRebalancer(ctx context.Context) {
 		if draining {
 			limit = drainCommitsPerRound // a scale-down in progress sets the pace
 		}
-		e.rebalanceRound(ctx, limit)
+		// Start-up grace: while the window is open, no hand-over starts. The
+		// layout has not moved yet (the verdicts that would move it are held —
+		// see Engine.startupAwaiting), so the round has nothing to do anyway;
+		// holding it keeps the window free of commit fences. A drain is an
+		// operator asking for motion and outranks the wait.
+		if e.rebalanceMayRun(e.TableSnapshot(), draining) {
+			e.rebalanceRound(ctx, limit)
+		}
 		e.finishPendingRemovals(ctx)
 		// Surplus-seat reclaim: the other half of a re-layout. A re-layout only
 		// ADDS seats (Table.applyReplanSlots), so a set left oversized by a

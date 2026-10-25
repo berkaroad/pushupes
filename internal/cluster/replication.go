@@ -218,6 +218,31 @@ type Engine struct {
 	failMu     sync.Mutex
 	failStreak map[string]int
 
+	// Start-up grace (see SetStartupGrace, startupAwaiting): on the control
+	// node's first start, the layout is already the one the previous run left
+	// on disk while the data nodes themselves are still coming up. Rendering
+	// a liveness verdict in that window marks every lagging data node down
+	// within seconds and the failover piles its slots onto whoever answered
+	// first — measured on a staged restart: 1024 slots on one data node 3.1s
+	// in, then ~34 minutes of serial hand-backs. The window therefore holds
+	// the verdict for the data nodes the directory knew at start-up until
+	// they have answered once (or the grace runs out).
+	//
+	// startedAt/startupGrace are fixed at construction and wiring; startupSeen
+	// (peers that answered a probe since this process started), gracePool (the
+	// registered data nodes the window covers) and graceLogged (one log line
+	// per held peer) are guarded by failMu.
+	startedAt    time.Time
+	startupGrace time.Duration
+	startupSeen  map[string]bool
+	gracePool    map[string]bool
+	graceLogged  map[string]bool
+	// graceHeld records that the window actually held at least one verdict (so
+	// the end of the window is worth a log line) and graceEnded that it has
+	// been reported once. Both guarded by failMu.
+	graceHeld  bool
+	graceEnded bool
+
 	// storageMu guards gauge, the cluster storage sample every node refreshes in
 	// the background (any node serves /admin/cluster/status — runStorageSampler).
 	// storageKick schedules a refresh; a status read finding the gauge stale
@@ -617,6 +642,14 @@ func NewEngine(node consensus, store *storage.Store, self string, logger *slog.L
 		hwGates:     make([]hwGate, store.SlotCount),
 		fetchSettle: DefaultFetchSettle,
 		traceAgg:    traceAgg,
+		// start-up grace: the window opens when this process's engine is built
+		// (a control node's first start is what it protects; a node that keeps
+		// running never re-opens it, so a leadership change does not reset the
+		// wait). Timed from here, not from the moment leadership was won.
+		startedAt:    time.Now(),
+		startupGrace: DefaultStartupGrace,
+		startupSeen:  map[string]bool{},
+		graceLogged:  map[string]bool{},
 	}
 	e.orderPool.New = func() any { return make([]int, 0, 64) }
 	e.parkedPool.New = func() any { return make([]parkedEntry, 0, 64) }
@@ -4411,55 +4444,9 @@ func (e *Engine) RunController(ctx context.Context) {
 				e.submit(&Command{Op: OpReplanSlots})
 			}
 		}
-		// 3) liveness sweep: probe peers over the peer plane; a peer that
-		// misses several consecutive probes is MARKED DOWN (leadership
-		// moves to live replicas; the directory entry, its addresses and
-		// its replica-set membership survive). A booting node is never
-		// evicted (threshold), and a node that answers probes again is
-		// marked back up — its copy is still a replica, so the ordinary
-		// fetch loop catches it up and the rebalancer hands its ring slots
-		// back. Commands are submitted only on a REAL state change: the
-		// steady-state table of a dead node is one mark_down, not a Raft
-		// entry per round.
-		for id, p := range tbl.Peers {
-			if id == e.self || p.PeerAddr == "" {
-				// peers without a peer address are not probed: membership
-				// is owned by the raft configuration, not by liveness.
-				continue
-			}
-			e.failMu.Lock()
-			if !e.alive(p.PeerAddr) {
-				e.failStreak[id]++
-				// A probe that fails because NOTHING IS LISTENING is not a slow
-				// node: the process is gone, and the deeper question the strike
-				// threshold exists for (is it slow or is it dead?) is already
-				// answered. Mark it down on this round instead of three — every
-				// round it stays in the table as an up member, its frozen LEO
-				// pins the watermark of every slot it replicated and its slots
-				// stay routed to a dead leader, which a batch workload sees as
-				// seconds of 0 msg/s.
-				refused := dialRefused(p.PeerAddr)
-				markDown := (e.failStreak[id] >= livenessFailThreshold || refused) && !p.Down
-				if markDown {
-					e.loggerf("peer %s unreachable (%d consecutive probes, refused connection: %t), marking it down",
-						id, e.failStreak[id], refused)
-				}
-				e.failMu.Unlock()
-				if markDown {
-					// The pick asks the replicas for their LEOs (peer round
-					// trips), so it runs WITHOUT the liveness lock: the sweep
-					// must not stall behind one failover.
-					e.failoverPeer(id)
-				}
-				continue
-			}
-			e.failStreak[id] = 0
-			if p.Down {
-				e.loggerf("peer %s answers probes again, marking it up", id)
-				e.submit(&Command{Op: OpMarkUp, NodeID: id})
-			}
-			e.failMu.Unlock()
-		}
+		// 3) liveness sweep: probe peers over the peer plane and render the
+		// verdict (see livenessSweep).
+		e.livenessSweep(tbl)
 		// 4) abandoned migrations: a controller that dies mid-hand-over leaves
 		// the slot's replicated state in migrating_out with nobody to clear
 		// it. Nothing else revisits a non-stable slot (replan_slots skips it,
@@ -4467,6 +4454,166 @@ func (e *Engine) RunController(ctx context.Context) {
 		// good. Return the ones this process is not driving to stable.
 		e.reconcileOrphanMigrations()
 	}
+}
+
+// livenessSweep renders one round of liveness verdicts: probe every peer over
+// the peer plane; a peer that misses several consecutive probes is MARKED DOWN
+// (leadership moves to live replicas; the directory entry, its addresses and
+// its replica-set membership survive). A node that answers probes again is
+// marked back up — its copy is still a replica, so the ordinary fetch loop
+// catches it up and the rebalancer hands its ring slots back. Commands are
+// submitted only on a REAL state change: the steady-state table of a dead node
+// is one mark_down, not a Raft entry per round.
+//
+// A peer the start-up grace window is still waiting for gets no verdict at all:
+// on a control node's first start the directory already carries the previous
+// run's layout, so an unanswered probe means "the process is still coming up"
+// for as long as the grace runs, and marking it down there is what concentrated
+// every slot on one data node (see Engine.startupAwaiting).
+func (e *Engine) livenessSweep(tbl *Table) {
+	now := time.Now()
+	awaiting, open := e.graceWindowState(tbl, now)
+	held := map[string]bool{}
+	if open {
+		held = awaiting
+		if len(held) > 0 {
+			e.failMu.Lock()
+			e.graceHeld = true
+			e.failMu.Unlock()
+		}
+	}
+	for id, p := range tbl.Peers {
+		if id == e.self || p.PeerAddr == "" {
+			// peers without a peer address are not probed: membership
+			// is owned by the raft configuration, not by liveness.
+			continue
+		}
+		e.failMu.Lock()
+		if !e.alive(p.PeerAddr) {
+			if held[id] {
+				if !e.graceLogged[id] {
+					e.graceLogged[id] = true
+					e.loggerf("start-up grace: %s is registered but has not answered a probe yet; holding its liveness verdict for up to %s (a node that stopped and one that never started look the same this early)",
+						id, e.startupGrace)
+				}
+				e.failMu.Unlock()
+				continue
+			}
+			e.failStreak[id]++
+			// A probe that fails because NOTHING IS LISTENING is not a slow
+			// node: the process is gone, and the deeper question the strike
+			// threshold exists for (is it slow or is it dead?) is already
+			// answered. Mark it down on this round instead of three — every
+			// round it stays in the table as an up member, its frozen LEO
+			// pins the watermark of every slot it replicated and its slots
+			// stay routed to a dead leader, which a batch workload sees as
+			// seconds of 0 msg/s.
+			refused := dialRefused(p.PeerAddr)
+			markDown := (e.failStreak[id] >= livenessFailThreshold || refused) && !p.Down
+			if markDown {
+				e.loggerf("peer %s unreachable (%d consecutive probes, refused connection: %t), marking it down",
+					id, e.failStreak[id], refused)
+			}
+			e.failMu.Unlock()
+			if markDown {
+				// The pick asks the replicas for their LEOs (peer round
+				// trips), so it runs WITHOUT the liveness lock: the sweep
+				// must not stall behind one failover.
+				e.failoverPeer(id)
+			}
+			continue
+		}
+		e.failStreak[id] = 0
+		// This peer has started: from here on its liveness verdict is the
+		// ordinary one — the grace covers a node that never answered, never a
+		// node that answered and then stopped.
+		e.startupSeen[id] = true
+		if p.Down {
+			e.loggerf("peer %s answers probes again, marking it up", id)
+			e.submit(&Command{Op: OpMarkUp, NodeID: id})
+		}
+		e.failMu.Unlock()
+	}
+	// One summary line when the window ends, so an operator reading the log
+	// knows why verdicts resumed: every covered data node answered, or the
+	// grace ran out with some still silent.
+	remaining, stillOpen := e.graceWindowState(tbl, time.Now())
+	if !stillOpen || len(remaining) == 0 {
+		e.noteGraceEnded(len(remaining))
+	}
+}
+
+// noteGraceEnded reports the end of the start-up grace window exactly once, and
+// only if it held a verdict at some point.
+func (e *Engine) noteGraceEnded(remaining int) {
+	e.failMu.Lock()
+	defer e.failMu.Unlock()
+	if e.graceEnded || !e.graceHeld {
+		return
+	}
+	e.graceEnded = true
+	if remaining > 0 {
+		e.loggerf("start-up grace (%s) is over with %d data node(s) still not answering; liveness verdicts resume",
+			e.startupGrace, remaining)
+		return
+	}
+	e.loggerf("start-up grace: every registered data node has answered; liveness verdicts resume")
+}
+
+// SetStartupGrace wires the -startup-grace knob: how long a control node's
+// first start holds the liveness verdict for registered data nodes that have
+// not answered yet. 0 disables the wait (verdicts render from the first round,
+// as before the knob existed).
+func (e *Engine) SetStartupGrace(d time.Duration) {
+	e.startupGrace = d
+}
+
+// startupAwaiting returns the data nodes the start-up grace window is still
+// waiting for, keyed by node id, or nil when there is nothing to wait for: the
+// knob is off, the window is over, or every node it covers has started.
+func (e *Engine) startupAwaiting(tbl *Table, now time.Time) map[string]bool {
+	awaiting, open := e.graceWindowState(tbl, now)
+	if !open {
+		return nil
+	}
+	return awaiting
+}
+
+// graceWindowState reports the covered data nodes that have not answered yet
+// and whether the window is still running. The covered set is the pool the
+// directory holds at the control node's first sweep — the data nodes of the
+// layout on disk. It is captured once, so a node that joins later is judged like
+// any other runtime change, which is also why this window exists for the control
+// node's first start and nothing else.
+func (e *Engine) graceWindowState(tbl *Table, now time.Time) (map[string]bool, bool) {
+	if e.startupGrace <= 0 {
+		return nil, false
+	}
+	open := now.Sub(e.startedAt) < e.startupGrace
+	e.failMu.Lock()
+	defer e.failMu.Unlock()
+	if e.gracePool == nil {
+		pool := map[string]bool{}
+		for id, p := range tbl.Peers {
+			if id != e.self && p.Hosts() && !p.Down {
+				pool[id] = true
+			}
+		}
+		if len(pool) == 0 {
+			return nil, open // the replicated directory is not loaded yet: capture on a later round
+		}
+		e.gracePool = pool
+	}
+	awaiting := map[string]bool{}
+	for id := range e.gracePool {
+		if !e.startupSeen[id] {
+			awaiting[id] = true
+		}
+	}
+	if len(awaiting) == 0 {
+		return nil, open
+	}
+	return awaiting, open
 }
 
 // alive probes a peer over the peer plane (PeerService.Ping).
