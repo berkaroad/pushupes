@@ -90,6 +90,10 @@ func (nopLogger) Errorf(string, ...any) {}
 const (
 	DefaultHeartbeatTimeout = 100 * time.Millisecond
 	DefaultElectionTimeout  = 500 * time.Millisecond
+	// DefaultFlushInterval is the consensus WAL's group-commit window: an
+	// append opens it, everything that arrives before it expires shares one
+	// fsync. It bounds how long a committed entry can sit unsynced.
+	DefaultFlushInterval = 100 * time.Millisecond
 	// minElectionPerHeartbeat is the smallest ratio the two knobs may have:
 	// below it one late heartbeat starts an election, which is the very churn
 	// the caller raising these values is trying to stop.
@@ -172,7 +176,7 @@ func (c *Config) withDefaults() error {
 			c.ElectionTimeout, minElectionPerHeartbeat, c.HeartbeatTimeout)
 	}
 	if c.FlushInterval <= 0 {
-		c.FlushInterval = 200 * time.Microsecond
+		c.FlushInterval = DefaultFlushInterval
 	}
 	if c.SegmentBytes <= 0 {
 		c.SegmentBytes = 64 << 20

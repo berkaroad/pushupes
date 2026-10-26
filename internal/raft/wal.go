@@ -91,7 +91,7 @@ func (o *WALOptions) withDefaults() {
 		o.SegmentBytes = 64 << 20
 	}
 	if o.FlushInterval <= 0 {
-		o.FlushInterval = 200 * time.Microsecond
+		o.FlushInterval = DefaultFlushInterval
 	}
 }
 
@@ -437,9 +437,9 @@ func (w *WAL) Flush() error {
 // it with a single fsync over everything buffered meanwhile, and once pending
 // is empty the loop parks on the dirty signal holding no timer at all. An
 // idle WAL therefore never wakes the scheduler — a standing ticker would
-// deliver one netpoll-breaking timer every FlushInterval (5000/s at the
-// default 200µs) whether or not anything was appended, and at rest that alone
-// was most of the process's CPU.
+// deliver one netpoll-breaking timer every FlushInterval (5000/s at a 200µs
+// window) whether or not anything was appended, and at rest that alone was
+// most of the process's CPU.
 func (w *WAL) flushLoop() {
 	defer close(w.doneCh)
 	var window *time.Timer

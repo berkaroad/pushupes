@@ -41,7 +41,7 @@ var ErrNotLeader = errors.New("not the cluster leader")
 
 // Consensus WAL defaults: the group-commit window and the segment size.
 const (
-	DefaultRaftFlushInterval = 200 * time.Microsecond
+	DefaultRaftFlushInterval = 100 * time.Millisecond
 	DefaultRaftSegmentBytes  = 64 << 20
 )
 

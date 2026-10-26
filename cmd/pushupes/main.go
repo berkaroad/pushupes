@@ -74,7 +74,7 @@ func main() {
 			"replica policy tier for a NEW cluster: low (1 copy per slot), medium (2, the default), high (3 copies per slot), or a positive number used as the factor directly; applied on the table's first plan only — an existing cluster keeps the policy the admin endpoint last set (env PUSHUPES_REPLICA_POLICY)")
 		segmentB = byteSize(envByteSizeOr("PUSHUPES_SEGMENT_BYTES", storage.DefaultSegmentBytes))
 		flushN   = flag.Int64("flush-messages", envInt64Or("PUSHUPES_FLUSH_MESSAGES", 1000), "fsync every N records (0 disables) (env PUSHUPES_FLUSH_MESSAGES)")
-		flushD   = flag.Duration("flush-interval", envDurationOr("PUSHUPES_FLUSH_INTERVAL", 5*time.Second), "fsync every interval (0 disables) (env PUSHUPES_FLUSH_INTERVAL)")
+		flushD   = flag.Duration("flush-interval", envDurationOr("PUSHUPES_FLUSH_INTERVAL", storage.DefaultFlushInterval), "fsync every interval (0 disables) (env PUSHUPES_FLUSH_INTERVAL)")
 		flushPar = flag.Int("flush-parallelism", envIntOr("PUSHUPES_FLUSH_PARALLELISM", 1), "segment fsyncs allowed in flight at once, the flush parallelism (1 = one at a time) (env PUSHUPES_FLUSH_PARALLELISM)")
 		// How long a woken fetch round waits for the rest of the write burst
 		// before answering. Every acknowledged append pays it once (the round

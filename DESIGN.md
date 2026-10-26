@@ -982,7 +982,7 @@ replica_policy  = medium       # 副本策略：low=每槽 1 份 / medium=2 份�
                               # 策略存在复制的槽表里，之后的修改走 POST /admin/cluster/replica-policy
 replica_count   = 2                # = ReplicaCountForPolicy(策略, 数据节点数)，控制器每轮重推
 election_mode   = leader       # preferred leader 自动回切
-flush.policy    = 每 1000 条或 5s（可关闭为纯页缓存）
+flush.policy    = 每 1000 条或 100ms（可关闭为纯页缓存）
                               # -flush-messages / PUSHUPES_FLUSH_MESSAGES（每 N 条）、
                               # -flush-interval / PUSHUPES_FLUSH_INTERVAL（每周期），0 关闭
 fetch-settle    = 200µs（fetch 轮被数据唤醒后的合并窗口：一轮覆盖整批写入涉及的多个槽；
@@ -1440,7 +1440,7 @@ len u32 | type u8 | crc32c u32 | payload[len]      # crc32c 覆盖 type+len+payl
 
 ```
 Append(typ, payload) → 编码入 buffer，返回 LSN（不落盘）
-flusher goroutine    → 等 dirty 信号或 200µs tick → write + fdatasync → 唤醒
+flusher goroutine    → 等 dirty 信号或 100ms tick → write + fdatasync → 唤醒
                        LSN ≤ durable 的等待者，并回调 OnDurable(durableLSN)
 Wait(lsn)            → 阻塞到自己的 LSN 落盘
 ```
@@ -1528,7 +1528,7 @@ Wait(lsn)            → 阻塞到自己的 LSN 落盘
 | `internal/cluster/peer_mux.go` | 实现自研 `raft.Transport`；`Addr() string`；首字节分流 |
 | `internal/cluster/register.go` | 用 `LeaderID()` 读当前 leader |
 | `internal/cluster/migration.go` | 读 `Stats` key（连字符/下划线两种写法兼容） |
-| `cmd/pushupes/main.go` | `-raft-flush-interval`(200µs) / `-raft-segment-bytes`(64MiB) |
+| `cmd/pushupes/main.go` | `-raft-flush-interval`(100ms) / `-raft-segment-bytes`(64MiB) |
 | `scripts/cluster.sh` | 启动传 `-peers`（`-bootstrap` 为 no-op 兼容位） |
 
 **共识层不碰**：`internal/storage/*`、`internal/data/*`、`internal/grpcapi/*`、

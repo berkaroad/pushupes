@@ -107,6 +107,9 @@ func startRaftOn(t *testing.T, dir string, eng *Engine, threshold uint64, within
 		SnapshotInterval:  time.Hour, // the threshold drives the snapshot here
 		HeartbeatTimeout:  40 * time.Millisecond,
 		ElectionTimeout:   120 * time.Millisecond,
+		// Test-scale group commit; the shipped 100ms window is a production
+		// durability budget (see cluster.DefaultRaftFlushInterval).
+		FlushInterval: 200 * time.Microsecond,
 	}, &FSM{applier: eng}, mux)
 	if err != nil {
 		// The reported failure surfaces exactly here.

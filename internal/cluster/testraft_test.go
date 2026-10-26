@@ -108,6 +108,9 @@ func newTestRaftCluster(t *testing.T, ids []string, appliers map[string]Applier)
 			ApplyTimeout:     5 * time.Second,
 			HeartbeatTimeout: 40 * time.Millisecond,
 			ElectionTimeout:  120 * time.Millisecond,
+			// Pin the group-commit window: the shipped 100ms is a durability
+			// budget for production, and every commit round here would pay it.
+			FlushInterval: 200 * time.Microsecond,
 		}, fsm, c.muxes[id])
 		if err != nil {
 			t.Fatalf("raft node %s: %v", id, err)

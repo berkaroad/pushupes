@@ -220,7 +220,7 @@ medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(�
 | `-bootstrap` | — | false | 由本节点撰写集群的初始配置：配合 `-peers` 用于点名非最小 id 的作者；单独使用（无 `-peers`）时撰写只有自己的单 voter 配置，后续 voter 用 `-join` 加入。learner 不能撰写，与 `-join` 同用启动即报错 |
 | `-replica-policy` | `PUSHUPES_REPLICA_POLICY` | medium | 副本策略档位：`low`=每槽 1 份、`medium`=2 份（默认）、`high`=每槽 3 份（容忍失去 2 个数据节点），或**正整数直接指定副本因子**。**只用于新集群的初始值**：策略存放在 Raft 复制的槽表里，之后只能经 `POST /admin/cluster/replica-policy` 修改，重启不会重刷；副本因子 = MIN(数据节点数（布局池 `HostingIDs()`）, 策略要求份数)。`GET /admin/cluster/status` 的 `replica_policy` / `replica_factor` 读回当前值；非法值启动即报错 |
 | `-flush-messages` | `PUSHUPES_FLUSH_MESSAGES` | 1000 | 每 N 条 fsync（0 关闭） |
-| `-flush-interval` | `PUSHUPES_FLUSH_INTERVAL` | 5s | 每周期 fsync（0 关闭） |
+| `-flush-interval` | `PUSHUPES_FLUSH_INTERVAL` | 100ms | 每周期 fsync（0 关闭） |
 | `-flush-parallelism` | `PUSHUPES_FLUSH_PARALLELISM` | 1 | 全存储同时在飞的段 fsync 上限（1=一次刷一个，即历史单刷盘链路）：一个许可信号量给所有 fsync 封顶，刷盘队列由持久 worker 池执行；显式 `Flush()`/`Close` 的 fsync 也在调用方 goroutine 上取同一许可、同受上限约束。刷盘轮按预算切片（每轮至多 8 个单元或 200ms）。<1 启动即报错；生效值可从 `/admin/stats` 的 `parallelism` 字段读回（机制见 DESIGN §3） |
 | `-segment-bytes` | `PUSHUPES_SEGMENT_BYTES` | 64MiB | WAL 段滚动大小：64MiB 整数倍，≤2GiB；可写字节数或带单位（`64MiB`/`1GiB`），env 同样接受带单位形式 |
 | `-fetch-settle` | `PUSHUPES_FETCH_SETTLE` | 200µs | fetch 轮被数据唤醒后的合并窗口：一轮覆盖整批写入涉及的多个槽；每次 ack 都要付它一次，换的是轮次与上报次数；0=首个槽有数据就答（轮次更多） |
@@ -230,7 +230,7 @@ medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(�
 | `-grpc-max-msg-size` | `PUSHUPES_GRPC_MAX_MSG_SIZE` | 4MiB | client 面 gRPC 消息上限（recv/send 同值）；`BatchAppend` 单批要装进它，可写 `16MiB` 等带单位形式（env 同样接受）；≤0 启动即报错 |
 | `-raft-heartbeat-timeout` | `PUSHUPES_RAFT_HEARTBEAT_TIMEOUT` | 100ms | 共识心跳间隔。leader 的心跳没按时到达就会被投票换掉，所以宿主机可能拖住共识事件循环时要与 `-raft-election-timeout` 一起放大 |
 | `-raft-election-timeout` | `PUSHUPES_RAFT_ELECTION_TIMEOUT` | 500ms | follower 多久收不到心跳就发起选举。必须 ≥ 2× 心跳，否则一次迟到的心跳就会掀掉 leader（启动即报错）；与心跳是一对比例，一起放大而不是只收窄其中一个 |
-| `-raft-flush-interval` | `PUSHUPES_RAFT_FLUSH_INTERVAL` | 200µs | 共识 WAL 组提交窗口：窗口内到达的追加共用一次 fsync |
+| `-raft-flush-interval` | `PUSHUPES_RAFT_FLUSH_INTERVAL` | 100ms | 共识 WAL 组提交窗口：窗口内到达的追加共用一次 fsync |
 | `-raft-segment-bytes` | `PUSHUPES_RAFT_SEGMENT_BYTES` | 64MiB | 共识 WAL 段滚动大小；可写字节数或带单位（`64MiB`），env 同样接受 |
 
 ### 客户端接入

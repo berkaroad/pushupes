@@ -46,9 +46,14 @@ type FlushPolicy struct {
 	Parallelism int
 }
 
-// DefaultFlushPolicy fsyncs every 1000 records or every 5 seconds.
+// DefaultFlushInterval is the shipped timed-flush cadence: a slot with pending
+// records fsyncs at least this often. It bounds how much of the WAL a crash can
+// lose, at the price of one fsync per open slot per interval.
+const DefaultFlushInterval = 100 * time.Millisecond
+
+// DefaultFlushPolicy fsyncs every 1000 records or every DefaultFlushInterval.
 func DefaultFlushPolicy() FlushPolicy {
-	return FlushPolicy{IntervalMessages: 1000, Interval: 5 * time.Second}
+	return FlushPolicy{IntervalMessages: 1000, Interval: DefaultFlushInterval}
 }
 
 // AppendOutcome is the result of a slot-level append, carrying the business
