@@ -69,12 +69,13 @@ message AppendResponse {
     STATUS_FAIL = 3;
   }
   Status status = 1;
-  uint32 err_id = 2; // wire error table: 1001 conflict, 1003 MOVED, 1004 ASK...
+  uint32 err_id = 2; // wire error table (pkg/client/errs.go): 1001 conflict, 1003 MOVED,
+  // 1004 ASK, 1007 ack timeout, 1008 replica catching up, 1009 no data plane...
   string message = 3;
   uint32 current_version = 4; // set on 1001 for client self-heal
   uint64 seq = 5;
   int32 slot = 6; // routing slot (authoritative even on redirects)
-  string node = 7; // redirect target "host:port" for MOVED/ASK/NOT_LEADER
+  string node = 7; // redirect target "host:port" for MOVED (1003) / ASK (1004)
   Record record = 8; // set on STATUS_EXISTS only (the stored duplicate)
 }
 

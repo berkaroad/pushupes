@@ -79,9 +79,9 @@ Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分
 
 - 每个节点独立的写入令牌桶：admin HTTP（`POST /admin/flow-control`）就地配置，
   只限该节点作为 leader 的写入，稳态上限 = `tokens / period`；桶空写入报
-  `fail/1006`，副本复制流量不占预算。
+  `fail/1005`，副本复制流量不占预算。
 - 运维应急面：不落盘、不进集群共识，重启即恢复不限流，`DELETE` 立即解除。
-- 客户端库把 1006 吸收为回压自动退避重发，调用方无感；控制台节点卡片显示
+- 客户端库把 1005 吸收为回压自动退避重发，调用方无感；控制台节点卡片显示
   流控配置，触发限流时闪烁提醒，并可直接设置。
 
 ### 管理控制台（frontend/）
@@ -235,34 +235,41 @@ medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(�
 
 ### 客户端接入
 
-事件读写只走 **gRPC client 面**（proto 契约 `proto/pushupes/v1/events.proto`）：
+事件读写只走 **gRPC client 面**（proto 契约 `proto/pushupes/v1/events.proto`）；admin 面只做集群运维，不承载数据读写。Go 调用方直接用 `pkg/client`：
 
-- `EventService/BatchAppend`：事件写入的唯一入口，单次与批量写入都走它——
-  一条 `AppendRequest` 就是单条写，多条就是批量。服务端逐条校验幂等与版本
-  （见 DESIGN.md），按请求同序返回逐条结果（回显
-  `aggregate_id`），槽不在本节点时以响应字段返回重定向：`err_id=1003/1004`
-  （MOVED/ASK）+ `node`（槽 leader 的 client 地址），客户端据此重连。批内
-  `aggregate_id` 必须各不相同，重复的那组整组 `fail/1002` 且不执行。服务端
-  同槽串行、异槽并行（并发上限为进程级 worker 池，`16 × runtime.GOMAXPROCS(0)`）。单批
-  必须装进 client 面 gRPC 消息上限（`-grpc-max-msg-size`，默认 4MiB）。
-- `EventService/ReadStream`：按聚合读取事件流（≤HW 语义）。
-- `EventService/ReadTails`：一次查询多个聚合的最新版本（resume 扫描用）。
-  服务端逐条应答：本地可服务的槽给版本，其余给该条自己的 1003 + `node`；
-  `pkg/client` 按本地路由表分组扇出、逐条修补重发。
-- `EventService/ReadVersionByTime`：按聚合 + 时间取「时间点及之前」的最大
-  版本锚点，再用 ReadStream 回放。
-- `EventService/ReadByCommand`：按 `command_id` 查询已写入的记录。
-  以上读接口与写一样走 MOVED 重定向（应答带 `err_id`/`slot`/`node`），
-  非本地槽不再由服务端代理转发；`pkg/client` 对调用方透明地跟随。
+```go
+cl, err := client.New(
+	[]string{"http://127.0.0.1:8591", "http://127.0.0.1:8592", "http://127.0.0.1:8593"},
+	&client.Config{RouteRefresh: 30 * time.Second}, // 槽→leader 路由表刷新周期；0 = 只在启动取一次
+)
+defer cl.Close()
 
-错误 ID：
-- `1001` 版本冲突（附 current_version）
-- `1002` 参数非法
-- `1003` MOVED
-- `1004` ASK
-- `1005` 本节点非 controller（admin 写命令专用，响应附 `controller` 与`controller_admin_addr`）
-- `1006` 本节点流控拒绝（见「节点级流控」；经 `pkg/client` 写入时该码被库吸收为回压，调用方看不到它）
-- `1007` 本地副本来源未证实（owner 围栏拦下该槽：leader 拒写、本地读答空，直到运维经 `/admin/slots/pending/adopt` 采纳、或删除槽目录，见 DESIGN §3.1）。
+resps, err := cl.BatchAppend(ctx, reqs)                     // 写：一条 AppendRequest 即单条写
+tails, err := cl.ReadTails(ctx, []string{"agg-1", "agg-2"}) // 读：一次取多个聚合的最新版本
+resp, err := cl.ReadStream(ctx, "agg-1", fromVersion, 100)  // 读：按版本回放事件流
+```
+
+库替调用方做了三件事：启动时调 `EventService/PrefetchRoutes` 取槽→leader 路由表并按 `RouteRefresh` 周期整体刷新、MOVED/ASK 就地修补本地行、每个节点一条复用长连接（写与读都按路由分组扇出，重定向对调用方透明）。另外三个旋钮：`Attempts`（一次调用的最大发送轮数，默认 3）、`CallTimeout`（单次 RPC 超时，默认 30s）、`FlowBackoff`（收到 1005 后的回压停顿，默认 100ms）。
+
+**写：`EventService/BatchAppend`** —— 事件写入的唯一入口，单条写与批量写都是它：一条 `AppendRequest` 即单条，多条即批量。服务端逐条校验幂等与版本（见 DESIGN.md），按请求同序返回逐条结果（回显 `aggregate_id`）；槽不在本节点时不代理转发，而是用响应字段回答重定向（`err_id=1003/1004` + `node` 给出槽 leader 的 client 地址），由库重连重发。批内 `aggregate_id` 必须各不相同，重复的那组整组按 1002 拒绝且不执行。同槽串行、异槽并行，并发上限为进程级 worker 池 `16 × runtime.GOMAXPROCS(0)`。单批必须装进 client 面 gRPC 消息上限（`-grpc-max-msg-size`，默认 4MiB）。
+
+**读**——四个接口，和写一样走 MOVED 重定向（应答带 `err_id`/`slot`/`node`），`pkg/client` 对调用方透明跟随：
+
+- `ReadStream`：按聚合回放事件流（≤HW 语义）。
+- `ReadTails`：一次查询多个聚合的最新版本（resume 扫描用）；本地不可服务的条目各自带 1003 + `node`，库按路由分组扇出、逐条修补重发。
+- `ReadVersionByTime`：取「该时间点及之前」的最大版本锚点，再用 `ReadStream` 回放。
+- `ReadByCommand`：按 `command_id` 查已写入的记录（幂等排查用）。
+
+**调用方需要处理的错误 ID**（其余都被库消化掉了）：
+
+- `1001` 版本冲突（附 `current_version`）：按应答给出的版本重发即可。
+- `1002` 参数非法：批内 `aggregate_id` 重复、字段越界等，整组不执行。
+- `1003` MOVED / `1004` ASK：`pkg/client` 自动跟随；用库时看不到这两个码。
+- `1005` 节点级流控拒绝（见「节点级流控」）：用库时被吸收为回压，调用方看不到；直连 gRPC 才需要自己退避。
+- `1006` 本地副本来源未证实：owner 围栏拦下该槽——leader 拒写、本地读答空。数据没丢，但 client 面没有可自愈的动作，要运维确认该副本属于当前世代后采纳、或删掉该槽目录才解除（命令在 admin 面，见 DESIGN §3.1）。
+- `1007` 高水位确认超时：记录**已落 leader WAL**，只是确认没等到。带同一 `command_id` 重试会命中 exists——重试即确认，不是重写。
+- `1008` 本节点是该槽 leader 但暂不可服务（无本地副本，或副本是空壳而别处有历史）：**什么都没写**，稍后重试即可。
+- `1009` 纯控制面节点：集群还没有数据面成员持有该槽（布局未规划）。什么都没写，重试无用，需要先规划布局（admin 面的运维动作）。
 
 仓库自带工具：
 
@@ -282,13 +289,13 @@ go run ./cmd/bench -nodes http://127.0.0.1:8591,http://127.0.0.1:8592,http://127
 go run ./cmd/batchsmoke -nodes http://127.0.0.1:8591,http://127.0.0.1:8592,http://127.0.0.1:8593
 
 # 流控回压冒烟（经 pkg/client：给 -admin 节点设 N tokens/period，并发写断言
-# 调用方零 1006 零失败——节点拒绝全部被库的回压吸收）
+# 调用方零 1005 零失败——节点拒绝全部被库的回压吸收）
 go run ./cmd/flowcheck -seed http://127.0.0.1:8591 -admin 127.0.0.1:8091 -tokens 2 -period 1s
 
 # 单槽灌数据（容量/恢复调试）
 go run ./cmd/seed -slot 7 -mib 512
 
-# 副本一致性体检：逐槽比较 leader 与各副本的聚合摘要（读 /admin/slots/N/describe）。
+# 副本一致性体检：逐槽比较 leader 与各副本的聚合摘要（经各节点 admin 面读槽位描述）。
 # 报出「LEO 相同但目录偏短」的发散副本 —— 这类副本在环上不可见（leader 回切器只看
 # 偏离环的槽），但读不到自己尾部，且会让该槽永远回切不回去。有发散时退出码 1。
 go run ./cmd/slotcheck -admins http://127.0.0.1:8091,http://127.0.0.1:8092,http://127.0.0.1:8093

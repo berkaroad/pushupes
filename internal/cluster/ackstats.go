@@ -166,9 +166,15 @@ type ackDiag struct {
 	// fail split by reason: "some appends failed" is only actionable once the
 	// count says whether that was the watermark deadline (a replication
 	// problem) or a business rule (the client's own request).
-	failTimeout atomic.Uint64 // the watermark deadline (1005, record still in the WAL)
+	failTimeout atomic.Uint64 // the watermark deadline (1007, record still in the WAL)
 	failVersion atomic.Uint64 // version must be +1 (1001)
 	failOther   atomic.Uint64 // anything else
+
+	// The two refusals a split error code now makes visible: a leader that
+	// cannot serve the slot yet (1008) and a control-plane-only node (1009).
+	// Both mean "nothing was written", unlike failTimeout.
+	failCatchingUp  atomic.Uint64 // 1008: leads the slot, holds no usable copy yet
+	failNoDataPlane atomic.Uint64 // 1009: control-plane-only member; layout unplanned
 
 	fence ackHist // migration write fence + route decision
 	land  ackHist // local WAL landing (business rules + write())
@@ -177,7 +183,7 @@ type ackDiag struct {
 	lag   hpHist  // watermark lag in records when the wait ended
 
 	waitersNow atomic.Int64  // calls parked in waitForHW right now
-	stalls     atomic.Uint64 // waits that hit the deadline (fail/1005)
+	stalls     atomic.Uint64 // waits that hit the deadline (fail/1007)
 	slots      []slotAck
 
 	// The replication-side terms behind hw_wait, so its residual can be
@@ -238,9 +244,11 @@ type AckView struct {
 	Fail      uint64 `json:"fail"`
 	Redirects uint64 `json:"redirects"`
 
-	FailTimeout uint64 `json:"fail_hw_timeout"`
-	FailVersion uint64 `json:"fail_version_conflict"`
-	FailOther   uint64 `json:"fail_other"`
+	FailTimeout     uint64 `json:"fail_hw_timeout"`
+	FailVersion     uint64 `json:"fail_version_conflict"`
+	FailCatchingUp  uint64 `json:"fail_replica_catching_up"`
+	FailNoDataPlane uint64 `json:"fail_no_data_plane"`
+	FailOther       uint64 `json:"fail_other"`
 
 	FenceRoute AckTiming `json:"fence_route"`
 	WalLand    AckTiming `json:"wal_land"`
@@ -282,9 +290,11 @@ func (e *Engine) AckStatsTop(worstN int) AckView {
 		Fail:      d.fail.Load(),
 		Redirects: d.redirects.Load(),
 
-		FailTimeout: d.failTimeout.Load(),
-		FailVersion: d.failVersion.Load(),
-		FailOther:   d.failOther.Load(),
+		FailTimeout:     d.failTimeout.Load(),
+		FailVersion:     d.failVersion.Load(),
+		FailCatchingUp:  d.failCatchingUp.Load(),
+		FailNoDataPlane: d.failNoDataPlane.Load(),
+		FailOther:       d.failOther.Load(),
 
 		FenceRoute: d.fence.view(),
 		WalLand:    d.land.view(),
@@ -356,7 +366,7 @@ func (e *Engine) noteCall(start, fenced time.Time, recs int, batch bool) {
 }
 
 // noteCallEnd books the whole Engine call and whether it was redirected to
-// another node (MOVED/ASK/NOT_LEADER: the client's latency, not this node's).
+// another node (MOVED/ASK: the client's latency, not this node's).
 func (e *Engine) noteCallEnd(start time.Time, redirected bool) {
 	e.ack.total.observe(time.Since(start))
 	if redirected {
@@ -377,8 +387,12 @@ func (e *Engine) noteOutcome(resp *data.AppendResponse) {
 	default:
 		e.ack.fail.Add(1)
 		switch resp.ErrID {
-		case data.ErrIDNotLeader:
+		case data.ErrIDAckTimeout:
 			e.ack.failTimeout.Add(1)
+		case data.ErrIDReplicaCatchingUp:
+			e.ack.failCatchingUp.Add(1)
+		case data.ErrIDNoDataPlane:
+			e.ack.failNoDataPlane.Add(1)
 		case data.ErrIDVersionConflict:
 			e.ack.failVersion.Add(1)
 		default:

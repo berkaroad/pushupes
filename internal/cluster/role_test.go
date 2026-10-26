@@ -247,8 +247,8 @@ func TestVoterRefusesUnassignedWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Status != data.StatusFail || resp.ErrID != data.ErrIDNotLeader {
-		t.Fatalf("voter append = %+v, want fail/1005 from the control-plane guard", resp)
+	if resp.Status != data.StatusFail || resp.ErrID != data.ErrIDNoDataPlane {
+		t.Fatalf("voter append = %+v, want fail/1009 from the control-plane guard", resp)
 	}
 
 	// The SAME refusal on the batch path: the client plane (BatchAppend)
@@ -263,8 +263,8 @@ func TestVoterRefusesUnassignedWrites(t *testing.T) {
 		t.Fatalf("batch answered %d results, want one per record", len(out))
 	}
 	for i, r := range out {
-		if r.Status != data.StatusFail || r.ErrID != data.ErrIDNotLeader {
-			t.Fatalf("batch record %d = %+v, want fail/1005 from the control-plane guard", i, r)
+		if r.Status != data.StatusFail || r.ErrID != data.ErrIDNoDataPlane {
+			t.Fatalf("batch record %d = %+v, want fail/1009 from the control-plane guard", i, r)
 		}
 	}
 	if out[0] == out[1] {

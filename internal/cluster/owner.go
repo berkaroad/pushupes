@@ -37,7 +37,7 @@
 // the same node id. The dir answers that with its own admission stamp,
 // <data>/admission.json {topology}, written the first time a live table
 // applies here. In a dir stamped for a DIFFERENT generation, a member slot
-// with no record is unproven: the leader refuses appends (fail/1007
+// with no record is unproven: the leader refuses appends (fail/1006
 // SlotUnproven, reason foreignDir) and local reads answer empty until an
 // operator acts explicitly — adopt (POST /admin/slots/pending/adopt: "this
 // dir's copies ARE this generation's"; adopting also refreshes the admission
@@ -241,9 +241,9 @@ func (e *Engine) stampPlacement(s int32, p *Placement) {
 	// path. The replicated table names self leader and the on-disk record
 	// is (or already was) the matching proof — both halves of what the
 	// fence loop would re-derive are in hand, and waiting for its next
-	// tick left every append to a freshly promoted slot answering 1007
+	// tick left every append to a freshly promoted slot answering 1006
 	// for up to a full tick: a 512-slot re-plan fenced whole seconds of
-	// client traffic (the err_1007 storm behind a scale-down).
+	// client traffic (the err_1006 storm behind a scale-down).
 	clearFence := func() {
 		e.ownerMu.Lock()
 		delete(e.pendingOwners, s)

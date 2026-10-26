@@ -71,8 +71,8 @@ func TestEmptyShellLeaderAnswersRetryable(t *testing.T) {
 		if resp == nil || resp.Status != data.StatusFail {
 			t.Fatalf("%s: want a fail answer, got %+v", where, resp)
 		}
-		if resp.ErrID != data.ErrIDNotLeader {
-			t.Fatalf("%s: want NOT_LEADER (retryable, keeps the client's ledger), got errID=%d", where, resp.ErrID)
+		if resp.ErrID != data.ErrIDReplicaCatchingUp {
+			t.Fatalf("%s: want 1008 replica-catching-up (retryable, keeps the client's ledger), got errID=%d", where, resp.ErrID)
 		}
 		if resp.CurrentVersion != 0 {
 			t.Fatalf("%s: refusal must not carry an adoptable version: %d", where, resp.CurrentVersion)
@@ -89,7 +89,7 @@ func TestEmptyShellLeaderAnswersRetryable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp != nil && resp.Status == data.StatusFail && resp.ErrID == data.ErrIDNotLeader {
+	if resp != nil && resp.Status == data.StatusFail && resp.ErrID == data.ErrIDReplicaCatchingUp {
 		t.Fatalf("the first sighting alone must not refuse: %+v", resp)
 	}
 	resp, err = e.SubmitAppend(context.Background(), rec)
@@ -167,7 +167,7 @@ func TestEmptyShellLeaderWaitsForTheConfirmWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp != nil && resp.Status == data.StatusFail && resp.ErrID == data.ErrIDNotLeader {
+	if resp != nil && resp.Status == data.StatusFail && resp.ErrID == data.ErrIDReplicaCatchingUp {
 		t.Fatalf("the first sighting alone must not refuse (window still open): %+v", resp)
 	}
 	// Age the sighting past the window: the second reading refuses.
@@ -183,7 +183,7 @@ func TestEmptyShellLeaderWaitsForTheConfirmWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp == nil || resp.Status != data.StatusFail || resp.ErrID != data.ErrIDNotLeader {
+	if resp == nil || resp.Status != data.StatusFail || resp.ErrID != data.ErrIDReplicaCatchingUp {
 		t.Fatalf("confirmed empty-shell leader must refuse retryably: %+v", resp)
 	}
 }

@@ -51,7 +51,7 @@ func leadSlot0(t *testing.T, e *Engine) {
 //   - with the watermark frozen mid-group, the group pays the deadline ONCE
 //     (measured), the records the watermark covers keep their success — their
 //     durability promise IS met — and only the records above it answer
-//     fail/1005 (still durable in the leader's WAL; a retry converges on
+//     fail/1007 (still durable in the leader's WAL; a retry converges on
 //     exists).
 func TestSubmitBatchMergedHWWait(t *testing.T) {
 	e, st := newTestEngine(t, "node-1")
@@ -106,10 +106,10 @@ func TestSubmitBatchMergedHWWait(t *testing.T) {
 			t.Fatalf("resp %d must stay success under the covered watermark: %+v", i, resps[i])
 		}
 	}
-	// seq 3..4 sit above the frozen watermark: fail/1005, durable in the WAL
+	// seq 3..4 sit above the frozen watermark: fail/1007, durable in the WAL
 	for i := 2; i < n; i++ {
-		if resps[i].Status != data.StatusFail || resps[i].ErrID != data.ErrIDNotLeader {
-			t.Fatalf("resp %d must fail 1005 above the watermark: %+v", i, resps[i])
+		if resps[i].Status != data.StatusFail || resps[i].ErrID != data.ErrIDAckTimeout {
+			t.Fatalf("resp %d must fail 1007 above the watermark: %+v", i, resps[i])
 		}
 	}
 	if leo := st.LastSeqOf(0); leo != n {
@@ -121,7 +121,7 @@ func TestSubmitBatchMergedHWWait(t *testing.T) {
 		t.Fatalf("group wait took %s; want ~one deadline of %s (merged, not per-record)", elapsed, e.hwWait)
 	}
 
-	// retry converges on exists for the 1005 records (they are durable)
+	// retry converges on exists for the 1007 records (they are durable)
 	retry, err := e.SubmitBatch(context.Background(), 0, []*data.EventRecord{recs[3]})
 	if err != nil {
 		t.Fatal(err)

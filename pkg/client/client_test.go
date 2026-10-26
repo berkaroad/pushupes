@@ -168,7 +168,7 @@ func rec(id string) *pushupesv1.AppendRequest {
 
 // ---- flow-control backpressure ----
 
-// throttleResp builds a per-record all-1006 batch answer: a node whose
+// throttleResp builds a per-record all-1005 batch answer: a node whose
 // token bucket is empty refuses every record of the batch it received.
 func throttleResp(req *pushupesv1.BatchAppendRequest) *pushupesv1.BatchAppendResponse {
 	out := &pushupesv1.BatchAppendResponse{}
@@ -209,7 +209,7 @@ func TestClientFlowControlRetriesUntilClean(t *testing.T) {
 			t.Fatalf("record %d unanswered", i)
 		}
 		if r.GetErrId() == ErrIDFlowControl {
-			t.Fatalf("record %d answered the raw 1006: the library must absorb it", i)
+			t.Fatalf("record %d answered the raw 1005: the library must absorb it", i)
 		}
 		if r.GetStatus() != pushupesv1.AppendResponse_STATUS_SUCCESS {
 			t.Fatalf("record %d status = %v", i, r.GetStatus())

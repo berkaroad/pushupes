@@ -183,7 +183,7 @@ func main() {
 			dirty := map[string]bool{}
 			// unresolved holds the version of a record whose fate the wire did
 			// not answer: a request that never came back (no-response) or an
-			// ambiguous 1005. Those are NOT failures — the request may have
+			// ambiguous 1007 (ack timeout). Those are NOT failures — the request may have
 			// landed and lost its answer in transport. The tail probe below
 			// settles each one: tail >= that version ⇒ it WAS written ⇒ count
 			// it as a success; otherwise the ledger rolls back and the retry
@@ -302,7 +302,7 @@ func main() {
 								//
 								// A REGRESSED tail needs one more proof
 								// before the ledger trusts it. The
-								// single-bump window (1005 refused and
+								// single-bump window (a 1005/1002 refusal, provably
 								// provably unwrote) rolls the ledger
 								// back exactly one; accepting that tail
 								// verbatim is right. But the handover
@@ -348,7 +348,7 @@ func main() {
 									//     adopt it (the CAS answered the
 									//     real tail, same rule as the
 									//     1001 self-heal below).
-									//   anything else (1005/1007/transport)
+									//   anything else (1005/1006/transport)
 									//     — the probe was aimed at the
 									//     wrong node or the window is
 									//     still open: keep armed.
@@ -375,7 +375,7 @@ func main() {
 										delete(dirty, probes[i])
 										continue
 									}
-									// 1005/1007/other failure: the probe
+									// 1005/1006/other failure: the probe
 									// aimed at the wrong node or the
 									// window is still open — keep armed.
 									continue
@@ -550,27 +550,34 @@ func main() {
 								// self-heal the local version map on 1001 so
 								// the next round sends tail+1 (same rule as
 								// the single-append path)
-								if resp.ErrId == client.ErrIDNotLeader {
-									// 1005 is DOUBLE-MEANING on the wire:
-									// a wrong-node refusal (nothing wrote)
-									// AND an ack-watermark timeout on the
-									// true leader (the record IS in the
-									// WAL). No client-side guess distinguishes
-									// them — and guessing wrong either
-									// re-sends an already-landed version
-									// (1001) or skips a slot (lost write).
-									// The tail probe answers authoritatively:
-									// keep the bump, arm the probe, and let
-									// the probe credit the record if it turns
-									// out to have landed.
+								if resp.ErrId == client.ErrIDAckTimeout {
+									// 1007: the leader waited out its
+									// watermark deadline, so the record IS
+									// in its WAL. Keep the bump, arm the
+									// tail probe and let it credit the
+									// record: rescinding the version would
+									// re-send a landed record (1001) or
+									// skip a slot (lost write).
 									ambigCnt.Add(1)
 									unresolved[chunk[k]] = ver[chunk[k]]
 									dirty[chunk[k]] = true
+								} else if resp.ErrId == client.ErrIDReplicaCatchingUp ||
+									resp.ErrId == client.ErrIDNoDataPlane {
+									// 1008/1009: the node refused before
+									// writing anything, and its own copy
+									// cannot answer a tail probe either
+									// (that IS the condition). Hand the
+									// version back and retry the same
+									// version next round; a no-data-plane
+									// cluster never accepts it, and those
+									// records end up in `fail` — the truth
+									// for that cluster.
+									ver[chunk[k]]--
 								} else if resp.ErrId != client.ErrIDVersionConflict &&
 									resp.CurrentVersion == 0 {
 									// a business fail that provably wrote
 									// nothing and reports no tail (1002,
-									// 1007): the bump was speculative,
+									// 1006): the bump was speculative,
 									// hand it back so the retry sends the
 									// SAME version the server still expects.
 									// The arm is not optional: a version
@@ -600,7 +607,7 @@ func main() {
 								if resp.ErrId == client.ErrIDVersionConflict ||
 									resp.CurrentVersion > 0 {
 									// 1001 answers "the tail is higher than
-									// you thought"; 1005 (watermark timeout)
+									// you thought"; 1007 (ack timeout)
 									// answers "the record IS durable above" —
 									// either way, adopt the reported version
 									// now or the NEXT bump walks into a 1001.
@@ -748,7 +755,7 @@ func main() {
 	}
 	if *batch > 0 {
 		// batch failures need their cause spelled out: unreachable-vs-answer
-		// and which wire error dominated (1001 self-heal races vs 1005 HW)
+		// and which wire error dominated (1001 self-heal races vs 1007 ack timeouts)
 		errIDMu.Lock()
 		// These are ATTEMPT-level wire outcomes, not record outcomes: `fail`
 		// above counts records that were never written, while a no-response or

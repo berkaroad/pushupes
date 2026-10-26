@@ -312,7 +312,7 @@ func TestSeatGrantsLabelWhyTheSeatAppeared(t *testing.T) {
 // with. Voters each write their own random id into their own consensus dir,
 // so a fence keyed on the current leader's id declared every copy a different
 // generation the moment leadership moved: a plain restart of a 3-voter
-// cluster left the whole data plane pending (writes failing err_id 1007)
+// cluster left the whole data plane pending (writes failing err_id 1006)
 // until an operator adopted every node by hand.
 func TestClusterGenerationComesFromTheReplicatedState(t *testing.T) {
 	e, _ := newTestEngine(t, "node-1")

@@ -79,12 +79,15 @@ func TestSlotOfRange(t *testing.T) {
 // one or sliding one off its value breaks every deployed client.
 func TestErrIDs(t *testing.T) {
 	cases := map[string]struct{ got, want int }{
-		"ErrIDVersionConflict": {ErrIDVersionConflict, 1001},
-		"ErrIDBadRequest":      {ErrIDBadRequest, 1002},
-		"ErrIDSlotNotLocal":    {ErrIDSlotNotLocal, 1003},
-		"ErrIDMigrating":       {ErrIDMigrating, 1004},
-		"ErrIDNotLeader":       {ErrIDNotLeader, 1005},
-		"ErrIDFlowControl":     {ErrIDFlowControl, 1006},
+		"ErrIDVersionConflict":   {ErrIDVersionConflict, 1001},
+		"ErrIDBadRequest":        {ErrIDBadRequest, 1002},
+		"ErrIDSlotNotLocal":      {ErrIDSlotNotLocal, 1003},
+		"ErrIDMigrating":         {ErrIDMigrating, 1004},
+		"ErrIDFlowControl":       {ErrIDFlowControl, 1005},
+		"ErrIDSlotUnproven":      {ErrIDSlotUnproven, 1006},
+		"ErrIDAckTimeout":        {ErrIDAckTimeout, 1007},
+		"ErrIDReplicaCatchingUp": {ErrIDReplicaCatchingUp, 1008},
+		"ErrIDNoDataPlane":       {ErrIDNoDataPlane, 1009},
 	}
 	for name, c := range cases {
 		if c.got != c.want {

@@ -14,7 +14,7 @@
 
 // Command flowcheck smoke-tests the Client library's flow-control
 // backpressure against a live cluster: with one node throttled hard,
-// concurrent writers must never see a 1006, must all land (idempotent
+// concurrent writers must never see a 1005, must all land (idempotent
 // retries), and the refused records must converge on success.
 package main
 
@@ -75,12 +75,12 @@ func main() {
 	// by pinning the slot rows through the cached table — the library
 	// writes to the slot leader, so we pick aggregates that hash to slots
 	// node-1 leads (learned from the routing table answer).
-	// (smoke brevity: the writers just spread; a 1006 reaching a caller
+	// (smoke brevity: the writers just spread; a 1005 reaching a caller
 	// is what fails the check, wherever it comes from.)
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	var saw1006, failed int
+	var sawThrottle, failed int
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	for w := 0; w < *writers; w++ {
@@ -107,7 +107,7 @@ func main() {
 					continue
 				}
 				if r.GetErrId() == client.ErrIDFlowControl {
-					saw1006++
+					sawThrottle++
 				}
 				switch r.GetStatus() {
 				case pushupesv1.AppendResponse_STATUS_SUCCESS, pushupesv1.AppendResponse_STATUS_EXISTS:
@@ -119,11 +119,11 @@ func main() {
 	}
 	wg.Wait()
 
-	fmt.Printf("writers=%d per=%d saw1006=%d failed=%d redirects=%d flowPauses=%d\n",
-		*writers, *perWriter, saw1006, failed, c.Redirects(), c.FlowPauses())
+	fmt.Printf("writers=%d per=%d sawFlowRefusal=%d failed=%d redirects=%d flowPauses=%d\n",
+		*writers, *perWriter, sawThrottle, failed, c.Redirects(), c.FlowPauses())
 	switch {
-	case saw1006 != 0:
-		fmt.Println("FAIL: a 1006 reached a caller — the library must absorb it")
+	case sawThrottle != 0:
+		fmt.Println("FAIL: a 1005 reached a caller — the library must absorb it")
 		os.Exit(1)
 	case c.FlowPauses() == 0:
 		fmt.Println("FAIL: FlowPauses=0 — the throttle never engaged (rate too high for this load?)")

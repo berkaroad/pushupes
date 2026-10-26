@@ -287,15 +287,16 @@ func (x *AppendRequest) GetEvents() []*Event {
 }
 
 type AppendResponse struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Status         AppendResponse_Status  `protobuf:"varint,1,opt,name=status,proto3,enum=pushupes.v1.AppendResponse_Status" json:"status,omitempty"`
-	ErrId          uint32                 `protobuf:"varint,2,opt,name=err_id,json=errId,proto3" json:"err_id,omitempty"` // wire error table: 1001 conflict, 1003 MOVED, 1004 ASK...
-	Message        string                 `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
-	CurrentVersion uint32                 `protobuf:"varint,4,opt,name=current_version,json=currentVersion,proto3" json:"current_version,omitempty"` // set on 1001 for client self-heal
-	Seq            uint64                 `protobuf:"varint,5,opt,name=seq,proto3" json:"seq,omitempty"`
-	Slot           int32                  `protobuf:"varint,6,opt,name=slot,proto3" json:"slot,omitempty"`    // routing slot (authoritative even on redirects)
-	Node           string                 `protobuf:"bytes,7,opt,name=node,proto3" json:"node,omitempty"`     // redirect target "host:port" for MOVED/ASK/NOT_LEADER
-	Record         *Record                `protobuf:"bytes,8,opt,name=record,proto3" json:"record,omitempty"` // set on STATUS_EXISTS only (the stored duplicate)
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Status AppendResponse_Status  `protobuf:"varint,1,opt,name=status,proto3,enum=pushupes.v1.AppendResponse_Status" json:"status,omitempty"`
+	ErrId  uint32                 `protobuf:"varint,2,opt,name=err_id,json=errId,proto3" json:"err_id,omitempty"` // wire error table (pkg/client/errs.go): 1001 conflict, 1003 MOVED,
+	// 1004 ASK, 1007 ack timeout, 1008 replica catching up, 1009 no data plane...
+	Message        string  `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
+	CurrentVersion uint32  `protobuf:"varint,4,opt,name=current_version,json=currentVersion,proto3" json:"current_version,omitempty"` // set on 1001 for client self-heal
+	Seq            uint64  `protobuf:"varint,5,opt,name=seq,proto3" json:"seq,omitempty"`
+	Slot           int32   `protobuf:"varint,6,opt,name=slot,proto3" json:"slot,omitempty"`    // routing slot (authoritative even on redirects)
+	Node           string  `protobuf:"bytes,7,opt,name=node,proto3" json:"node,omitempty"`     // redirect target "host:port" for MOVED (1003) / ASK (1004)
+	Record         *Record `protobuf:"bytes,8,opt,name=record,proto3" json:"record,omitempty"` // set on STATUS_EXISTS only (the stored duplicate)
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }

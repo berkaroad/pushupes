@@ -152,7 +152,7 @@ type Engine struct {
 
 	// owner fence (owner.go): pendingOwners is the set of slots whose local
 	// copy is unproven for the live table (leader service refused with
-	// fail/1007 until adopted, or until the copy is removed from disk by
+	// fail/1006 until adopted, or until the copy is removed from disk by
 	// the operator) — the verdict a stranger-dir admission stamp renders
 	// on record-less data; every other member slot is proven by its
 	// placement and stamped.
@@ -307,7 +307,7 @@ type Engine struct {
 	dropMu    sync.Mutex
 	dropAfter time.Duration
 	// hwWait is the watermark deadline an acknowledged append waits on
-	// before fail/1005 (default defaultHWWaitTimeout; a batch group pays it
+	// before fail/1007 (default defaultHWWaitTimeout; a batch group pays it
 	// ONCE — see SubmitBatch). Tests shorten it.
 	hwWait       time.Duration
 	dropGen      uint64
@@ -634,7 +634,7 @@ func NewEngine(node consensus, store *storage.Store, self string, logger *slog.L
 		// long once it sees the hand-over committed (-drop-after).
 		dropAfter: DefaultDropRetention,
 		// how long an acknowledged append waits for the slot's high
-		// watermark before fail/1005 (the record stays in the leader's WAL;
+		// watermark before fail/1007 (the record stays in the leader's WAL;
 		// a client retry converges on exists). A batch pays this deadline
 		// once per slot group, not once per record (SubmitBatch's merged
 		// wait). Tests shorten it.
@@ -1162,7 +1162,7 @@ func (e *Engine) controlOnlyRefusal(slot int32) *data.AppendResponse {
 	}
 	return &data.AppendResponse{
 		Status: data.StatusFail,
-		ErrID:  data.ErrIDNotLeader,
+		ErrID:  data.ErrIDNoDataPlane,
 		Err:    "cluster has no data-plane members; this node is control-plane only",
 		Slot:   slot,
 	}
@@ -1216,7 +1216,7 @@ func (e *Engine) submitAppendLocked(ctx context.Context, rec *data.EventRecord, 
 	}
 }
 
-// RedirectError signals MOVED (1003) / ASK (1004) / NOT_LEADER (1005).
+// RedirectError signals MOVED (1003) / ASK (1004).
 // Slot is the routed slot so the response can tell the client which
 // routing entry to refresh.
 type RedirectError struct {
@@ -1262,7 +1262,7 @@ func (e *Engine) SlotRouteTable() []string {
 // before its replicas pulled the record.
 func (e *Engine) localAppend(slot int32, rec *data.EventRecord) (*data.AppendResponse, error) {
 	// Flow control (one node-wide token budget shared by every slot this
-	// node leads): a refused append answers fail/1006 without touching the
+	// node leads): a refused append answers fail/1005 without touching the
 	// WAL. Only the leader copy pays — this function only runs when THIS
 	// node serves the slot's writes.
 	if ok, bucket := e.takeFor(slot); !ok {
@@ -1283,7 +1283,7 @@ func (e *Engine) localAppend(slot int32, rec *data.EventRecord) (*data.AppendRes
 			(resp.ErrID == data.ErrIDVersionConflict || resp.ErrID == data.ErrIDBadRequest || resp.ErrID == data.ErrIDSlotUnproven) {
 			// The token paid for a record that never landed on the leader's
 			// log (a business-rule fail): give it back. A watermark timeout
-			// (fail/1005) keeps its charge — the record IS durable above —
+			// (fail/1007) keeps its charge — the record IS durable above —
 			// and so does EXISTS, per the operator's rule for idempotent
 			// retries.
 			flowRefund(bucket)
@@ -1310,7 +1310,7 @@ func (e *Engine) localAppendThrottled(slot int32, rec *data.EventRecord) (*data.
 	e.noteWait(slot, time.Since(tWait), e.hwLagRecords(slot, hw), werr != nil)
 	if werr != nil {
 		resp.Status = data.StatusFail
-		resp.ErrID = data.ErrIDNotLeader
+		resp.ErrID = data.ErrIDAckTimeout
 		resp.Err = werr.Error()
 		return resp, nil
 	}
@@ -1374,14 +1374,14 @@ func (e *Engine) landLocalAppend(slot int32, rec *data.EventRecord) (*data.Appen
 	// that — rewriting a slot whose history lives elsewhere into a fresh
 	// version-1 stream (the dg22 storm: hundreds of 1001s and a copy that
 	// crawled 0→6 frames while the real chain was at ~550). Answering a
-	// retryable NOT_LEADER instead keeps the client's ledger intact until the
+	// retryable 1008 instead keeps the client's ledger intact until the
 	// copy materializes; the move is re-planned if it never does.
 	if e.leaderCopyMissingWithHistory(slot) {
 		e.logger.Warn("append: this node leads the slot but holds no copy of it (handover history); answering retryable",
 			"slot", slot, "agg", rec.AggregateID, "op", "leader_without_copy")
 		return &data.AppendResponse{
 			Status: data.StatusFail,
-			ErrID:  data.ErrIDNotLeader,
+			ErrID:  data.ErrIDReplicaCatchingUp,
 			Err:    "replica catching up",
 			Slot:   slot,
 		}, nil
@@ -1396,7 +1396,7 @@ func (e *Engine) landLocalAppend(slot int32, rec *data.EventRecord) (*data.Appen
 			"slot", slot, "agg", rec.AggregateID, "op", "leader_empty_shell")
 		return &data.AppendResponse{
 			Status: data.StatusFail,
-			ErrID:  data.ErrIDNotLeader,
+			ErrID:  data.ErrIDReplicaCatchingUp,
 			Err:    "replica catching up",
 			Slot:   slot,
 		}, nil
@@ -1449,12 +1449,12 @@ func (e *Engine) landLocalAppend(slot int32, rec *data.EventRecord) (*data.Appen
 // ONCE, against the largest seq the group wrote. Records are judged against
 // the watermark observed when the wait ends: on timeout, the prefix the
 // watermark does cover is still acknowledged success (its durability promise is
-// met), only the records above it fail/1005 — durable in the leader's WAL,
+// met), only the records above it fail/1007 — durable in the leader's WAL,
 // retried by the client under the same command_id, converging on exists. A
 // stalled replica set therefore costs the group ONE timeout, not one per
 // record, and never re-fails records the watermark already covers.
 //
-// A routing outcome that is not local (MOVED/ASK/NOT_LEADER for the slot)
+// A routing outcome that is not local (MOVED/ASK for the slot)
 // fails the WHOLE group the same way: it is slot-level state, every record
 // shares the answer. Migration forwarding stays per record (best effort).
 func (e *Engine) SubmitBatch(ctx context.Context, slot int32, recs []*data.EventRecord) (out []*data.AppendResponse, err error) {
@@ -1574,13 +1574,13 @@ func (e *Engine) batchLocal(ctx context.Context, slot int32, recs []*data.EventR
 		// The group's wait ran out. Judge every record against the watermark
 		// waitForHW observed at the deadline: the prefix it covers keeps its
 		// success (its durability promise IS met), only the records above it
-		// fail/1005 — durable in the leader's WAL, retried by the client
+		// fail/1007 — durable in the leader's WAL, retried by the client
 		// under the same command_id, converging on exists. The timeout thus
 		// costs the group ONE deadline, not one per record.
 		for _, resp := range out {
 			if resp.Status == data.StatusSuccess && resp.Seq > hw {
 				resp.Status = data.StatusFail
-				resp.ErrID = data.ErrIDNotLeader
+				resp.ErrID = data.ErrIDAckTimeout
 				resp.Err = werr.Error()
 			}
 		}
@@ -3740,7 +3740,7 @@ func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
 func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, sweep bool) (bool, error) {
 	addr := e.peerAddr(leader)
 	if addr == "" {
-		return false, data.ErrNotLeader
+		return false, data.ErrLeaderUnreachable
 	}
 	e.diag.fetchRounds.Add(1)
 	scr := e.fetchScratchPool.Get().(*fetchScratch)

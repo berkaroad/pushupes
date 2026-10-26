@@ -150,7 +150,7 @@ func sameSlotAggregates(t *testing.T, e *Engine, n int) []string {
 }
 
 // TestFlowControlOnWritePath drives real appends and batches through the
-// throttle: refusal answers fail/1006 before the WAL, a business-rule fail
+// throttle: refusal answers fail/1005 before the WAL, a business-rule fail
 // refunds, a drained bucket also refuses an otherwise-invalid record (the
 // throttle is checked first), the batch truncates at the first refusal, and
 // clearing the config unblocks everything.
@@ -180,16 +180,16 @@ func TestFlowControlOnWritePath(t *testing.T) {
 	if resp := append1(aggs[1], 1, "b-1"); resp.Status != data.StatusSuccess {
 		t.Fatalf("post-refund append = %s (%s), want success (refund must have returned the token)", resp.Status, resp.Err)
 	}
-	// Bucket now holds both tokens away. Even an invalid record answers 1006
+	// Bucket now holds both tokens away. Even an invalid record answers 1005
 	// — the throttle is consulted BEFORE the business rules.
 	resp = append1(aggs[1], 99, "b-conflict")
 	if resp.Status != data.StatusFail || resp.ErrID != data.ErrIDFlowControl || resp.Err != "FlowControl" {
-		t.Fatalf("drained-bucket append = %s/%d (%s), want fail/1006 FlowControl", resp.Status, resp.ErrID, resp.Err)
+		t.Fatalf("drained-bucket append = %s/%d (%s), want fail/1005 FlowControl", resp.Status, resp.ErrID, resp.Err)
 	}
 
 	// Batch on the drained slot: the group is not atomic, but every record
 	// past the first refusal never lands. Here the bucket is empty at
-	// record 1, so the WHOLE group answers 1006 and the WAL does not move.
+	// record 1, so the WHOLE group answers 1005 and the WAL does not move.
 	recs := []*data.EventRecord{
 		makeRecord(aggs[0], 2, "g-1"),
 		makeRecord(aggs[1], 2, "g-2"),
@@ -201,7 +201,7 @@ func TestFlowControlOnWritePath(t *testing.T) {
 	}
 	for i, o := range outs {
 		if o.Status != data.StatusFail || o.ErrID != data.ErrIDFlowControl {
-			t.Fatalf("batch record %d = %s/%d, want fail/1006", i, o.Status, o.ErrID)
+			t.Fatalf("batch record %d = %s/%d, want fail/1005", i, o.Status, o.ErrID)
 		}
 	}
 	if w := st.WriteCount(slot); w != 2 {
@@ -256,7 +256,7 @@ func TestFlowBucketSharedAcrossSlots(t *testing.T) {
 		t.Fatal(err)
 	}
 	if resp.Status != data.StatusFail || resp.ErrID != data.ErrIDFlowControl {
-		t.Fatalf("slot B write = %+v, want fail/1006 (node budget drained by slot A)", resp)
+		t.Fatalf("slot B write = %+v, want fail/1005 (node budget drained by slot A)", resp)
 	}
 	// attribution: the refusal counted slot B, not slot A.
 	_, total, slots := e.FlowStats()

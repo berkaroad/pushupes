@@ -226,7 +226,7 @@ func TestOwnerFenceEndToEnd(t *testing.T) {
 	}
 	resp, err = e.landLocalAppend(5, ownerRecord(agg5, 3, "cmd-5c"))
 	if err != nil || resp.Status != data.StatusFail || resp.ErrID != data.ErrIDSlotUnproven {
-		t.Fatalf("fenced append = %+v/%v, want fail/1007", resp, err)
+		t.Fatalf("fenced append = %+v/%v, want fail/1006", resp, err)
 	}
 	if bound, _, _, _ := e.readAdmission(5); bound != 0 {
 		t.Fatalf("fenced leader read admission bound = %d, want 0 (empty answer)", bound)
@@ -257,7 +257,7 @@ func TestOwnerFenceEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Any verdict INSIDE the seq space proves the slot is back in service:
-	// 1001 here would be a version conflict, which the fence (1007) could
+	// 1001 here would be a version conflict, which the fence (1006) could
 	// never produce.
 	if resp.ErrID == data.ErrIDSlotUnproven || resp.Status == data.StatusFail && resp.ErrID == 0 {
 		t.Fatalf("adopted append still fenced: %+v", resp)

@@ -23,7 +23,6 @@ import (
 	"testing"
 
 	"github.com/berkaroad/pushupes/internal/cluster"
-	"github.com/berkaroad/pushupes/internal/data"
 	"github.com/berkaroad/pushupes/internal/storage"
 )
 
@@ -37,34 +36,74 @@ func decodeBody(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 	return body
 }
 
-// TestRefuseNotControllerCarriesController pins the shape of a follower's
-// refusal of a controller-only command: it is a 429 with the same err_id
-// (1005) the admin plane already used for this case, and it names the
-// controller — its node id and admin address — both in the message and as
-// fields, so a client can retry the command against the right node without
-// parsing the prose.
-func TestRefuseNotControllerCarriesController(t *testing.T) {
+// TestRefuseNotControllerRedirects pins the shape of a follower's refusal of a
+// controller-only command: a 307 whose Location carries the SAME path onto the
+// controller's admin address, so an HTTP client that follows redirects lands on
+// the node that can commit the command (307 keeps the method and body a
+// POST/DELETE command needs). The body still names the controller for callers
+// that inspect instead of following, and carries NO err_id: this is an admin
+// plane routing fact, not a data-plane error code.
+func TestRefuseNotControllerRedirects(t *testing.T) {
+	cases := []struct {
+		name    string
+		admin   string // as registered: bare host:port or a full URL
+		wantLoc string
+	}{
+		{"bare host:port", "127.0.0.1:8092", "http://127.0.0.1:8092/admin/slots/3/migrate?dry=1"},
+		{"with scheme", "http://127.0.0.1:8092", "http://127.0.0.1:8092/admin/slots/3/migrate?dry=1"},
+		{"trailing slash", "http://127.0.0.1:8092/", "http://127.0.0.1:8092/admin/slots/3/migrate?dry=1"},
+	}
+	for _, tc := range cases {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/slots/3/migrate?dry=1", strings.NewReader(`{"to_node":"node-2"}`))
+		handled := refuseNotController(rec, req, &cluster.NotControllerError{
+			LeaderID:  "node-2",
+			AdminAddr: tc.admin,
+		})
+		if !handled {
+			t.Fatalf("%s: a NotControllerError must be rendered as a refusal", tc.name)
+		}
+		if rec.Code != http.StatusTemporaryRedirect {
+			t.Fatalf("%s: status = %d, want %d", tc.name, rec.Code, http.StatusTemporaryRedirect)
+		}
+		if loc := rec.Header().Get("Location"); loc != tc.wantLoc {
+			t.Fatalf("%s: Location = %q, want %q", tc.name, loc, tc.wantLoc)
+		}
+		body := decodeBody(t, rec)
+		if _, ok := body["err_id"]; ok {
+			t.Fatalf("%s: refusal must not carry a data-plane err_id: %v", tc.name, body)
+		}
+		if body["controller"] != "node-2" || body["controller_admin_addr"] != tc.admin {
+			t.Fatalf("%s: refusal does not carry the controller: %v", tc.name, body)
+		}
+		msg, _ := body["error"].(string)
+		if !strings.Contains(msg, "node-2") {
+			t.Fatalf("%s: refusal message must name the controller id: %q", tc.name, msg)
+		}
+	}
+}
+
+// TestRefuseNotControllerWithoutAddress pins the "no controller known yet" end:
+// there is nothing to redirect to, so the answer states the fact as a 503 with
+// Retry-After instead of pointing at a node that may not exist.
+func TestRefuseNotControllerWithoutAddress(t *testing.T) {
 	rec := httptest.NewRecorder()
-	handled := refuseNotController(rec, &cluster.NotControllerError{
-		LeaderID:  "node-2",
-		AdminAddr: "http://127.0.0.1:8092",
-	})
-	if !handled {
+	req := httptest.NewRequest(http.MethodPost, "/admin/cluster/plan", nil)
+	if !refuseNotController(rec, req, &cluster.NotControllerError{}) {
 		t.Fatal("a NotControllerError must be rendered as a refusal")
 	}
-	if rec.Code != http.StatusTooEarly {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusTooEarly)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	if loc := rec.Header().Get("Location"); loc != "" {
+		t.Fatalf("Location must be empty when no controller is known, got %q", loc)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra == "" {
+		t.Fatal("503 refusal must carry Retry-After")
 	}
 	body := decodeBody(t, rec)
-	if body["err_id"] != float64(data.ErrIDNotLeader) {
-		t.Fatalf("err_id = %v, want %d", body["err_id"], data.ErrIDNotLeader)
-	}
-	if body["controller"] != "node-2" || body["controller_admin_addr"] != "http://127.0.0.1:8092" {
-		t.Fatalf("refusal does not carry the controller: %v", body)
-	}
-	msg, _ := body["error"].(string)
-	if !strings.Contains(msg, "node-2") || !strings.Contains(msg, "http://127.0.0.1:8092") {
-		t.Fatalf("refusal message must name the controller id and address: %q", msg)
+	if _, ok := body["err_id"]; ok {
+		t.Fatalf("refusal must not carry a data-plane err_id: %v", body)
 	}
 }
 
@@ -73,7 +112,8 @@ func TestRefuseNotControllerCarriesController(t *testing.T) {
 // nothing is written by the helper).
 func TestRefuseNotControllerIgnoresOtherErrors(t *testing.T) {
 	rec := httptest.NewRecorder()
-	if refuseNotController(rec, errors.New("unknown target node \"nope\"")) {
+	req := httptest.NewRequest(http.MethodPost, "/admin/cluster/plan", nil)
+	if refuseNotController(rec, req, errors.New("unknown target node \"nope\"")) {
 		t.Fatal("a plain error must not be rendered as a controller refusal")
 	}
 	if rec.Body.Len() != 0 || rec.Code != http.StatusOK {
@@ -109,12 +149,18 @@ func TestAdminWriteHandlersRefuseWithoutController(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
 		rec := httptest.NewRecorder()
 		srv.ServeHTTP(rec, req)
-		if rec.Code != http.StatusTooEarly {
-			t.Fatalf("%s: status = %d (%s), want %d", tc.name, rec.Code, rec.Body.String(), http.StatusTooEarly)
+		// No Raft node at all: the controller is unknown, so there is nowhere
+		// to redirect to and the answer is a retryable 503 (never a redirect
+		// to a node that does not exist, never a data-plane err_id).
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s: status = %d (%s), want %d", tc.name, rec.Code, rec.Body.String(), http.StatusServiceUnavailable)
+		}
+		if loc := rec.Header().Get("Location"); loc != "" {
+			t.Fatalf("%s: no controller is known, so there must be no Location: %q", tc.name, loc)
 		}
 		body := decodeBody(t, rec)
-		if body["err_id"] != float64(data.ErrIDNotLeader) {
-			t.Fatalf("%s: err_id = %v, want %d", tc.name, body["err_id"], data.ErrIDNotLeader)
+		if _, ok := body["err_id"]; ok {
+			t.Fatalf("%s: refusal must not carry a data-plane err_id: %v", tc.name, body)
 		}
 		if msg, _ := body["error"].(string); !strings.Contains(msg, "not the controller") {
 			t.Fatalf("%s: refusal message %q is not actionable", tc.name, msg)

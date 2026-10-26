@@ -49,8 +49,8 @@ func TestLeaderWithoutCopyAnswersRetryable(t *testing.T) {
 	if resp == nil || resp.Status != data.StatusFail {
 		t.Fatalf("want a fail answer (retryable), got %+v", resp)
 	}
-	if resp.ErrID != data.ErrIDNotLeader {
-		t.Fatalf("want NOT_LEADER (retryable, keeps the client's ledger), got errID=%d", resp.ErrID)
+	if resp.ErrID != data.ErrIDReplicaCatchingUp {
+		t.Fatalf("want 1008 replica-catching-up (retryable, keeps the client's ledger), got errID=%d", resp.ErrID)
 	}
 	if resp.CurrentVersion != 0 {
 		t.Fatalf("a refused answer must not carry a version the client could adopt: %d", resp.CurrentVersion)

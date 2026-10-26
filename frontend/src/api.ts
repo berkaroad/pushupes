@@ -207,13 +207,19 @@ export async function fetchSlotDescribe(addr: string, slot: number): Promise<Slo
 //
 // Every admin command that mutates Raft state (the replicated slot table) —
 // migrate, remove-replica, plan — is controller-only: only the Raft leader can
-// commit it. A follower REFUSES such a command (425, err_id 1005) instead of
-// forwarding it: the admin plane is not a proxy for the controller, and
-// node-to-node traffic lives on the peer plane. The status answer carries the
-// controller's identity directly (controller / controller_admin_addr), so the
-// console always knows where to post — even when its pinned base is a
-// follower (mid-election, stale pin). Everything here is the single path for
-// those writes — no write command may be addressed anywhere else.
+// commit it. A follower REFUSES such a command instead of forwarding it: the
+// admin plane is not a proxy for the controller, and node-to-node traffic lives
+// on the peer plane. The refusal is a 307 Temporary Redirect whose Location is
+// the controller's admin address plus the same path (so any HTTP client that
+// follows redirects lands on the right node with method and body intact), and
+// the body still carries controller / controller_admin_addr for callers that
+// inspect it. There is no err_id: that is an admin-plane routing fact, not a
+// data-plane error. A cluster with no elected controller answers 503 with
+// Retry-After instead (nowhere to point at). The status answer carries the
+// controller's identity directly, so the console always knows where to post —
+// even when its pinned base is a follower (mid-election, stale pin). Everything
+// here is the single path for those writes — no write command may be addressed
+// anywhere else.
 
 // controllerAdminAddr is the shared "which node may I write to?" lookup: the
 // controller (Raft leader) admin address from a status snapshot — preferred
@@ -235,11 +241,14 @@ export function controllerAdminAddr(st: ClusterStatus | null): string {
 }
 
 // isNotControllerError recognizes a follower's refusal of a controller-only
-// command: the admin plane answers 429 with err_id 1005 (data.ErrIDNotLeader)
-// and a message that says "not the controller" and names the node that is.
+// command: 307 Temporary Redirect (controller known, body names it) or 503
+// (no controller elected yet). Browsers usually follow the 307 transparently;
+// when they do not, the message fallback keeps the retry working against older
+// nodes (and any proxy that rewrites the status).
 export function isNotControllerError(e: any): boolean {
+  const code = e?.response?.status
+  if (code === 307 || code === 503) return true
   const d = e?.response?.data
-  if (d?.err_id === 1005) return true
   const msg = d?.error ?? e?.message ?? ''
   return /not the controller|not the cluster leader|not controller/i.test(String(msg))
 }

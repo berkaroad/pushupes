@@ -103,9 +103,16 @@ seq 升序重放同一批记录，把计数器重建到 LEO。
 | 1002 | ERR_BAD_REQUEST | 参数非法（空 events、超长字段等） |
 | 1003 | ERR_SLOT_NOT_LOCAL | 槽位不在本节点（MOVED，附正确节点） |
 | 1004 | ERR_MIGRATING | 槽位迁移中（ASK 语义，附目标节点） |
-| 1005 | ERR_NOT_LEADER | 本节点非该槽 leader（附 leader 地址） |
-| 1006 | ERR_FLOW_CONTROL | 本节点流控拒绝（message 固定 `FlowControl`；令牌桶取空时写入不落 WAL 直接失败，见 §6.2） |
-| 1007 | ERR_SLOT_UNPROVEN | 本地副本来源未证实（owner 围栏：leader 拒写、本地读答空，直到运维采纳或丢弃，见 §3.1） |
+| 1005 | ERR_FLOW_CONTROL | 本节点流控拒绝（message 固定 `FlowControl`；令牌桶取空时写入不落 WAL 直接失败，见 §6.2） |
+| 1006 | ERR_SLOT_UNPROVEN | 本地副本来源未证实（owner 围栏：leader 拒写、本地读答空，直到运维采纳或丢弃，见 §3.1） |
+| 1007 | ERR_ACK_TIMEOUT | 高水位确认超时：记录**已落 leader WAL**，按同 command_id 重试命中 exists（重试即确认） |
+| 1008 | ERR_REPLICA_CATCHING_UP | 本节点是该槽 leader 但暂不可服务（无本地副本 / 空壳副本）：未写入，稍后重试 |
+| 1009 | ERR_NO_DATA_PLANE | 本节点是纯控制面成员（集群尚无数据面成员持有该槽）：未写入，重试无用，需先规划布局 |
+
+编号从 1001 起**连续、无保留号**（项目尚未上线，不留兼容占位）；每个编号都对客户端可见，
+admin 面不占数据面编号（controller 归属用 HTTP 307/503 表达，见 §6.1）。`pkg/client` 自己分支的只有
+1003/1004（跟随重定向重发）与 1005（吸收为回压）；其余编号原样交给调用方——库既不隐藏「这条被拒」，
+也不替调用方重试。
 
 并发控制：锁粒度 = slot。同一槽串行写（保证 seq/version 原子推进），
 不同槽并行。1024 槽 = 最多 1024 条并行写路径。
@@ -125,10 +132,10 @@ seq 升序重放同一批记录，把计数器重建到 LEO。
   `Engine.SubmitBatch`——整组一次写栅栏、一次路由表读取、按请求顺序逐条落盘
   （WAL 顺序 = 请求顺序），然后**整组只等一次槽高水位**（合并等待：对组内最大
   seq 等一次；超时水位覆盖到的前缀仍 success——其持久化承诺已兑现——水位之上
-  的条目才 fail/1005，记录仍在 leader WAL，按同 command_id 重试命中 exists。
+  的条目才 fail/1007，记录仍在 leader WAL，按同 command_id 重试命中 exists。
   副本停滞时整组只付一个截止周期，不是每条一个）。不同槽并发执行，并发上限
   为进程级 worker 池（`16 × runtime.GOMAXPROCS(0)`；一批铺满 1024 槽时不至于瞬间压上等量并发 WAL 写者）。
-- 重定向（MOVED/ASK/NOT_LEADER）也是**逐条结果**：该条 fail + 权威
+- 重定向（MOVED/ASK）也是**逐条结果**：该条 fail + 权威
   `slot`/`node`，服务端不代理转发写；客户端刷新路由后只重发受影响的那几条。
   幂等规则保证"部分成功 + 按 command_id 重试"安全收敛。
 
@@ -225,8 +232,8 @@ Body: Record*，每条记录：
   无记录」的副本来历不明，等待运维裁决（空席位不算——没有字节就没有争议）。
 - **判定**（leader 席位才会被围栏；冗余副本的读由同步证明门控，写由复制协议
   对账）：记录匹配 ⇒ 盖新记录（表变化后刷新）；目录为外来世代且副本无记录 /
-  记录世代不符 / 任期倒退 ⇒ 该槽 PENDING——leader 拒写 `fail/1007`
-  （不落 WAL，与 1006 同级的前置拒绝）、本地读答空。围栏只拒绝，从不删除：
+  记录世代不符 / 任期倒退 ⇒ 该槽 PENDING——leader 拒写 `fail/1006`
+  （不落 WAL，与 1005 同级的前置拒绝）、本地读答空。围栏只拒绝，从不删除：
   证据留在盘上等运维决定。
 - **运维裁决**（节点本地接口，不经 Raft、不转发，与 §6.2 流控同形）：
   `GET /admin/slots/pending` 查看本节点被围的槽与原因；
@@ -337,7 +344,7 @@ Body: Record*，每条记录：
     与基线等价（233/248/231），叠在并行之上也无增益——一批的确认等的是这批里最后一条
     记录所在槽的 apply，而那条上报只能在它 apply 之后发出，提前上报无法缩短它。
     等待高水位
-    超过 10s 返回 `fail/1005`，此时记录已在 leader WAL 落定——客户端应带同一
+    超过 10s 返回 `fail/1007`，此时记录已在 leader WAL 落定——客户端应带同一
     command_id 重试，命中 `exists` 即确认。
   - ISR 维护：follower 在 `replica.lag.time.max` 内跟上进 ISR；
     掉出后按自己 LEO 重新追。
@@ -718,7 +725,10 @@ GET  /healthz
 
 Raft 配置（谁投票）与复制的成员目录（槽表里的成员列表）是两件事，这一节把它们
 绑在一起。**接口只在 admin 面，且只有 controller（Raft leader）能执行**：follower
-拒绝并回 `controller`/`controller_admin_addr`（客户端改投），admin 面从不转发。
+用 307 把请求指回 controller（`Location` = controller 的 admin 地址 + 原路径，
+方法/体原样保留），响应体里另带 `controller`/`controller_admin_addr` 供不跟随
+重定向的调用方直接改投；尚无 controller 时没有可指向的节点，改回 503 + `Retry-After`。
+admin 面从不转发，也**不占用数据面错误码**：controller 归属用 HTTP 307/503 表达（见 §6.1 末段）。
 
 - **加成员 = 新节点自己的 `-join` 声明**（`PeerService/Adopt`，非 leader 转递；
   admin 面没有加成员接口）：只给 peer（共识）地址，`role` 必填（见 §12.1），
@@ -824,11 +834,15 @@ leader 才有（从副本进度上报里维护，`isr` 列的是**已同步的�
 
 **控制器专属写命令（migrate / remove-replica / plan）必须直接发到 Raft leader 的
 admin 地址**：admin 面**不做**任何到 leader 的转发（节点间流量统一走 peer 面），
-follower 收到这类命令一律**拒绝**（HTTP 425 + `err_id=1005`，响应里带
-`controller`（节点 id）与 `controller_admin_addr`，提示直接发到该 admin 地址）。
+follower 收到这类命令一律**拒绝**：`307 Temporary Redirect` + `Location`（controller 的
+admin 地址 + 原请求路径，307 保留方法与请求体，POST/DELETE 命令可直接被 HTTP 客户端
+跟随），响应体同时带 `controller`（节点 id）与 `controller_admin_addr`。**没有错误码**——
+「本节点不是 controller」是 admin 面的路由事实，不是数据面错误，因此不占用任何 err_id
+（历史上它与数据面的 NOT_LEADER 撞过同一个数字）。集群尚未选出 controller 时无处可指，
+回 `503` + `Retry-After: 1`。
 前端从已在轮询的 `/admin/cluster/status` 拿 `raft.leader` → `peers[id].admin_addr`
-得到目标地址（零额外请求）；若「读表到发出请求」之间 leader 发生切换（响应
-1005），**重读一次 status 换新 controller 重试一次**，仍失败则报可读错误
+得到目标地址（零额外请求）；若「读表到发出请求」之间 leader 发生切换（收到 307 或
+503），**重读一次 status 换新 controller 重试一次**，仍失败则报可读错误
 （`withController`，见 `frontend/src/api.ts`）。
 
 **待清理副本口径**：`GET /admin/status` 的 `dropping[]` 与 `/admin/slots/{slot}/describe`
@@ -852,7 +866,7 @@ follower 收到这类命令一律**拒绝**（HTTP 425 + `err_id=1005`，响应�
 
 令牌桶按操作者的模型运转：取走一个令牌，就记下它的归还时间点（取走时刻 + period）；
 每次取令牌前先把所有已到期的时间点一次性归还（最小堆扫堆头），桶空即触发流控——
-写入报 `fail/1006`（message 固定 `FlowControl`），记录不落 WAL、不等高水位。没有
+写入报 `fail/1005`（message 固定 `FlowControl`），记录不落 WAL、不等高水位。没有
 后台补充线程：堆空意味着令牌全可取，空闲桶零成本；稳态上限 = tokens / period
 （整个节点）。改配置换代：旧桶整弃、下一笔写在新预算下重建桶；每槽累计拒绝计数
 在换代中保留（前端作差判「是否刚触发」需要单调计数）。**桶归节点，计数归槽**：
@@ -862,10 +876,10 @@ follower 收到这类命令一律**拒绝**（HTTP 425 + `err_id=1005`，响应�
 
 取走的令牌何时退还：落不进 leader WAL 的记录不占预算——业务规则失败（1001 版本
 冲突 / 1002 参数非法）与 WAL 写错误都立即归还令牌；EXISTS（同 command_id 幂等
-重试）与高水位超时（fail/1005，记录实际已在 leader WAL 落定）**不**退款：exists
+重试）与高水位超时（fail/1007，记录实际已在 leader WAL 落定）**不**退款：exists
 同样是「一条写入请求」，按请求计数计费，退款会让客户端的重试风暴免费穿透流控；
-1005 的预算确实换到了持久化。批量写入非原子：
-逐条向节点桶取令牌，第 k 条取不到则第 k 条及其后所有条目直接 1006（不再尝试落盘），
+1007 的预算确实换到了持久化。批量写入非原子：
+逐条向节点桶取令牌，第 k 条取不到则第 k 条及其后所有条目直接 1005（不再尝试落盘），
 之前已落地的条目照常合并等待高水位。栅栏/路由/幂等顺序不变：流控检查发生在
 localAppend/batchLocal 的落盘之前，与写栅栏、路由表读取同一条 leader 路径。
 
@@ -879,19 +893,19 @@ UI 只在治理发生的对象——节点——上呈现。数据都不走新�
 `GET /admin/status` 轮询顺带 `flow_control`（配置视图）与 `flow_control_hits`
 （与 writes 同下标的每槽累计拒绝数，前端按节点作差判触发）。
 
-**客户端库把 1006 吸收为回压**：`pkg/client` 的 `BatchAppend` 从不把 1006 交给调用方。
+**客户端库把 1005 吸收为回压**：`pkg/client` 的 `BatchAppend` 从不把 1005 交给调用方。
 一次调用的**各目的节点并发发送**（每节点一个 goroutine）：某节点被限流只拖累它自己的
 记录，同批里发往其他节点的记录照常单程往返——串行分发会让一个节点的回压窗口把整批
 所有节点的写入一起压到 1/窗口倍数（实测 bench --conns 1 --batch 100 下健康节点跟着
 掉速）。被拒的记录（同批中被 accepted 的已应答、被 redirect 的照常走重定向自愈）进入回退环：
-持有该节点的**闸门**（每节点一个，首个 1006 创建），每 `Config.FlowBackoff`（默认
-100ms）只重发被拒子集，直到一轮应答不再含 1006 才放闸；闸门关闭期间，发往该节点的
-后续写请求全部在闸门外排队（读不进闸门：副本读不取令牌、永远不会收到 1006）。排队
+持有该节点的**闸门**（每节点一个，首个 1005 创建），每 `Config.FlowBackoff`（默认
+100ms）只重发被拒子集，直到一轮应答不再含 1005 才放闸；闸门关闭期间，发往该节点的
+后续写请求全部在闸门外排队（读不进闸门：副本读不取令牌、永远不会收到 1005）。排队
 等待发生在 Attempts 计圈之外——限流是等待，不是重试。回发安全靠 command_id 幂等兜底：
 落在拒判之前的记录下一轮答 EXISTS，不会双份。持闸者 ctx 截止则放闸并把记录降级回
 普通重发队列，绝不把节点永久关闸。观测面 `Client.FlowPauses()` 数被拒的回发轮次。
 活簇冒烟：`cmd/flowcheck`（节点 2 tokens/1s + 8 并发写 160 流）——2516 次节点拒绝
-全部被库吸收，调用方零 1006、零失败。
+全部被库吸收，调用方零 1005、零失败。
 
 ## 7. 高性能要点
 
@@ -1639,7 +1653,7 @@ Wait(lsn)            → 阻塞到自己的 LSN 落盘
   factor 2 / 560-560-560 落地，不再出现 factor 1 窗口，也没有随后的席位重排波。
 - 池为空（集群只有 voter）时：不提交 plan（避免失败条目每秒重提交把 commit
   推高），槽表保持零条目；客户端在该节点写入得到显式拒绝
-  `fail/1005` + `"cluster has no data-plane members; this node is control-plane only"`
+  `fail/1009` + `"cluster has no data-plane members; this node is control-plane only"`
   （单条 `SubmitAppend` 与 client 面批量 `SubmitBatch` 两条入口都拦，见
   `controlOnlyRefusal`）。第一个数据面成员自报后，控制器自动补 plan。
 
@@ -1688,7 +1702,7 @@ Wait(lsn)            → 阻塞到自己的 LSN 落盘
   learner 按新世代重新接收布局（世代是复制状态里的值，不是当前 leader 的目录 id，
   所以换 leader 不会让 learner 重来）。**集群不提供「保留槽数据、重建共识」的降级
   路径**：旧副本除非被运维显式采纳（owner 围栏，§3.1），一律停在 pending，
-  写入得 `fail/1007`。改造集群形态走成员逐个 `remove` + `join`，或从空目录重建。
+  写入得 `fail/1006`。改造集群形态走成员逐个 `remove` + `join`，或从空目录重建。
 
 learner 的槽表与投票节点的是同一份复制状态，因此路由、取副本、迁移、owner 围栏
 全部复用同一套 Engine 代码；它唯一与投票节点不同的地方是「表从 socket 来而不是从

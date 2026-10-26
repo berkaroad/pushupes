@@ -416,7 +416,7 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60_000_000_000) // 60s
 	defer cancel()
 	if err := s.Engine.MigrateSlot(ctx, int32(slot), req.ToNode); err != nil {
-		if refuseNotController(w, err) {
+		if refuseNotController(w, r, err) {
 			return
 		}
 		writeErr(w, http.StatusInternalServerError, 0, err.Error())
@@ -452,7 +452,7 @@ func (s *Server) handleRemoveReplica(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30_000_000_000) // 30s
 	defer cancel()
 	if err := s.Engine.RemoveReplica(ctx, int32(slot), req.Node); err != nil {
-		if refuseNotController(w, err) {
+		if refuseNotController(w, r, err) {
 			return
 		}
 		writeErr(w, http.StatusInternalServerError, 0, err.Error())
@@ -466,7 +466,7 @@ func (s *Server) handleRemoveReplica(w http.ResponseWriter, r *http.Request) {
 // retries there) rather than forwarding it.
 func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	if err := s.Engine.SubmitCommand(&cluster.Command{Op: cluster.OpPlanSlots}); err != nil {
-		if refuseNotController(w, err) {
+		if refuseNotController(w, r, err) {
 			return
 		}
 		writeErr(w, http.StatusInternalServerError, 0, err.Error())
@@ -497,7 +497,7 @@ func (s *Server) handleSetReplicaPolicy(w http.ResponseWriter, r *http.Request) 
 	}
 	policy, factor, err := s.Engine.SetReplicaPolicy(req.Policy)
 	if err != nil {
-		if refuseNotController(w, err) {
+		if refuseNotController(w, r, err) {
 			return
 		}
 		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, err.Error())
@@ -595,7 +595,7 @@ func (s *Server) handleCancelDrain(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	status, err := s.Engine.CancelDrain(ctx, id)
 	if err != nil {
-		if refuseNotController(w, err) {
+		if refuseNotController(w, r, err) {
 			return
 		}
 		if errors.Is(err, cluster.ErrBadMember) {
@@ -627,7 +627,7 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	status, err := s.Engine.RemoveMember(ctx, id)
 	if err != nil {
-		if refuseNotController(w, err) {
+		if refuseNotController(w, r, err) {
 			return
 		}
 		if errors.Is(err, cluster.ErrBadMember) {
@@ -665,7 +665,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // These endpoints act on THIS node's local copies — no Raft command, no
 // redirect, nothing replicated, in the same shape handleSetFlowControl uses
 // for the other node-local knob. A fenced (pending) slot refuses writes with
-// fail/1007 and answers reads empty until an operator adopts the copy
+// fail/1006 and answers reads empty until an operator adopts the copy
 // ("this WAL belongs to this generation") or removes the slot directory on
 // disk (the fence re-reads the ground truth each round and lifts the verdict
 // by itself).
@@ -728,21 +728,44 @@ func flowControlView(cfg cluster.FlowConfig) map[string]any {
 
 // refuseNotController renders a controller-only command that a FOLLOWER
 // refused, and reports whether it handled the error. Nothing is forwarded: the
-// response instead says which node is the controller — its node id and admin
-// address — so the caller can retry the command directly against it. The two
-// extra fields are the machine-readable form of the same fact (a client should
-// not have to parse the prose to find the node to retry on); the status code
-// matches the one handlePlan has always used for this case.
-func refuseNotController(w http.ResponseWriter, err error) bool {
+// answer is a 307 whose Location points at the controller's admin address with
+// the same path, so an HTTP client that follows redirects lands on the node
+// that can commit the command (307 keeps the method and body, which is what a
+// POST/DELETE command needs). The body still names the controller — node id and
+// admin address — for callers that inspect the answer instead of following it.
+//
+// There is no err_id here on purpose: "this node is not the controller" is a
+// routing fact about the admin plane, not a data-plane error, so the admin plane
+// does not take a data-plane number for it (pkg/client/errs.go numbers only what
+// answers a client). A cluster with no elected controller has nowhere to point
+// at, so it answers 503 with Retry-After instead of redirecting to a node that
+// does not exist yet.
+func refuseNotController(w http.ResponseWriter, r *http.Request, err error) bool {
 	var nc *cluster.NotControllerError
 	if !errors.As(err, &nc) {
 		return false
 	}
-	writeJSON(w, http.StatusTooEarly, map[string]any{
+	code := http.StatusTemporaryRedirect
+	if base := adminBaseWithScheme(nc.AdminAddr); base != "" {
+		w.Header().Set("Location", base+r.URL.RequestURI())
+	} else {
+		code = http.StatusServiceUnavailable
+		w.Header().Set("Retry-After", "1")
+	}
+	writeJSON(w, code, map[string]any{
 		"error":                 nc.Error(),
-		"err_id":                data.ErrIDNotLeader,
 		"controller":            nc.LeaderID,
 		"controller_admin_addr": nc.AdminAddr,
 	})
 	return true
+}
+
+// adminBaseWithScheme makes an admin address absolute: peer registration may
+// carry a bare host:port, and a Location header must be a URL.
+func adminBaseWithScheme(addr string) string {
+	addr = strings.TrimRight(strings.TrimSpace(addr), "/")
+	if addr == "" || strings.Contains(addr, "://") {
+		return addr
+	}
+	return "http://" + addr
 }

@@ -14,7 +14,8 @@
 
 // Package data defines the core domain types for the pushupes: the
 // EventRecord appended to slot WALs, its binary encoding, the CRC16 slot
-// routing, and the wire-level error IDs.
+// routing, and — in errs.go — the wire-level error IDs and the domain errors
+// they map to.
 package data
 
 import (
@@ -461,37 +462,6 @@ func SlotOf(aggregateID string, slotCount int) int32 {
 	return client.SlotOf(aggregateID, slotCount)
 }
 
-// ---- Error IDs and domain errors ------------------------------------------
-
-// Wire-level error IDs returned in AppendResponse.ErrID on fail/MOVED/ASK.
-// The table lives in pkg/client (the client-facing wire contract — the
-// client side is where these ids are branched on); these are the server-side
-// names for the same numbers.
-const (
-	ErrIDVersionConflict = client.ErrIDVersionConflict
-	ErrIDBadRequest      = client.ErrIDBadRequest
-	ErrIDSlotNotLocal    = client.ErrIDSlotNotLocal // MOVED
-	ErrIDMigrating       = client.ErrIDMigrating    // ASK
-	ErrIDNotLeader       = client.ErrIDNotLeader
-	ErrIDFlowControl     = client.ErrIDFlowControl  // the node's flow control refused the append
-	ErrIDSlotUnproven    = client.ErrIDSlotUnproven // local copy without a proven generation (owner fence)
-)
-
-var (
-	// ErrBadRequest maps to error ID 1002.
-	ErrBadRequest = errors.New("bad request")
-	// ErrVersionConflict maps to 1001.
-	ErrVersionConflict = errors.New("version conflict")
-	// ErrSlotNotLocal maps to 1003 (MOVED).
-	ErrSlotNotLocal = errors.New("slot not owned by this node")
-	// ErrMigrating maps to 1004 (ASK).
-	ErrMigrating = errors.New("slot is migrating")
-	// ErrNotLeader maps to 1005.
-	ErrNotLeader = errors.New("not leader for this slot")
-	// ErrRecordNotFound is returned by point lookups.
-	ErrRecordNotFound = errors.New("record not found")
-)
-
 // ---- Append result --------------------------------------------------------
 //
 // The client-facing request/response message shapes live in the gRPC proto
@@ -515,6 +485,6 @@ type AppendResponse struct {
 	CurrentVersion uint32       `json:"current_version,omitempty"`
 	Seq            uint64       `json:"seq,omitempty"`
 	Slot           int32        `json:"slot"`
-	Node           string       `json:"node,omitempty"`   // redirect target for MOVED/ASK/NOT_LEADER
+	Node           string       `json:"node,omitempty"`   // redirect target for MOVED (1003) / ASK (1004)
 	Record         *EventRecord `json:"record,omitempty"` // set on success/exists
 }

@@ -35,26 +35,26 @@ type Config struct {
 	RouteRefresh time.Duration // slot->leader table re-fetch interval; 0 = fetch once at startup (default 30s)
 	Attempts     int           // max send rounds per BatchAppend call, retries of redirected records included (default 3)
 	CallTimeout  time.Duration // per-attempt RPC timeout inside BatchAppend (default 30s)
-	FlowBackoff  time.Duration // pause after a node answers 1006 (flow control); the refused records re-send and the node's gate stays closed until one answer comes back un-throttled (default 100ms)
+	FlowBackoff  time.Duration // pause after a node answers 1005 (flow control); the refused records re-send and the node's gate stays closed until one answer comes back un-throttled (default 100ms)
 }
 
 // Client talks to a pushupes cluster's data plane: routing resolved and
 // maintained by PrefetchRoutes (seeded at New, refreshed on a timer,
 // patched per MOVED/ASK in between), one long-lived gRPC connection per
 // node address shared by every call, per-record redirect self-heal on
-// the write and read paths, and flow-control backpressure: a node that answers 1006
+// the write and read paths, and flow-control backpressure: a node that answers 1005
 // gets its refused records re-sent every FlowBackoff (default 100ms) while
 // a per-node gate stays closed, pausing every later write to that node
 // until one re-send comes back un-throttled. Business rules (idempotency,
 // version checks) pass through untouched: a Client answers what the
-// cluster answered — except the 1006 itself, which the library absorbs as
+// cluster answered — except the 1005 itself, which the library absorbs as
 // waiting rather than relaying.
 type Client struct {
 	cfg     Config
 	connsMu sync.Mutex
 	conns   map[string]*grpc.ClientConn
 	gatesMu sync.Mutex
-	gates   map[string]*gateT // per-node flow-control gate; created open on the first 1006, kept until the Client is dropped
+	gates   map[string]*gateT // per-node flow-control gate; created open on the first 1005, kept until the Client is dropped
 	routes  *routeTable
 	rr      atomic.Uint64 // round-robin cursor for entry picks
 	// Dead-address penalty box: an entry address whose transport just
@@ -100,7 +100,7 @@ func New(nodes []string, cfg *Config) (*Client, error) {
 	if c.cfg.CallTimeout <= 0 {
 		// Deliberately longer than the cluster's write-ack watermark deadline
 		// (10s by default): when a leader cannot confirm a record it answers
-		// fail/1005, and that answer must reach the caller. If the two
+		// fail/1007 (ack timeout), and that answer must reach the caller. If the two
 		// timeouts coincide the RPC dies first, the library requeues the
 		// records it never saw an answer for, and the retry hits the
 		// idempotency fence and answers exists — a stalled append reported as
@@ -129,7 +129,7 @@ func (c *Client) SlotCount() int { return c.routes.slotCountNow() }
 // the refresh period is too long for the churn, not an error.
 func (c *Client) Redirects() uint64 { return c.redirects.Load() }
 
-// FlowPauses counts the 1006-answered re-send rounds the write path has
+// FlowPauses counts the 1005-answered re-send rounds the write path has
 // run since New: one per refused answer (the first batch and every
 // FlowBackoff retry). Growth means some node's token bucket is actively
 // refusing this client's writes — the library is absorbing it as waiting,
@@ -187,11 +187,11 @@ func (c *Client) event(addr string) pushupesv1.EventServiceClient {
 
 // ---- flow-control gate --------------------------------------------------
 
-// gateT is one node's gate. While the node refuses appends (1006 — the
+// gateT is one node's gate. While the node refuses appends (1005 — the
 // operator throttle at its node-wide token bucket), the goroutine that
 // entered backpressure HOLDS the gate: it sleeps FlowBackoff, re-sends the
 // refused records, and keeps holding until an answer comes back without a
-// single 1006, then releases. Every other write destined for that node
+// single 1005, then releases. Every other write destined for that node
 // parks meanwhile — the pause is what keeps a throttled node from being
 // hammered by a whole fleet of concurrent callers. The open flag is one
 // atomic so the fast path (gate open, the overwhelming majority of calls)
@@ -281,11 +281,11 @@ func (g *gateT) hold(ctx context.Context) bool {
 	}
 }
 
-// release reopens the gate after a clean (1006-free) answer and wakes ALL
+// release reopens the gate after a clean (1005-free) answer and wakes ALL
 // parked waiters by closing (then remaking) the channel. Holder-only.
 // Woken writers that are BatchAppend callers re-check via the send-loop
 // fast path and ride the next batch open; the next throttle is entered by
-// whichever answer carries a 1006 from then on.
+// whichever answer carries a 1005 from then on.
 func (g *gateT) release() {
 	g.mu.Lock()
 	g.open.Store(true)
@@ -320,7 +320,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // unanswered when the attempts ran out — the error (last transport
 // failure, informational) says which. Business outcomes (success/exists/
 // fail with their error ids) are the cluster's, untouched — EXCEPT flow
-// control: a 1006 never reaches the caller. Refused records are re-sent
+// control: a 1005 never reaches the caller. Refused records are re-sent
 // every Config.FlowBackoff while the node's gate is held closed, parking
 // every later write to that node, until one answer comes back
 // un-throttled (see gateT).
@@ -466,7 +466,7 @@ func (c *Client) sendGroup(ctx context.Context, attempt int, addr string,
 	// The node's token bucket refused part of the batch: become the gate
 	// holder (concurrent contenders for the same throttle park in hold),
 	// sleep FlowBackoff, and re-send ONLY the refused records until an
-	// answer carries no 1006, then release the gate. Re-sending is safe:
+	// answer carries no 1005, then release the gate. Re-sending is safe:
 	// append idempotency keys on command_id, so a record the node wrote
 	// before throttling answers exists on the next round, never twice. The
 	// loop runs past Config.Attempts on purpose — Attempts counts REDIRECT

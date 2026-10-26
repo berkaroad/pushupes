@@ -18,7 +18,7 @@ package cluster
 // slot this node LEADS — the control and its configuration live at the same
 // granularity, the node. Any leader-side write to any of this node's slots
 // takes one token from the node's bucket. A rejected append answers
-// fail/1006 (data.ErrIDFlowControl, message "FlowControl") without touching
+// fail/1005 (data.ErrIDFlowControl, message "FlowControl") without touching
 // the WAL. The configuration lives only in this process — set through
 // POST /admin/flow-control, it is not replicated through Raft and a restart
 // returns the node to unlimited.

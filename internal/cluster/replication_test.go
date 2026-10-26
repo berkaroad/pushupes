@@ -670,7 +670,7 @@ func TestTransportUnreachableOnlyCountsTransport(t *testing.T) {
 		{"slow server", status.Error(codes.DeadlineExceeded, "context deadline exceeded"), false},
 		{"session stopped here", status.Error(codes.Canceled, "context canceled"), false},
 		{"application error", status.Error(codes.Internal, "mfetch: invalid"), false},
-		{"routing answer", data.ErrNotLeader, false},
+		{"unaddressable leader", data.ErrLeaderUnreachable, false},
 		{"no error", nil, false},
 	}
 	for _, c := range cases {
@@ -977,7 +977,7 @@ func TestReLayoutSeatDoesNotGateHW(t *testing.T) {
 // of the watermark min, so an append must not park on that seat's report
 // either — waiting for it waits for an event that cannot move the watermark.
 // On a low->medium flip a slot's only other copy IS such a seat, and the
-// parked appends rode the full wait deadline into fail/1005 plus an
+// parked appends rode the full wait deadline into fail/1007 plus an
 // idempotent-retry exists (measured on a 3-node flip: hw_wait max pinned at
 // the deadline while every term of the report round stayed under 30ms, and
 // bench printed +100 exists per stalled batch).
@@ -1029,7 +1029,7 @@ func TestBuildingSeatDoesNotParkTheAck(t *testing.T) {
 // record, so that record must not queue behind another slot's catch-up chunk:
 // bulk catch-up moves megabytes per slot under the round's payload budget, and
 // on a cluster whose per-slot logs run to tens of megabytes one rotation lap
-// outlasts the append's wait deadline — the append then fails/1005 and its
+// outlasts the append's wait deadline — the append then fails/1007 and its
 // idempotent retry answers exists (measured: gap=1, in_isr, building=false).
 // The budget is shrunk here so the ORDER decides, and the request lists the
 // backlog slot first with the rotation pinned: under a plain rotation order the
