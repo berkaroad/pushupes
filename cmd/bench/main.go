@@ -44,6 +44,10 @@ import (
 )
 
 func main() {
+	// programStart anchors the startup phase: everything before the first
+	// append carries no records, so it must stay out of the throughput
+	// denominator.
+	programStart := time.Now()
 	nodes := flag.String("nodes", "127.0.0.1:8591", "comma-separated node client-plane (gRPC) addrs; the routing table is resolved from one of them via PrefetchRoutes")
 	aggs := flag.Int("aggs", 100, "number of aggregate ids")
 	dur := flag.Duration("duration", 10*time.Second, "sustained write duration")
@@ -64,6 +68,7 @@ func main() {
 		os.Exit(2)
 	}
 	body := makeBody(*size)
+	var warmed int32 = 0
 	// The reusable client (pkg/client) owns everything routing-shaped:
 	// PrefetchRoutes seeds the slot->leader table (its answer length is the
 	// cluster's slot count — the ALGORITHM is the shared contract, the COUNT
@@ -94,52 +99,21 @@ func main() {
 	fmt.Printf("aggregates=%d across %d slots (body=%dB conns=%d duration=%s)\n",
 		len(aggIDs), len(slotSeen), *size, *connsFlag, *dur)
 
-	// resume per-aggregate versions against the slot LEADER (replicas only
-	// show <=HW data; under-estimating the tail burns retries on 1001).
-	//
-	// One ReadTails for the whole list instead of a per-aggregate ReadStream
-	// probe chain: the per-aggregate form cost O(aggregates x log(tail)) RPCs
-	// and grew with the data already on disk (measured 5.5s at 58k existing
-	// records across 1000 aggregates). The library groups the list by the
-	// cached routing table and drives one sub-call per holding node,
-	// following per-entry MOVED itself, so the call site stays a single
-	// call.
-	//
-	// This phase is NOT part of the write window, and it is timed separately
-	// so the reported throughput stays a write-phase number.
-	resumeStart := time.Now()
-	lastVers := make([]uint32, len(aggIDs))
-	{
-		cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		resp, err := cl.ReadTails(cctx, aggIDs)
-		cancel()
-		if err != nil {
-			fmt.Printf("warn: read tails: %v (tails left at 0)\n", err)
-		} else if len(resp.Results) != len(aggIDs) {
-			fmt.Printf("warn: read tails: got %d results for %d aggregates\n",
-				len(resp.Results), len(aggIDs))
-		} else {
-			for i, r := range resp.Results {
-				lastVers[i] = r.Version
-			}
-		}
-	}
-	var resumeSum uint64
-	for _, v := range lastVers {
-		resumeSum += uint64(v)
-	}
-	fmt.Printf("resuming: %d existing records across aggregates (probed in %s)\n",
-		resumeSum, time.Since(resumeStart).Round(time.Millisecond))
+	// Every aggregate starts at version 1: the window assumes an empty
+	// aggregate space (the matrix cold-starts a cluster per cell). Aimed at a
+	// cluster that already holds these ids, the first append of each agg
+	// answers 1001, the leader's tail is adopted and the record is re-sent —
+	// one extra round per aggregate, and no resume probe.
 
 	// 3) run
-	ctx, cancel := context.WithTimeout(context.Background(), *dur)
-	defer cancel()
+	globalCtx, globalCancel := context.WithCancel(context.Background())
+	defer globalCancel()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
 		fmt.Println("\ninterrupted, draining...")
-		cancel()
+		globalCancel()
 	}()
 
 	var total, okCnt, existsCnt, failCnt, noRespCnt, windowDropped atomic.Int64
@@ -182,6 +156,10 @@ func main() {
 	// per-run salt: a fixed RNG seed would reproduce last run's command_ids
 	// and every append would idempotently return "exists" instead of writing.
 	runSalt := time.Now().UnixNano()
+	// The write window is re-stamped by the first append (see warmed);
+	// everything the process did up to that point — routing prefetch, client
+	// dial, id generation — is reported as startup, never charged to
+	// throughput.
 	start := time.Now()
 	for w := 0; w < nw; w++ {
 		wg.Add(1)
@@ -192,12 +170,9 @@ func main() {
 			for i := w; i < len(aggIDs); i += nw {
 				targets = append(targets, aggIDs[i])
 			}
+			// ver is filled by bump: an absent entry means the aggregate
+			// holds no record yet, so its first send is version 1.
 			ver := make(map[string]uint32, len(targets))
-			for _, t := range targets {
-				if idx := aggIndex(aggIDs, t); idx >= 0 {
-					ver[t] = lastVers[idx]
-				}
-			}
 			// dirty holds aggregates whose last send left the server-side
 			// version UNKNOWN (a batch that ran out of answers on a dead
 			// transport — the record may or may not have landed). Sending
@@ -236,7 +211,7 @@ func main() {
 					for agg := range unresolved {
 						aggs = append(aggs, agg)
 					}
-					cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					cctx, cancel := context.WithTimeout(globalCtx, 5*time.Second)
 					presp, perr := cl.ReadTails(cctx, aggs)
 					cancel()
 					if perr == nil && len(presp.Results) == len(aggs) {
@@ -277,8 +252,7 @@ func main() {
 			// AUTHENTICATED on its last answered round: the ver it
 			// sent, the server tail that answer carried, and whether
 			// the bump was then rolled back (ver--). A 1001 sample
-			// prints this history so the gap's origin is visible —
-			// guesswork over "+2" ends where the trace begins.
+			// prints this history, so a +2 gap shows its origin.
 			type lastSeenT struct {
 				sent, tail uint32
 				rolled     bool
@@ -286,43 +260,7 @@ func main() {
 			lastSeen := map[string]lastSeenT{}
 			bumpRound := map[string]int{}
 			bumpPrev := map[string]uint32{}
-			// trace: per-aggregate event ledger (round, kind, ver,
-			// tail). Every event for EVERY agg goes in — the ledger
-			// is small (one line per answered round) and the full
-			// sequence around a 1001 is what turns the +2 debate
-			// into a printout. Dumped at exit for sampled aggs.
-			type traceEv struct {
-				round int
-				kind  string
-				ver   uint32
-				tail  uint32
-			}
-			trace := map[string][]traceEv{}
-			traced := map[string]bool{} // aggs worth dumping (1001 hits)
 			round := 0
-			// traceAdd appends with a sliding window so the LEDGER
-			// around the 1001 (which can land at round 30k) survives;
-			// a first-400 cap would only ever show round-1 history.
-			defer func() {
-				for agg := range traced {
-					bizSampleMu.Lock()
-					fmt.Printf("  trace %s:\n", agg)
-					for _, ev := range trace[agg] {
-						fmt.Printf("    r%d %s v=%d tail=%d\n", ev.round, ev.kind, ev.ver, ev.tail)
-					}
-					bizSampleMu.Unlock()
-				}
-			}()
-			traceAdd := func(agg string, kind string, ver, tail uint32) {
-				if traced[agg] {
-					return // freeze the ledger at the conflict
-				}
-				evs := append(trace[agg], traceEv{round, kind, ver, tail})
-				if len(evs) > 150 {
-					evs = append(evs[:0:0], evs[len(evs)-120:]...)
-				}
-				trace[agg] = evs
-			}
 			seq := 0
 			// bump builds one fresh append request for agg (next version,
 			// fresh command id).
@@ -345,14 +283,14 @@ func main() {
 				// are resent (as one batch) to their own leader. Throughput
 				// counts records, latency counts batch round trips (retries
 				// included).
-				for ctx.Err() == nil {
+				for globalCtx.Err() == nil {
 					round++
 					if len(dirty) > 0 {
 						probes := make([]string, 0, len(dirty))
 						for agg := range dirty {
 							probes = append(probes, agg)
 						}
-						cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+						cctx, cancel := context.WithTimeout(globalCtx, 10*time.Second)
 						presp, perr := cl.ReadTails(cctx, probes)
 						cancel()
 						if perr == nil && len(presp.Results) == len(probes) {
@@ -390,7 +328,7 @@ func main() {
 									continue
 								}
 								if rolled := lastSeen[probes[i]].rolled; rolled && r.Version+1 == ver[probes[i]] {
-									octx, ocancel := context.WithTimeout(context.Background(), 10*time.Second)
+									octx, ocancel := context.WithTimeout(globalCtx, 10*time.Second)
 									oresps, oerr := cl.BatchAppend(octx, []*pushupesv1.AppendRequest{{
 										AggregateId: probes[i],
 										Version:     ver[probes[i]],
@@ -420,7 +358,6 @@ func main() {
 									oresp := oresps[0]
 									if oresp.Status == pushupesv1.AppendResponse_STATUS_SUCCESS ||
 										oresp.Status == pushupesv1.AppendResponse_STATUS_EXISTS {
-										traceAdd(probes[i], "probe-own", ver[probes[i]], oresp.CurrentVersion)
 										if _, ok := unresolved[probes[i]]; ok {
 											// SUCCESS/EXISTS at this version means the
 											// cluster holds it: the lost answer was
@@ -435,7 +372,6 @@ func main() {
 									}
 									if oresp.ErrId == client.ErrIDVersionConflict && oresp.CurrentVersion >= ver[probes[i]] {
 										ver[probes[i]] = oresp.CurrentVersion
-										traceAdd(probes[i], "probe-own-adopt", oresp.CurrentVersion, oresp.CurrentVersion)
 										delete(dirty, probes[i])
 										continue
 									}
@@ -462,7 +398,6 @@ func main() {
 									}
 									delete(unresolved, probes[i])
 								}
-								traceAdd(probes[i], "probe", ver[probes[i]], r.Version)
 								bizSampleMu.Lock()
 								if len(bizSamples) < 24 {
 									bizSamples = append(bizSamples,
@@ -491,13 +426,11 @@ func main() {
 						for _, agg := range targets {
 							if !dirty[agg] {
 								rt = append(rt, agg)
-							} else {
-								traceAdd(agg, "skip", ver[agg], 0)
 							}
 						}
 					}
 					for c := 0; c < len(rt); c += *batch {
-						if ctx.Err() != nil {
+						if globalCtx.Err() != nil {
 							return
 						}
 						end := c + *batch
@@ -516,8 +449,11 @@ func main() {
 						// gate on ctx death and answers what it can; records
 						// left unanswered because the WINDOW closed are counted
 						// as window-dropped, never as failures.
-						resps, berr := cl.BatchAppend(ctx, recs)
-						if berr != nil && ctx.Err() == nil && len(resps) == 0 {
+						if atomic.CompareAndSwapInt32(&warmed, 0, 1) {
+							start = time.Now()
+						}
+						resps, berr := cl.BatchAppend(globalCtx, recs)
+						if berr != nil && globalCtx.Err() == nil && len(resps) == 0 {
 							errSampleMu.Lock()
 							if len(errSamples) < 8 {
 								errSamples = append(errSamples, berr.Error())
@@ -542,7 +478,7 @@ func main() {
 							}
 							continue
 						}
-						if berr != nil && ctx.Err() == nil {
+						if berr != nil && globalCtx.Err() == nil {
 							errSampleMu.Lock()
 							if len(errSamples) < 8 {
 								errSamples = append(errSamples, berr.Error())
@@ -556,14 +492,13 @@ func main() {
 						// with the same rule as an unanswered record
 						// (fate unknown: a ReadTails probe, never a
 						// +2 into a self-made 1001).
-						if berr != nil && ctx.Err() == nil && len(resps) < len(chunk) {
+						if berr != nil && globalCtx.Err() == nil && len(resps) < len(chunk) {
 							for _, agg := range chunk[len(resps):] {
 								noRespCnt.Add(1)
 								ls := lastSeen[agg]
 								lastSeen[agg] = lastSeenT{sent: ls.sent, tail: ls.tail, rolled: true}
 								unresolved[agg] = ver[agg]
 								ver[agg]--
-								traceAdd(agg, "nil", ver[agg], 0)
 								dirty[agg] = true
 							}
 						}
@@ -575,7 +510,7 @@ func main() {
 								// attempt loop itself answers or requeues
 								// every record); count it as dropped, not
 								// failed.
-								if ctx.Err() != nil {
+								if globalCtx.Err() != nil {
 									windowDropped.Add(1)
 								} else {
 									// Fate unknown, not a failure: the tail
@@ -590,7 +525,6 @@ func main() {
 									lastSeen[chunk[k]] = lastSeenT{sent: ls.sent, tail: ls.tail, rolled: true}
 									unresolved[chunk[k]] = ver[chunk[k]]
 									ver[chunk[k]]--
-									traceAdd(chunk[k], "nil", ver[chunk[k]], 0)
 									dirty[chunk[k]] = true
 								}
 								continue
@@ -600,15 +534,9 @@ func main() {
 							case pushupesv1.AppendResponse_STATUS_SUCCESS:
 								delete(unwritten, chunk[k])
 								okCnt.Add(1)
-								if len(trace[chunk[k]]) < 400 {
-									traceAdd(chunk[k], "ok", ver[chunk[k]], resp.CurrentVersion)
-								}
 							case pushupesv1.AppendResponse_STATUS_EXISTS:
 								delete(unwritten, chunk[k])
 								existsCnt.Add(1)
-								if len(trace[chunk[k]]) < 400 {
-									traceAdd(chunk[k], "exists", ver[chunk[k]], resp.CurrentVersion)
-								}
 							default:
 								unwritten[chunk[k]] = ver[chunk[k]]
 								errIDMu.Lock()
@@ -659,18 +587,16 @@ func main() {
 									bizSampleMu.Lock()
 									if len(bizSamples) < 12 {
 										ls := lastSeen[chunk[k]]
-										bizSamples = append(bizSamples,
-											fmt.Sprintf("1001 agg=%s sent_v=%d server_tail=%d last{sent=%d tail=%d rolled=%v} bumpRound=%d",
-												chunk[k], ver[chunk[k]], resp.CurrentVersion,
-												ls.sent, ls.tail, ls.rolled, bumpRound[chunk[k]]))
+										if ver[chunk[k]] > 1 {
+											bizSamples = append(bizSamples,
+												fmt.Sprintf("1001 agg=%s sent_v=%d server_tail=%d last{sent=%d tail=%d rolled=%v} bumpRound=%d",
+													chunk[k], ver[chunk[k]], resp.CurrentVersion,
+													ls.sent, ls.tail, ls.rolled, bumpRound[chunk[k]]))
+										}
 									}
 									bizSampleMu.Unlock()
 								}
 								lastSeen[chunk[k]] = lastSeenT{sent: ver[chunk[k]], tail: resp.CurrentVersion}
-								traceAdd(chunk[k], fmt.Sprintf("biz_%d", resp.ErrId), ver[chunk[k]], resp.CurrentVersion)
-								if resp.ErrId == client.ErrIDVersionConflict {
-									traced[chunk[k]] = true
-								}
 								if resp.ErrId == client.ErrIDVersionConflict ||
 									resp.CurrentVersion > 0 {
 									// 1001 answers "the tail is higher than
@@ -688,7 +614,7 @@ func main() {
 						// completed inside the window — a call cut at the
 						// deadline has no real latency to report.
 						total.Add(int64(answered))
-						if ctx.Err() == nil {
+						if globalCtx.Err() == nil {
 							lat := float64(time.Since(t0).Microseconds()) / 1000.0
 							latMu.Lock()
 							latencies = append(latencies, lat)
@@ -698,9 +624,9 @@ func main() {
 				}
 				return
 			}
-			for ctx.Err() == nil {
+			for globalCtx.Err() == nil {
 				for _, agg := range targets {
-					if ctx.Err() != nil {
+					if globalCtx.Err() != nil {
 						return
 					}
 					seq++
@@ -711,7 +637,10 @@ func main() {
 						Events:    []*pushupesv1.Event{{Type: "BenchAppend", Body: body}},
 					}
 					t0 := time.Now()
-					resp := singleAppend(cl, ctx, req)
+					if atomic.CompareAndSwapInt32(&warmed, 0, 1) {
+						start = time.Now()
+					}
+					resp := singleAppend(cl, globalCtx, req)
 					// version self-heal: if the leader reports a newer tail
 					// (resume estimate lagged), adopt it and retry once.
 					if resp != nil &&
@@ -720,12 +649,12 @@ func main() {
 						ver[agg] = resp.CurrentVersion
 						req.Version = resp.CurrentVersion + 1
 						t0 = time.Now()
-						resp = singleAppend(cl, ctx, req)
+						resp = singleAppend(cl, globalCtx, req)
 					}
 					if resp == nil {
 						// unanswered only ever means the window closed
 						// mid-backpressure — dropped, not failed
-						if ctx.Err() != nil {
+						if globalCtx.Err() != nil {
 							windowDropped.Add(1)
 						} else {
 							// Fate unknown: the exit probe below settles it,
@@ -752,20 +681,7 @@ func main() {
 					}
 				}
 			}
-			// (the dump rides a defer — the batch loop exits through a
-			// bare `return` when the window closes, and a trailing
-			// block after the if/else would never run)
-			// dump trace for the aggs that hit 1001: the full event
-			// ledger around the +2 gap — round, kind, what ver said,
-			// what the server said. Guesswork ends at a printout.
-			for agg := range traced {
-				bizSampleMu.Lock()
-				fmt.Printf("  trace %s:\n", agg)
-				for _, ev := range trace[agg] {
-					fmt.Printf("    r%d %s v=%d tail=%d\n", ev.round, ev.kind, ev.ver, ev.tail)
-				}
-				bizSampleMu.Unlock()
-			}
+
 		}(w)
 	}
 
@@ -774,17 +690,28 @@ func main() {
 	go func() {
 		tk := time.NewTicker(*reportEvery)
 		defer tk.Stop()
-		var last int64
+		var lastTotal int64
+		var lastOKCnt int64
 		for {
 			select {
+			case <-globalCtx.Done():
+				return
 			case <-done:
 				return
 			case t := <-tk.C:
-				cur := total.Load()
-				fmt.Printf("t+%4.1fs  total=%8d  rate=%8.0f msg/s  ok=%d exists=%d fail=%d\n",
-					t.Sub(start).Seconds(), cur, float64(cur-last)/reportEvery.Seconds(),
+				if atomic.LoadInt32(&warmed) == 0 {
+					continue
+				}
+				if t.After(start.Add(*dur)) {
+					globalCancel()
+				}
+				curTotal := total.Load()
+				curOKCnt := okCnt.Load()
+				fmt.Printf("t+%4.0fs  total=%8d  rate=%8.0f msg/s  throughput=%8.0f msg/s  ok=%d exists=%d fail=%d\n",
+					t.Sub(start).Seconds(), curTotal, float64(curTotal-lastTotal)/reportEvery.Seconds(), float64(curOKCnt-lastOKCnt)/reportEvery.Seconds(),
 					okCnt.Load(), existsCnt.Load(), failCnt.Load())
-				last = cur
+				lastTotal = curTotal
+				lastOKCnt = curOKCnt
 			}
 		}
 	}()
@@ -800,7 +727,7 @@ func main() {
 		}
 		return fmt.Sprintf("%.2fms", latencies[int(q*float64(len(latencies)-1))])
 	}
-	resumeElapsed := start.Sub(resumeStart)
+	startupElapsed := start.Sub(programStart)
 	fmt.Printf("\n== bench done in %s ==\n", elapsed.Round(time.Millisecond))
 	fmt.Printf("attempts=%d ok=%d exists=%d fail=%d redirects=%d\n",
 		total.Load(), okCnt.Load(), existsCnt.Load(), failCnt.Load(), cl.Redirects())
@@ -845,15 +772,12 @@ func main() {
 		bizSampleMu.Unlock()
 
 	}
-	fmt.Printf("throughput=%.0f msg/s  latency p50=%s p90=%s p99=%s\n",
-		float64(total.Load())/elapsed.Seconds(), pct(0.5), pct(0.9), pct(0.99))
-	// Two different denominators are easy to confuse: the line above divides
-	// by the write window only, while the per-slot delta further down divides
-	// by everything the process spent after the chain was ready (resume
-	// probing included). Print both explicitly instead of letting one of them
-	// masquerade as "the" throughput.
-	fmt.Printf("phases: resume=%s (probe only, excluded from throughput=), window=%s (append phase)\n",
-		resumeElapsed.Round(time.Millisecond), elapsed.Round(time.Millisecond))
+	fmt.Printf("rate=%.0f msg/s  throughput=%.0f msg/s  latency p50=%s p90=%s p99=%s\n",
+		float64(total.Load())/elapsed.Seconds(), float64(okCnt.Load())/elapsed.Seconds(), pct(0.5), pct(0.9), pct(0.99))
+	// The line above divides by the append window only. Print the launch gap
+	// next to it so a slow start cannot masquerade as a slow cluster.
+	fmt.Printf("phases: startup=%s (process start to first append, excluded from throughput=), window=%s (append phase)\n",
+		startupElapsed.Round(time.Millisecond), elapsed.Round(time.Millisecond))
 
 	if failCnt.Load() > 0 {
 		fmt.Println("NOTE: some appends failed; check cluster health")
@@ -870,16 +794,6 @@ func singleAppend(cl *client.Client, ctx context.Context, req *pushupesv1.Append
 	// as a window-drop, never a failure.
 	resps, _ := cl.BatchAppend(ctx, []*pushupesv1.AppendRequest{req})
 	return resps[0]
-}
-
-// aggIndex finds an aggregate id's position; -1 when absent.
-func aggIndex(ids []string, want string) int {
-	for i, id := range ids {
-		if id == want {
-			return i
-		}
-	}
-	return -1
 }
 
 func makeBody(size int) []byte {
