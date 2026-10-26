@@ -88,9 +88,11 @@ type Node struct {
 	replicators  map[string]*replicator
 	waiters      []applyWaiter
 	barriers     []barrierWait
-	pendingAcks  []pendingAck
-	durableLSN   uint64
-	snapRunning  bool
+	// durableLSN is the highest WAL LSN the flusher has fsync'd on this node.
+	// The leader's write path parks answers the watermark has not yet reached
+	// (see onDurable), so it is loop state.
+	durableLSN  uint64
+	snapRunning bool
 	// snapWG tracks the goroutine writing a snapshot file into the data
 	// directory, so Close does not return while one is still being placed.
 	snapWG sync.WaitGroup
@@ -183,6 +185,13 @@ func NewNode(cfg Config, fsm FSM, tr Transport) (*Node, error) {
 		closingAcked: map[string]bool{},
 	}
 
+	// Durability notifications drive the leader-side answer holds: the
+	// flusher publishes the highest durable LSN, and the run loop releases
+	// every parked command and membership answer whose record it now covers.
+	// Wire before the first append so the bootstrap rounds count too.
+	n.log.wal.SetOnDurable(n.publishDurable)
+	n.durableLSN = n.log.wal.durableNow()
+
 	// Membership is recovered from the log: the conf record is this node's own
 	// copy of the configuration (rewritten whenever a change commits), and the
 	// conf ENTRIES in the log are replayed on top of it. A node that has a
@@ -262,19 +271,15 @@ func NewNode(cfg Config, fsm FSM, tr Transport) (*Node, error) {
 	n.rebuildClients(nil)
 
 	n.srv = newRPCServer(cfg.NodeID, tr, n.handleRPC, n.acceptablePeer, cfg.Logger)
-	// Durability notifications drive deferred acknowledgements: the flusher
-	// publishes the highest durable LSN and the loop releases every follower
-	// ack and commit step that was waiting on it.
-	n.log.wal.SetOnDurable(n.publishDurable)
 	go n.srv.run()
 	n.publishView()
 	go n.run()
 	return n, nil
 }
 
-// publishDurable records the highest durable LSN and nudges the run loop. It is
-// called from the flusher goroutine and must never block: the atomic keeps the
-// maximum, so a coalesced wake-up is always enough.
+// publishDurable records the highest durable LSN and nudges the run loop. It
+// is called from the flusher goroutine and must never block: the atomic keeps
+// the maximum, so a coalesced wake-up is always enough.
 func (n *Node) publishDurable(lsn uint64) {
 	for {
 		cur := n.durableSeq.Load()

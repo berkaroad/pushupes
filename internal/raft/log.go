@@ -126,9 +126,9 @@ func (l *raftLog) replay(recs []Record) error {
 	return nil
 }
 
-// appendEntries persists entries and waits for durability. Use it when the
-// caller must not proceed until the records are on disk (the leader's own
-// appends).
+// appendEntries persists entries and waits for durability. It is reserved for
+// one-time startup records — the bootstrap configuration entry — where the
+// node must not come up before the record is on disk.
 func (l *raftLog) appendEntries(es []Entry) error {
 	lsn, err := l.appendEntriesAsync(es)
 	if err != nil {
@@ -141,10 +141,13 @@ func (l *raftLog) appendEntries(es []Entry) error {
 }
 
 // appendEntriesAsync persists entries into the WAL and updates the in-memory
-// log without waiting for the fsync; it returns the LSN of the last record, so
-// the caller can defer its acknowledgement until the flusher reports that LSN
-// durable. Followers use it to answer AppendEntries without blocking the run
-// loop on I/O.
+// log without waiting for the fsync; it returns the LSN of the last record for
+// callers that want to track it. Both halves of the write path use it: the
+// leader appends a batch, replicates, and commits on the quorum's replies —
+// only the CLIENT answer then waits for the leader's own flush round — while
+// the follower appends what the leader sent and answers the AppendEntries on
+// the spot. The group-commit flusher moves the buffer to disk on its own
+// schedule, hurried along by flushSoon when an answer is parked on it.
 func (l *raftLog) appendEntriesAsync(es []Entry) (uint64, error) {
 	if len(es) == 0 {
 		return 0, nil
@@ -193,6 +196,23 @@ func (l *raftLog) appendEntriesAsync(es []Entry) (uint64, error) {
 		l.lsns = append(l.lsns, lsns[i])
 	}
 	return lsns[len(lsns)-1], nil
+}
+
+// lsnOf reports the WAL record LSN that carries the entry at index — false
+// when the entry no longer lives in the log (snapshot-trimmed or lost). The
+// leader's deferred answers consult it: a missing LSN means the record's
+// durability rides its snapshot file, which was fsync'd when written.
+func (l *raftLog) lsnOf(index uint64) (uint64, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.entries) == 0 {
+		return 0, false
+	}
+	first := l.entries[0].Index
+	if index < first || index > first+uint64(len(l.entries)-1) {
+		return 0, false
+	}
+	return l.lsns[index-first], true
 }
 
 // setHardState persists term/voteFor.

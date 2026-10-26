@@ -1303,10 +1303,23 @@ func (e *Engine) localAppendThrottled(slot int32, rec *data.EventRecord) (*data.
 	if err != nil || resp.Status != data.StatusSuccess {
 		return resp, err
 	}
-	// success: wait for the watermark so the acknowledged record survives a
-	// leader crash (see the function comment).
+	// success: the acknowledgement owes two promises — the record is covered
+	// by the in-sync replicas' watermark (a leader crash cannot lose it),
+	// and it has passed an fsync on this node's own disk (a whole-cluster
+	// power loss cannot lose it). The legs run CONCURRENTLY inside the one
+	// hwWait deadline: a parked fsync waiter fires its own round immediately
+	// (storage's policy honors waiters over the timed window), so the
+	// acknowledgement costs max(replica round, fsync round), never their sum
+	// and never the flush interval.
 	tWait := time.Now()
+	deadline := tWait.Add(e.hwWait)
+	durCh := make(chan uint64, 1)
+	go func() { durCh <- e.store.AwaitDurable(slot, resp.Seq, deadline) }()
 	hw, werr := e.waitForHW(context.Background(), slot, resp.Seq, e.hwWait)
+	dur := <-durCh
+	if werr == nil && dur < resp.Seq {
+		werr = fmt.Errorf("cluster: local fsync covered %d below seq %d before the deadline", dur, resp.Seq)
+	}
 	e.noteWait(slot, time.Since(tWait), e.hwLagRecords(slot, hw), werr != nil)
 	if werr != nil {
 		resp.Status = data.StatusFail
@@ -1567,18 +1580,43 @@ func (e *Engine) batchLocal(ctx context.Context, slot int32, recs []*data.EventR
 	if maxSeq == 0 {
 		return out, nil // nothing new landed: fail/exists only, no wait
 	}
+	// The group's success also owes a leader fsync covering its last record
+	// (a whole-cluster power loss may not erase an acknowledged write). Like
+	// the single-append path the two legs run concurrently inside one hwWait
+	// deadline — the parked fsync waiter fires its round on the spot. floor
+	// is the seq BOTH gates vouch for — nothing above it may be reported as
+	// confirmed — so the fsync leg's observation counts even when the
+	// watermark leg failed: records below a failed watermark's observation
+	// keep their success only when a settled fsync covers them too.
+	// waitForHW answers 0 when the slot needs no replica wait (RF<=1): that
+	// success already vouches for maxSeq, and the watermark floor then
+	// clamps it alone.
 	tWait := time.Now()
+	deadline := tWait.Add(e.hwWait)
+	durCh := make(chan uint64, 1)
+	go func() { durCh <- e.store.AwaitDurable(slot, maxSeq, deadline) }()
 	hw, werr := e.waitForHW(context.Background(), slot, maxSeq, e.hwWait)
+	dur := <-durCh
+	floor := maxSeq
+	if werr != nil {
+		floor = hw
+	}
+	if dur < floor {
+		floor = dur
+	}
+	if floor < maxSeq && werr == nil {
+		werr = fmt.Errorf("cluster: local fsync covered %d below seq %d before the deadline", floor, maxSeq)
+	}
 	e.noteWait(slot, time.Since(tWait), e.hwLagRecords(slot, hw), werr != nil)
 	if werr != nil {
-		// The group's wait ran out. Judge every record against the watermark
-		// waitForHW observed at the deadline: the prefix it covers keeps its
+		// The group's wait ran out. Judge every record against the floor the
+		// gates observed at the deadline: the prefix it covers keeps its
 		// success (its durability promise IS met), only the records above it
 		// fail/1007 — durable in the leader's WAL, retried by the client
 		// under the same command_id, converging on exists. The timeout thus
 		// costs the group ONE deadline, not one per record.
 		for _, resp := range out {
-			if resp.Status == data.StatusSuccess && resp.Seq > hw {
+			if resp.Status == data.StatusSuccess && resp.Seq > floor {
 				resp.Status = data.StatusFail
 				resp.ErrID = data.ErrIDAckTimeout
 				resp.Err = werr.Error()

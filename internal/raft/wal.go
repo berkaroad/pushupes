@@ -24,7 +24,9 @@
 // LSN; a background flusher writes the buffer, fdatasync()s it, then wakes
 // every caller whose LSN is now durable. N concurrent appends therefore share
 // one fsync instead of paying one each; a caller that must be durable before it
-// is acknowledged waits with Wait(lsn).
+// is acknowledged waits with Wait(lsn) — or, on the leader's answer path,
+// holds the answer and asks the flusher to close the window now (flushSoon),
+// parking on the OnDurable notification instead of a blocking wait.
 //
 // Crash recovery scans segments in order and truncates at the first record
 // whose framing or CRC is bad, dropping only the tail — records already
@@ -82,7 +84,8 @@ type WALOptions struct {
 	FlushInterval time.Duration // group-commit window
 	// OnDurable, when set, is called (from the flusher goroutine) with the
 	// highest LSN now on disk after every successful fsync. It must not block
-	// for long: durability callers use it to release deferred acknowledgements.
+	// for long: the leader's write path uses it to release the answers its
+	// append path deferred on local durability.
 	OnDurable func(lsn uint64)
 }
 
@@ -139,6 +142,7 @@ type WAL struct {
 	closed    bool
 
 	dirty     chan struct{}
+	urgent    chan struct{}
 	closeReq  chan struct{}
 	doneCh    chan struct{}
 	closeOnce sync.Once
@@ -165,6 +169,7 @@ func OpenWAL(dir string, opts WALOptions) (*WAL, error) {
 		opts:     opts,
 		lock:     lock,
 		dirty:    make(chan struct{}, 1),
+		urgent:   make(chan struct{}, 1),
 		closeReq: make(chan struct{}),
 		doneCh:   make(chan struct{}),
 	}
@@ -195,6 +200,15 @@ func (w *WAL) flushCount() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.flushes
+}
+
+// buffered counts the records sitting in the group-commit buffer, written to
+// the log but not yet fsync'd. The durability regressions read it to prove an
+// acknowledgement landed while its record was still in memory.
+func (w *WAL) buffered() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.pending)
 }
 
 // ---- recovery ----
@@ -451,6 +465,17 @@ func (w *WAL) flushLoop() {
 				window = time.NewTimer(w.opts.FlushInterval)
 				windowC = window.C
 			}
+		case <-w.urgent:
+			// A parked acknowledgement asked for the window now: close it
+			// early so this round carries its record. Anything appended
+			// between the request and this wake-up rides the same fsync —
+			// the one cost of holding the early round is the one round.
+			if window != nil {
+				window.Stop()
+				window = nil
+				windowC = nil
+			}
+			w.flush()
 		case <-windowC:
 			window = nil
 			windowC = nil
@@ -495,10 +520,29 @@ func (w *WAL) flush() {
 }
 
 // SetOnDurable installs the durability callback (see WALOptions.OnDurable).
+// The WAL opens before the node exists, so the node wires itself in here.
 func (w *WAL) SetOnDurable(fn func(lsn uint64)) {
 	w.mu.Lock()
 	w.onDurable = fn
 	w.mu.Unlock()
+}
+
+// flushSoon asks the flusher to close the group-commit window now instead of
+// at its expiry: a leader-side answer parked on local durability is waiting
+// for this round. The signal coalesces (cap-1), so a whole batch of parked
+// answers costs one wake-up, and it never blocks the caller.
+func (w *WAL) flushSoon() {
+	select {
+	case w.urgent <- struct{}{}:
+	default:
+	}
+}
+
+// durableNow reports the highest LSN already fsync'd.
+func (w *WAL) durableNow() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.durable
 }
 
 // writePending writes records into the current segment, rotating between

@@ -93,6 +93,11 @@ type confWaiter struct {
 	deadline   time.Time
 	cc         confChange
 	timeoutMsg string
+	// applied marks the change committed AND applied here, with the answer
+	// still waiting on the leader's own fsync (the same hold the command
+	// waiters take). A committed change is never timed out away: the deadline
+	// protects against a missing quorum, not against a flush round.
+	applied bool
 }
 
 // confReq is a membership change posted to the run loop.
@@ -286,7 +291,7 @@ func (n *Node) advancePendingAdd() {
 // replication the change depends on.
 func (n *Node) waitConf(cc confChange, req *confReq, deadline time.Time) {
 	idx := n.log.LastIndex() + 1
-	if err := n.log.appendEntries([]Entry{{Index: idx, Term: n.term, Kind: KindConf, Data: encodeConfChange(cc)}}); err != nil {
+	if _, err := n.log.appendEntriesAsync([]Entry{{Index: idx, Term: n.term, Kind: KindConf, Data: encodeConfChange(cc)}}); err != nil {
 		n.clearPending(cc)
 		req.resp <- err
 		return
@@ -316,6 +321,9 @@ func (n *Node) sweepConfDeadlines(now time.Time) {
 	}
 	next := time.Time{}
 	for idx, w := range n.confWaiters {
+		if w.applied {
+			continue // committed + applied, parked on the flush round: onDurable releases it
+		}
 		if now.Before(w.deadline) {
 			next = earliest(next, w.deadline)
 			continue
@@ -379,8 +387,14 @@ func (n *Node) onConfCommitted(e Entry, index uint64) {
 		}
 	}
 	if w, ok := n.confWaiters[index]; ok {
-		delete(n.confWaiters, index)
-		w.ch <- nil
+		w.applied = true
+		if n.answerDurable(index) {
+			delete(n.confWaiters, index)
+			w.ch <- nil
+		} else {
+			n.confWaiters[index] = w
+			n.log.wal.flushSoon()
+		}
 	}
 }
 

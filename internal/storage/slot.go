@@ -115,6 +115,17 @@ type Slot struct {
 	segmentBytes int64
 	flush        FlushPolicy
 	pendingFlush int64
+	// durableSeq is the fsync coverage watermark: every record at or below it
+	// passed an fsync whose whole prepare round settled (see flushCov). The
+	// write-ack path waits on it (Store.AwaitDurable) so an acknowledged
+	// record survives even a whole-cluster power loss.
+	durableSeq uint64
+	// durWaiters counts write-ack callers parked on the coverage watermark.
+	// A parked waiter makes the slot due for a flush round under ANY policy
+	// — the timed window then sets only the background cadence for writes
+	// nobody is acknowledging, while an acknowledgement pays fsync time and
+	// queue depth, not the interval.
+	durWaiters int
 	// unflushedSinceNS is when this slot went from having nothing unflushed
 	// to holding records that still need an fsync (0 = nothing waiting). It is
 	// the durability-exposure clock FlushStats reports. The slot lock writes
@@ -406,6 +417,9 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 			s.seqCounter.Store(last.BaseSeq - 1)
 		}
 	}
+	// A loaded copy IS its own disk image: everything it just read back is
+	// durable by definition, so the coverage watermark opens at the log end.
+	s.durableSeq = s.seqCounter.Load()
 	return s, nil
 }
 
@@ -1091,6 +1105,46 @@ func (s *Slot) WaitForSeq(wantSeq uint64, deadline time.Time) uint64 {
 	return s.seqCounter.Load()
 }
 
+// DurableSeq is the fsync coverage watermark: every record at or below it has
+// passed an fsync that settled (see flushCov). Callers that only report, not
+// wait, read it lock-free through the store.
+func (s *Slot) DurableSeq() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.durableSeq
+}
+
+// WaitDurableSeq blocks until the slot's fsync coverage reaches wantSeq or the
+// deadline passes; it returns the watermark observed at wake-up. The write-ack
+// path parks here: an acknowledged record must be on the leader's own disk.
+// Parking registers the waiter, which makes the slot due for a flush round
+// under any policy (the timed window then only paces writes nobody is
+// acknowledging), and one kick of the flusher schedules that round — the wake
+// itself rides the slot condition.
+func (s *Slot) WaitDurableSeq(wantSeq uint64, deadline time.Time) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.durableSeq >= wantSeq {
+		return s.durableSeq
+	}
+	s.durWaiters++
+	if s.store != nil {
+		s.store.kickFlush()
+	}
+	defer func() { s.durWaiters-- }()
+	for s.durableSeq < wantSeq {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		// timed wait: wake the waiter at the deadline even without a settle
+		timer := time.AfterFunc(remaining, func() { s.cond.Broadcast() })
+		s.cond.Wait()
+		timer.Stop()
+	}
+	return s.durableSeq
+}
+
 // CurrentVersion returns the aggregate's last stored version (0 = unknown).
 func (s *Slot) CurrentVersion(aggregateID string) uint32 {
 	s.mu.RLock()
@@ -1556,6 +1610,10 @@ func (s *Slot) flushInline() error {
 		return err
 	}
 	s.markFlushedLocked()
+	if leo := s.seqCounter.Load(); leo > s.durableSeq {
+		s.durableSeq = leo
+		s.cond.Broadcast()
+	}
 	return nil
 }
 
@@ -1631,6 +1689,9 @@ func (s *Slot) prepareFlushLocked(now time.Time, force bool) ([]*flushUnit, time
 		if !fired && !due.IsZero() && !due.After(now) {
 			fired = true
 		}
+		if !fired && s.durWaiters > 0 {
+			fired = true // an acknowledgement is parked: its round is due now
+		}
 	}
 	if !fired {
 		return nil, due, false
@@ -1649,6 +1710,15 @@ func (s *Slot) prepareFlushLocked(now time.Time, force bool) ([]*flushUnit, time
 			recs:     seg.unflushed,
 			enq:      now,
 		})
+	}
+	if len(units) > 0 {
+		// One coverage claim per round, handed to every unit it snapshots:
+		// the log end recorded here becomes assertable when the LAST unit of
+		// the round settles its fsync (see flushCov).
+		cov := &flushCov{seq: s.seqCounter.Load(), left: len(units)}
+		for _, u := range units {
+			u.cov = cov
+		}
 	}
 	// Push the index buffers out while the lock is already held: those are
 	// buffered writes (no fsync) and the index may lag the WAL, so they ride
@@ -1689,6 +1759,13 @@ func (s *Slot) settleFlush(u *flushUnit, err error) {
 		seg.unflushed = 0
 	}
 	seg.lastFlushTime = time.Now()
+	if u.cov != nil {
+		u.cov.left--
+		if u.cov.left == 0 && u.cov.seq > s.durableSeq {
+			s.durableSeq = u.cov.seq
+			s.cond.Broadcast()
+		}
+	}
 	s.pendingFlush -= u.recs
 	if s.pendingFlush <= 0 {
 		s.markFlushedLocked()

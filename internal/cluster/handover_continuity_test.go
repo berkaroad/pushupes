@@ -67,10 +67,19 @@ func TestHandoverKeepsEveryAckedRecordVisible(t *testing.T) {
 	if err := ctrl.awaitApplied(context.Background(), 15*time.Second); err != nil {
 		t.Fatalf("setup apply: %v", err)
 	}
-	// every engine applies the same raft entries
-	for time.Now().Before(time.Now().Add(2 * time.Second)) {
-		if len(peer.TableSnapshot().Slots) == 8 && len(third.TableSnapshot().Slots) == 8 {
+	// Every engine applies the same raft entries — and the controller is
+	// whoever won the election, so SRC may be a follower here whose apply
+	// trails the commit. The planned table must be visible on all three
+	// before the ledger starts; check src too (and hold a real deadline,
+	// not one recomputed every turn).
+	settleDeadline := time.Now().Add(15 * time.Second)
+	for {
+		if len(src.TableSnapshot().Slots) == 8 && len(peer.TableSnapshot().Slots) == 8 && len(third.TableSnapshot().Slots) == 8 {
 			break
+		}
+		if time.Now().After(settleDeadline) {
+			t.Fatalf("tables did not settle: src=%d peer=%d third=%d",
+				len(src.TableSnapshot().Slots), len(peer.TableSnapshot().Slots), len(third.TableSnapshot().Slots))
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

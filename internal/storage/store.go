@@ -673,13 +673,38 @@ func (st *Store) StalledAggs(slotID int32) []string {
 	return s.StalledAggs()
 }
 
-// LastSeq returns the durable LEO for one slot (0 when the slot is unknown).
+// LastSeq returns the slot's log end offset — the highest appended seq, riding
+// the page-cache write (fsync coverage is DurableSeqOf). 0 when unknown.
 func (st *Store) LastSeqOf(slotID int32) uint64 {
 	s, err := st.Slot(slotID)
 	if err != nil {
 		return 0
 	}
 	return s.LastSeq()
+}
+
+// DurableSeqOf reports the slot's fsync coverage watermark: every record at or
+// below it has passed a settled fsync on this node (0 when the slot is unknown).
+func (st *Store) DurableSeqOf(slotID int32) uint64 {
+	s, err := st.Slot(slotID)
+	if err != nil {
+		return 0
+	}
+	return s.DurableSeq()
+}
+
+// AwaitDurable blocks until every record at or below wantSeq has passed an
+// fsync on this node, or the deadline passes; it returns the coverage
+// watermark observed at wake-up. The client-facing write paths park here after
+// the replica watermark gate: an acknowledged append must also be on the
+// leader's own disk, so a whole-cluster power loss cannot erase a confirmed
+// record.
+func (st *Store) AwaitDurable(slotID int32, wantSeq uint64, deadline time.Time) uint64 {
+	s, err := st.Slot(slotID)
+	if err != nil {
+		return 0
+	}
+	return s.WaitDurableSeq(wantSeq, deadline)
 }
 
 // WakeChan returns the current wake handle for one slot: it closes on the

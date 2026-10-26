@@ -58,6 +58,20 @@ type flushUnit struct {
 	newBytes int64    // of size, the bytes not covered by an earlier fsync (durable from here)
 	recs     int64    // records this fsync covers, settled into seg.unflushed/pendingFlush
 	enq      time.Time
+	cov      *flushCov // the round's coverage claim (nil for a sealed-segment enqueue)
+}
+
+// flushCov claims one prepare round's coverage: the slot's log end at the
+// moment the round snapshotted its segments. The claim lands on the slot's
+// durable watermark once EVERY unit of the round has settled an fsync — every
+// record appended before the snapshot then sits on disk in every segment it
+// touched. A round whose unit the queue dropped to dedup stays unclaimed: the
+// in-flight fsync it merged behind flushes those bytes anyway, and the NEXT
+// round's snapshot (a higher log end) lands the claim. Claims are monotonic,
+// so the watermark only ever asserts what a settled fsync proved.
+type flushCov struct {
+	seq  uint64
+	left int
 }
 
 // flusher owns every fsync in the store.

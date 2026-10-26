@@ -38,7 +38,7 @@ Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分
   data-1 ◀──MFetch 长轮询拉取（peer 面 83xx，与 Raft 同端口族）──▶ data-2
   follower 按 leader 分组批量拉增量，应答是裸 WAL 字节、原样落盘，
   批量回报 LEO，leader 推进 HW = ISR 内最小 LEO；
-  写入等到高水位覆盖该条记录才回 success（单节点宕机不丢已确认写入）
+  写入等高水位覆盖该条记录且 leader 本地 fsync 落定才回 success（单节点宕机或整簇掉电都不丢已确认写入）
 ```
 
 三条链路各走各的面：共识与数据复制都走 peer 面，事件读写只走 client 面，
@@ -50,8 +50,9 @@ Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分
 
 - 控制面用自研 Raft 只复制**元数据**（槽位分配表与集群成员）；事件数据由副本
   向 leader 拉取复制，两相分离。
-- 写入经全部同步副本落盘后才确认：回 `success` 的写入不会因单节点宕机而丢失；
-  副本全部掉线的极端情况下可用性优先（承诺只对同步副本成立）。
+- 写入经全部同步副本写入日志、且 leader 本地 fsync 落定后才确认：回
+  `success` 的写入不会因单节点宕机或整簇掉电而丢失；
+  副本全部掉线的极端情况下可用性优先（复制承诺只对同步副本成立，落盘承诺由 leader 自己的盘兜底）。
 - 节点失联自动故障切换（该节点名下所有槽重选 leader），恢复后自动回切；读写
   都靠 MOVED/ASK 重定向到达槽 owner，服务端不中继流量，客户端库自动跟随。
 - 恢复判定不等探活的连接退避：重启的节点自报注册即清掉离线标记（要求对端 peer 端口
@@ -219,8 +220,8 @@ medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(�
 | `-adopt-interval` | `PUSHUPES_ADOPT_INTERVAL` | 3s | 尚未成为集群成员的节点每隔多久向 `-join` 目标重试一次自报（多地址轮转，个别成员不可达不影响加入） |
 | `-bootstrap` | — | false | 由本节点撰写集群的初始配置：配合 `-peers` 用于点名非最小 id 的作者；单独使用（无 `-peers`）时撰写只有自己的单 voter 配置，后续 voter 用 `-join` 加入。learner 不能撰写，与 `-join` 同用启动即报错 |
 | `-replica-policy` | `PUSHUPES_REPLICA_POLICY` | medium | 副本策略档位：`low`=每槽 1 份、`medium`=2 份（默认）、`high`=每槽 3 份（容忍失去 2 个数据节点），或**正整数直接指定副本因子**。**只用于新集群的初始值**：策略存放在 Raft 复制的槽表里，之后只能经 `POST /admin/cluster/replica-policy` 修改，重启不会重刷；副本因子 = MIN(数据节点数（布局池 `HostingIDs()`）, 策略要求份数)。`GET /admin/cluster/status` 的 `replica_policy` / `replica_factor` 读回当前值；非法值启动即报错 |
-| `-flush-messages` | `PUSHUPES_FLUSH_MESSAGES` | 1000 | 每 N 条 fsync（0 关闭） |
-| `-flush-interval` | `PUSHUPES_FLUSH_INTERVAL` | 100ms | 每周期 fsync（0 关闭） |
+| `-flush-messages` | `PUSHUPES_FLUSH_MESSAGES` | 1000 | 每 N 条 fsync（0 关闭）——这是无人等待时的后台节奏；写入确认不等窗口：停靠的确认即时触发该槽的组提交轮，合批 = 一轮 fsync 期间积累的全部追加 |
+| `-flush-interval` | `PUSHUPES_FLUSH_INTERVAL` | 100ms | 每周期 fsync（0 关闭）——同上，只定后台节奏；确认路径的本地落盘腿付的是 fsync 时长与队列深度，复制高水位腿与它并行，ack ≈ 两腿取最大 |
 | `-flush-parallelism` | `PUSHUPES_FLUSH_PARALLELISM` | 1 | 全存储同时在飞的段 fsync 上限（1=一次刷一个，即历史单刷盘链路）：一个许可信号量给所有 fsync 封顶，刷盘队列由持久 worker 池执行；显式 `Flush()`/`Close` 的 fsync 也在调用方 goroutine 上取同一许可、同受上限约束。刷盘轮按预算切片（每轮至多 8 个单元或 200ms）。<1 启动即报错；生效值可从 `/admin/stats` 的 `parallelism` 字段读回（机制见 DESIGN §3） |
 | `-segment-bytes` | `PUSHUPES_SEGMENT_BYTES` | 64MiB | WAL 段滚动大小：64MiB 整数倍，≤2GiB；可写字节数或带单位（`64MiB`/`1GiB`），env 同样接受带单位形式 |
 | `-fetch-settle` | `PUSHUPES_FETCH_SETTLE` | 200µs | fetch 轮被数据唤醒后的合并窗口：一轮覆盖整批写入涉及的多个槽；每次 ack 都要付它一次，换的是轮次与上报次数；0=首个槽有数据就答（轮次更多） |
@@ -230,7 +231,7 @@ medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(�
 | `-grpc-max-msg-size` | `PUSHUPES_GRPC_MAX_MSG_SIZE` | 4MiB | client 面 gRPC 消息上限（recv/send 同值）；`BatchAppend` 单批要装进它，可写 `16MiB` 等带单位形式（env 同样接受）；≤0 启动即报错 |
 | `-raft-heartbeat-timeout` | `PUSHUPES_RAFT_HEARTBEAT_TIMEOUT` | 100ms | 共识心跳间隔。leader 的心跳没按时到达就会被投票换掉，所以宿主机可能拖住共识事件循环时要与 `-raft-election-timeout` 一起放大 |
 | `-raft-election-timeout` | `PUSHUPES_RAFT_ELECTION_TIMEOUT` | 500ms | follower 多久收不到心跳就发起选举。必须 ≥ 2× 心跳，否则一次迟到的心跳就会掀掉 leader（启动即报错）；与心跳是一对比例，一起放大而不是只收窄其中一个 |
-| `-raft-flush-interval` | `PUSHUPES_RAFT_FLUSH_INTERVAL` | 100ms | 共识 WAL 组提交窗口：窗口内到达的追加共用一次 fsync |
+| `-raft-flush-interval` | `PUSHUPES_RAFT_FLUSH_INTERVAL` | 100ms | 共识 WAL 组提交窗口：窗口内到达的追加共用一次 fsync；等待确认的应答会把所属轮提前关窗（确认延迟 = fsync 轮，不等窗口） |
 | `-raft-segment-bytes` | `PUSHUPES_RAFT_SEGMENT_BYTES` | 64MiB | 共识 WAL 段滚动大小；可写字节数或带单位（`64MiB`），env 同样接受 |
 
 ### 客户端接入
@@ -267,7 +268,7 @@ resp, err := cl.ReadStream(ctx, "agg-1", fromVersion, 100)  // 读：按版本�
 - `1003` MOVED / `1004` ASK：`pkg/client` 自动跟随；用库时看不到这两个码。
 - `1005` 节点级流控拒绝（见「节点级流控」）：用库时被吸收为回压，调用方看不到；直连 gRPC 才需要自己退避。
 - `1006` 本地副本来源未证实：owner 围栏拦下该槽——leader 拒写、本地读答空。数据没丢，但 client 面没有可自愈的动作，要运维确认该副本属于当前世代后采纳、或删掉该槽目录才解除（命令在 admin 面，见 DESIGN §3.1）。
-- `1007` 高水位确认超时：记录**已落 leader WAL**，只是确认没等到。带同一 `command_id` 重试会命中 exists——重试即确认，不是重写。
+- `1007` 确认等待超时：记录**已落 leader WAL**，只是同步副本高水位或 leader 本地 fsync 没等到。带同一 `command_id` 重试会命中 exists——重试即确认，不是重写。
 - `1008` 本节点是该槽 leader 但暂不可服务（无本地副本，或副本是空壳而别处有历史）：**什么都没写**，稍后重试即可。
 - `1009` 纯控制面节点：集群还没有数据面成员持有该槽（布局未规划）。什么都没写，重试无用，需要先规划布局（admin 面的运维动作）。
 

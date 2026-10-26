@@ -89,20 +89,17 @@ type snapshotDone struct {
 type applyWaiter struct {
 	index uint64
 	ch    chan applyResp
+	// held marks an answer that applied but waits on the leader's own fsync:
+	// res carries it until onDurable frees it. The ack promise is
+	// quorum-written AND leader-durable — application itself is not held back
+	// (applied moves on, only the client answer parks).
+	held bool
+	res  applyResp
 }
 
 type barrierWait struct {
 	index uint64
 	ch    chan error
-}
-
-// pendingAck is a follower AppendEntries reply waiting for its record to be
-// fsync'd. Deferring the reply keeps the run loop off the durability critical
-// path.
-type pendingAck struct {
-	lsn          uint64
-	leaderCommit uint64
-	resp         chan appendEntriesResp
 }
 
 // ---- timers ----
@@ -346,7 +343,7 @@ func (n *Node) becomeLeader() {
 	}
 	// Commit an entry from the current term (a no-op) so entries left over
 	// from previous terms can be committed safely.
-	if err := n.log.appendEntries([]Entry{{Index: last + 1, Term: n.term, Kind: KindNoop}}); err != nil {
+	if _, err := n.log.appendEntriesAsync([]Entry{{Index: last + 1, Term: n.term, Kind: KindNoop}}); err != nil {
 		n.logger.Errorf("raft: append leader no-op: %v", err)
 	}
 	n.publishView()
@@ -454,7 +451,6 @@ func (n *Node) onAppendEntries(req *appendEntriesReq) {
 		return
 	}
 
-	var ackLSN uint64
 	if len(m.Entries) > 0 {
 		es := m.Entries
 		if es[0].Index <= n.commitIndex {
@@ -471,33 +467,21 @@ func (n *Node) onAppendEntries(req *appendEntriesReq) {
 			es = keep
 		}
 		if len(es) > 0 {
-			lsn, err := n.log.appendEntriesAsync(es)
-			if err != nil {
+			if _, err := n.log.appendEntriesAsync(es); err != nil {
 				n.logger.Errorf("raft: append entries: %v", err)
 				req.resp <- appendEntriesResp{Term: n.term, Success: false, LastIndex: n.log.LastIndex()}
 				return
 			}
-			ackLSN = lsn
 		}
 	}
 
-	if ackLSN == 0 {
-		// Heartbeat, or everything the leader sent was already committed.
-		n.advanceFollowerCommit(m.LeaderCommit)
-		n.applyCommitted()
-		n.publishView()
-		req.resp <- appendEntriesResp{Term: n.term, Success: true, LastIndex: n.log.LastIndex()}
-		return
-	}
-
-	// Durability before acknowledgement, without blocking the loop on I/O: the
-	// reply is released when the flusher reports this record on disk.
-	n.pendingAcks = append(n.pendingAcks, pendingAck{
-		lsn:          ackLSN,
-		leaderCommit: m.LeaderCommit,
-		resp:         req.resp,
-	})
+	// Acknowledge on write: the reply goes out the moment the entries are in
+	// the log and its WAL buffer. The group-commit flusher persists the
+	// buffer in the background, its own pace, never gating the reply.
+	n.advanceFollowerCommit(m.LeaderCommit)
+	n.applyCommitted()
 	n.publishView()
+	req.resp <- appendEntriesResp{Term: n.term, Success: true, LastIndex: n.log.LastIndex()}
 }
 
 // advanceFollowerCommit moves the follower's commit index up to what the
@@ -513,29 +497,6 @@ func (n *Node) advanceFollowerCommit(leaderCommit uint64) {
 	if c > n.commitIndex {
 		n.commitIndex = c
 	}
-}
-
-// onDurable releases every deferred follower acknowledgement and commit step
-// whose record is now on disk.
-func (n *Node) onDurable(lsn uint64) {
-	if lsn > n.durableLSN {
-		n.durableLSN = lsn
-	}
-	if len(n.pendingAcks) == 0 {
-		return
-	}
-	kept := n.pendingAcks[:0]
-	for _, pa := range n.pendingAcks {
-		if pa.lsn > n.durableLSN {
-			kept = append(kept, pa)
-			continue
-		}
-		n.advanceFollowerCommit(pa.leaderCommit)
-		n.applyCommitted()
-		n.publishView()
-		pa.resp <- appendEntriesResp{Term: n.term, Success: true, LastIndex: n.log.LastIndex()}
-	}
-	n.pendingAcks = kept
 }
 
 func (n *Node) onAppendResult(r appendResult) {
@@ -769,13 +730,61 @@ func (n *Node) respondAt(index uint64, res any) {
 	}
 	kept := n.waiters[:0]
 	for _, w := range n.waiters {
-		if w.index <= index {
-			w.ch <- applyResp{value: res}
+		if w.index > index {
+			kept = append(kept, w)
 			continue
 		}
-		kept = append(kept, w)
+		if !n.answerDurable(w.index) {
+			// The entry applied but this node's fsync has not reached its WAL
+			// record yet: hold the answer, and ask the flusher to close the
+			// group-commit window now — the window is a latency budget, not a
+			// promise, and a parked answer has earned its round.
+			w.held = true
+			w.res = applyResp{value: res}
+			kept = append(kept, w)
+			n.log.wal.flushSoon()
+			continue
+		}
+		w.ch <- applyResp{value: res}
 	}
 	n.waiters = kept
+}
+
+// answerDurable is the leader-side half of the ack promise: a command may be
+// confirmed to its client only once a quorum has written it AND this node's
+// own fsync covers its WAL record — a whole-cluster power loss then finds the
+// record on the leader's disk. Entries already trimmed from the log are
+// durable by construction (their durability rides the snapshot file).
+func (n *Node) answerDurable(index uint64) bool {
+	lsn, ok := n.log.lsnOf(index)
+	return !ok || lsn <= n.durableLSN
+}
+
+// onDurable lifts the holds the write path parked on local durability: every
+// command answer and membership-change answer whose record the flusher just
+// fsync'd goes out now. The follower half of the protocol is not on this path
+// — followers answer AppendEntries on the write.
+func (n *Node) onDurable(lsn uint64) {
+	if lsn > n.durableLSN {
+		n.durableLSN = lsn
+	}
+	if len(n.waiters) > 0 {
+		kept := n.waiters[:0]
+		for _, w := range n.waiters {
+			if w.held && n.answerDurable(w.index) {
+				w.ch <- w.res
+				continue
+			}
+			kept = append(kept, w)
+		}
+		n.waiters = kept
+	}
+	for idx, cw := range n.confWaiters {
+		if cw.applied && n.answerDurable(idx) {
+			delete(n.confWaiters, idx)
+			cw.ch <- nil
+		}
+	}
 }
 
 func (n *Node) releaseBarriers() {
@@ -822,12 +831,13 @@ func (n *Node) onApplyBatch(first *applyReq) {
 	for i, r := range batch {
 		entries = append(entries, Entry{Index: base + uint64(i) + 1, Term: n.term, Kind: KindCommand, Data: r.cmd})
 	}
-	// Append to the log and hand the entries to the replicators before waiting
-	// for our own fsync: the follower round trip then overlaps the local
-	// durability wait instead of being serialised behind it. The commit step
-	// below still waits for durability, so nothing is acknowledged early.
-	lsn, err := n.log.appendEntriesAsync(entries)
-	if err != nil {
+	// Write on write, answer on durability: entries go into the WAL buffer,
+	// the replicators start their round trips immediately, and commit counts
+	// the quorum as soon as the replies arrive. The client answer then parks
+	// (respondAt) until this node's fsync covers the record — the flusher is
+	// kicked to close the window on the spot — so the run loop never waits on
+	// disk while the ack still promises a leader-durable record.
+	if _, err := n.log.appendEntriesAsync(entries); err != nil {
 		for _, r := range batch {
 			r.resp <- applyResp{err: err}
 		}
@@ -838,9 +848,6 @@ func (n *Node) onApplyBatch(first *applyReq) {
 	}
 	n.publishView()
 	n.kickAll()
-	if werr := n.log.wal.Wait(lsn); werr != nil {
-		n.logger.Errorf("raft: waiting for local durability: %v", werr)
-	}
 	n.maybeAdvanceCommit()
 	n.applyCommitted()
 }

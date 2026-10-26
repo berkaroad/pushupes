@@ -105,7 +105,7 @@ seq 升序重放同一批记录，把计数器重建到 LEO。
 | 1004 | ERR_MIGRATING | 槽位迁移中（ASK 语义，附目标节点） |
 | 1005 | ERR_FLOW_CONTROL | 本节点流控拒绝（message 固定 `FlowControl`；令牌桶取空时写入不落 WAL 直接失败，见 §6.2） |
 | 1006 | ERR_SLOT_UNPROVEN | 本地副本来源未证实（owner 围栏：leader 拒写、本地读答空，直到运维采纳或丢弃，见 §3.1） |
-| 1007 | ERR_ACK_TIMEOUT | 高水位确认超时：记录**已落 leader WAL**，按同 command_id 重试命中 exists（重试即确认） |
+| 1007 | ERR_ACK_TIMEOUT | 确认等待超时（同步副本高水位或 leader 本地 fsync 未在该腿的 10s 期限前覆盖），记录**已落 leader WAL**，按同 command_id 重试命中 exists（重试即确认） |
 | 1008 | ERR_REPLICA_CATCHING_UP | 本节点是该槽 leader 但暂不可服务（无本地副本 / 空壳副本）：未写入，稍后重试 |
 | 1009 | ERR_NO_DATA_PLANE | 本节点是纯控制面成员（集群尚无数据面成员持有该槽）：未写入，重试无用，需先规划布局 |
 
@@ -175,8 +175,12 @@ Body: Record*，每条记录：
   双写不一致的竞态）。
 - 崩溃尾部撕裂：扫描遇不完整记录即在完整边界截断。
 - **刷盘策略**：flush.policy 可配（每 N 条 / 每 T 毫秒 fsync；默认组提交
-  依赖页缓存）。写入确认的是**复制**（ISR 高水位覆盖该 seq），不是逐条
-  本地 fsync——持久化边界与刷盘策略挂钩，见 §4。
+  依赖页缓存）。写入确认的是**复制 + leader 本地落盘**：ISR 高水位覆盖该
+  seq，且组提交轮把该 seq 覆盖进 leader 自己的盘（持久化水位见 §4 的
+  `AwaitDurable` 链路）；follower 侧的回报以帧写入为准。两条确认腿在同一个
+  10s 期限内**并行**：停靠的 fsync 等待者让该槽立刻到期并踢出刷盘轮（时间
+  窗只给无人等待的写入定后台节奏），确认延迟 ≈ max(副本往返, fsync 排队 +
+  fsync)，吞吐由「一轮 fsync 覆盖窗口内全部积累」的组提交扩展。
 - **刷盘执行：全局单线程、段级队项**（`internal/storage/flusher.go`）：
   全存储一个刷盘 goroutine，队列单元是「（槽，段）」并按入队时间老先出；
   每次 fsync 分三相——锁内快照（`prepareFlushLocked`）→ **锁外** `File.Sync()`
@@ -311,10 +315,12 @@ Body: Record*，每条记录：
   - **写入成功的条件**：一条记录（`BatchAppend` 携带的每条 `AppendRequest`
     各自适用）只有满足以下全部条件才对客户端回
     `success`——(1) 幂等与版本校验通过并落入 leader 的 WAL；(2) 该槽的高水位
-    已覆盖此 seq，即**每个 in-sync 副本都已把同一记录写进自己的 WAL**。
-    因此任何一个单节点故障都不会丢失已确认的写入。三个边界：ISR 内所有副本
+    已覆盖此 seq，即**每个 in-sync 副本都已把同一记录写进自己的 WAL**；
+    (3) leader 本地 fsync 已覆盖此 seq（组提交轮的持久化水位，`AwaitDurable`）。
+    因此任何单节点故障、乃至整簇同时掉电，都不会丢失已确认的写入——(3) 让
+    leader 自己那块盘成为最后的底线。三个边界：ISR 内所有副本
     失联时，持久化承诺只对 in-sync 副本成立，高水位跟随 leader LEO、写入
-    不阻塞（等副本重新追平 ISR 后该记录重新受保护）；**\"不在服务中的副本\"不算
+    不因副本缺失而阻塞（fsync 腿照常等待；等副本重新追平 ISR 后该记录重新受保护）；**\"不在服务中的副本\"不算
     in-sync、不压高水位**——(1) 正在搭建的席位（迁移的准入目标
     `migrating_out → MigratingTo`；成员数变化后重排新补进来的席位；
     以及在 leader 切换那一刻仍年轻（`seatBuildGrace` 内入席）且未追平的席位——
@@ -343,8 +349,7 @@ Body: Record*，每条记录：
     对照实验同时排除了「把上报拆成轮内多波」这条路：单独改上报（串行 apply + 轮内多波）
     与基线等价（233/248/231），叠在并行之上也无增益——一批的确认等的是这批里最后一条
     记录所在槽的 apply，而那条上报只能在它 apply 之后发出，提前上报无法缩短它。
-    等待高水位
-    超过 10s 返回 `fail/1007`，此时记录已在 leader WAL 落定——客户端应带同一
+    等待高水位或 leader 本地 fsync 覆盖（各 10s 期限）返回 `fail/1007`，此时记录已在 leader WAL 落定——客户端应带同一
     command_id 重试，命中 `exists` 即确认。
   - ISR 维护：follower 在 `replica.lag.time.max` 内跟上进 ISR；
     掉出后按自己 LEO 重新追。
@@ -1373,8 +1378,14 @@ Raft 的 API 面很窄，只有 4 个文件与它打交道（`cluster.go`、`fsm
 
 #### 11.1.4 安全前提
 
-1. **提交前 fsync**：leader 把条目写进 WAL 并落盘后才计入多数派；follower 先落盘
-   再 ack。否则多数派 ack 的日志可能在崩溃后消失。
+1. **多数派写入 + leader 本地落盘**：leader 把条目追加进 WAL buffer 即计入多数派，
+   follower 追加后当场回 AppendEntries（两侧都不等自己的刷盘），多数派回执一到
+   即推进提交；但**客户端的确认在此之后还要等 leader 本节点的 fsync 轮覆盖该
+   记录**——被暂扣的应答会让组提交轮立即关窗，等待的是 fsync 时长与队列，不是
+   窗口大小。follower 未落盘的尾巴若在其掉电后消失，由已落盘的 leader 重发补齐。
+   因此：已确认的命令整簇掉电后必在 leader 盘上找到，单节点任何故障不丢。快照
+   可固化「已 apply 未落盘」的中间态（apply 不被确认闸拦下），全簇同时掉电时该
+   命令的存续按各盘落盘时序而定——这是暂扣窗口内唯一的非确定性。
 2. **peer 端口分流的谜面冲突**：`peerMux` 靠「首字节 = 'P' → gRPC，其余 → 共识」
    分类，自研握手魔数**首字节必须 ≠ 'P'**，取 `0x9E`。
 
@@ -1440,13 +1451,14 @@ len u32 | type u8 | crc32c u32 | payload[len]      # crc32c 覆盖 type+len+payl
 
 ```
 Append(typ, payload) → 编码入 buffer，返回 LSN（不落盘）
-flusher goroutine    → 等 dirty 信号或 100ms tick → write + fdatasync → 唤醒
-                       LSN ≤ durable 的等待者，并回调 OnDurable(durableLSN)
+flusher goroutine    → 等 dirty 信号或 100ms tick 或 urgent 提前关窗 → write +
+                       fdatasync → 唤醒 LSN ≤ durable 的等待者，并回调
+                       OnDurable(durable)（leader 的暂扣应答靠它释放）
 Wait(lsn)            → 阻塞到自己的 LSN 落盘
 ```
 
-- 顺序写路径：1 命令 1 fsync。
-- 并发/批量路径：N 条摊成 1 次 fsync（实测 200 条 / 1 次）。
+- 一个组提交窗口内的全部追加共用 1 次 fsync（实测 200 条 / 1 次）；应答路径
+  不等 fsync，`Wait` 只服务于选举投票状态与成员配置这类必须先落盘再放行的记录。
 
 ### 11.4 快照
 
@@ -1500,10 +1512,10 @@ Wait(lsn)            → 阻塞到自己的 LSN 落盘
 - **Apply 语义**：注册 waiter 必须在可能推进 commit 之前；已 applied 的直接应答；
   **每条推进 applied 的分支都必须应答 waiter**（含条目已被快照裁掉的情况）。
   Apply 请求走独立 channel，loop 一次 drain 整批、**一次 append + 一次 fsync**。
-- **follower 的 ack 异步化**：follower 不在 loop 里等 fsync，而是异步追加 + 落盘
-  通知到达后再应答（`WAL.OnDurable` → 原子量 + cap-1 信号唤醒 loop）。
-- **leader 的 Apply 顺序**：先追加并立即 kick 复制，**再**等本地 fsync —— 本地
-  落盘与 follower 往返重叠。
+- **应答两段式**：follower 追加条目后当场回 AppendEntries（写入即响应，落盘归
+  它的后台节奏）；leader 侧多数派回执一到即推进提交并 apply，但**发给客户端的
+  确认暂扣到本节点 fsync 轮覆盖该记录**——暂扣即踢轮（`WAL.flushSoon`），主循环
+  全程不等磁盘，确认等的是「一个轮」而不是「一个窗口」。
 - RPC 集：`RequestVote/Resp`、`AppendEntries/Resp`、`InstallSnapshot/Resp`。
   选举超时 500ms~1s 随机、心跳 100ms（`cluster.Config` 未传时用默认值）。
 
