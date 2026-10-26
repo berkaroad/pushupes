@@ -164,6 +164,58 @@ func TestVoterJoinerAnnouncesItselfThroughJoinList(t *testing.T) {
 	}, "the voter joiner to announce its admin/client addresses and its role")
 }
 
+// TestRegistrationBeforeTheJoinIsNotCommitted pins the cold-boot ordering: a
+// node announces its addresses from the moment it starts (1s fast rounds) while
+// its own join offer waits on the 3s adopt interval, so the announcement
+// routinely reaches the leader BEFORE the command that admits it. Committing it
+// then would put an entry in the log no state machine can apply — every data
+// node replaying it stalled its feed on "register: unknown peer node-4" and
+// re-subscribed in a loop until a later image covered the entry. The leader
+// answers "not in the directory yet" instead, and the announcer's heartbeat
+// carries the announcement until the join lands.
+func TestRegistrationBeforeTheJoinIsNotCommitted(t *testing.T) {
+	e := newLeaderEngine(t)
+	before := commitIndexOf(t, e.node)
+
+	err := e.acceptRegistration(&Registration{
+		ID: "node-4", AdminAddr: "127.0.0.1:9194", ClientAddr: "127.0.0.1:9294", Role: RoleLearner,
+	})
+	if err == nil {
+		t.Fatal("an announcement for a node the directory does not hold must be refused, not committed")
+	}
+	if _, ok := e.TableSnapshot().Peers["node-4"]; ok {
+		t.Fatal("registration created a directory entry; membership is not the announcement's to grant")
+	}
+	if after := commitIndexOf(t, e.node); after != before {
+		t.Fatalf("a refused announcement advanced the commit index: %d -> %d", before, after)
+	}
+
+	// Once the entry exists (the join landed), the same announcement lands.
+	join(t, e, "node-4", "127.0.0.1:9194")
+	if err := e.acceptRegistration(&Registration{
+		ID: "node-4", AdminAddr: "127.0.0.1:9194", ClientAddr: "127.0.0.1:9294", Role: RoleLearner,
+	}); err != nil {
+		t.Fatalf("registration after the join: %v", err)
+	}
+	if p := e.TableSnapshot().Peers["node-4"]; p.AdminAddr != "127.0.0.1:9194" || p.Role != RoleLearner {
+		t.Fatalf("announcement did not patch the entry: %+v", p)
+	}
+}
+
+// TestRegisterForAnUnknownPeerAppliesAsANoOp keeps older logs replayable: an
+// OpRegister entry written before the submit-side guard (or one that races a
+// leave) must be a no-op on every state machine rather than an apply error —
+// an apply error is what takes a data node's whole layout feed down.
+func TestRegisterForAnUnknownPeerAppliesAsANoOp(t *testing.T) {
+	e, _ := newTestEngine(t, "node-1")
+	applyCmd(t, e, &Command{Op: OpRegister, Peer: &Peer{
+		ID: "node-4", AdminAddr: "127.0.0.1:9194", ClientAddr: "127.0.0.1:9294", Role: RoleLearner,
+	}})
+	if _, ok := e.TableSnapshot().Peers["node-4"]; ok {
+		t.Fatal("registration materialized a member out of nothing")
+	}
+}
+
 // TestPeerAddrForNodeUsesDirectory pins the relay lookup order: a member
 // admitted at runtime carries its peer address in the replicated directory
 // but NOT in the static -peers list, and a follower relaying a registration

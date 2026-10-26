@@ -173,3 +173,33 @@ func TestTableBinaryRoundTripDownFlag(t *testing.T) {
 		}
 	}
 }
+
+// TestVerdictsForADepartedNodeApplyAsNoOps pins the apply side of the same rule
+// OpRegister follows: a liveness verdict (or a recovery mark) for an id the
+// directory no longer holds has no state to land on — the removal already
+// purged that node's leadership and seats. The sweep reads a table snapshot and
+// then submits, so a removal that commits in between is a real ordering; the
+// command must be a no-op on every state machine rather than an apply error,
+// which is what ends a data node's whole layout feed (it stops the stream,
+// forgets the resume point and re-dials onto the same entry).
+func TestVerdictsForADepartedNodeApplyAsNoOps(t *testing.T) {
+	for _, op := range []string{OpMarkDown, OpMarkUp} {
+		tbl := markdownTable()
+		before := tbl.Clone()
+		if err := tbl.Apply(&Command{Op: op, NodeID: "node-9"}); err != nil {
+			t.Fatalf("%s for a departed node must apply as a no-op: %v", op, err)
+		}
+		if _, ok := tbl.Peers["node-9"]; ok {
+			t.Fatalf("%s materialized a member out of nothing", op)
+		}
+		if got, want := len(tbl.Slots), len(before.Slots); got != want {
+			t.Fatalf("%s touched the slot table: %d slots, want %d", op, got, want)
+		}
+		for s, pl := range tbl.Slots {
+			if want := before.Slots[s]; pl.Leader != want.Leader || pl.Epoch != want.Epoch {
+				t.Fatalf("%s moved leadership of a slot it knows nothing about: slot %d %+v -> %+v",
+					op, s, want, pl)
+			}
+		}
+	}
+}

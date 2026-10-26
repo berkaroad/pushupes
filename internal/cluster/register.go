@@ -92,6 +92,21 @@ func (e *Engine) acceptRegistration(reg *Registration) error {
 		// peer it comes from is running, whatever the probe's cached
 		// connection says.
 		e.noteRecovery(reg)
+		// The directory entry must exist BEFORE the announcement is committed.
+		// OpRegister patches an existing entry and never creates one (membership
+		// belongs to the configuration/directory path), so committing an
+		// announcement for an id the table does not hold writes a log entry no
+		// state machine can apply: the leader's own apply fails, and every data
+		// node replaying that log stalls its feed on it ("apply layout entry N:
+		// register: unknown peer node-4" in a reconnect loop). It is a real
+		// ordering, not a bug elsewhere — a node announces its addresses from
+		// the moment it starts (1s fast rounds) while its own join offer waits
+		// on a 3s adopt interval, so on a cold boot the announcement routinely
+		// beats the command that admits it. Answering "not in the directory
+		// yet" leaves the announcement on its heartbeat until the join lands.
+		if _, ok := e.TableSnapshot().Peers[reg.ID]; !ok {
+			return fmt.Errorf("register: %s is not in the directory yet; the cluster joins it first", reg.ID)
+		}
 		// Registrations are retried on a steady heartbeat (registerRetrySteady,
 		// every 10s), so an announcement that matches what the table already
 		// holds is the common case — and committing it would only advance the

@@ -826,7 +826,15 @@ func (t *Table) Apply(c *Command) error {
 		}
 		p, ok := t.Peers[c.Peer.ID]
 		if !ok {
-			return fmt.Errorf("register: unknown peer %s", c.Peer.ID)
+			// An announcement only ever patches an entry that exists: the
+			// announcer keeps announcing on its heartbeat, so a join that lands
+			// later is picked up by the next round. Failing here would write an
+			// unapplyable entry into the log (every data node's feed stalls on
+			// it) for an announcement that beat its own admission — a real
+			// cold-boot ordering, since a node announces at 1s while its join
+			// offer waits on the 3s adopt interval. Old logs written before the
+			// submit-side guard exist too; they must replay without errors.
+			return nil
 		}
 		p.AdminAddr, p.ClientAddr = c.Peer.AdminAddr, c.Peer.ClientAddr
 		if c.Peer.Role != "" {
@@ -889,7 +897,13 @@ func (t *Table) Apply(c *Command) error {
 		// replica as leader (preferring one that is itself active).
 		p, ok := t.Peers[c.NodeID]
 		if !ok {
-			return fmt.Errorf("mark_down: unknown peer %s", c.NodeID)
+			// The entry is gone (a removal committed between the sweep's
+			// snapshot and this apply). A verdict about a node the directory
+			// no longer holds says nothing: the leave already purged its
+			// leadership and seats, and erroring here would take every data
+			// node's layout feed down over a command that has no state to
+			// land on (see the same rule in OpRegister).
+			return nil
 		}
 		if !p.Down {
 			p.Down = true
@@ -918,7 +932,10 @@ func (t *Table) Apply(c *Command) error {
 	case OpMarkUp:
 		p, ok := t.Peers[c.NodeID]
 		if !ok {
-			return fmt.Errorf("mark_up: unknown peer %s", c.NodeID)
+			// Same rule as OpMarkDown: a recovered node the directory no longer
+			// holds stays out until it joins again (its own offer re-admits it),
+			// and a no-op keeps the feeds alive.
+			return nil
 		}
 		if p.Down {
 			p.Down = false
