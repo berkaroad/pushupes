@@ -255,31 +255,14 @@ medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(�
   以上读接口与写一样走 MOVED 重定向（应答带 `err_id`/`slot`/`node`），
   非本地槽不再由服务端代理转发；`pkg/client` 对调用方透明地跟随。
 
-错误 ID：`1001` 版本冲突（附 current_version）、`1002` 参数非法、
-`1003` MOVED、`1004` ASK、`1005` 本节点非 controller（admin 写命令专用，
-响应附 `controller` 与 `controller_admin_addr`）、`1006` 本节点流控拒绝
-（见「节点级流控」；经 `pkg/client` 写入时该码被库吸收为回压，调用方看不到它）、
-`1007` 本地副本来源未证实（owner 围栏拦下该槽：leader 拒写、本地读答空，直到
-运维经 `/admin/slots/pending/adopt` 采纳、或删除槽目录，见 DESIGN §3.1。来源
-证明以复制表为权威：表把你的节点排进某槽，该槽目录即由表盖章；只有整个数据
-目录的准入戳指向别的世代（指错 `-data`、共识状态重建）且副本无记录时才会围栏，
-adopt 一条命令即可同时采纳副本与准入目录）。世代号
-是复制状态里的集群级值（`GET /admin/cluster/status` 的 `topology`，每个节点报同一个），
-只有真正重建共识状态才会换世代；普通重启、raft 换主都不影响副本来源的证明。
-
-admin 面 HTTP（仅管理）：`GET /admin/cluster/status`、`GET /admin/status`、
-`GET /admin/slots/{slot}/describe`、`GET /admin/slots/{slot}/streams`、
-`POST /admin/slots/{slot}/migrate`、`POST /admin/slots/{slot}/remove-replica`、
-`POST /admin/cluster/plan`、`POST /admin/cluster/replica-policy`、
-`DELETE /admin/cluster/nodes/{id}`（摘成员：服务端先排干再正式移除，在线与否不问，客户端无中断）、
-`POST /admin/cluster/nodes/{id}/cancel-drain`（取消缩容：清 drain / 待移除标记，节点重新参与
-布局；未标记条目回 `change:"none"`。**加成员没有 admin 接口**——新节点带 `-join` 启动即自报入群）、
-`POST/GET/DELETE /admin/flow-control`（节点本地：收到请求的节点就是被设置/查询/
-恢复的节点）、`GET /admin/slots/pending`、`POST /admin/slots/pending/adopt`
-（owner 围栏：查看被拦副本并采纳「属于当前世代」，同样节点本地；丢弃走运维
-手工删除槽目录，见 DESIGN §3.1）、`GET /healthz`、`/debug/pprof/`。
-**控制器专属写命令（migrate / remove-replica / plan / replica-policy / 摘成员 / 取消缩容）
-必须直接发到 Raft leader 的 admin 地址**，follower 一律拒绝（425 + 1005），不做转发。
+错误 ID：
+- `1001` 版本冲突（附 current_version）
+- `1002` 参数非法
+- `1003` MOVED
+- `1004` ASK
+- `1005` 本节点非 controller（admin 写命令专用，响应附 `controller` 与`controller_admin_addr`）
+- `1006` 本节点流控拒绝（见「节点级流控」；经 `pkg/client` 写入时该码被库吸收为回压，调用方看不到它）
+- `1007` 本地副本来源未证实（owner 围栏拦下该槽：leader 拒写、本地读答空，直到运维经 `/admin/slots/pending/adopt` 采纳、或删除槽目录，见 DESIGN §3.1）。
 
 仓库自带工具：
 
@@ -328,15 +311,15 @@ go run ./cmd/slotcheck -admins http://127.0.0.1:8091,http://127.0.0.1:8092,http:
 
 | 数据节点 | 连接数 | 批大小 | 吞吐量 (msg/s) | p50 | p90 | p99 |
 |---|---|---|---|---|---|---|
-| 1 | 1 | 1 | 3176 | 0.20 ms | 0.28 ms | 2.62 ms |
-| 1 | 1 | 10 | 28821 | 0.29 ms | 0.36 ms | 1.27 ms |
-| 1 | 1 | 100 | 75036 | 1.06 ms | 1.63 ms | 3.81 ms |
-| 1 | 4 | 1 | 11519 | 0.28 ms | 0.43 ms | 2.50 ms |
-| 1 | 4 | 10 | 70622 | 0.48 ms | 0.74 ms | 2.12 ms |
-| 1 | 4 | 100 | 122784 | 2.71 ms | 4.73 ms | 9.76 ms |
-| 2 | 1 | 1 | 320 | 3.37 ms | 5.41 ms | 6.87 ms |
-| 2 | 1 | 10 | 4123 | 2.02 ms | 2.57 ms | 15.64 ms |
-| 2 | 1 | 100 | 17840 | 4.75 ms | 6.59 ms | 20.35 ms |
-| 2 | 4 | 1 | 2385 | 1.18 ms | 2.31 ms | 10.35 ms |
-| 2 | 4 | 10 | 11040 | 3.16 ms | 4.65 ms | 12.91 ms |
-| 2 | 4 | 100 | 23187 | 15.04 ms | 23.90 ms | 47.56 ms |
+| 1 | 1 | 1 | 3208 | 0.20 ms | 0.27 ms | 2.64 ms |
+| 1 | 1 | 10 | 29299 | 0.28 ms | 0.36 ms | 1.31 ms |
+| 1 | 1 | 100 | 73744 | 1.04 ms | 1.64 ms | 3.58 ms |
+| 1 | 4 | 1 | 11395 | 0.28 ms | 0.44 ms | 2.55 ms |
+| 1 | 4 | 10 | 71467 | 0.47 ms | 0.74 ms | 1.86 ms |
+| 1 | 4 | 100 | 109402 | 2.70 ms | 5.28 ms | 16.13 ms |
+| 2 | 1 | 1 | 320 | 3.31 ms | 5.43 ms | 7.05 ms |
+| 2 | 1 | 10 | 4155 | 2.01 ms | 2.57 ms | 15.39 ms |
+| 2 | 1 | 100 | 16362 | 4.73 ms | 8.74 ms | 25.77 ms |
+| 2 | 4 | 1 | 2380 | 1.20 ms | 2.30 ms | 10.29 ms |
+| 2 | 4 | 10 | 9620 | 3.26 ms | 4.93 ms | 15.10 ms |
+| 2 | 4 | 100 | 23723 | 15.04 ms | 23.41 ms | 40.27 ms |
