@@ -192,27 +192,37 @@ func (e *Engine) peerAddrForNode(id string) string {
 }
 
 // RegisterAnnouncer periodically announces this node's data-plane
-// addresses over the peer ports of every configured entry point.
+// addresses over the peer ports of the members it can reach.
 type RegisterAnnouncer struct {
-	e     *Engine
-	reg   Registration
-	ports []string
+	e    *Engine
+	reg  Registration
+	join []string // the -join list: the only addresses a joiner knows statically
 }
 
-func (e *Engine) NewRegisterAnnouncer() *RegisterAnnouncer {
+// NewRegisterAnnouncer builds the announcer. joinTargets is the node's -join
+// list (empty for the author, which knows the cluster through -peers): a voter
+// JOINER deliberately starts with an EMPTY peer list — its raft configuration
+// arrives from the leader's log, so a seeded voter set would be a fiction —
+// and the join list is therefore the only address its announcement loop can
+// start from. Deriving the targets from the configured peers alone left every
+// voter joiner silent: the configuration named it as a voter while the
+// directory kept the author's placeholder (no admin/client address, no role),
+// so the control plane showed one node and anything routing by the controller's
+// admin address had nothing to dial as soon as a joiner won the election.
+func (e *Engine) NewRegisterAnnouncer(joinTargets ...string) *RegisterAnnouncer {
 	reg := Registration{
 		ID:         e.self,
 		AdminAddr:  e.node.Cfg().AdminAddr,
 		ClientAddr: e.node.Cfg().ClientAddr,
 		Role:       e.node.Cfg().Role,
 	}
-	targets := make([]string, 0, len(e.node.Cfg().Peers)+1)
-	for _, p := range e.node.Cfg().Peers {
-		if p.PeerAddr != "" && p.ID != e.self {
-			targets = append(targets, p.PeerAddr)
+	join := make([]string, 0, len(joinTargets))
+	for _, t := range joinTargets {
+		if a := HostPort(NormalizeAddr(t)); a != "" {
+			join = append(join, a)
 		}
 	}
-	return &RegisterAnnouncer{e: e, reg: reg, ports: targets}
+	return &RegisterAnnouncer{e: e, reg: reg, join: join}
 }
 
 // Run announces until ctx closes. Early rounds retry fast so a booting
@@ -220,8 +230,8 @@ func (e *Engine) NewRegisterAnnouncer() *RegisterAnnouncer {
 // heartbeat that also heals addresses when a node restarts with new
 // ports.
 func (a *RegisterAnnouncer) Run(ctx context.Context) {
-	if len(a.ports) == 0 {
-		return // single-node: the controller join carries our addresses
+	if len(a.targets()) == 0 {
+		return // nobody to announce to: single node, and the controller join carries our addresses
 	}
 	interval := registerRetryFast
 	for {
@@ -237,6 +247,43 @@ func (a *RegisterAnnouncer) Run(ctx context.Context) {
 	}
 }
 
+// targets lists where one announcement may go this round, the most direct
+// first: the controller's peer address (it commits the announcement), then the
+// -join list, the configured peer directory, and finally every peer address the
+// replicated directory knows — so a static list that has gone stale (or a join
+// seed that has died since) cannot strand the heartbeat. The node's own address
+// is never a target.
+//
+// It is derived per round rather than once at startup because the address a
+// joiner can use changes as it learns the cluster: before admission it knows
+// only -join, afterwards the directory names the controller.
+func (a *RegisterAnnouncer) targets() []string {
+	self := HostPort(NormalizeAddr(a.e.node.Cfg().PeerAddr))
+	out := make([]string, 0, len(a.join)+len(a.e.node.Cfg().Peers)+1)
+	seen := make(map[string]bool, cap(out))
+	add := func(raw string) {
+		addr := HostPort(NormalizeAddr(raw))
+		if addr == "" || addr == self || seen[addr] {
+			return
+		}
+		seen[addr] = true
+		out = append(out, addr)
+	}
+	add(a.e.leaderPeerAddr())
+	for _, addr := range a.join {
+		add(addr)
+	}
+	for _, p := range a.e.node.Cfg().Peers {
+		add(p.PeerAddr)
+	}
+	if tbl := a.e.TableSnapshot(); tbl != nil {
+		for _, p := range tbl.Peers {
+			add(p.PeerAddr)
+		}
+	}
+	return out
+}
+
 func (a *RegisterAnnouncer) done() bool {
 	tbl := a.e.TableSnapshot()
 	p, ok := tbl.Peers[a.reg.ID]
@@ -245,7 +292,7 @@ func (a *RegisterAnnouncer) done() bool {
 }
 
 func (a *RegisterAnnouncer) announceOnce(ctx context.Context) {
-	for _, addr := range a.ports {
+	for _, addr := range a.targets() {
 		select {
 		case <-ctx.Done():
 			return

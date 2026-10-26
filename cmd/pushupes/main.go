@@ -254,10 +254,12 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 	// Data-plane address self-discovery + inter-node plane: PeerService
 	// (gRPC) is served on the peer port beside Raft (demuxed by first
 	// byte); announce our admin/client addresses until they land in the
-	// routing table.
+	// routing table. A voter joiner's configured peer list is empty by
+	// design (its configuration arrives from the leader's log), so the
+	// -join targets are what its first announcements go through.
 	peerSrv := eng.ServePeer(peerGRPC)
 	defer peerSrv.Stop()
-	go eng.NewRegisterAnnouncer().Run(ctx)
+	go eng.NewRegisterAnnouncer(targets...).Run(ctx)
 
 	// Runtime join: every non-author node — voter joiner AND learner alike —
 	// offers itself through the -join list until the leader admits it (into

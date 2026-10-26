@@ -15,9 +15,11 @@
 package cluster
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"testing"
+	"time"
 )
 
 // commitIndexOf reads the Raft commit index a node reports in its stats
@@ -100,6 +102,66 @@ func TestRegistrationChangeStillCommits(t *testing.T) {
 	if after := commitIndexOf(t, e.node); after != stable {
 		t.Fatalf("post-change heartbeat advanced commit index: %d -> %d", stable, after)
 	}
+}
+
+// TestVoterJoinerAnnouncesItselfThroughJoinList pins the announce path of a
+// voter that was NOT the cluster's author. Such a node is a voter in the raft
+// configuration while its own configured peer list is empty (the configuration
+// arrives from the leader's log, so a seeded voter set would be a fiction), and
+// the controller's voter sync leaves its directory entry carrying nothing but
+// the configuration's peer address. Live shape before the fix: three voters in
+// the configuration, ONE node in the directory with an admin/client address and
+// a role — so the console counted a single control node and, once a joiner won
+// the election, nothing could resolve the controller's admin address.
+func TestVoterJoinerAnnouncesItselfThroughJoinList(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	ids := []string{"node-1", "node-2", "node-3"}
+	engines := map[string]*Engine{}
+	appliers := map[string]Applier{}
+	for _, id := range ids {
+		eng, _ := newTestEngine(t, id)
+		engines[id] = eng
+		appliers[id] = eng
+	}
+	c := newTestRaftCluster(t, ids, appliers)
+	leaderID := c.waitLeader(15 * time.Second)
+	leaderNode := c.nodes[leaderID]
+	leaderEng := engines[leaderID]
+	leaderEng.SetNode(leaderNode)
+	srv := leaderEng.ServePeer(c.muxes[leaderID].GRPCListener())
+	defer srv.Stop()
+
+	joinerID := ""
+	for _, id := range ids {
+		if id != leaderID {
+			joinerID = id
+			break
+		}
+	}
+	joinerNode := c.nodes[joinerID]
+	joinerNode.cfg.Peers = nil // the joiner shape: no static peer directory
+	joinerNode.cfg.Role = RoleVoter
+	joinerEng := engines[joinerID]
+	joinerEng.SetNode(joinerNode)
+
+	// What the controller's voter sync writes for a configuration member that
+	// has never announced itself: the peer address and nothing else.
+	applyCmd(t, leaderEng, &Command{Op: OpJoinNode, Peer: &Peer{
+		ID: joinerID, PeerAddr: joinerNode.Cfg().PeerAddr,
+	}})
+	if p := leaderEng.TableSnapshot().Peers[joinerID]; p.AdminAddr != "" || p.ClientAddr != "" || p.Role != "" {
+		t.Fatalf("premise: the seeded voter entry already announced itself: %+v", p)
+	}
+
+	// The joiner knows one thing at startup: its -join list.
+	go joinerEng.NewRegisterAnnouncer(leaderNode.Cfg().PeerAddr).Run(ctx)
+
+	waitFor(t, 20*time.Second, func() bool {
+		p, ok := leaderEng.TableSnapshot().Peers[joinerID]
+		return ok && p.AdminAddr != "" && p.ClientAddr != "" && p.Role == RoleVoter
+	}, "the voter joiner to announce its admin/client addresses and its role")
 }
 
 // TestPeerAddrForNodeUsesDirectory pins the relay lookup order: a member
