@@ -61,11 +61,13 @@ func ValidateSegmentBytes(n int64) error {
 	if n > MaxSegmentBytes {
 		return fmt.Errorf("segment-bytes %d (%d MiB) is above the %d MiB maximum", n, n/mib, MaxSegmentBytes/mib)
 	}
-	if n%SegmentBytesMultiple != 0 {
-		lo := n / SegmentBytesMultiple * SegmentBytesMultiple
-		hi := lo + SegmentBytesMultiple
-		return fmt.Errorf("segment-bytes %d (%d MiB) is not a multiple of %d MiB (nearest valid: %d MiB or %d MiB)",
-			n, n/mib, SegmentBytesMultiple/mib, lo/mib, hi/mib)
+	if n&(n-1) != 0 {
+		// n is at least MinSegmentBytes, which is itself a power of two, so the
+		// floor of the sequence is always a valid suggestion.
+		lo := int64(1) << (63 - bits.LeadingZeros64(uint64(n)))
+		hi := lo << 1
+		return fmt.Errorf("segment-bytes %d (%d MiB) is not a power of two (nearest valid: %d MiB or %d MiB)",
+			n, n/mib, lo/mib, hi/mib)
 	}
 	return nil
 }

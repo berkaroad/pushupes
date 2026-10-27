@@ -979,7 +979,7 @@ UI 只在治理发生的对象——节点——上呈现。数据都不走新�
 
 ```
 slot_count      = 1024         # 固定不可配置（2^10；按最多 256 个数据节点 × 每节点 4 槽估算，见 §7.2）
-segment_bytes   = 67108864     # 默认 64MiB；须为 64MiB 的整数倍，最小 64MiB、最大 2GiB
+segment_bytes   = 67108864     # 默认 64MiB；须为 2 的次幂（64MiB/128MiB/256MiB…），最小 64MiB、最大 2GiB
                               # -segment-bytes / PUSHUPES_SEGMENT_BYTES 可写字节数或带单位
                               # （256MiB / 1GiB / 268435456）
 replica_policy  = medium       # 副本策略：low=每槽 1 份 / medium=2 份（默认）/ high=3 份，或正整数直接指定副本因子；副本因子 = MIN(数据节点数, 策略要求份数)
@@ -1208,8 +1208,9 @@ K=4096/2048/1024 则对 3/5/7 全部
 **K = 1024 = 2^10 = 256 个数据节点 × 每节点 4 槽**（数据节点数取偶数）。
 2~256 之间的一切 2 的幂次节点数整除 1024，每节点槽主数精确等于 K/N（§7.2.3）；
 每节点至少 4 个槽，保证迁移粒度在全规模下仍然可用。段大小默认
-`storage.DefaultSegmentBytes = 64MiB`（经 `-segment-bytes` 可配，64MiB 的整数
-倍至 2GiB；段、索引与刷盘的各项默认值集中在 `internal/storage/config.go`）——
+`storage.DefaultSegmentBytes = 64MiB`（经 `-segment-bytes` 可配，2 的次幂、64MiB
+至 2GiB，如 64MiB/128MiB/256MiB；段、索引与刷盘的各项默认值集中在
+`internal/storage/config.go`）——
 定标场景是「单数据节点 4 核/16GiB/1TiB、记录 1~4KiB」：1KiB 记录
 时未封段 seq 项 = 8B × 热槽 × S/2 ÷ 记录 ≈ 0.25GiB（全 1024 槽皆热），加布隆
 1.34GiB + 稀疏索引 0.27GiB + 杂项，活堆 ≈2.0GiB、峰值 ≈5.7GiB ✓（聚合 ~1 千万

@@ -575,7 +575,7 @@ func (c *Config) Register(fs *flag.FlagSet) {
 	fs.StringVar(&c.ReplicaPolicy, "replica-policy", envOr("PUSHUPES_REPLICA_POLICY", c.ReplicaPolicy),
 		"replica policy tier for a NEW cluster: low (1 copy per slot), medium (2, the default), high (3 copies per slot), or a positive number used as the factor directly; applied on the table's first plan only — an existing cluster keeps the policy the admin endpoint last set (env PUSHUPES_REPLICA_POLICY)")
 	c.SegmentBytes = envByteSizeOr("PUSHUPES_SEGMENT_BYTES", c.SegmentBytes)
-	fs.Var(sizeFlag{&c.SegmentBytes}, "segment-bytes", "WAL segment roll `size` (bytes, or a suffix like 256MiB/1GiB); a multiple of 64MiB, at most 2GiB (env PUSHUPES_SEGMENT_BYTES)")
+	fs.Var(sizeFlag{&c.SegmentBytes}, "segment-bytes", "WAL segment roll `size` (bytes, or a suffix like 256MiB/1GiB); a power of two from 64MiB up to 2GiB (64MiB, 128MiB, 256MiB ...) (env PUSHUPES_SEGMENT_BYTES)")
 	fs.Int64Var(&c.FlushMessages, "flush-messages", envInt64Or("PUSHUPES_FLUSH_MESSAGES", c.FlushMessages), "fsync every N records (0 disables) (env PUSHUPES_FLUSH_MESSAGES)")
 	fs.DurationVar(&c.FlushInterval, "flush-interval", envDurationOr("PUSHUPES_FLUSH_INTERVAL", c.FlushInterval), "fsync every interval (0 disables) (env PUSHUPES_FLUSH_INTERVAL)")
 	fs.IntVar(&c.FlushParallelism, "flush-parallelism", envIntOr("PUSHUPES_FLUSH_PARALLELISM", c.FlushParallelism), "segment fsyncs allowed in flight at once, the flush parallelism (1 = one at a time) (env PUSHUPES_FLUSH_PARALLELISM)")
