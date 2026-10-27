@@ -82,18 +82,10 @@ type Slot struct {
 	seqCounter atomic.Uint64
 
 	aggs map[string]aggEntry // aggregate directory (see slotaggs.go)
-	blms *bloomSet
-	// blmsMark is where the newest segment's filters start in blms.filters;
-	// blmsSkipInsert suppresses inserts while a segment whose filter comes off
-	// disk has its metadata applied.
-	blmsMark       int
-	blmsSkipInsert bool
-	// blmsWatermark is the highest seq already placed into blms. Indexing runs
-	// in ascending seq order (writes append at the newest seq, recovery walks
-	// segments and their frames in order), so anything at or below it is
-	// already in the filter and must not be placed again — recovery replays a
-	// whole WAL on every start, and re-placing costs real bytes-per-entry.
-	blmsWatermark uint64
+	// blms is the command-dedup filter (rule 1): one bit array per
+	// generation, each header recording the highest seq its bits cover
+	// (bloomstore.go). Its watermark is the point a restart replays from.
+	blms *bloomStore
 
 	// Stranded-frame memory (see indexMetaLocked's close loop and
 	// stranded_chain_test.go): a frame whose version arrives before its
@@ -187,8 +179,12 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 		flush:        flush,
 		lastFlush:    time.Now(),
 		aggs:         make(map[string]aggEntry),
-		blms:         &bloomSet{},
 	}
+	blms, err := openBloomStore(dir, slotID)
+	if err != nil {
+		return nil, fmt.Errorf("slot %d command bloom: %w", slotID, err)
+	}
+	s.blms = blms
 	s.cond = sync.NewCond(&s.mu)
 	w := make(chan struct{})
 	s.wake.Store(&w)
@@ -218,39 +214,6 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 			seg.Close()
 			return nil, fmt.Errorf("slot %d: %s seq gap (base %d, expected %d)", slotID, p, seg.BaseSeq, expected)
 		}
-		s.blmsMark = len(s.blms.filters)
-		var segIdx *segCmdIndex
-		if !isTail && seg.RecordCnt > 0 {
-			// A sealed segment's command bloom either comes off its index file
-			// or is rebuilt at startup from the records indexed just below.
-			ix, ierr := openSegCmdIndex(s.Dir, s.ID, seg.BaseSeq, true)
-			if ierr != nil {
-				seg.Close()
-				return nil, fmt.Errorf("slot %d command index %s: %w", slotID, p, ierr)
-			}
-			if ix != nil && ix.Bloom() != nil && ix.Valid() {
-				segIdx = ix
-				s.blmsSkipInsert = true
-			} else if ix != nil {
-				ix.Close()
-			}
-		}
-		// A trusted disk bloom answers "maybe" for every hash it placed, so
-		// any record whose hash it does NOT report is a placement that never
-		// reached the file — the shape the pre-pinning era left behind (a
-		// segment's hashes leaked into an earlier segment's already-written
-		// filter). Open re-places those gaps in memory; startup repair also
-		// rewrites the .cidx's bloom section (entry bytes re-emitted
-		// unchanged). The other direction (a bit for a hash that is not in
-		// the segment) is harmless and not counted.
-		gaps := 0
-		checkDiskBloom := func(hash uint64) {
-			if segIdx != nil && !segIdx.Bloom().maybe(hash) {
-				segIdx.blm.insert(hash)
-				segBloomGaps.Add(1)
-				gaps++
-			}
-		}
 		if seg.RecordCnt > 0 {
 			from := seg.BaseSeq
 			if load != nil {
@@ -264,7 +227,6 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 					if !ok {
 						break // openSegIndex validated every entry first
 					}
-					checkDiskBloom(e.hash)
 					s.indexMetaLocked(e.seq, data.RecordMeta{
 						AggregateID: e.aggID,
 						Version:     e.version,
@@ -286,7 +248,6 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 			// (usually nothing, at most one index block).
 			if from <= seg.LastSeq {
 				if err := seg.ScanHeaders(from, func(seq uint64, meta data.RecordMeta) bool {
-					checkDiskBloom(meta.CommandHash)
 					s.indexMetaLocked(seq, meta)
 					seg.IndexRecord(seq, meta)
 					return true
@@ -309,51 +270,23 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 			}
 			expected = seg.LastSeq + 1
 		}
-		switch {
-		case segIdx != nil:
-			if gaps > 0 {
-				segBloomRepaired.Add(1)
-				if mode == slotOpenLoadAndRepair {
-					if err := writeSegCidxBloom(s.Dir, s.ID, seg.BaseSeq, segIdx.Bloom().filters); err != nil {
-						// The in-memory set is complete for this process; a
-						// failed persist is retried by the next start.
-						segIndexUnusable.Add(1)
-					}
-				}
+		if !isTail && seg.RecordCnt > 0 && mode == slotOpenLoadAndRepair {
+			// A sealed segment's sorted command index is the only form a
+			// lookup can search; writing it belongs to a start. A file that is
+			// there and validates is left alone — rewriting every segment's
+			// index on every start would read and re-emit the whole slot.
+			ix, ierr := openSegCmdIndex(s.Dir, s.ID, seg.BaseSeq)
+			usable := ierr == nil && ix != nil && ix.Valid()
+			if ix != nil {
+				_ = ix.Close()
 			}
-			s.blms.filters = append(s.blms.filters, segIdx.Bloom().filters...)
-			segIdx.Close()
-			s.blmsSkipInsert = false
-			// The segment's filters are its disk bloom: record the range so a
-			// lookup can gate the .cidx open on it.
-			seg.cmdFilters = s.blms.filters[s.blmsMark:]
-			// The segment's whole bloom just came off disk, so every seq it
-			// covers is already placed. Advance the watermark past them or the
-			// index replay below would place each hash a second time.
-			if seg.RecordCnt > 0 && seg.LastSeq > s.blmsWatermark {
-				s.blmsWatermark = seg.LastSeq
-			}
-		case !isTail && seg.RecordCnt > 0:
-			// No usable bloom for a sealed segment. Rebuilding it needs the
-			// records just indexed, which is startup work; running, the set is
-			// marked incomplete so it never claims a command is absent.
-			s.blmsSkipInsert = false
-			// The replay above placed this segment's hashes into the range from
-			// the mark; record it whether or not the disk write follows.
-			seg.cmdFilters = s.blms.filters[s.blmsMark:]
-			if mode == slotOpenLoadAndRepair {
-				if err := writeSegCmdIndex(seg, s.blms.filters[s.blmsMark:]); err != nil {
+			if !usable {
+				if err := writeSegCmdIndex(seg); err != nil {
 					segIndexUnusable.Add(1)
-					s.blms.unsafe = true
 				} else {
 					segCmdBuilt.Add(1)
 				}
-			} else {
-				segIndexUnusable.Add(1)
-				s.blms.unsafe = true
 			}
-		default:
-			s.blmsSkipInsert = false
 		}
 		if mode == slotOpenLoadAndRepair || (isTail && load != nil) {
 			// An empty segment (a header-only file from an earlier start) has
@@ -469,18 +402,11 @@ func (s *Slot) indexRecordLocked(seq uint64, rec *data.EventRecord) {
 // that could only ever disagree by accident of which write path ran.
 func (s *Slot) indexMetaLocked(seq uint64, m data.RecordMeta) {
 	e := s.aggs[m.AggregateID]
-	if !s.blmsSkipInsert {
-		// A seq at or below the watermark was already indexed (the recovery
-		// paths replay a whole WAL through here, and every caller walks seqs
-		// in ascending order), so its hash is already in the filter. Asking
-		// the filter itself cannot answer this: a bloom "maybe" is also true
-		// for colliding hashes, and skipping on it would drop a stored command
-		// from the filter for good. The watermark is exact.
-		s.blms.insertPlacedFrom(s.blmsMark, m.CommandHash, seq <= s.blmsWatermark)
-		if seq > s.blmsWatermark {
-			s.blmsWatermark = seq
-		}
-	}
+	// Place the record's hash on the way in: the filter is what answers rule 1
+	// without a record read. Insertion is a no-op at or below the filter's
+	// watermark (a record an earlier process already placed), and a store that
+	// cannot place marks itself unsafe rather than hiding the command.
+	s.blms.insert(seq, m.CommandHash)
 	next := uint32(e.sealedN+e.n) + 1
 	if m.Version == next {
 		e.version = m.Version
@@ -624,11 +550,6 @@ func (s *Slot) tail() (*Segment, error) {
 		// on that goroutine with no slot lock held, so a slow device no longer
 		// blocks the roll (or this slot's appends) behind it.
 		s.enqueueSealedLocked(seg)
-		// The sealed segment keeps its placement range as its lookup gate;
-		// the mark then moves past it so the next segment's placements start
-		// a filter of their own (bloomSet.insertPlacedFrom).
-		seg.cmdFilters = s.blms.filters[s.blmsMark:]
-		s.blmsMark = len(s.blms.filters)
 		// Its indexes (the .idx tail, the sorted .cidx and the .aidx) are
 		// materialized by the store's seal worker with no slot lock held: the
 		// walk, the sorts and the three fsyncs used to run right here, holding
@@ -1162,14 +1083,20 @@ func (s *Slot) RecordByCommand(commandID string) (*data.EventRecord, uint64, err
 	return rec, seq, nil
 }
 
-// lookupCommandLocked finds a stored command: the sealed segments' command
-// filters and sorted indexes (newest first), then the writable segment, whose
-// write-order index is scanned — but only when the writable segment's own
-// filters (the chain slice from blmsMark, pinned to it at placement) may hold
-// the hash. Every candidate is confirmed against the record it points at, so
-// a hash collision or a damaged index can only cost time. Caller holds s.mu.
+// lookupCommandLocked finds a stored command: the sealed segments' sorted
+// command indexes (newest first), then the writable segment, whose write-order
+// index is scanned. The slot's filter gates the walk first, so a hash the slot
+// never stored costs no index open at all. Every candidate is confirmed against
+// the record it points at, so a hash collision or a damaged index can only cost
+// time. Caller holds s.mu.
 func (s *Slot) lookupCommandLocked(commandID string, hash uint64) (*data.EventRecord, uint64, bool, error) {
 	if commandID == "" {
+		return nil, 0, false, nil
+	}
+	// The filter's "absent" covers every segment at once: an index is opened
+	// only for a hash the slot may hold at all.
+	if !s.blms.maybe(hash) {
+		idemSealedSkips.Add(1)
 		return nil, 0, false, nil
 	}
 	var buf [4 << 10]byte
@@ -1179,20 +1106,14 @@ func (s *Slot) lookupCommandLocked(commandID string, hash uint64) (*data.EventRe
 			continue
 		}
 		if seg.Writable() {
-			if !s.tailMaybeLocked(hash) {
-				continue
-			}
 			rec, seq, err := s.lookupTailCommandLocked(seg, commandID, hash, buf[:])
 			if err != nil || rec != nil {
 				return rec, seq, rec != nil, err
 			}
 			continue
 		}
-		if !s.segMaybeLocked(seg, hash) {
-			continue
-		}
 		idemSealedOpens.Add(1)
-		ix, err := openSegCmdIndex(s.Dir, s.ID, seg.BaseSeq, false)
+		ix, err := openSegCmdIndex(s.Dir, s.ID, seg.BaseSeq)
 		if err != nil {
 			return nil, 0, false, err
 		}
@@ -1219,42 +1140,6 @@ func (s *Slot) lookupCommandLocked(commandID string, hash uint64) (*data.EventRe
 		}
 	}
 	return nil, 0, false, nil
-}
-
-// tailMaybeLocked reports whether the writable segment may hold a record with
-// this hash. The chain slice from blmsMark covers exactly the writable
-// segment's placements (bloomSet.insertPlacedFrom pins a hash to the filter
-// slice of the segment that owns it, and seal advances the mark), so a "no"
-// here means the tail's .idx cannot answer for this hash either. An unsafe
-// set says maybe, and so does a tail whose own slice is still empty — placing
-// and scanning are cheap compared to a wrong "absent". Caller holds s.mu.
-func (s *Slot) tailMaybeLocked(hash uint64) bool {
-	if s.blms.unsafe || len(s.blms.filters) <= s.blmsMark {
-		return true
-	}
-	for _, f := range s.blms.filters[s.blmsMark:] {
-		if f.maybe(hash) {
-			return true
-		}
-	}
-	idemTailSkips.Add(1)
-	return false
-}
-
-// segMaybeLocked reports whether a sealed segment's own filters may hold the
-// hash. No filters recorded for the segment (a bloom the slot never built or
-// loaded) always says maybe. Caller holds s.mu.
-func (s *Slot) segMaybeLocked(seg *Segment, hash uint64) bool {
-	if s.blms.unsafe || len(seg.cmdFilters) == 0 {
-		return true
-	}
-	for _, f := range seg.cmdFilters {
-		if f.maybe(hash) {
-			return true
-		}
-	}
-	idemSealedSkips.Add(1)
-	return false
 }
 
 // lookupTailCommandLocked searches the writable segment, whose command index is
@@ -1888,6 +1773,11 @@ func (s *Slot) Close() error {
 			firstErr = err
 		}
 	}
+	// The filter's bits are durable before its header claims them, so a
+	// restart replays only the records appended after this point.
+	if err := s.blms.close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	return firstErr
 }
 
@@ -1902,6 +1792,9 @@ func (s *Slot) Drop() error {
 		seg.Close()
 	}
 	s.segments = nil
+	if err := s.blms.close(); err != nil {
+		return err
+	}
 	return os.RemoveAll(s.Dir)
 }
 

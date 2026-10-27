@@ -83,7 +83,7 @@ func TestSealedCommandIndexServesColdLookups(t *testing.T) {
 		t.Fatalf("expected a sealed segment, have %d segments", sl.SegmentCount())
 	}
 	// Force the cold path: no in-memory table at all.
-	sl.blms = &bloomSet{}
+	sl.blms = emptyTestBloom(t)
 	rec, seq, err := sl.RecordByCommand("cmd-1")
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +118,7 @@ func TestSealedCommandIndexServesColdLookups(t *testing.T) {
 	// re-index history), so the lookup finds nothing until the next start.
 	removeCmdIndexes(t, dir, data.SlotOf(agg, 4))
 	running := open(false)
-	running.blms = &bloomSet{}
+	running.blms = emptyTestBloom(t)
 	if rec, _, err := running.RecordByCommand("cmd-1"); err != nil || rec != nil {
 		t.Fatalf("without an index a running node should find nothing: rec=%v err=%v", rec, err)
 	}
@@ -126,7 +126,7 @@ func TestSealedCommandIndexServesColdLookups(t *testing.T) {
 	if got := countCmdIndexes(t, dir, data.SlotOf(agg, 4)); got == 0 {
 		t.Fatal("startup did not write the missing command index")
 	}
-	repaired.blms = &bloomSet{}
+	repaired.blms = emptyTestBloom(t)
 	if rec, seq, err := repaired.RecordByCommand("cmd-1"); err != nil || rec == nil || seq != 1 {
 		t.Fatalf("after repair: rec=%v seq=%d err=%v", rec, seq, err)
 	}
@@ -138,7 +138,7 @@ func TestSealedCommandIndexServesColdLookups(t *testing.T) {
 	if segCmdBuilt.Load() == built {
 		t.Fatal("a damaged command index was not rebuilt at startup")
 	}
-	healed.blms = &bloomSet{}
+	healed.blms = emptyTestBloom(t)
 	if rec, seq, err := healed.RecordByCommand("cmd-1"); err != nil || rec == nil || seq != 1 {
 		t.Fatalf("after damage repair: rec=%v seq=%d err=%v", rec, seq, err)
 	}

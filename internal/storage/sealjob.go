@@ -143,7 +143,6 @@ func (f *flusher) materializeSeal(j *sealJob) {
 	if idx != nil {
 		idx.syncFn = f.syncThroughMu
 	}
-	filters := seg.cmdFilters
 	snaps := sl.snapshotSealedAggsLocked(seg)
 	sl.mu.Unlock()
 
@@ -166,7 +165,7 @@ func (f *flusher) materializeSeal(j *sealJob) {
 		segIndexUnusable.Add(1)
 		return
 	}
-	if err := writeSegCmdIndexFrom(seg, filters, entries, f.syncThroughMu); err != nil {
+	if err := writeSegCmdIndexFrom(seg, entries, f.syncThroughMu); err != nil {
 		segIndexUnusable.Add(1)
 	}
 	lists := buildSealedAggLists(snaps, seg, entries)
@@ -297,7 +296,7 @@ func (s *Slot) materializeSealedLocked(seg *Segment) error {
 	if err := seg.indexFlushAndClose(); err != nil {
 		return err
 	}
-	if err := writeSegCmdIndex(seg, seg.cmdFilters); err != nil {
+	if err := writeSegCmdIndex(seg); err != nil {
 		segIndexUnusable.Add(1)
 	}
 	if err := s.sealAggSeqsLocked(seg); err != nil {

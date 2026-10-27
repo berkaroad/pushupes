@@ -71,7 +71,6 @@ type segCmdIndex struct {
 	block   int64  // block number currently cached
 	cached  []byte // that block's payload
 	invalid bool
-	blm     *bloomSet // the segment's command bloom, when the file carries one
 }
 
 // segCidxBlocks is the number of entry blocks a file with count entries holds.
@@ -84,19 +83,19 @@ func segCidxPath(dir string, baseSeq uint64) string {
 // writeSegCmdIndex walks a just-sealed segment and writes its commands sorted
 // by hash to <baseSeq>.cidx (temp file + rename, so a partial index never
 // exists). The walk is header-only and happens once per segment, at seal.
-func writeSegCmdIndex(seg *Segment, filters []*bloomBits) error {
+func writeSegCmdIndex(seg *Segment) error {
 	sorted, err := collectSegCmdEntries(seg)
 	if err != nil {
 		return err
 	}
-	return writeSegCmdIndexFrom(seg, filters, sorted, nil)
+	return writeSegCmdIndexFrom(seg, sorted, nil)
 }
 
 // writeSegCmdIndexFrom writes an already-collected entry list. The seal worker
 // walks the segment once and feeds the same entries to the aggregate index, so
 // this form takes the collection result; sync, when set, replaces the plain
 // (*os.File).Sync (the worker routes it through flushMu).
-func writeSegCmdIndexFrom(seg *Segment, filters []*bloomBits, sorted []segCmdEntry, syncFn func(*os.File) error) error {
+func writeSegCmdIndexFrom(seg *Segment, sorted []segCmdEntry, syncFn func(*os.File) error) error {
 	dir := filepath.Dir(seg.Path)
 	if syncFn == nil {
 		syncFn = (*os.File).Sync
@@ -121,13 +120,11 @@ func writeSegCmdIndexFrom(seg *Segment, filters []*bloomBits, sorted []segCmdEnt
 		os.Remove(tmp)
 		return e
 	}
-	var bloom []byte
-	if len(filters) > 0 {
-		bloom = (&bloomSet{filters: filters}).encode()
-	}
 	hdr := segIdxHeaderBuf(segCidxMagic, seg.SlotID, seg.BaseSeq)
 	binary.BigEndian.PutUint64(hdr[20:28], uint64(len(sorted)))
-	binary.BigEndian.PutUint32(hdr[28:32], uint32(len(bloom)))
+	// The bloom section stays empty: the slot's dedup filter lives in its own
+	// generations (bloomstore.go), so a segment index carries entries only.
+	binary.BigEndian.PutUint32(hdr[28:32], 0)
 	if _, err := f.Write(hdr); err != nil {
 		return cleanup(err)
 	}
@@ -151,11 +148,6 @@ func writeSegCmdIndexFrom(seg *Segment, filters []*bloomBits, sorted []segCmdEnt
 			return cleanup(err)
 		}
 	}
-	if len(bloom) > 0 {
-		if _, err := f.Write(bloom); err != nil {
-			return cleanup(err)
-		}
-	}
 	if err := syncFn(f); err != nil {
 		return cleanup(err)
 	}
@@ -164,89 +156,6 @@ func writeSegCmdIndexFrom(seg *Segment, filters []*bloomBits, sorted []segCmdEnt
 		return err
 	}
 	return os.Rename(tmp, segCidxPath(dir, seg.BaseSeq))
-}
-
-// writeSegCidxBloom replaces ONLY the bloom section of an existing .cidx.
-// The entry blocks are copied byte-for-byte: the caller has already trusted
-// them (ix.Valid() checked every block CRC at this open), and the point of
-// this repair is to persist a bloom that a startup gap-check found short —
-// without the frame walk the full rewrite would need. Temp file + rename,
-// the same atomicity contract as writeSegCmdIndex: a half-written repair is
-// simply absent, and the next start redoes it.
-func writeSegCidxBloom(dir string, slotID int32, baseSeq uint64, filters []*bloomBits) error {
-	path := segCidxPath(dir, baseSeq)
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	h := make([]byte, segCidxHeaderByte)
-	if err := readAtFull(f, h, 0); err != nil {
-		return err
-	}
-	if !checkSegIdxHeader(h, segCidxMagic, slotID, baseSeq) {
-		return fmt.Errorf("%s: bad header", filepath.Base(path))
-	}
-	count := int(binary.BigEndian.Uint64(h[20:28]))
-	if count <= 0 {
-		return fmt.Errorf("%s: empty entry section", filepath.Base(path))
-	}
-	last := count % segCidxBlockMax
-	entryBytes := int64(segCidxBlocks(count)) * int64(segCidxBlockMax*segCidxEntryBytes+4)
-	if last != 0 {
-		entryBytes -= int64(segCidxBlockMax*segCidxEntryBytes + 4 - (last*segCidxEntryBytes + 4))
-	}
-	st, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	if st.Size() < int64(segCidxHeaderByte)+entryBytes {
-		return fmt.Errorf("%s: entry section truncated", filepath.Base(path))
-	}
-	bloom := (&bloomSet{filters: filters}).encode()
-	binary.BigEndian.PutUint32(h[28:32], uint32(len(bloom)))
-	tmp := path + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	cleanup := func(e error) error {
-		out.Close()
-		os.Remove(tmp)
-		return e
-	}
-	if _, err := out.Write(h); err != nil {
-		return cleanup(err)
-	}
-	// Windowed copy of the validated entry bytes — re-emitted unchanged.
-	buf := make([]byte, segIdxScanWindowB)
-	end := int64(segCidxHeaderByte) + entryBytes
-	for off := int64(segCidxHeaderByte); off < end; {
-		n := int64(len(buf))
-		if end-off < n {
-			n = end - off
-		}
-		if err := readAtFull(f, buf[:n], off); err != nil {
-			return cleanup(err)
-		}
-		if _, err := out.Write(buf[:n]); err != nil {
-			return cleanup(err)
-		}
-		off += n
-	}
-	if len(bloom) > 0 {
-		if _, err := out.Write(bloom); err != nil {
-			return cleanup(err)
-		}
-	}
-	if err := out.Sync(); err != nil {
-		return cleanup(err)
-	}
-	if err := out.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, path)
 }
 
 // collectSegCmdEntries reads a segment's frame headers into sorted-ready
@@ -287,11 +196,7 @@ func collectSegCmdEntries(seg *Segment) ([]segCmdEntry, error) {
 
 // openSegCmdIndex opens a sealed segment's command index; nil when it is not
 // there or does not validate (the caller then falls back to walking).
-// wantBloom loads (and decodes) the file's bloom section: only the slot-open
-// path needs it — a lookup binary-searches the entries and gates on the
-// segment's filters already in memory, so decoding a ~80KB filter on every
-// open would be pure CPU for an answer nobody reads.
-func openSegCmdIndex(dir string, slotID int32, baseSeq uint64, wantBloom bool) (*segCmdIndex, error) {
+func openSegCmdIndex(dir string, slotID int32, baseSeq uint64) (*segCmdIndex, error) {
 	f, err := os.Open(segCidxPath(dir, baseSeq))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -319,19 +224,6 @@ func openSegCmdIndex(dir string, slotID int32, baseSeq uint64, wantBloom bool) (
 		return nil, nil
 	}
 	ix := &segCmdIndex{dir: dir, slotID: slotID, baseSeq: baseSeq, count: count, f: f, block: -1}
-	if wantBloom {
-		if bloomLen := int(binary.BigEndian.Uint32(h[28:32])); bloomLen > 0 {
-			last := count % segCidxBlockMax
-			entryBytes := int64(segCidxBlocks(count)) * int64(segCidxBlockMax*segCidxEntryBytes+4)
-			if last != 0 {
-				entryBytes -= int64(segCidxBlockMax*segCidxEntryBytes + 4 - (last*segCidxEntryBytes + 4))
-			}
-			buf := make([]byte, bloomLen)
-			if err := readAtFull(f, buf, int64(segCidxHeaderByte)+entryBytes); err == nil {
-				ix.blm = decodeBloomSet(buf)
-			}
-		}
-	}
 	segIndexUsed.Add(1)
 	return ix, nil
 }
@@ -390,15 +282,6 @@ func (ix *segCmdIndex) entryAt(i int64) (segCmdEntry, bool) {
 		seq:    ix.baseSeq + uint64(binary.BigEndian.Uint32(data[p+4:p+8])),
 		off:    int64(binary.BigEndian.Uint32(data[p+8 : p+12])),
 	}, true
-}
-
-// Bloom returns the segment's command bloom filter (nil when the file has none
-// or it did not validate).
-func (ix *segCmdIndex) Bloom() *bloomSet {
-	if ix == nil {
-		return nil
-	}
-	return ix.blm
 }
 
 // Valid checks every block's CRC: a start uses it to tell "no index" from

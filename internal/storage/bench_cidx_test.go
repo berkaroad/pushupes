@@ -81,7 +81,7 @@ func BenchmarkCidxOpenForLookup(b *testing.B) {
 	b.ReportAllocs()
 	b.Run("with-bloom(startup)", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			ix, err := openSegCmdIndex(fx.dir, 7, fx.baseSeq, true)
+			ix, err := openSegCmdIndex(fx.dir, 7, fx.baseSeq)
 			if err != nil || ix == nil {
 				b.Fatal(err)
 			}
@@ -90,7 +90,7 @@ func BenchmarkCidxOpenForLookup(b *testing.B) {
 	})
 	b.Run("no-bloom(lookup)", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			ix, err := openSegCmdIndex(fx.dir, 7, fx.baseSeq, false)
+			ix, err := openSegCmdIndex(fx.dir, 7, fx.baseSeq)
 			if err != nil || ix == nil {
 				b.Fatal(err)
 			}
@@ -98,7 +98,7 @@ func BenchmarkCidxOpenForLookup(b *testing.B) {
 		}
 	})
 	// The search itself answers either way — spot-check one command.
-	ix, _ := openSegCmdIndex(fx.dir, 7, fx.baseSeq, false)
+	ix, _ := openSegCmdIndex(fx.dir, 7, fx.baseSeq)
 	target := uint32(fx.cmdHashes[42] >> 32)
 	if _, err := ix.LookupCmd(target, func(e segCmdEntry) bool {
 		return e.seq == 43

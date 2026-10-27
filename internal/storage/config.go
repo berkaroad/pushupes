@@ -144,12 +144,15 @@ const (
 	drainRoundMaxAge   = 200 * time.Millisecond
 )
 
-// Bloom filter shapes and the sequential read window of a block index scan.
+// Command-dedup bloom filter shape (see bloomstore.go). One generation holds
+// bloomGenBits bits for bloomGenRecords records — 21.5 bits per record with
+// bloomK probes, 0.0049% false positives per full generation. A lookup walks
+// every generation, so a slot's rate is the sum over generations: ten
+// generations (10⁹ records) is 0.049%, inside the 0.1% budget.
 const (
-	bloomK              = 3  // hash probes per entry
-	bloomBitsPerEntry   = 16 // ~0.5% false positives at k=3 (full filter)
-	bloomFirstCapacity  = 1 << 10
-	bloomFilterMaxBytes = 1 << 24
+	bloomK          = 10 // probes per record: the optimum at 21.5 bits
+	bloomGenRecords = 100_000_000
+	bloomGenBits    = 1 << 31 // power of two: a probe is a mask, not a modulo
 	// segIdxScanWindowB is the sequential read window a scan walks a block file
 	// in: one pread per window instead of two per block (head, then head+body),
 	// with no per-block allocation. Blocks fit in a window with room to spare

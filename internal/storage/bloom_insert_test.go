@@ -24,19 +24,18 @@ import (
 // The command filter answers "definitely not stored", and the idempotency check
 // skips its disk lookup on that answer — so the filter may over-report ("maybe"
 // for a hash it never placed) but must never under-report. Meanwhile the
-// recovery paths replay every record of every segment on every start, and the
-// filter grows by doubling with its entry count driving full(), so placing the
-// same hash twice costs real bytes-per-entry and raises the false-positive rate
-// (2 B/entry measured when each command is placed exactly once).
+// recovery paths replay every record of every segment on every start, so
+// placing the same hash twice spends a generation slot for nothing.
 //
 // The exact "already placed" answer cannot come from the filter itself: a bloom
-// "maybe" is also true for the ~0.5% of hashes that collide with unrelated
-// entries, and skipping on it would drop a stored command from the filter for
-// good. It comes from the record's slot seq instead — indexMetaLocked runs in
-// ascending seq order and the slot tracks a watermark of what it has placed.
+// "maybe" is also true for the hashes that collide with unrelated records, and
+// skipping on it would drop a stored command from the filter for good. It comes
+// from the record's slot seq instead — indexMetaLocked runs in ascending seq
+// order and the filter carries a watermark of the seqs its bits cover
+// (bloomstore.go).
 //
 // These tests drive the real entry point (indexMetaLocked), because that is
-// where the dedup lives; bloomSet.insert alone has no way to know.
+// where the dedup lives; bloomStore.insert alone has no way to know.
 func TestBloomIndexingIsIdempotent(t *testing.T) {
 	sl := openTestSlot(t)
 
@@ -56,7 +55,7 @@ func TestBloomIndexingIsIdempotent(t *testing.T) {
 		sl.indexMetaLocked(seq, m)
 	}
 	sl.mu.Unlock()
-	first := sl.blms.entries()
+	first := sl.blms.records()
 
 	// Replay the same seqs three more times: exactly what a restart does.
 	sl.mu.Lock()
@@ -67,12 +66,15 @@ func TestBloomIndexingIsIdempotent(t *testing.T) {
 		}
 	}
 	sl.mu.Unlock()
-	if got := sl.blms.entries(); got != first {
-		t.Errorf("replaying %d already-indexed seqs 3x changed entries: %d -> %d (want no change)",
+	if got := sl.blms.records(); got != first {
+		t.Errorf("replaying %d already-indexed seqs 3x changed records: %d -> %d (want no change)",
 			n, first, got)
 	}
 
-	// The new filters must not have been created either.
+	// The new generations must not have been created either.
+	if got := sl.blms.gensCount(); got != 1 {
+		t.Errorf("replaying covered seqs opened %d generations, want 1", got)
+	}
 	for i := 0; i < n; i++ {
 		seq, m := meta(i)
 		if !sl.blms.maybe(m.CommandHash) {
@@ -81,95 +83,15 @@ func TestBloomIndexingIsIdempotent(t *testing.T) {
 	}
 }
 
-// A filter that comes off a segment's command index must know how loaded it is:
-// full() gates whether the chain hands new hashes to a fresh filter, and a
-// decoded filter used to report 0 entries — so it stayed "not full" forever,
-// absorbing past its capacity and understating the density in every report.
-func TestDecodedFilterKnowsItsLoad(t *testing.T) {
-	set := &bloomSet{}
-	const n = 900 // most of bloomFirstCapacity
-	for i := 0; i < n; i++ {
-		set.insert(data.HashCommandID(fmt.Sprintf("load-%d", i)))
-	}
-	got := decodeBloomSet(set.encode())
-	if got == nil {
-		t.Fatal("decodeBloomSet rejected what encode wrote")
-	}
-	if got.entries() == 0 {
-		t.Fatalf("decoded set reports 0 entries (wrote %d): full() would never trigger", n)
-	}
-	if diff := got.entries() - n; diff > n/4 || diff < -n/4 {
-		t.Errorf("decoded entry estimate %d is too far from the %d placed", got.entries(), n)
-	}
-	for i := 0; i < n; i++ {
-		id := fmt.Sprintf("load-%d", i)
-		if !got.maybe(data.HashCommandID(id)) {
-			t.Fatalf("decoded filter reports %q absent", id)
-		}
-	}
-	// A saturated filter must decode as full, not as empty.
-	sat := &bloomSet{}
-	for i := 0; i < bloomFirstCapacity*3; i++ {
-		sat.insert(data.HashCommandID(fmt.Sprintf("sat-%d", i)))
-	}
-	dec := decodeBloomSet(sat.encode())
-	if dec == nil {
-		t.Fatal("saturated set failed to decode")
-	}
-	filled := false
-	for _, f := range dec.filters {
-		if f.entries > f.capacity() {
-			t.Errorf("decoded entries %d exceed capacity %d", f.entries, f.capacity())
-		}
-		if f.full() {
-			filled = true
-		}
-	}
-	if !filled {
-		t.Error("a saturated filter decoded as not-full: the chain would keep growing one filter")
-	}
-}
-
-// A set that grows past its first filter must keep answering for hashes placed
-// in the older ones.
-func TestBloomChainKeepsOlderFilters(t *testing.T) {
-	set := &bloomSet{}
-	const early = 1500
-	for i := 0; i < early; i++ {
-		set.insert(data.HashCommandID(fmt.Sprintf("early-%d", i)))
-	}
-	for i := 0; i < 20000; i++ {
-		set.insert(data.HashCommandID(fmt.Sprintf("late-%d", i)))
-	}
-	if len(set.filters) < 2 {
-		t.Fatalf("expected the chain to grow, got %d filter(s)", len(set.filters))
-	}
-	for i := 0; i < early; i++ {
-		id := fmt.Sprintf("early-%d", i)
-		if !set.maybe(data.HashCommandID(id)) {
-			t.Fatalf("hash placed in an older filter (%q) reports absent after growth", id)
-		}
-	}
-	// The exact replay signal (placed=true) must be a no-op even with room in
-	// the newest filter — this is the case that kept re-placing old hashes.
-	before := set.entries()
-	for i := 0; i < 500; i++ {
-		set.insertPlacedFrom(0, data.HashCommandID(fmt.Sprintf("early-%d", i)), true)
-	}
-	if got := set.entries(); got != before {
-		t.Errorf("replaying already-placed hashes changed entries: %d -> %d", before, got)
-	}
-}
-
-// The watermark must survive a reopen: the second start loads the segments'
-// blooms (or rebuilds them) and must not place the same records again. Two
-// consecutive reopens must land on the same number.
+// The watermark must survive a reopen so the second start does not place the
+// same records again, and the reloaded generation must answer for everything
+// it covers.
 func TestBloomWatermarkSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
 	const agg = "wm-agg"
 	const copies = 400
 
-	entriesAfterOpen := func(open func() *Store) int {
+	recordsAfterOpen := func(open func() *Store) uint64 {
 		st := open()
 		slot := st.SlotOf(agg)
 		if _, err := st.Slot(slot); err != nil {
@@ -179,7 +101,7 @@ func TestBloomWatermarkSurvivesReopen(t *testing.T) {
 		if err != nil || sl == nil {
 			t.Fatalf("slot not loaded: %v", err)
 		}
-		n := sl.blms.entries()
+		n := sl.blms.records()
 		if err := st.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -198,21 +120,22 @@ func TestBloomWatermarkSurvivesReopen(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	_ = slot
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	second := entriesAfterOpen(func() *Store { return openStoreAt(t, dir) })
-	third := entriesAfterOpen(func() *Store { return openStoreAt(t, dir) })
+	second := recordsAfterOpen(func() *Store { return openStoreAt(t, dir) })
+	third := recordsAfterOpen(func() *Store { return openStoreAt(t, dir) })
 	if second != third {
-		t.Errorf("filter entries differ across restarts: %d then %d (each start re-places records)",
+		t.Errorf("filter records differ across restarts: %d then %d (each start re-places records)",
 			second, third)
 	}
-	// Coverage is proven on the lookup answers, not the entry count: a filter
-	// loaded from disk carries a density ESTIMATE of its placements, so the
-	// sum can sit a percent off the records it covers. Every seeded command
-	// must still resolve to its stored seq.
+	if second != copies {
+		t.Errorf("filter records after reopen: %d, want %d (the header's coverage was not resumed)",
+			second, copies)
+	}
+	// Coverage is proven on the lookup answers too: every seeded command must
+	// resolve to its stored seq after a reopen.
 	st4 := openStoreAt(t, dir)
 	sl4, err := st4.Slot(slot)
 	if err != nil {
@@ -232,6 +155,14 @@ func TestBloomWatermarkSurvivesReopen(t *testing.T) {
 	if err := st4.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// emptyTestBloom returns a filter that answers "maybe" for everything — the
+// cold-start shape a test uses to force lookups onto the disk indexes — with
+// its own scratch directory so nothing lands in the slot's own filter files.
+func emptyTestBloom(t *testing.T) *bloomStore {
+	t.Helper()
+	return openTestBloom(t, t.TempDir())
 }
 
 // openTestSlot returns a bare slot with an empty filter set, for driving
