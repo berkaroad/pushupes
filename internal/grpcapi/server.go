@@ -25,7 +25,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"runtime"
 	"sync"
 	"time"
 
@@ -34,6 +33,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/berkaroad/pushupes/internal/cluster"
+	"github.com/berkaroad/pushupes/internal/config"
 	"github.com/berkaroad/pushupes/internal/data"
 	"github.com/berkaroad/pushupes/internal/lease"
 	"github.com/berkaroad/pushupes/internal/storage"
@@ -59,18 +59,9 @@ type Server struct {
 	batchJobs chan *batchJob
 }
 
-// batchPoolWorkers sizes the persistent slot-worker pool that executes
-// every BatchAppend's slot groups: sixteen times the process CPU width
-// (16 × runtime.GOMAXPROCS(0)), so the fan-out follows the machine the
-// node runs on. A worker holds its slot for the whole SubmitBatch —
-// mostly parked on the merged watermark wait, holding no CPU — so a pool
-// the width of the CPU would queue waits that previously ran overlapped.
-// Measured under multi-writer batch load, sixteen CPUs' worth of workers
-// keeps the pool from throttling the load while still bounding concurrent
-// WAL writers process-wide, and the
-// long-lived workers keep their grown execution stacks warm across
-// batches.
-var batchPoolWorkers = 16 * runtime.GOMAXPROCS(0)
+// The persistent slot-worker pool that executes every BatchAppend's slot
+// groups is sized by config.BatchPoolWorkers (sixteen times the process CPU
+// width); see that constant for why the factor is not 1.
 
 // batchJob is one slot group handed to the pool: the worker executes
 // batchSlot over the group's record positions, fills their results, and
@@ -122,7 +113,7 @@ func NewServer(eng *cluster.Engine, store *storage.Store, logger *slog.Logger, s
 		selfClientAddr: cluster.HostPort(selfClientAddr),
 		batchJobs:      make(chan *batchJob),
 	}
-	for i := 0; i < batchPoolWorkers; i++ {
+	for i := 0; i < config.BatchPoolWorkers; i++ {
 		go s.batchWorker()
 	}
 	return s
@@ -239,7 +230,7 @@ func (s *Server) batchSlot(ctx context.Context, slot int32, reqs []*pushupesv1.A
 // same write path as the engine's single append (write fence, routing,
 // idempotency, version check, HW wait), and distinct
 // slots run concurrently under the server's shared worker pool of
-// batchPoolWorkers workers (16 × runtime.GOMAXPROCS(0): workers spend most
+// config.BatchPoolWorkers workers (16 × runtime.GOMAXPROCS(0): workers spend most
 // of a slot group parked on the merged watermark wait, so the pool is
 // wider than the CPU to keep waits overlapped; it bounds concurrent WAL
 // writers process-wide and keeps its stacks warm across batches). The

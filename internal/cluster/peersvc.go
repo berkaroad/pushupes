@@ -41,6 +41,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 	"github.com/berkaroad/pushupes/internal/lease"
 )
@@ -50,26 +51,6 @@ const (
 	// that every gRPC connection starts with. Raft's wire protocol begins
 	// with an RPC version byte (0), so the classification never collides.
 	grpcMagicByte = byte('P')
-
-	peerRPCTimeout = 30 * time.Second
-	// failoverPickTimeout bounds ONE round of "what is your LEO for these
-	// slots?" asked of the failover candidates. The pick is best effort (a
-	// candidate that does not answer just drops out of the running), so it gets
-	// a healthy-peer budget rather than the general peer RPC timeout — a
-	// failover must not wait 30s for a dying node's answer.
-	failoverPickTimeout = 1 * time.Second
-	peerPingTimeout     = 2 * time.Second
-	// storageQueryTimeout bounds ONE round of "what are your slot sizes?"
-	// (the cluster storage gauge, see runStorageSampler). Shorter than the
-	// general peer RPC budget: a peer that does not answer costs the gauge one
-	// sample, not the whole refresh.
-	storageQueryTimeout = 2 * time.Second
-
-	// peerMaxMsgBytes bounds gRPC messages on the peer plane. Snapshot
-	// segments stream in <=4MiB chunks and fetch rounds cap at
-	// maxPayloadBytes (32MiB), so a 64MiB ceiling covers every message
-	// with headroom while keeping a malicious peer from pinning memory.
-	peerMaxMsgBytes = 64 << 20
 )
 
 // peerServer adapts Engine onto pushupesv1.PeerServiceServer. The adapter
@@ -286,7 +267,7 @@ func (pc *peerClient) client(addr string) (pushupesv1.PeerServiceClient, error) 
 			Timeout:             3 * time.Second,
 			PermitWithoutStream: true,
 		}),
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(peerMaxMsgBytes), grpc.MaxCallSendMsgSize(peerMaxMsgBytes)),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(config.PeerMaxMsgBytes), grpc.MaxCallSendMsgSize(config.PeerMaxMsgBytes)),
 	)
 	if err != nil {
 		return nil, err
@@ -486,8 +467,8 @@ func (e *Engine) ClosePeers() { e.peers.close() }
 // it; Serve exits on its own when the listener closes.
 func (e *Engine) ServePeer(d net.Listener) *grpc.Server {
 	srv := grpc.NewServer(
-		grpc.MaxRecvMsgSize(peerMaxMsgBytes),
-		grpc.MaxSendMsgSize(peerMaxMsgBytes),
+		grpc.MaxRecvMsgSize(config.PeerMaxMsgBytes),
+		grpc.MaxSendMsgSize(config.PeerMaxMsgBytes),
 		// The client keeps idle peer conns warm with 10s pings
 		// (PermitWithoutStream); relax the default 5min enforcement so the
 		// server does not GOAWAY "too_many_pings" on them.
@@ -579,7 +560,7 @@ func (e *Engine) peerSlotSizes(ctx context.Context, addr string, slots []int32) 
 	if err != nil {
 		return nil, nil, err
 	}
-	cctx, cancel := context.WithTimeout(ctx, storageQueryTimeout)
+	cctx, cancel := context.WithTimeout(ctx, config.StorageQueryTimeout)
 	defer cancel()
 	resp, err := c.SlotSizes(cctx, &pushupesv1.SlotSizesRequest{Slots: slots})
 	if err != nil {
@@ -597,7 +578,7 @@ func (e *Engine) peerSlotLeos(ctx context.Context, addr string, slots []int32) (
 	if err != nil {
 		return nil, err
 	}
-	cctx, cancel := context.WithTimeout(ctx, peerRPCTimeout)
+	cctx, cancel := context.WithTimeout(ctx, config.PeerRPCTimeout)
 	defer cancel()
 	resp, err := c.SlotLeos(cctx, &pushupesv1.SlotLeosRequest{Slots: slots})
 	if err != nil {

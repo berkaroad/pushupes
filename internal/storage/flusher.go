@@ -38,15 +38,6 @@ import (
 // therefore delays a single 256MiB segment, not every segment of that slot, and
 // not the rest of the queue.
 
-// The drain round's budget: at most this many units, or this much wall clock,
-// per round. Between rounds the loop re-runs the policy pass and yields, which
-// keeps a seal storm or a threshold-crossing wave from holding the fsync
-// pipeline (and the device) for as long as the queue is deep.
-const (
-	drainRoundMaxUnits = 8
-	drainRoundMaxAge   = 200 * time.Millisecond
-)
-
 // flushUnit is one segment's outstanding fsync. Everything the syscall needs
 // was snapshotted under the slot's write lock in prepareFlushLocked, so the
 // flusher never touches slot state outside the lock's windows.

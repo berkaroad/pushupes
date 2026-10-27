@@ -19,7 +19,8 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"time"
+
+	"github.com/berkaroad/pushupes/internal/config"
 )
 
 // HTTPServer owns the listener lifecycle for the API handler tree.
@@ -34,7 +35,7 @@ func NewServer(addr string, handler http.Handler, logger *slog.Logger) *HTTPServ
 		httpServer: &http.Server{
 			Addr:              addr,
 			Handler:           handler,
-			ReadHeaderTimeout: 10 * time.Second,
+			ReadHeaderTimeout: config.AdminReadHeaderTimeout,
 		},
 		logger: logger,
 	}

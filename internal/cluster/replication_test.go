@@ -24,6 +24,7 @@ import (
 	"net"
 	"sync"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	"github.com/berkaroad/pushupes/internal/data"
 	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 	"github.com/berkaroad/pushupes/internal/lease"
@@ -638,7 +639,7 @@ func TestUnreachableQuorumMarksPeerDown(t *testing.T) {
 
 	// A witness older than the window must not count towards a quorum.
 	ctrl.unreachMu.Lock()
-	ctrl.unreach["node-4"] = map[string]time.Time{"node-2": time.Now().Add(-2 * unreachableWindow)}
+	ctrl.unreach["node-4"] = map[string]time.Time{"node-2": time.Now().Add(-2 * config.UnreachableWindow)}
 	ctrl.unreachMu.Unlock()
 	report("node-4", "node-4") // self-report: ignored, and must not refresh the table
 	if down("node-4") {
@@ -646,7 +647,7 @@ func TestUnreachableQuorumMarksPeerDown(t *testing.T) {
 	}
 	report("node-2", "node-4")
 	if down("node-4") {
-		t.Fatalf("one fresh witness must not be a quorum even with a stale one present (window is %s)", unreachableWindow)
+		t.Fatalf("one fresh witness must not be a quorum even with a stale one present (window is %s)", config.UnreachableWindow)
 	}
 	report("node-3", "node-4")
 	// (Only the verdict is handed off the RPC path; the quorum decision itself is
@@ -1253,8 +1254,8 @@ func TestFetchItemAckCritical(t *testing.T) {
 		want bool
 	}{
 		{"one record (the canonical tail)", FetchItem{FromSeq: 9, NextSeq: 10}, true},
-		{"the tail threshold", FetchItem{FromSeq: 1, NextSeq: 1 + fetchTailRecords}, true},
-		{"one over the threshold", FetchItem{FromSeq: 1, NextSeq: 2 + fetchTailRecords}, false},
+		{"the tail threshold", FetchItem{FromSeq: 1, NextSeq: 1 + config.FetchTailRecords}, true},
+		{"one over the threshold", FetchItem{FromSeq: 1, NextSeq: 2 + config.FetchTailRecords}, false},
 		{"a bulk chunk", FetchItem{FromSeq: 1, NextSeq: 4097}, false},
 		{"unset NextSeq is unknown, not a tail", FetchItem{FromSeq: 5}, false},
 		{"empty payload", FetchItem{FromSeq: 5, NextSeq: 5}, false},

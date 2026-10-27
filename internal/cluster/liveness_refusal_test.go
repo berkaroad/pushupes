@@ -17,6 +17,8 @@ package cluster
 import (
 	"testing"
 	"time"
+
+	"github.com/berkaroad/pushupes/internal/config"
 )
 
 // TestRefusedPortNeedsTheConfirmWindow: a refused peer port is the strongest
@@ -43,7 +45,7 @@ func TestRefusedPortNeedsTheConfirmWindow(t *testing.T) {
 
 	// The port has now refused for longer than the window: the process is gone.
 	e.failMu.Lock()
-	e.refusedSince["node-2"] = time.Now().Add(-refusedConfirmWindow - time.Second)
+	e.refusedSince["node-2"] = time.Now().Add(-config.RefusedConfirmWindow - time.Second)
 	e.failMu.Unlock()
 	e.livenessSweep(e.TableSnapshot())
 	if !e.TableSnapshot().Peers["node-2"].Down {
@@ -62,7 +64,7 @@ func TestRefusalClockClearsWhenThePeerAnswers(t *testing.T) {
 	applyCmd(t, e, &Command{Op: OpPlanSlots})
 	e.SetStartupGrace(0)
 	e.failMu.Lock()
-	e.refusedSince["node-2"] = time.Now().Add(-refusedConfirmWindow - time.Second)
+	e.refusedSince["node-2"] = time.Now().Add(-config.RefusedConfirmWindow - time.Second)
 	e.failMu.Unlock()
 
 	e.livenessSweep(e.TableSnapshot())

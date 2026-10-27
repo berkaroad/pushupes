@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -97,7 +96,7 @@ func OpenStore(dir string, slotCount int32, segmentBytes int64, flush FlushPolic
 // segment).
 func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushPolicy, mode slotOpenMode) (*Store, error) {
 	if slotCount <= 0 {
-		slotCount = data.DefaultSlotCount
+		slotCount = DefaultSlotCount
 	}
 	if segmentBytes <= 0 {
 		segmentBytes = DefaultSegmentBytes
@@ -135,10 +134,7 @@ func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushP
 	}
 	// Phase 2: open/rebuild them with a bounded worker pool. The first
 	// error wins; callers treat a failed open as fatal startup anyway.
-	workers := runtime.GOMAXPROCS(0)
-	if workers < 4 {
-		workers = 4
-	}
+	workers := slotOpenWorkers
 	var (
 		wg      sync.WaitGroup
 		errOnce sync.Once

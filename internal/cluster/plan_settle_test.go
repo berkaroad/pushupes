@@ -17,6 +17,8 @@ package cluster
 import (
 	"fmt"
 	"testing"
+
+	"github.com/berkaroad/pushupes/internal/config"
 )
 
 // The settle gate is what keeps a cold start from laying out a cluster that has
@@ -69,7 +71,7 @@ func TestPlanSettleDoesNotStallARestartingCluster(t *testing.T) {
 func TestPlanSettleIsBoundedUnderChurn(t *testing.T) {
 	e := &Engine{}
 	planned := false
-	for i := 0; i < planSettleMaxRounds+2; i++ {
+	for i := 0; i < config.PlanSettleMaxRounds+2; i++ {
 		pool := []string{"node-1", fmt.Sprintf("node-%d", i+2)}
 		planned = e.poolSettled(pool, nil)
 		if planned {
@@ -77,7 +79,7 @@ func TestPlanSettleIsBoundedUnderChurn(t *testing.T) {
 		}
 	}
 	if !planned {
-		t.Fatalf("a churning pool was never planned under within %d rounds", planSettleMaxRounds+2)
+		t.Fatalf("a churning pool was never planned under within %d rounds", config.PlanSettleMaxRounds+2)
 	}
 	if e.planPoolWaited != 0 {
 		t.Fatalf("deferral counter = %d, want it cleared once the plan ran", e.planPoolWaited)

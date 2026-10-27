@@ -17,6 +17,8 @@ package cluster
 import (
 	"fmt"
 	"time"
+
+	"github.com/berkaroad/pushupes/internal/config"
 )
 
 // Post-migration local cleanup, as seen from the outside.
@@ -75,12 +77,6 @@ import (
 // it surplus again (or the operator) reclaims it. Restarting therefore never
 // deletes anything.
 
-// DefaultDropRetention is how long a migrated slot's former source keeps its
-// local copy before dropping it. Long enough to survive an immediately noticed
-// bad migration, short enough that surplus copies do not linger; operators
-// tune it with -drop-after.
-const DefaultDropRetention = 30 * time.Second
-
 // ResolveDropRetention turns a configured -drop-after value into the window
 // actually used, and rejects the one value that cannot mean anything:
 //
@@ -93,9 +89,9 @@ const DefaultDropRetention = 30 * time.Second
 func ResolveDropRetention(d time.Duration) (time.Duration, error) {
 	switch {
 	case d < 0:
-		return 0, fmt.Errorf("drop retention %s must not be negative (positive = the retention window, 0 = the default %s; there is no way to disable the automatic post-migration cleanup)", d, DefaultDropRetention)
+		return 0, fmt.Errorf("drop retention %s must not be negative (positive = the retention window, 0 = the default %s; there is no way to disable the automatic post-migration cleanup)", d, config.DropAfter)
 	case d == 0:
-		return DefaultDropRetention, nil
+		return config.DropAfter, nil
 	default:
 		return d, nil
 	}
@@ -106,7 +102,7 @@ func ResolveDropRetention(d time.Duration) (time.Duration, error) {
 func (e *Engine) SetDropRetention(d time.Duration) {
 	w, err := ResolveDropRetention(d)
 	if err != nil {
-		w = DefaultDropRetention // never applies a nonsensical window
+		w = config.DropAfter // never applies a nonsensical window
 	}
 	e.dropMu.Lock()
 	e.dropAfter = w

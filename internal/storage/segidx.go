@@ -865,13 +865,6 @@ func scanIdxEntries(path, magic string, slotID int32, baseSeq uint64, entryBytes
 	return scanIdxEntriesFile(f, magic, slotID, baseSeq, entryBytes, fn)
 }
 
-// segIdxScanWindowB is the sequential read window a scan walks a block file
-// in: one pread per window instead of two per block (head, then head+body),
-// with no per-block allocation. Blocks fit in a window with room to spare
-// (a full .idx block is segIdxBlockHead+segIdxBlockMax*28 bytes), so a block
-// can only span windows by corruption and the walk re-windows at its start.
-const segIdxScanWindowB = 256 << 10
-
 // scanIdxBlocksFile is the walk kernel: it hands each CRC-validated block's
 // entry payload to onBlock and stops when onBlock returns false. It reports
 // how many body bytes were read and whether any validated block was seen

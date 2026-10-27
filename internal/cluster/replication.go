@@ -22,7 +22,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -32,6 +31,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	"github.com/berkaroad/pushupes/internal/data"
 	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 	"github.com/berkaroad/pushupes/internal/storage"
@@ -120,7 +120,7 @@ type Engine struct {
 	parkedPool   sync.Pool // []parkedEntry
 	progressPool sync.Pool // *progressBatch
 	scanPool     sync.Pool // *fetchScan (per-position "has data" + wake handle + LEO)
-	fetchBudget  int64     // bytes one fetch round may carry (maxPayloadBytes; tests shrink it to pin the visit order)
+	fetchBudget  int64     // bytes one fetch round may carry (config.MaxPayloadBytes; tests shrink it to pin the visit order)
 	// fetchRingMu guards fetchRingBusy: the followers that last reported being
 	// behind on a ring seat. While one is, the other sessions are served at
 	// half the round budget — that node's catch-up is what a layout change
@@ -239,7 +239,7 @@ type Engine struct {
 	graceLogged  map[string]bool
 	// refusedSince is when a peer's peer port started REFUSING connections
 	// (nothing listening) — the clock the "the process is gone" verdict has to
-	// run out (see refusedConfirmWindow). A process that just restarted refuses
+	// run out (see config.RefusedConfirmWindow). A process that just restarted refuses
 	// for a moment too, so one refused probe is not a verdict. Guarded by failMu.
 	refusedSince map[string]time.Time
 	// graceHeld records that the window actually held at least one verdict (so
@@ -307,7 +307,7 @@ type Engine struct {
 	dropMu    sync.Mutex
 	dropAfter time.Duration
 	// hwWait is the watermark deadline an acknowledged append waits on
-	// before fail/1007 (default defaultHWWaitTimeout; a batch group pays it
+	// before fail/1007 (default config.HWWaitTimeout; a batch group pays it
 	// ONCE — see SubmitBatch). Tests shorten it.
 	hwWait       time.Duration
 	dropGen      uint64
@@ -372,16 +372,9 @@ type seatKey struct {
 	node string
 }
 
-// seatBuildGrace bounds how long a seat counts as "being built" for a leader
-// that takes the slot over mid-catch-up (see takeover). A copy that is still
-// fetching after this window is treated as an ordinary member — the promise
-// must not stay relaxed for a seat that is simply slow, and a fetch that long
-// means something else is wrong.
-const seatBuildGrace = time.Minute
-
 // takeover starts this leader's view of a slot it just gained. The seats present
 // are recorded (they are the set the promise rests on) and so are the "building"
-// marks: a seat seated within seatBuildGrace is a copy that is plausibly still
+// marks: a seat seated within config.SeatBuildGrace is a copy that is plausibly still
 // fetching, and the new leader has no leadership history to tell it apart from
 // an established member — so it must NOT gate this leader's writes (that is what
 // turns a hand-over of a slot with a seat mid-catch-up into a full-watermark
@@ -420,7 +413,7 @@ func (e *Engine) noteSeatAges() {
 func (e *Engine) youngSeats(slot int32, seats []string, now time.Time) []string {
 	var out []string
 	for _, s := range seats {
-		if at, ok := e.seated[seatKey{slot, s}]; ok && now.Sub(at) < seatBuildGrace {
+		if at, ok := e.seated[seatKey{slot, s}]; ok && now.Sub(at) < config.SeatBuildGrace {
 			out = append(out, s)
 		}
 	}
@@ -521,12 +514,12 @@ type fetchSession struct {
 	// lastSweep bounds when unchanged positions were last stamped: the
 	// liveness of frozen slots rides the periodic sweep round (time-based
 	// because idle rounds each last the full long-poll wait, so a count
-	// cadence would sweep every N*fetchWait and brush isrStaleAfter).
+	// cadence would sweep every N*config.FetchWait and brush config.ISRStaleAfter).
 	lastSweep time.Time
 	// unreachable counts CONSECUTIVE transport-level failures of this session's
 	// rounds (a dead leader's connection), and lastReport throttles the
 	// witnesses this session sends the controller: one per suspect per
-	// unreachableWindow, so a leader that stays dead does not turn its
+	// config.UnreachableWindow, so a leader that stays dead does not turn its
 	// followers into a report stream (see reportLeaderUnreachable). Touched only
 	// by this session's own goroutine.
 	unreachable int
@@ -538,47 +531,6 @@ type fetchSession struct {
 // long-poll (wait) absorbs quiet periods inside one request, so the
 // whole idle cycle (wait+maxBackoff) must stay inside the ISR staleness
 // window for replicas to remain in-sync.
-const (
-	fetchBaseInterval = 100 * time.Millisecond
-	fetchMaxBackoff   = 2 * time.Second
-	fetchWait         = 2 * time.Second // follower-requested long-poll budget
-	fetchSlack        = 1 * time.Second // client-side timeout margin
-	fetchMaxWait      = 5 * time.Second // leader-side cap on a requested wait
-	// DefaultFetchSettle is the fetch round's coalescing window (see
-	// SetFetchSettle): how long a woken round waits for the rest of the same
-	// write burst before it scans and answers. Measured on the 3-node bench
-	// (1KiB, conns 4, batch 100, mirrored 2ms/200us/0 sweep): answering at
-	// once is WORSE than coalescing (fewer slots per round leaves the tail of a
-	// burst to a later round: hw_wait 6.42ms at 0 vs 4.60ms at 200us against
-	// 5.70ms at 2ms), so the window earns its keep -- but 2ms is overpaid, at
-	// 37 slots per round against 29 for the same acknowledgement latency.
-	DefaultFetchSettle = 200 * time.Microsecond
-	fetchSweepInterval = 2 * time.Second  // stamp all positions at least this often
-	isrStaleAfter      = 10 * time.Second // must exceed fetchWait+fetchMaxBackoff
-	// commitFloorWait bounds how long a leader holds a write back while its
-	// copy catches up to the slot's commit floor (see awaitCommitFloor). The
-	// catch-up is one fetch round in the normal case; the bound only exists so
-	// a stalled fetch degrades to the old behaviour instead of wedging writes.
-	commitFloorWait      = 2 * time.Second
-	defaultHWWaitTimeout = 10 * time.Second // the write-ack watermark deadline
-
-	// fetchTailRecords is how close to a slot's head a follower counts as
-	// ACK-CRITICAL: a position within this many records is served before the
-	// round's bulk backlog share. It is a record count (not bytes) because the
-	// property being protected is "the follower is one round's production
-	// behind", and a writer produces records, not bytes; a tail's byte size is
-	// still bounded by the round budget's per-slot read cap.
-	fetchTailRecords = 64
-	// maxEarlyReportsPerRound caps how many ACK-CRITICAL positions a round
-	// reports the moment they land (see fetchRound): each is one small RPC, so
-	// the cap bounds a round whose tails are unusually many without ever
-	// letting the urgent ones wait for the round's bulk apply.
-	maxEarlyReportsPerRound = 16
-	// maxPayloadBytes caps one long-poll response: during a backlog the
-	// session streams item by item across rounds instead of building a
-	// gigabyte JSON blob of every slot at once.
-	maxPayloadBytes = 32 << 20
-)
 
 // Applying one fetch round: the round's items are different slots, so they are
 // applied concurrently (a small pool) while one slot's records stay in seq order
@@ -587,14 +539,9 @@ const (
 // round's positions are reported once, after it lands (see the call site in
 // fetchRound).
 //
-// The pool scales with the CPU budget this process actually has. GOMAXPROCS(0)
-// is the runtime's own view of it — the same measure the store's open workers
-// use — so inside a container it reflects the enforced quota rather than the
-// host's core count, and a node does not fan out a worker per host core.
-var (
-	applyWorkers     = 2 * runtime.GOMAXPROCS(0) // slots applied concurrently within one round
-	applyParallelMin = runtime.GOMAXPROCS(0)     // below this, a pool costs more than it saves
-)
+// The pool's width is config.ApplyWorkers / config.ApplyParallelMin: GOMAXPROCS(0)
+// scaled by the factors documented beside them, so inside a container the
+// fan-out follows the enforced quota rather than the host's core count.
 
 // NewEngine wires the cluster to the local storage. The Raft node may be
 // attached later with SetNode (they reference each other).
@@ -632,27 +579,27 @@ func NewEngine(node consensus, store *storage.Store, self string, logger *slog.L
 		migrating:       map[int32]struct{}{},
 		// post-migration cleanup: the former source keeps its copy for this
 		// long once it sees the hand-over committed (-drop-after).
-		dropAfter: DefaultDropRetention,
+		dropAfter: config.DropAfter,
 		// how long an acknowledged append waits for the slot's high
 		// watermark before fail/1007 (the record stays in the leader's WAL;
 		// a client retry converges on exists). A batch pays this deadline
 		// once per slot group, not once per record (SubmitBatch's merged
 		// wait). Tests shorten it.
-		hwWait: defaultHWWaitTimeout,
+		hwWait: config.HWWaitTimeout,
 		// leader rebalance: enabled by default, tuned with -rebalance-interval
 		// (an interval of 0 turns it off).
-		rebalanceInterval: DefaultRebalanceInterval,
+		rebalanceInterval: config.RebalanceInterval,
 		// per-slot ack-chain tallies, indexed by slot id (read-only after this)
 		ack:         ackDiag{slots: make([]slotAck, store.SlotCount)},
 		hwGates:     make([]hwGate, store.SlotCount),
-		fetchSettle: DefaultFetchSettle,
+		fetchSettle: config.FetchSettle,
 		traceAgg:    traceAgg,
 		// start-up grace: the window opens when this process's engine is built
 		// (a control node's first start is what it protects; a node that keeps
 		// running never re-opens it, so a leadership change does not reset the
 		// wait). Timed from here, not from the moment leadership was won.
 		startedAt:    time.Now(),
-		startupGrace: DefaultStartupGrace,
+		startupGrace: config.StartupGrace,
 		startupSeen:  map[string]bool{},
 		graceLogged:  map[string]bool{},
 		refusedSince: map[string]time.Time{},
@@ -661,9 +608,9 @@ func NewEngine(node consensus, store *storage.Store, self string, logger *slog.L
 	e.parkedPool.New = func() any { return make([]parkedEntry, 0, 64) }
 	e.progressPool.New = func() any { return &progressBatch{} }
 	e.scanPool.New = func() any { return &fetchScan{} }
-	e.fetchBudget = maxPayloadBytes
-	e.divergedConfirm = divergedConfirmWindow
-	e.emptyLeaderConfirm = emptyLeaderConfirmWindow
+	e.fetchBudget = config.MaxPayloadBytes
+	e.divergedConfirm = config.DivergedConfirmWindow
+	e.emptyLeaderConfirm = config.EmptyLeaderConfirmWindow
 	e.fetchScratchPool.New = func() any { return &fetchScratch{} }
 	e.fences = make([]slotFence, store.SlotCount)
 	if e.logger == nil {
@@ -675,7 +622,7 @@ func NewEngine(node consensus, store *storage.Store, self string, logger *slog.L
 	// is posted mid-round. One line per node so an operator can see what the
 	// process actually chose on its machine.
 	e.logger.Info("fetch round apply pool",
-		"apply_workers", applyWorkers, "apply_parallel_min", applyParallelMin)
+		"apply_workers", config.ApplyWorkers, "apply_parallel_min", config.ApplyParallelMin)
 	return e
 }
 
@@ -806,12 +753,6 @@ func (e *Engine) leaderCopyMissingWithHistory(slot int32) bool {
 	return ok && p.Leader == e.self && p.Epoch >= 2
 }
 
-// emptyLeaderConfirmWindow is how long a slot must keep reading as an
-// empty-shell leader before writes are refused: a copy being (re)built can
-// briefly read empty while its seats still report the previous holder's
-// history — the same transient that confirmDiverged guards against.
-const emptyLeaderConfirmWindow = 2 * time.Second
-
 // leaderEmptyShellWithHistory reports the empty-shell sibling of
 // leaderCopyMissingWithHistory: this node leads a slot that has moved before
 // (epoch >= 2), its local copy EXISTS but holds zero records, and a seat in
@@ -824,7 +765,7 @@ const emptyLeaderConfirmWindow = 2 * time.Second
 // the adopt-and-rewrite storm the missing-copy guard exists to refuse.
 // The evidence is the seat ledger every fetch round already feeds: no new
 // RPC, no new protocol. The reading must be confirmed across
-// emptyLeaderConfirmWindow before it refuses; it holds until the shell fills
+// config.EmptyLeaderConfirmWindow before it refuses; it holds until the shell fills
 // or the seat evidence clears.
 func (e *Engine) leaderEmptyShellWithHistory(slot int32) bool {
 	if !e.store.SlotPresent(slot) || e.store.LastSeqOf(slot) != 0 {
@@ -925,7 +866,7 @@ func (e *Engine) awaitCommitFloor(slot int32) {
 	}
 	e.logger.Info("slot commit floor: holding the write until the local copy catches up",
 		"slot", slot, "floor", floor, "leo", e.store.LastSeqOf(slot), "op", "commit_floor_wait")
-	deadline := time.Now().Add(commitFloorWait)
+	deadline := time.Now().Add(config.CommitFloorWait)
 	for {
 		if e.store.LastSeqOf(slot) >= floor {
 			return
@@ -1051,7 +992,7 @@ func (e *Engine) syncMigrationState() {
 	// Leadership bookkeeping: a slot this node just STARTED leading carries
 	// the previous term's follower positions in e.repl. Their leos are as of
 	// the old leader's last progress sample — often far below this node's own
-	// LEO — and they stay "fresh" for isrStaleAfter, so advanceHW's min would
+	// LEO — and they stay "fresh" for config.ISRStaleAfter, so advanceHW's min would
 	// freeze the watermark below the leader's LEO until each follower happens
 	// to report again. That freeze is what blocked every append to
 	// the 10s watermark wait deadline around a migration. Dropping the bookkeeping makes
@@ -1656,8 +1597,8 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 	// gate, so the acknowledged append wakes on the movement itself instead of
 	// on a poll interval. The tick is the safety net for transitions that
 	// produce no report (a replica going stale, a peer marked down); see
-	// hwWaitTick.
-	tick := time.NewTicker(hwWaitTick)
+	// config.HWWaitTick.
+	tick := time.NewTicker(config.HWWaitTick)
 	defer tick.Stop()
 	for {
 		// Same eligibility rule as the watermark min in advanceHW, computed
@@ -1675,7 +1616,7 @@ func (e *Engine) waitForHW(ctx context.Context, slot int32, seq uint64, timeout 
 		if sr != nil {
 			hw = sr.hw
 			hwAt = sr.hwAt
-			cutoff := time.Now().Add(-isrStaleAfter)
+			cutoff := time.Now().Add(-config.ISRStaleAfter)
 			leaderLEO := e.store.LastSeqOf(slot)
 			for _, node := range members {
 				if node == e.self {
@@ -1770,7 +1711,7 @@ func (e *Engine) logHWStall(slot int32, seq, hw uint64) {
 	}
 	var reps []rep
 	if sr != nil {
-		cutoff := time.Now().Add(-isrStaleAfter)
+		cutoff := time.Now().Add(-config.ISRStaleAfter)
 		now := time.Now()
 		for i, node := range sr.node {
 			reps = append(reps, rep{node, sr.leo[i], int64(now.Sub(sr.lastOK[i]).Seconds()),
@@ -1813,7 +1754,7 @@ func (e *Engine) replicaCount(slot int32) int {
 // order).
 func (e *Engine) seatVouchable(sr *slotRepl, node string) bool {
 	i := sr.find(node)
-	if i < 0 || !sr.lastOK[i].After(time.Now().Add(-isrStaleAfter)) {
+	if i < 0 || !sr.lastOK[i].After(time.Now().Add(-config.ISRStaleAfter)) {
 		return false
 	}
 	if e.sessionGone(node, sr.lastOK[i]) {
@@ -1840,7 +1781,7 @@ func (e *Engine) isr(slot int32) []string {
 	if sr == nil {
 		return nil
 	}
-	cutoff := time.Now().Add(-isrStaleAfter)
+	cutoff := time.Now().Add(-config.ISRStaleAfter)
 	var out []string
 	for i, node := range sr.node {
 		if !sr.lastOK[i].After(cutoff) || sr.isBuilding(node) {
@@ -1871,7 +1812,7 @@ func (e *Engine) sessionGone(follower string, lastReport time.Time) bool {
 // This is the fast half of "a replica that is not being served must not pin the
 // writes": the transport says so the moment the connection dies, while the
 // replicated liveness verdict (mark_down) needs consecutive probe rounds and the
-// staleness cutoff (isrStaleAfter) is a ten-second window. Without it a killed
+// staleness cutoff (config.ISRStaleAfter) is a ten-second window. Without it a killed
 // node's frozen LEO pins every slot it replicated until its seats leave the
 // table — observed as an eight-second 0 msg/s window in a batch workload, since
 // one pinned slot stalls a whole batch (the batch waits for every slot's
@@ -1892,7 +1833,7 @@ func (e *Engine) noteFollowerSessionLost(follower string, slots []int32) {
 	}
 	// Re-deriving a whole session's watermarks is O(slots) locks: a follower
 	// that flaps must not pay for that per flap.
-	verbose := !e.goneSess[follower].After(now.Add(-sessionLossRecheck))
+	verbose := !e.goneSess[follower].After(now.Add(-config.SessionLossRecheck))
 	e.goneSess[follower] = now
 	e.replMu.Unlock()
 	if !verbose {
@@ -1907,10 +1848,6 @@ func (e *Engine) noteFollowerSessionLost(follower string, slots []int32) {
 	}
 }
 
-// sessionLossRecheck throttles the watermark re-derivation a session loss
-// triggers (see noteFollowerSessionLost): at most one per interval per follower.
-const sessionLossRecheck = 200 * time.Millisecond
-
 // ---- Unreachable witnesses: followers' evidence, the controller's verdict -----
 //
 // A slot leader that is KILLED is visible to every node fetching from it the
@@ -1922,27 +1859,10 @@ const sessionLossRecheck = 200 * time.Millisecond
 // one observer's broken link is not evidence, several observers' is.
 //
 // The cost is event-driven and tiny: one small unary RPC per observer per
-// unreachableWindow (the connection is already pooled, the body is two node
+// config.UnreachableWindow (the connection is already pooled, the body is two node
 // ids), then the one OpMarkDown the probe path would have submitted anyway. The
 // sweep stays as the fallback — nobody may be watching a node that hosts no
 // replicated slots, and a partitioned observer cannot report at all.
-const (
-	// unreachableQuorum is how many DISTINCT observers must report the same
-	// node within unreachableWindow before it is marked down ahead of the probe
-	// threshold. Two is the smallest number that cannot be a single broken
-	// link; it is deliberately not a majority: the witnesses are the nodes
-	// actively fetching from the suspect, which is every other member in
-	// practice, and waiting for a majority would give back the latency the
-	// scheme exists to remove.
-	unreachableQuorum = 2
-	// unreachableWindow is how long a witness counts, and how often one
-	// observer may report the same suspect.
-	unreachableWindow = time.Second
-	// unreachableReportAfter is how many CONSECUTIVE transport failures make a
-	// session's observer speak up: one failure can be a blip (a table-driven
-	// session restart, a hiccup), two in a row at fetch cadence cannot.
-	unreachableReportAfter = 2
-)
 
 // transportUnreachable reports whether a fetch round failed at the TRANSPORT
 // level — the peer's connection is gone (a dead process, a broken link), which
@@ -1978,7 +1898,7 @@ func (e *Engine) reportLeaderUnreachable(suspect string) {
 	}
 	reporter := e.self
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), peerPingTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), config.PeerPingTimeout)
 		defer cancel()
 		c, err := e.peerRPC(addr)
 		if err != nil {
@@ -2075,7 +1995,7 @@ func (e *Engine) freshestReplicas(down string) (map[int32]string, map[int32]uint
 	// best-effort freshness probe on the failover path (a healthy peer answers in
 	// a millisecond), so a hanging candidate must not hold up the failover — it
 	// simply drops out of the running and the table rule covers its slots.
-	ctx, cancel := context.WithTimeout(context.Background(), failoverPickTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), config.FailoverPickTimeout)
 	defer cancel()
 	type answer struct {
 		id   string
@@ -2161,13 +2081,13 @@ func (e *Engine) recordUnreachable(reporter, suspect string) {
 		e.unreach[suspect] = seen
 	}
 	for r, at := range seen {
-		if now.Sub(at) > unreachableWindow {
+		if now.Sub(at) > config.UnreachableWindow {
 			delete(seen, r) // a stale witness is not a witness
 		}
 	}
 	seen[reporter] = now
 	n := len(seen)
-	acted := n >= unreachableQuorum
+	acted := n >= config.UnreachableQuorum
 	if acted {
 		delete(e.unreach, suspect)
 	}
@@ -2208,7 +2128,7 @@ func (e *Engine) advanceHW(slot int32) {
 	}
 	leaderLEO := e.store.LastSeqOf(slot)
 	minLEO := leaderLEO
-	cutoff := time.Now().Add(-isrStaleAfter)
+	cutoff := time.Now().Add(-config.ISRStaleAfter)
 	for _, node := range e.tableReplicasOf(slot) {
 		if node == e.self {
 			continue
@@ -2486,7 +2406,7 @@ func aggregateRepl(repl map[int32]*slotRepl, leoOf func(int32) uint64, now time.
 			}
 			pv.Slots++
 			okAge := now.Sub(sr.lastOK[i])
-			if okAge <= isrStaleAfter {
+			if okAge <= config.ISRStaleAfter {
 				pv.InISRSlots++
 			}
 			if a := okAge.Seconds(); a > pv.OldestOKAgeS {
@@ -2668,7 +2588,7 @@ func (e *Engine) SyncedLeaderSlots() (led, synced, seats int) {
 	e.tableMu.RLock()
 	defer e.tableMu.RUnlock()
 	factor := e.table.Replicas
-	cutoff := time.Now().Add(-isrStaleAfter)
+	cutoff := time.Now().Add(-config.ISRStaleAfter)
 	for s, p := range e.table.Slots {
 		if p == nil || p.Leader != e.self {
 			continue
@@ -2722,7 +2642,7 @@ func (e *Engine) noteReplicaProgress(slot int32, follower string, leo uint64, no
 	i := sr.find(follower)
 	prev, wasFresh := uint64(0), false
 	if i >= 0 {
-		prev, wasFresh = sr.leo[i], now.Sub(sr.lastOK[i]) <= isrStaleAfter
+		prev, wasFresh = sr.leo[i], now.Sub(sr.lastOK[i]) <= config.ISRStaleAfter
 	}
 	sr.touch(follower, leo, now)
 	// A report means this follower IS being served again: its earlier session
@@ -2797,7 +2717,7 @@ func (b *progressBatch) apply(e *Engine) {
 		// round; a full write per entry was the top CPU consumer). A
 		// STALE replica re-reporting the same LEO must still re-join the
 		// in-sync set — advanceHW runs when freshness flipped.
-		wasFresh := b.now.Sub(sr.lastOK[j]) <= isrStaleAfter
+		wasFresh := b.now.Sub(sr.lastOK[j]) <= config.ISRStaleAfter
 		if b.stamp || !wasFresh {
 			sr.lastOK[j] = b.now
 			if !wasFresh {
@@ -2961,7 +2881,7 @@ func (f *fetchScan) resize(n int) {
 
 // ackCritical reports whether position i is one a live append is waiting on:
 // the slot has data for the follower and the follower is within
-// fetchTailRecords of that slot's head. Those are the records whose delivery
+// config.FetchTailRecords of that slot's head. Those are the records whose delivery
 // is what lifts a parked append's watermark, so the round serves them before
 // the bulk (see the visit-order note in HandleMFetchCtx).
 func (f *fetchScan) ackCritical(i int, froms []uint64) bool {
@@ -2973,7 +2893,7 @@ func (f *fetchScan) ackCritical(i int, froms []uint64) bool {
 		return false
 	}
 	// moved implies leo >= from, so the gap is at least 1 and never underflows.
-	return f.leos[i]+1-from <= fetchTailRecords
+	return f.leos[i]+1-from <= config.FetchTailRecords
 }
 
 // reset clears the wake handles before the buffer goes back to the pool, so a
@@ -3003,20 +2923,12 @@ type parkedEntry struct {
 // ackCritical reports whether a served item is an ACK-CRITICAL position: the
 // leader serves those before the round's bulk (see the visit order in
 // HandleMFetchCtx) because the follower's next report of that slot is what
-// lifts a parked append's watermark. A tail carries at most fetchTailRecords
+// lifts a parked append's watermark. A tail carries at most config.FetchTailRecords
 // records, which is what identifies it on this side. Unset NextSeq reads as
 // "unknown", never as a tail.
 func (it *FetchItem) ackCritical() bool {
-	return it.NextSeq > it.FromSeq && it.NextSeq-it.FromSeq <= fetchTailRecords
+	return it.NextSeq > it.FromSeq && it.NextSeq-it.FromSeq <= config.FetchTailRecords
 }
-
-// HandleMFetchCtx serves PeerService.MFetch: one multiplexed replica fetch
-// round (all slots a follower takes from this leader, long-polled as a
-// unit). ctx cancels the long-poll (client disconnect / deadline).
-// ringCatchUpWindow bounds how long a follower's ring-catch-up report keeps the
-// other sessions at half budget: a session that stopped reporting (its node went
-// away, the slots moved) must not throttle them forever.
-const ringCatchUpWindow = 30 * time.Second
 
 // noteRingCatchUp records whether the follower reported being behind on a ring
 // seat, which makes its catch-up the critical path of a layout change.
@@ -3044,7 +2956,7 @@ func (e *Engine) ringCatchUpBusy(self string) bool {
 	busy := false
 	now := time.Now()
 	for f, at := range e.fetchRingBusy {
-		if now.Sub(at) > ringCatchUpWindow {
+		if now.Sub(at) > config.RingCatchUpWindow {
 			delete(e.fetchRingBusy, f) // stale: the session stopped reporting
 			continue
 		}
@@ -3223,7 +3135,7 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 			// data, do NOT park a fresh wake handle — the data landed
 			// before this point, so a clean handle would only fire on the
 			// NEXT append and the slot would idle until the wait deadline
-			// (that stall, not the wake path, was the p99=fetchWait tail). The rotating cursor serves it next round; marking
+			// (that stall, not the wake path, was the p99=config.FetchWait tail). The rotating cursor serves it next round; marking
 			// starved makes the response return now instead. If the slot
 			// is truly empty, park so future appends still wake the poll.
 			if waitMS > 0 {
@@ -3375,7 +3287,7 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 	// A round that booked ledger values answers NOW even when it has no
 	// payload: the sample this round computed is exactly what the follower's
 	// read admission waits on, and parking would hold it back until the next
-	// data wake or the wait deadline (up to fetchWait — the stall that made
+	// data wake or the wait deadline (up to config.FetchWait — the stall that made
 	// an acknowledged watermark visibly trail at a synced replica on the
 	// live cluster). Pure-changed rounds are rare and cheap (a report lift,
 	// an ISR re-join); data rounds already answer now via `served`.
@@ -3384,8 +3296,8 @@ func (e *Engine) HandleMFetchCtx(ctx context.Context, req MFetchRequest) (*MFetc
 		e.diag.parkedNow.Add(1)
 		defer e.diag.parkedNow.Add(-1)
 		wait := time.Duration(waitMS) * time.Millisecond
-		if wait > fetchMaxWait {
-			wait = fetchMaxWait
+		if wait > config.FetchMaxWait {
+			wait = config.FetchMaxWait
 		}
 		deadline := time.After(wait)
 		ping := e.hwPingWait() // arm BEFORE parking (see hwPingWait)
@@ -3711,7 +3623,7 @@ func (e *Engine) syncSessions(ctx context.Context) {
 // error doubles the sleep up to maxBackoff. The leader's long-poll absorbs
 // quiet periods inside the request itself.
 func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
-	sess.lastSweep = time.Now().Add(-fetchSweepInterval) // sweep on the first round
+	sess.lastSweep = time.Now().Add(-config.FetchSweepInterval) // sweep on the first round
 	backoff := time.Duration(0)
 	for {
 		if ctx.Err() != nil {
@@ -3724,14 +3636,14 @@ func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
 		}
 		slots, ok := sess.slots.Load().([]int32)
 		if !ok || len(slots) == 0 {
-			backoff = fetchBaseInterval
+			backoff = config.FetchBaseInterval
 			continue
 		}
 		// Ordinary rounds report positions and let the leader skip
-		// unchanged entries; a sweep round every fetchSweepInterval stamps
+		// unchanged entries; a sweep round every config.FetchSweepInterval stamps
 		// liveness for everything (<= a few seconds, far inside the 10s
 		// staleness window even counting a full long-poll round).
-		sweep := time.Since(sess.lastSweep) >= fetchSweepInterval
+		sweep := time.Since(sess.lastSweep) >= config.FetchSweepInterval
 		if sweep {
 			sess.lastSweep = time.Now()
 		}
@@ -3744,7 +3656,7 @@ func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
 			// routing answer or a session stopped by the table is NOT evidence.
 			if transportUnreachable(err) {
 				sess.unreachable++
-				if sess.unreachable >= unreachableReportAfter && time.Since(sess.lastReport) >= unreachableWindow {
+				if sess.unreachable >= config.UnreachableReportAfter && time.Since(sess.lastReport) >= config.UnreachableWindow {
 					sess.lastReport = time.Now()
 					e.reportLeaderUnreachable(sess.leader)
 				}
@@ -3755,15 +3667,15 @@ func (e *Engine) sessionLoop(ctx context.Context, sess *fetchSession) {
 			// spin. An *empty* round is NOT backed off — the long-poll made
 			// it zero-CPU, and sleeping between rounds is exactly what
 			// stalled records past the wait deadline (p90 = the
-			// fetchWait tail): a record landing in the backoff window rode
+			// config.FetchWait tail): a record landing in the backoff window rode
 			// no wake until the next round started.
 			if backoff == 0 {
-				backoff = fetchBaseInterval
+				backoff = config.FetchBaseInterval
 			} else {
 				backoff *= 2
 			}
-			if backoff > fetchMaxBackoff {
-				backoff = fetchMaxBackoff
+			if backoff > config.FetchMaxBackoff {
+				backoff = config.FetchMaxBackoff
 			}
 			continue
 		}
@@ -3788,9 +3700,9 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 	for i, s := range slots {
 		froms[i] = e.store.LastSeqOf(s) + 1
 	}
-	reqCtx, cancel := context.WithTimeout(ctx, fetchWait+fetchSlack+5*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, config.FetchWait+config.FetchSlack+5*time.Second)
 	defer cancel()
-	fr, release, err := e.peerMFetch(reqCtx, addr, &MFetchRequest{Follower: e.self, WaitMS: fetchWait.Milliseconds(), Slots: slots, FromSeqs: froms, Sweep: sweep})
+	fr, release, err := e.peerMFetch(reqCtx, addr, &MFetchRequest{Follower: e.self, WaitMS: config.FetchWait.Milliseconds(), Slots: slots, FromSeqs: froms, Sweep: sweep})
 	if err != nil {
 		return false, err
 	}
@@ -3821,7 +3733,7 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 		// per-slot logs run to tens of megabytes: acknowledged writes fell to
 		// ~100 msg/s with clean node-side counters, i.e. the append waited on
 		// the bulk apply, not on anything broken). A tail item carries at most
-		// fetchTailRecords records, which is what identifies it here.
+		// config.FetchTailRecords records, which is what identifies it here.
 		//
 		// replicaApply times the landing itself (the apply pool's wall time for
 		// this round's items): the follower's term of hw_wait's residual, from
@@ -3844,7 +3756,7 @@ func (e *Engine) fetchRound(ctx context.Context, leader string, slots []int32, s
 			repMu.Lock()
 			changed = append(changed, it.Slot)
 			leos = append(leos, from)
-			early := earlyReports < maxEarlyReportsPerRound && it.ackCritical()
+			early := earlyReports < config.MaxEarlyReportsPerRound && it.ackCritical()
 			if early {
 				earlyReports++
 			}
@@ -3878,7 +3790,7 @@ func (e *Engine) applyFetchItems(items []FetchItem, report func(it *FetchItem, f
 	if len(items) == 0 {
 		return false, nil
 	}
-	if len(items) < applyParallelMin {
+	if len(items) < config.ApplyParallelMin {
 		for i := range items {
 			if err := e.applyItem(&items[i], report); err != nil {
 				return false, err
@@ -3886,7 +3798,7 @@ func (e *Engine) applyFetchItems(items []FetchItem, report func(it *FetchItem, f
 		}
 		return true, nil
 	}
-	workers := applyWorkers
+	workers := config.ApplyWorkers
 	if workers > len(items) {
 		workers = len(items)
 	}
@@ -4303,29 +4215,6 @@ func (e *Engine) applyHwLedger(leader string, slots []int32, values []uint64) {
 
 // ---- Controller: membership + failover ---------------------------------------
 
-// refusedConfirmWindow is how long a peer's peer port must keep REFUSING
-// connections before the controller calls the process gone. A refused connect is
-// the strongest liveness signal there is — nothing is listening — but a process
-// that just restarted refuses too while it binds its port (measured: under a
-// second), so a single refusal must not be a verdict: the whole first
-// whole-cluster wave that made every lagging data node look dead came from
-// acting one probe too early. Past the window the verdict is kept by wall clock
-// rather than by the strike count, so a round that runs long (a slow peer's
-// probe timeout) does not stretch it.
-const refusedConfirmWindow = 3 * time.Second
-
-// livenessFailThreshold is the number of consecutive failed health probes
-// before the controller fails a peer's slots over (~3s of outage given the
-// 1s reconcile tick and 2s probe timeout; well beyond a node's boot time).
-const livenessFailThreshold = 3
-
-// RunController reconciles cluster state; only the Raft leader executes it.
-// planSettleMaxRounds bounds how long the layout waits for the data-plane pool
-// to stop changing. Two deferred rounds is one cold start's worth of
-// registration and one straggler's worth of patience; a membership that keeps
-// moving gets laid out anyway rather than not at all.
-const planSettleMaxRounds = 2
-
 // poolSettled reports whether the layout may be planned under this pool in this
 // round, carrying the settle state across rounds.
 //
@@ -4342,7 +4231,7 @@ const planSettleMaxRounds = 2
 //
 // It defers only while the pool differs from the one the last plan ran under
 // (planned): a steady cluster, or one whose plan already matches its members,
-// never waits. planSettleMaxRounds bounds the wait so a pool that keeps moving
+// never waits. config.PlanSettleMaxRounds bounds the wait so a pool that keeps moving
 // is still planned under.
 func (e *Engine) poolSettled(pool, planned []string) bool {
 	if sameMembers(pool, planned) {
@@ -4354,7 +4243,7 @@ func (e *Engine) poolSettled(pool, planned []string) bool {
 		e.planPoolSeen, e.planPoolWaited = nil, 0
 		return true
 	}
-	if e.planPoolWaited >= planSettleMaxRounds {
+	if e.planPoolWaited >= config.PlanSettleMaxRounds {
 		e.loggerf("layout: the data-plane pool (%v) is still changing after %d deferred rounds; planning under it anyway",
 			pool, e.planPoolWaited)
 		e.planPoolSeen, e.planPoolWaited = nil, 0
@@ -4589,13 +4478,13 @@ func (e *Engine) livenessSweep(tbl *Table) {
 					since = at
 					e.refusedSince[id] = since
 				}
-				markDown = at.Sub(since) >= refusedConfirmWindow && !p.Down
+				markDown = at.Sub(since) >= config.RefusedConfirmWindow && !p.Down
 				reason = fmt.Sprintf("nothing has been listening on its peer port for %s", at.Sub(since).Round(time.Millisecond))
 			} else {
 				// A black-holed or a merely slow peer: not the "nothing
 				// listening" signal, so the strike count decides.
 				delete(e.refusedSince, id)
-				markDown = e.failStreak[id] >= livenessFailThreshold && !p.Down
+				markDown = e.failStreak[id] >= config.LivenessFailThreshold && !p.Down
 				reason = fmt.Sprintf("%d consecutive probes", e.failStreak[id])
 			}
 			if markDown {
@@ -4706,15 +4595,10 @@ func (e *Engine) graceWindowState(tbl *Table, now time.Time) (map[string]bool, b
 
 // alive probes a peer over the peer plane (PeerService.Ping).
 func (e *Engine) alive(addr string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), peerPingTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), config.PeerPingTimeout)
 	defer cancel()
 	return e.peerPing(ctx, addr) == nil
 }
-
-// dialRefusedTimeout bounds the fast "is anything listening" dial. A refused
-// connection comes back immediately; only a black-holed address (a firewall
-// dropping SYN) waits this long.
-const dialRefusedTimeout = 300 * time.Millisecond
 
 // dialPeerPort reports what one TCP connect to the peer port at addr says:
 // listening when the connect completes (something accepts there), refused when
@@ -4723,7 +4607,7 @@ const dialRefusedTimeout = 300 * time.Millisecond
 // The directory stores addresses with their scheme, so the dial strips it (a raw
 // "http://host:port" is not a dialable address).
 func dialPeerPort(addr string) (listening, refused bool) {
-	c, err := net.DialTimeout("tcp", HostPort(addr), dialRefusedTimeout)
+	c, err := net.DialTimeout("tcp", HostPort(addr), config.DialRefusedTimeout)
 	if err == nil {
 		c.Close()
 		return true, false
@@ -4781,17 +4665,9 @@ type storageGauge struct {
 	at       time.Time
 }
 
-// storageSampleInterval is how stale the cluster storage gauge may get before
-// a reader of /admin/cluster/status triggers a background refresh. The sum
-// needs one peer round trip per other member, so it is never computed inline:
-// the status answers from the last sample, and the read that found the sample
-// stale schedules the next one. A console polling the page therefore keeps the
-// gauge fresh; with no reader at all, an idle node samples nothing.
-const storageSampleInterval = 2 * time.Second
-
 // runStorageSampler keeps the gauge fresh ON DEMAND: only the first sample (at
 // boot) and reader-triggered kicks refresh it. A status read older than
-// storageSampleInterval schedules the next sample (see ClusterStorageStats),
+// config.StorageSampleInterval schedules the next sample (see ClusterStorageStats),
 // so the gauge converges to the console's polling cadence instead of adding a
 // peer-plane round trip per other member every 2 seconds forever — which is
 // what an idle cluster was paying for a number nobody was looking at.
@@ -4818,7 +4694,7 @@ func (e *Engine) kickStorage() {
 
 // refreshStorage samples the on-disk size of every slot's leader copy: the slots
 // this node leads are read locally, every other leader is asked over the peer
-// plane in parallel under storageQueryTimeout. A leader that does not answer
+// plane in parallel under config.StorageQueryTimeout. A leader that does not answer
 // leaves the sample incomplete (the sum is then a lower bound) rather than
 // failing the refresh — a dead node must not hide the size of everything else.
 func (e *Engine) refreshStorage() {
@@ -4838,7 +4714,7 @@ func (e *Engine) refreshStorage() {
 	}
 	complete := true
 	if len(byLeader) > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), storageQueryTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), config.StorageQueryTimeout)
 		defer cancel()
 		type answer struct {
 			slots []int32
@@ -4894,7 +4770,7 @@ func (e *Engine) refreshStorage() {
 func (e *Engine) ClusterStorageStats() (bytes, count uint64, complete bool) {
 	e.storageMu.Lock()
 	bytes, count, complete, at := e.gauge.bytes, e.gauge.count, e.gauge.complete, e.gauge.at
-	stale := at.IsZero() || time.Since(at) >= storageSampleInterval
+	stale := at.IsZero() || time.Since(at) >= config.StorageSampleInterval
 	e.storageMu.Unlock()
 	if stale {
 		e.kickStorage()

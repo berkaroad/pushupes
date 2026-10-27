@@ -50,7 +50,6 @@ const (
 	// at (confLen bytes) sits between it and the payload's length/crc.
 	snapshotHeader = 4 + 1 + 8 + 8 + 4 + 8 + 4
 	snapshotSuffix = ".snap"
-	snapshotKeep   = 2
 )
 
 func snapshotDir(raftDir string) string { return filepath.Join(raftDir, "snapshot") }

@@ -16,7 +16,6 @@ package cluster
 
 import (
 	"sync"
-	"time"
 )
 
 // hwGate wakes the calls parked in waitForHW when a slot's high watermark
@@ -61,12 +60,3 @@ func (g *hwGate) kick() {
 	close(g.ch)
 	g.ch = nil
 }
-
-// hwWaitTick is waitForHW's safety net. The watermark normally advances on a
-// replica report, which kicks the gate; the transitions that produce no report
-// at all — a replica going stale (isrStaleAfter with no further reports) or a
-// peer being marked down — are why a parked wait still re-checks on a tick.
-// It replaces a 2ms poll: 40x less work with the same worst case on those
-// paths, and no poll interval at all on the common one. A variable so a test
-// can push it out of the way and prove the wake comes from the event.
-var hwWaitTick = 50 * time.Millisecond

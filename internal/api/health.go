@@ -15,13 +15,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	"github.com/berkaroad/pushupes/internal/health"
 )
-
-// healthScanTimeout bounds one walk: 1024+ slots x a few local describes is
-// seconds of work; anything beyond minutes is a node wedged, and the walk
-// must not live past its usefulness.
-const healthScanTimeout = 2 * time.Minute
 
 type healthTracker struct {
 	scan func(ctx context.Context) (health.Result, int, error)
@@ -49,7 +45,7 @@ func (t *healthTracker) trigger() bool {
 	t.mu.Unlock()
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), healthScanTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), config.HealthScanTimeout)
 		defer cancel()
 		res, compared, err := t.scan(ctx)
 		t.mu.Lock()

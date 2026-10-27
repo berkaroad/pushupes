@@ -20,6 +20,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/berkaroad/pushupes/internal/config"
 )
 
 // deadPeerAddr is a loopback address nothing listens on: a probe there fails
@@ -29,7 +31,7 @@ func deadPeerAddr(id string) string { return "127.0.0.1:1" }
 
 // judgeDead drives the sweep to a "dead" verdict for the given peers: with the
 // refusal confirmation window in place, a port that stops listening is judged on
-// the wall clock (refusedConfirmWindow) rather than on the first probe — so a test
+// the wall clock (config.RefusedConfirmWindow) rather than on the first probe — so a test
 // that wants the verdict backdates that clock instead of sleeping through it.
 func judgeDead(t *testing.T, e *Engine, ids ...string) {
 	t.Helper()
@@ -39,7 +41,7 @@ func judgeDead(t *testing.T, e *Engine, ids ...string) {
 			if e.refusedSince == nil {
 				e.refusedSince = map[string]time.Time{}
 			}
-			e.refusedSince[id] = time.Now().Add(-refusedConfirmWindow - time.Second)
+			e.refusedSince[id] = time.Now().Add(-config.RefusedConfirmWindow - time.Second)
 		}
 		e.failMu.Unlock()
 	}
@@ -73,8 +75,8 @@ func startupGraceEngine(t *testing.T) *Engine {
 // the grace inert and mark the very same peers down.
 func TestStartupGraceHoldsVerdictsForDataNodesThatHaveNotStarted(t *testing.T) {
 	e := startupGraceEngine(t)
-	if e.startupGrace != DefaultStartupGrace {
-		t.Fatalf("default grace = %s, want %s", e.startupGrace, DefaultStartupGrace)
+	if e.startupGrace != config.StartupGrace {
+		t.Fatalf("default grace = %s, want %s", e.startupGrace, config.StartupGrace)
 	}
 	e.livenessSweep(e.TableSnapshot())
 	tbl := e.TableSnapshot()
@@ -100,7 +102,7 @@ func TestStartupGraceHoldsVerdictsForDataNodesThatHaveNotStarted(t *testing.T) {
 // — which caps the failover delay at the grace.
 func TestStartupGraceExpiresIntoTheOrdinaryVerdict(t *testing.T) {
 	e := startupGraceEngine(t)
-	e.startedAt = time.Now().Add(-DefaultStartupGrace - time.Second)
+	e.startedAt = time.Now().Add(-config.StartupGrace - time.Second)
 	judgeDead(t, e, "node-2", "node-3")
 	tbl := e.TableSnapshot()
 	for _, id := range []string{"node-2", "node-3"} {
@@ -208,7 +210,7 @@ func TestStartupGraceReportsItsEndOnce(t *testing.T) {
 	t.Run("grace ran out", func(t *testing.T) {
 		e, buf := newLogged(t)
 		e.livenessSweep(e.TableSnapshot())
-		e.startedAt = time.Now().Add(-DefaultStartupGrace - time.Second)
+		e.startedAt = time.Now().Add(-config.StartupGrace - time.Second)
 		e.livenessSweep(e.TableSnapshot())
 		if msg := buf.String(); !strings.Contains(msg, "is over with 2 data node(s) still not answering") {
 			t.Fatalf("the expiry must be reported with the nodes still silent:\n%s", msg)

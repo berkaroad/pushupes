@@ -80,27 +80,8 @@ func (nopLogger) Infof(string, ...any)  {}
 func (nopLogger) Warnf(string, ...any)  {}
 func (nopLogger) Errorf(string, ...any) {}
 
-// The consensus timings every node starts with. ElectionTimeout is how long a
-// follower waits for a heartbeat before standing for election, so it has to stay
-// several multiples of the heartbeat: a late heartbeat — a busy apply batch, a
-// CPU-throttled container, a stalled event loop — must not look like a dead
-// leader. Hosts where that happens raise both (-raft-election-timeout /
-// -raft-heartbeat-timeout, PUSHUPES_RAFT_* on the node, RAFT_* in the cluster
-// start script) instead of living with the churn.
-const (
-	DefaultHeartbeatTimeout = 100 * time.Millisecond
-	DefaultElectionTimeout  = 500 * time.Millisecond
-	// DefaultFlushInterval is the consensus WAL's group-commit window: an
-	// append opens it, everything that arrives before it expires shares one
-	// fsync. It bounds how long a committed entry can sit unsynced.
-	DefaultFlushInterval = 100 * time.Millisecond
-	// minElectionPerHeartbeat is the smallest ratio the two knobs may have:
-	// below it one late heartbeat starts an election, which is the very churn
-	// the caller raising these values is trying to stop.
-	minElectionPerHeartbeat = 2
-)
-
-// Config configures one node. Zero-valued timing knobs fall back to defaults.
+// Config configures one node. Zero-valued timing knobs fall back to the shipped
+// defaults in config.go.
 type Config struct {
 	NodeID  string
 	DataDir string
@@ -157,13 +138,13 @@ func (c *Config) withDefaults() error {
 		return errors.New("raft: this node is not in the voter set")
 	}
 	if c.ApplyTimeout <= 0 {
-		c.ApplyTimeout = 10 * time.Second
+		c.ApplyTimeout = DefaultApplyTimeout
 	}
 	if c.SnapshotThreshold == 0 {
-		c.SnapshotThreshold = 1024
+		c.SnapshotThreshold = DefaultSnapshotThreshold
 	}
 	if c.SnapshotInterval <= 0 {
-		c.SnapshotInterval = 30 * time.Second
+		c.SnapshotInterval = DefaultSnapshotInterval
 	}
 	if c.HeartbeatTimeout <= 0 {
 		c.HeartbeatTimeout = DefaultHeartbeatTimeout
@@ -179,7 +160,7 @@ func (c *Config) withDefaults() error {
 		c.FlushInterval = DefaultFlushInterval
 	}
 	if c.SegmentBytes <= 0 {
-		c.SegmentBytes = 64 << 20
+		c.SegmentBytes = DefaultSegmentBytes
 	}
 	if c.Logger == nil {
 		c.Logger = nopLogger{}

@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	"github.com/berkaroad/pushupes/internal/data"
 )
 
@@ -213,9 +214,9 @@ func TestWaitForHWWakesOnAdvance(t *testing.T) {
 	leadSlot0(t, e)
 	e.hwWait = 30 * time.Second
 
-	saved := hwWaitTick
-	hwWaitTick = 30 * time.Second
-	defer func() { hwWaitTick = saved }()
+	saved := config.HWWaitTick
+	config.HWWaitTick = 30 * time.Second
+	defer func() { config.HWWaitTick = saved }()
 
 	// one in-sync replica, watermark one record behind
 	e.replMu.Lock()

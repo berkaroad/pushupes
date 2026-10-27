@@ -33,13 +33,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	"github.com/berkaroad/pushupes/internal/raft"
-)
-
-const (
-	peerPeekTimeout = 10 * time.Second
-	peerAcceptQueue = 64
-	peerDialTimeout = 2 * time.Second
 )
 
 type acceptResult struct {
@@ -74,8 +69,8 @@ func newPeerMux(bindAddr string, advertise *net.TCPAddr) (*peerMux, error) {
 	m := &peerMux{
 		listener:  tcpLn,
 		advertise: advertise,
-		raftCh:    make(chan acceptResult, peerAcceptQueue),
-		grpcCh:    make(chan acceptResult, peerAcceptQueue),
+		raftCh:    make(chan acceptResult, config.PeerAcceptQueue),
+		grpcCh:    make(chan acceptResult, config.PeerAcceptQueue),
 		closed:    make(chan struct{}),
 	}
 	if m.advertise == nil || m.advertise.Port == 0 {
@@ -131,7 +126,7 @@ func (m *peerMux) demux() {
 // replays it (both consumers need the full stream); the deadline is
 // cleared before handing over (raft and gRPC manage their own).
 func peekMagic(tc *net.TCPConn) (net.Conn, bool, error) {
-	_ = tc.SetReadDeadline(time.Now().Add(peerPeekTimeout))
+	_ = tc.SetReadDeadline(time.Now().Add(config.PeerPeekTimeout))
 	br := bufio.NewReader(tc)
 	if _, err := br.Peek(1); err != nil {
 		_ = tc.SetReadDeadline(time.Time{})

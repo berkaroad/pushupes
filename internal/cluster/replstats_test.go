@@ -157,7 +157,7 @@ func TestAggregateReplPure(t *testing.T) {
 	if p := peers[0]; p.Slots != 1 || p.InISRSlots != 1 || p.WorstLEOLag != 3 || p.OldestOKAgeS < 0.5 {
 		t.Fatalf("node-2 view = %+v, want slots=1 in_isr=1 lag=3 age~1", p)
 	}
-	// node-3: two slots, one report stale (30s > isrStaleAfter), 7 behind on
+	// node-3: two slots, one report stale (30s > the ISR stale window), 7 behind on
 	// slot 1 and level on slot 2.
 	if p := peers[1]; p.Slots != 2 || p.InISRSlots != 1 || p.WorstLEOLag != 7 || p.OldestOKAgeS < 25 {
 		t.Fatalf("node-3 view = %+v, want slots=2 in_isr=1 lag=7 age~30", p)

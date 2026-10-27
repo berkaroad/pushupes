@@ -33,17 +33,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	"github.com/berkaroad/pushupes/internal/raft"
 )
 
 // ErrNotLeader is returned when a command is submitted on a follower.
 var ErrNotLeader = errors.New("not the cluster leader")
-
-// Consensus WAL defaults: the group-commit window and the segment size.
-const (
-	DefaultRaftFlushInterval = 100 * time.Millisecond
-	DefaultRaftSegmentBytes  = 64 << 20
-)
 
 // Applier is implemented by the engine: it applies replicated slot-table
 // commands and can snapshot/restore that state.
@@ -203,16 +198,16 @@ type Config struct {
 
 func (c *Config) withDefaults() {
 	if c.ApplyTimeout <= 0 {
-		c.ApplyTimeout = 10 * time.Second
+		c.ApplyTimeout = config.RaftApplyTimeout
 	}
 	if c.SnapshotThreshold == 0 {
-		c.SnapshotThreshold = 1024
+		c.SnapshotThreshold = config.RaftSnapshotThreshold
 	}
 	if c.SnapshotInterval <= 0 {
-		c.SnapshotInterval = 30 * time.Second
+		c.SnapshotInterval = config.RaftSnapshotInterval
 	}
 	if c.TrailingLogs == 0 {
-		c.TrailingLogs = 256
+		c.TrailingLogs = config.RaftTrailingLogs
 	}
 	if c.HeartbeatTimeout <= 0 {
 		c.HeartbeatTimeout = raft.DefaultHeartbeatTimeout

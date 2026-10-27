@@ -22,13 +22,6 @@ package raft
 import (
 	"errors"
 	"fmt"
-	"time"
-)
-
-const (
-	rpcTimeout         = 5 * time.Second
-	snapshotRPCTimeout = 30 * time.Second
-	maxAppendBatch     = 64
 )
 
 type replicateRound struct {

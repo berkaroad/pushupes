@@ -16,7 +16,8 @@ import (
 	"sort"
 	"strconv"
 	"sync"
-	"time"
+
+	"github.com/berkaroad/pushupes/internal/config"
 )
 
 // The classification kinds. The strings are the CLI's output vocabulary and
@@ -167,7 +168,7 @@ func Scan(ctx context.Context, adminOf map[string]string, slots map[int64]SlotPl
 	if jobs < 1 {
 		jobs = 1
 	}
-	hc := &http.Client{Timeout: 15 * time.Second}
+	hc := &http.Client{Timeout: config.HealthClientTimeout}
 	ids := make([]int64, 0, len(slots))
 	for s := range slots {
 		ids = append(ids, s)

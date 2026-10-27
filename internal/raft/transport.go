@@ -29,10 +29,6 @@ import (
 	"time"
 )
 
-const (
-	handshakeTimeout = 2 * time.Second
-)
-
 // Transport is the peer-plane listener. Dial returns a raw connection; the
 // RPC layer performs its own handshake on it. The cluster package implements
 // this over the port that also demuxes the inter-node gRPC plane.

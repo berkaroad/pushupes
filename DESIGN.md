@@ -820,7 +820,7 @@ admin 面从不转发，也**不占用数据面错误码**：controller 归属�
 全文件扫描；这类问题交给持有该槽的节点（leader/副本，前端按 placement 选
 admin 地址）回答。分页用 `?after=<aggregate_id>` 游标顺序游走，一页只材料化
 limit 条（有界堆选取，内存 O(limit)，与槽内聚合数无关）；单次响应上限
-`MaxStreamPage=1000`，默认 `DefaultStreamPage=200`。
+`storage.MaxStreamPage=1000`，默认 `storage.DefaultStreamPage=200`。
 
 `/admin/slots/{slot}/describe` 返回的是**被询问节点自己的视角**：`hw`/`isr` 只有槽
 leader 才有（从副本进度上报里维护，`isr` 列的是**已同步的副本**，不含 leader 自己），
@@ -1170,7 +1170,7 @@ K=4096/2048/1024 则对 3/5/7 全部
 契约的一部分（客户端必须自行算出聚合落哪个槽，才能按 `PrefetchRoutes`
 的路由行直接写 leader），服务端代码引用同一实现（`internal/data.SlotOf`
 只做委托，委托一致性有钉测）。**总槽数不在契约内**：客户端代码不硬编码
-它，从 `PrefetchRoutes` 应答的数组长度读取；`data.DefaultSlotCount` 只是
+它，从 `PrefetchRoutes` 应答的数组长度读取；`storage.DefaultSlotCount` 只是
 服务端建库默认值。算法改动 = 客户端兼容性事故，所以 `pkg/client` 带金标
 向量测试（另一语言独立实现算出），任何漂移都会先撞上它。
 
@@ -1209,7 +1209,8 @@ K=4096/2048/1024 则对 3/5/7 全部
 2~256 之间的一切 2 的幂次节点数整除 1024，每节点槽主数精确等于 K/N（§7.2.3）；
 每节点至少 4 个槽，保证迁移粒度在全规模下仍然可用。段大小默认
 `storage.DefaultSegmentBytes = 64MiB`（经 `-segment-bytes` 可配，64MiB 的整数
-倍至 2GiB）——定标场景是「单数据节点 4 核/16GiB/1TiB、记录 1~4KiB」：1KiB 记录
+倍至 2GiB；段、索引与刷盘的各项默认值集中在 `internal/storage/config.go`）——
+定标场景是「单数据节点 4 核/16GiB/1TiB、记录 1~4KiB」：1KiB 记录
 时未封段 seq 项 = 8B × 热槽 × S/2 ÷ 记录 ≈ 0.25GiB（全 1024 槽皆热），加布隆
 1.34GiB + 稀疏索引 0.27GiB + 杂项，活堆 ≈2.0GiB、峰值 ≈5.7GiB ✓（聚合 ~1 千万
 再 +2GiB，仍在 16GiB 预算内）。小段的代价是段数（16384）、句柄与派生索引文件，
@@ -1232,7 +1233,7 @@ K=1024 在 256 个数据节点时恰好用满这一下限，扩节点到超过 K
 表内数字为历史实测/外推（当时槽数 1680/4096），新口径 (1024, 64M) 的单节点
 1KiB 行：未封 ≈0.25G、布隆 ≈1.3G、段数 ≈16384、每槽迁移量 ≈1G。
 
-- **槽数固定为 `data.DefaultSlotCount = 1024`（无 `-slots`/配置入口）**。
+- **槽数固定为 `storage.DefaultSlotCount = 1024`（无 `-slots`/配置入口）**。
 - 5/7 节点同参数下峰值只有 3 节点的约 60% / 45%（历史实测），**节点数越少，
   失效态越重**，按小规模拓扑规划内存即可覆盖所有规模。
 

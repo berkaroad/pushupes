@@ -21,16 +21,11 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 )
 
 // ---- Slot handover: stage, catch up, commit ----------------------------------
-
-// handoverStageTimeout bounds the table command that stages a handover (the
-// target joins the replica set). The catch-up itself is not bounded here: the
-// target pulls at whatever rate the fetch path gives it, and the controller
-// commits on a later round once the target holds the source's log.
-const handoverStageTimeout = 5 * time.Second
 
 // ---- Engine-side handover steps ----------------------------------------------
 
@@ -77,7 +72,7 @@ func (e *Engine) stageMigration(ctx context.Context, slot int32, toNode string) 
 	if err := e.submit(&Command{Op: OpSlotAddReplica, Slots: []int32{slot}, NodeID: toNode}); err != nil {
 		return false, fmt.Errorf("add target replica: %w", err)
 	}
-	if err := e.awaitApplied(ctx, handoverStageTimeout); err != nil {
+	if err := e.awaitApplied(ctx, config.HandoverStageTimeout); err != nil {
 		return true, err
 	}
 	e.logger.Info("handover staged: target joined the replica set and pulls over the fetch path",
@@ -139,7 +134,7 @@ func (e *Engine) commitMigration(ctx context.Context, slot int32, toNode string)
 	if err := e.submit(&Command{Op: OpSlotState, Slots: []int32{slot}, State: SlotMigratingOut, MigratingTo: toNode}); err != nil {
 		return fmt.Errorf("stage: %w", err)
 	}
-	if err := e.awaitApplied(ctx, handoverStageTimeout); err != nil {
+	if err := e.awaitApplied(ctx, config.HandoverStageTimeout); err != nil {
 		return err
 	}
 	// The commit fence. Sampling the target's log end offset and moving the
@@ -180,7 +175,7 @@ func (e *Engine) commitMigration(ctx context.Context, slot int32, toNode string)
 			e.rollbackMigration(slot)
 			return fmt.Errorf("commit(dead source): %w", err)
 		}
-		if err := e.awaitApplied(ctx, handoverStageTimeout); err != nil {
+		if err := e.awaitApplied(ctx, config.HandoverStageTimeout); err != nil {
 			return err
 		}
 		e.logger.Info("handover committed against an offline source: no writer to fence, the best live report is the floor",
@@ -202,7 +197,7 @@ func (e *Engine) commitMigration(ctx context.Context, slot int32, toNode string)
 		e.rollbackMigration(slot)
 		return fmt.Errorf("commit: %w", err)
 	}
-	if err := e.awaitApplied(ctx, handoverStageTimeout); err != nil {
+	if err := e.awaitApplied(ctx, config.HandoverStageTimeout); err != nil {
 		return err
 	}
 	epoch := int64(0)
@@ -578,7 +573,7 @@ func (e *Engine) liveReplicaTail(ctx context.Context, slot int32, from, to strin
 	if !known {
 		return 0, 0, false
 	}
-	qctx, cancel := context.WithTimeout(ctx, failoverPickTimeout)
+	qctx, cancel := context.WithTimeout(ctx, config.FailoverPickTimeout)
 	defer cancel()
 	ask := func(id string) (uint64, bool) {
 		if id == e.self {
@@ -735,7 +730,7 @@ func (e *Engine) peerDropSlot(ctx context.Context, addr string, slot int32, self
 	if err != nil {
 		return err
 	}
-	cctx, cancel := context.WithTimeout(ctx, peerRPCTimeout)
+	cctx, cancel := context.WithTimeout(ctx, config.PeerRPCTimeout)
 	defer cancel()
 	_, err = c.DropSlot(cctx, &pushupesv1.DropSlotRequest{Slot: slot, Node: self})
 	return err
@@ -758,7 +753,7 @@ func (e *Engine) peerDurableLEO(ctx context.Context, addr string, slot int32) (u
 	if err != nil {
 		return 0, err
 	}
-	cctx, cancel := context.WithTimeout(ctx, peerRPCTimeout)
+	cctx, cancel := context.WithTimeout(ctx, config.PeerRPCTimeout)
 	defer cancel()
 	resp, err := c.SlotLeo(cctx, &pushupesv1.SlotLeoRequest{Slot: slot, Flush: true})
 	if err != nil {

@@ -91,7 +91,7 @@ type WALOptions struct {
 
 func (o *WALOptions) withDefaults() {
 	if o.SegmentBytes <= 0 {
-		o.SegmentBytes = 64 << 20
+		o.SegmentBytes = DefaultSegmentBytes
 	}
 	if o.FlushInterval <= 0 {
 		o.FlushInterval = DefaultFlushInterval

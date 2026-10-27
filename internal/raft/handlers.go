@@ -22,8 +22,6 @@ import (
 	"time"
 )
 
-const rpcHandlerTimeout = 30 * time.Second
-
 func (n *Node) handleRPC(typ byte, payload []byte) (byte, []byte, error) {
 	switch typ {
 	case msgRequestVote:

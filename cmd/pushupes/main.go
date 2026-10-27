@@ -30,11 +30,10 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/berkaroad/pushupes/internal/api"
 	"github.com/berkaroad/pushupes/internal/cluster"
-	"github.com/berkaroad/pushupes/internal/data"
+	"github.com/berkaroad/pushupes/internal/config"
 	"github.com/berkaroad/pushupes/internal/raft"
 	"github.com/berkaroad/pushupes/internal/storage"
 
@@ -44,150 +43,107 @@ import (
 	"github.com/berkaroad/pushupes/internal/grpcapi"
 )
 
-// defaultGrpcMaxMsgBytes is the client-plane gRPC message cap: gRPC's own
-// default (4 MiB). Operators raise it with -grpc-max-msg-size when batches
-// carry more records than fit in 4 MiB.
-const defaultGrpcMaxMsgBytes = 4 << 20
+// defaultConfig is the shipped startup configuration: the knobs internal/config
+// owns come from config.Default, and the ones a layer owns come from that
+// layer — the storage knobs and the slot count from internal/storage, the
+// replica policy tier from cluster and the three consensus knobs
+// (WAL window, WAL segment size, heartbeat/election timings) from the consensus
+// package. Each default therefore has one definition, in the package
+// whose contract it belongs to.
+func defaultConfig() *config.Config {
+	cfg := config.Default()
+	cfg.SegmentBytes = storage.DefaultSegmentBytes
+	cfg.FlushMessages = storage.DefaultFlushMessages
+	cfg.FlushInterval = storage.DefaultFlushInterval
+	cfg.FlushParallelism = storage.DefaultFlushParallelism
+	cfg.SlotCount = storage.DefaultSlotCount
+	cfg.ReplicaPolicy = string(cluster.DefaultReplicaPolicy)
+	cfg.RaftFlushInterval = raft.DefaultFlushInterval
+	cfg.RaftSegmentBytes = raft.DefaultSegmentBytes
+	cfg.RaftHeartbeatTimeout = raft.DefaultHeartbeatTimeout
+	cfg.RaftElectionTimeout = raft.DefaultElectionTimeout
+	return cfg
+}
 
 func main() {
-	var (
-		nodeID     = flag.String("node", envOr("PUSHUPES_NODE", "node-1"), "node id (env PUSHUPES_NODE)")
-		adminAddr  = flag.String("admin", envOr("PUSHUPES_ADMIN", "http://127.0.0.1:8091"), "HTTP admin listen address: admin API + pprof (env PUSHUPES_ADMIN); events and all inter-node traffic use -client and -peer")
-		clientAddr = flag.String("client", envOr("PUSHUPES_CLIENT", "http://127.0.0.1:8591"), "gRPC data-plane listen address: event writes and queries (env PUSHUPES_CLIENT)")
-		peerAddr   = flag.String("peer", envOr("PUSHUPES_PEER", "http://127.0.0.1:8391"), "Raft transport + peer gRPC listen address: all node-to-node traffic (env PUSHUPES_PEER)")
-		dataDir    = flag.String("data", envOr("PUSHUPES_DATA", "./data"), "data directory (env PUSHUPES_DATA)")
-		peers      = flag.String("peers", envOr("PUSHUPES_PEERS", ""), "the cluster AUTHOR's initial Raft configuration document, nothing else: comma list of id=http://host:peerport (bare host:peerport and the legacy id:peerport:adminport:clientport also accepted; admin/client addrs are self-registered). Passing it makes THIS node the author, and it must name itself in the list; every other node joins through -join (mutually exclusive) (env PUSHUPES_PEERS)")
-		joinAddr   = flag.String("join", envOr("PUSHUPES_JOIN", ""), "comma list of one or more running cluster members (host:peerport, optional id=) this node offers ITSELF to until admitted — the only way a node joins: -join plus the intended -role. Voter joiners land in the raft configuration, learners in the directory; the node's own -peer is the address authority. Mutually exclusive with -peers (env PUSHUPES_JOIN)")
-		adoptTo    = flag.Duration("adopt-interval", envDurationOr("PUSHUPES_ADOPT_INTERVAL", cluster.DefaultAdoptInterval),
-			"how often a node that is not a cluster member yet retries offering itself through the -join targets, tried in rotation (env PUSHUPES_ADOPT_INTERVAL)")
-		// The slot count is a permanent layout decision (routing, placement,
-		// migration granularity), so it is not a runtime knob — it is fixed at
-		// data.DefaultSlotCount. See DESIGN §7.2.
-		slotCount = data.DefaultSlotCount
-		// The replica policy tier (low / medium / high) behind the per-slot
-		// replica factor. This flag only SEEDS a brand-new cluster: the policy
-		// lives in the replicated slot table, so on an existing cluster the
-		// table's value wins and the admin endpoint
-		// (POST /admin/cluster/replica-policy) is the entry point for every
-		// change. See DESIGN §4.
-		replicaPolicy = flag.String("replica-policy", envOr("PUSHUPES_REPLICA_POLICY", string(cluster.DefaultReplicaPolicy)),
-			"replica policy tier for a NEW cluster: low (1 copy per slot), medium (2, the default), high (3 copies per slot), or a positive number used as the factor directly; applied on the table's first plan only — an existing cluster keeps the policy the admin endpoint last set (env PUSHUPES_REPLICA_POLICY)")
-		segmentB = byteSize(envByteSizeOr("PUSHUPES_SEGMENT_BYTES", storage.DefaultSegmentBytes))
-		flushN   = flag.Int64("flush-messages", envInt64Or("PUSHUPES_FLUSH_MESSAGES", 1000), "fsync every N records (0 disables) (env PUSHUPES_FLUSH_MESSAGES)")
-		flushD   = flag.Duration("flush-interval", envDurationOr("PUSHUPES_FLUSH_INTERVAL", storage.DefaultFlushInterval), "fsync every interval (0 disables) (env PUSHUPES_FLUSH_INTERVAL)")
-		flushPar = flag.Int("flush-parallelism", envIntOr("PUSHUPES_FLUSH_PARALLELISM", 1), "segment fsyncs allowed in flight at once, the flush parallelism (1 = one at a time) (env PUSHUPES_FLUSH_PARALLELISM)")
-		// How long a woken fetch round waits for the rest of the write burst
-		// before answering. Every acknowledged append pays it once (the round
-		// carrying its record pays it), and it buys rounds: 0 answers as soon
-		// as the first slot has data, at the cost of more rounds and reports.
-		fetchSettleD = flag.Duration("fetch-settle", envDurationOr("PUSHUPES_FETCH_SETTLE", cluster.DefaultFetchSettle),
-			"fetch round coalescing window after a data wake (0 answers at once) (env PUSHUPES_FETCH_SETTLE)")
-		dropAfter = flag.Duration("drop-after", envDurationOr("PUSHUPES_DROP_AFTER", cluster.DefaultDropRetention),
-			"post-migration retention: how long the FORMER SOURCE keeps its local copy of a migrated slot before dropping it (positive = that window, 0 = the default 30s; negative is rejected; the cleanup cannot be disabled — env PUSHUPES_DROP_AFTER)")
-		rebalanceInterval = flag.Duration("rebalance-interval", envDurationOr("PUSHUPES_REBALANCE_INTERVAL", cluster.DefaultRebalanceInterval),
-			"how often the controller checks the leader layout against the slot ring and hands deviated slots back (a node that died returns to its own slots after failover; 0 disables the rebalancer; negative is rejected — env PUSHUPES_REBALANCE_INTERVAL)")
-		startupGrace = flag.Duration("startup-grace", envDurationOr("PUSHUPES_STARTUP_GRACE", cluster.DefaultStartupGrace),
-			"how long a control node's first start waits for the data nodes the directory already knows to come up before it starts treating an unanswered peer as failed, and keeps the first rebalance rounds out of that window (a whole-cluster restart whose data nodes start a few seconds late keeps its leader layout instead of piling every slot onto the first node that answers; 0 = render verdicts from the first round; negative is rejected — env PUSHUPES_STARTUP_GRACE)")
-		// The client plane keeps gRPC's stock 4MiB message cap by default.
-		// BatchAppend asks for one batch to fit inside the cap, so the
-		// operator raises it together with typical batch size (a 4MiB cap
-		// carries roughly 4000 records of 1KiB bodies).
-		grpcMaxMsg    = byteSize(envByteSizeOr("PUSHUPES_GRPC_MAX_MSG_SIZE", defaultGrpcMaxMsgBytes))
-		bootstrap     = flag.Bool("bootstrap", false, "author this cluster's initial configuration from this node. With -peers the author is the node whose id leads the list unless -bootstrap names another; -bootstrap alone (no -peers) authors a single-voter configuration this node can grow with -join voters later. A learner never authors, and -bootstrap is refused together with -join (env PUSHUPES_BOOTSTRAP not read: this is a startup decision, not a tunable)")
-		role          = flag.String("role", envOr("PUSHUPES_ROLE", ""), "this node's place in the cluster, required: voter (control plane — votes in the consensus group and hosts NO slot replicas) or learner (data plane — receives the replicated layout from the control plane without voting). The smallest deployment is one control node plus one data node (env PUSHUPES_ROLE)")
-		raftHeartbeat = flag.Duration("raft-heartbeat-timeout", envDurationOr("PUSHUPES_RAFT_HEARTBEAT_TIMEOUT", raft.DefaultHeartbeatTimeout),
-			"consensus heartbeat interval (env PUSHUPES_RAFT_HEARTBEAT_TIMEOUT). A leader whose heartbeats do not arrive in time is voted out, so on a host that can delay the consensus event loop raise this together with -raft-election-timeout")
-		raftElection = flag.Duration("raft-election-timeout", envDurationOr("PUSHUPES_RAFT_ELECTION_TIMEOUT", raft.DefaultElectionTimeout),
-			"consensus election timeout: how long a follower waits for a heartbeat before standing for election (env PUSHUPES_RAFT_ELECTION_TIMEOUT). At least 2x -raft-heartbeat-timeout; raise both when the cluster votes leaders out under load")
-		raftFlush = flag.Duration("raft-flush-interval", envDurationOr("PUSHUPES_RAFT_FLUSH_INTERVAL", cluster.DefaultRaftFlushInterval),
-			"consensus WAL group-commit window: appends arriving within it share a single fsync (env PUSHUPES_RAFT_FLUSH_INTERVAL)")
-		raftSegB = byteSize(envByteSizeOr("PUSHUPES_RAFT_SEGMENT_BYTES", cluster.DefaultRaftSegmentBytes))
-	)
-	// -segment-bytes takes a size, not just a byte count: 268435456 or 256MiB.
-	flag.Var(&segmentB, "segment-bytes", "WAL segment roll `size` (bytes, or a suffix like 256MiB/1GiB); a multiple of 64MiB, at most 2GiB (env PUSHUPES_SEGMENT_BYTES)")
-	flag.Var(&grpcMaxMsg, "grpc-max-msg-size", "client-plane gRPC max message `size` in bytes (suffixes like 16MiB accepted; the gRPC default 4MiB applies when unset) (env PUSHUPES_GRPC_MAX_MSG_SIZE)")
-	flag.Var(&raftSegB, "raft-segment-bytes", "consensus WAL segment roll `size` (bytes, or a suffix like 64MiB) (env PUSHUPES_RAFT_SEGMENT_BYTES)")
+	cfg := defaultConfig()
+	cfg.Register(flag.CommandLine)
 	flag.Parse()
 
 	base := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	logger := base.With("node", *nodeID)
+	logger := base.With("node", cfg.NodeID)
 
-	if err := run(*nodeID, *adminAddr, *clientAddr, *peerAddr, *dataDir, *peers, *joinAddr, *role, *adoptTo, slotCount, *replicaPolicy, int64(segmentB), int64(grpcMaxMsg), *flushN, *flushD, *flushPar, *dropAfter, *fetchSettleD, *rebalanceInterval, *startupGrace, *bootstrap, *raftFlush, *raftHeartbeat, *raftElection, int64(raftSegB), logger); err != nil {
+	if err := run(cfg, logger); err != nil {
 		logger.Error("pushupes exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, role string, adoptInterval time.Duration, slotCount int, replicaPolicy string, segmentBytes, grpcMaxMsgBytes int64, flushN int64, flushD time.Duration, flushPar int, dropAfter, fetchSettle, rebalanceInterval, startupGrace time.Duration, bootstrap bool, raftFlush, raftHeartbeat, raftElection time.Duration, raftSegBytes int64, logger *slog.Logger) error {
-	nodeRole, err := cluster.NormalizeRole(role)
+func run(cfg *config.Config, logger *slog.Logger) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	nodeRole, err := cluster.NormalizeRole(cfg.Role)
 	if err != nil {
 		return err
 	}
 	// Canonical form for every stored address: scheme required. A bare
 	// host:port gets the default "http://" prefix; an explicit protocol
 	// is honoured as passed. TCP-level uses (listen/dial) strip it again.
-	adminAddr = cluster.NormalizeAddr(adminAddr)
-	clientAddr = cluster.NormalizeAddr(clientAddr)
-	peerAddr = cluster.NormalizeAddr(peerAddr)
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	cfg.AdminAddr = cluster.NormalizeAddr(cfg.AdminAddr)
+	cfg.ClientAddr = cluster.NormalizeAddr(cfg.ClientAddr)
+	cfg.PeerAddr = cluster.NormalizeAddr(cfg.PeerAddr)
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return err
 	}
 
-	if err := storage.ValidateSegmentBytes(segmentBytes); err != nil {
+	if err := storage.ValidateSegmentBytes(cfg.SegmentBytes); err != nil {
 		return err
-	}
-	// The client-plane message cap must be positive; a zero/negative value
-	// would break every gRPC call on the data plane (fail fast at startup).
-	if grpcMaxMsgBytes <= 0 {
-		return fmt.Errorf("-grpc-max-msg-size %s must be positive", humanBytes(grpcMaxMsgBytes))
 	}
 	// Post-migration retention: 0 means "the default", a negative window is
 	// rejected here (fail fast). There is no way to switch the cleanup off.
-	dropRetention, err := cluster.ResolveDropRetention(dropAfter)
+	dropRetention, err := cluster.ResolveDropRetention(cfg.DropAfter)
 	if err != nil {
 		return err
 	}
 	logger.Info("post-migration cleanup: the former source drops its local copy after this retention",
 		"drop_after", dropRetention.String())
-	if flushPar < 1 {
-		return fmt.Errorf("-flush-parallelism %d must be at least 1 (one segment fsync in flight)", flushPar)
-	}
-	store, err := storage.OpenStore(dataDir, int32(slotCount), segmentBytes, storage.FlushPolicy{
-		IntervalMessages: flushN,
-		Interval:         flushD,
-		Parallelism:      flushPar,
+	store, err := storage.OpenStore(cfg.DataDir, int32(cfg.SlotCount), cfg.SegmentBytes, storage.FlushPolicy{
+		IntervalMessages: cfg.FlushMessages,
+		Interval:         cfg.FlushInterval,
+		Parallelism:      cfg.FlushParallelism,
 	})
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer store.Close()
-	logger.Info("segment fsync parallelism", "in_flight", flushPar,
+	logger.Info("segment fsync parallelism", "in_flight", cfg.FlushParallelism,
 		"note", "1 keeps one fsync at a time; more lets independent segments overlap on the device")
 
 	// Membership comes first: authorship is a startup decision, and every
 	// wrong combination fails the process before any port is bound.
-	selfPeer := cluster.Peer{ID: nodeID, PeerAddr: peerAddr, AdminAddr: adminAddr, ClientAddr: clientAddr}
-	author, peers, targets, err := membershipPlan(nodeID, peersCSV, joinAddr, nodeRole, bootstrap, selfPeer)
+	selfPeer := cluster.Peer{ID: cfg.NodeID, PeerAddr: cfg.PeerAddr, AdminAddr: cfg.AdminAddr, ClientAddr: cfg.ClientAddr}
+	author, peers, targets, err := membershipPlan(cfg.NodeID, cfg.Peers, cfg.Join, nodeRole, cfg.Bootstrap, selfPeer)
 	if err != nil {
 		return err
 	}
 	seeding := !author
 	if seeding {
 		logger.Info("starting as a joiner: offering itself through the -join members",
-			"role", nodeRole, "node", nodeID, "targets", targets)
+			"role", nodeRole, "node", cfg.NodeID, "targets", targets)
 	}
 
 	// The engine is the Applier the FSM calls into; it also needs the Raft
 	// node to submit commands. Build the engine first with a nil node, then
 	// hand it to NewNode and wire the node back in.
-	eng := cluster.NewEngine(nil, store, nodeID, logger)
+	eng := cluster.NewEngine(nil, store, cfg.NodeID, logger)
 	eng.SetDropRetention(dropRetention)
 	// -replica-policy is a seed, not a live knob: an invalid value is a
 	// startup error (same fail-fast rule as -drop-after), and a valid one is
 	// applied by the controller ONLY on a brand-new cluster's first plan. An
 	// existing cluster keeps the policy stored in the replicated table — the
 	// admin endpoint is the entry point for every change after that.
-	bootPolicy, err := cluster.NormalizeReplicaPolicy(replicaPolicy)
+	bootPolicy, err := cluster.NormalizeReplicaPolicy(cfg.ReplicaPolicy)
 	if err != nil {
 		return fmt.Errorf("-replica-policy: %w", err)
 	}
@@ -199,44 +155,35 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 	// Leader rebalance: interval 0 is the operator's off switch; a negative
 	// value is a startup error (same fail-fast rule as -drop-after). Commits
 	// are strictly serial inside the loop, so this cadence paces convergence.
-	if rebalanceInterval < 0 {
-		return fmt.Errorf("-rebalance-interval %s must not be negative (positive = the check cadence, 0 = the rebalancer is off)", rebalanceInterval)
-	}
-	eng.SetRebalanceConfig(rebalanceInterval)
-	if startupGrace < 0 {
-		return fmt.Errorf("-startup-grace %s must not be negative (positive = how long the first rebalance waits for the registered data nodes to come up, 0 = no wait)", startupGrace)
-	}
-	eng.SetStartupGrace(startupGrace)
-	if startupGrace > 0 {
+	eng.SetRebalanceConfig(cfg.RebalanceInterval)
+	eng.SetStartupGrace(cfg.StartupGrace)
+	if cfg.StartupGrace > 0 {
 		logger.Info("start-up grace: a control node's first start holds its liveness verdict for the data nodes the directory already knows until they answer once, and keeps the first rebalance rounds out of that window",
-			"grace", startupGrace.String())
+			"grace", cfg.StartupGrace.String())
 	} else {
 		logger.Info("start-up grace disabled (-startup-grace is 0): liveness verdicts render from the first round")
 	}
-	if fetchSettle < 0 {
-		return fmt.Errorf("-fetch-settle %s must not be negative", fetchSettle)
-	}
-	eng.SetFetchSettle(fetchSettle)
-	if rebalanceInterval > 0 {
+	eng.SetFetchSettle(cfg.FetchSettle)
+	if cfg.RebalanceInterval > 0 {
 		logger.Info("leader rebalance: the controller hands deviated slots back to the ring layout, one commit per round (serial)",
-			"interval", rebalanceInterval.String())
+			"interval", cfg.RebalanceInterval.String())
 	} else {
 		logger.Info("leader rebalance disabled (-rebalance-interval is 0)")
 	}
 
 	node, peerGRPC, err := cluster.NewNode(cluster.Config{
-		NodeID:           nodeID,
-		PeerAddr:         peerAddr,
-		AdminAddr:        adminAddr,
-		ClientAddr:       clientAddr,
+		NodeID:           cfg.NodeID,
+		PeerAddr:         cfg.PeerAddr,
+		AdminAddr:        cfg.AdminAddr,
+		ClientAddr:       cfg.ClientAddr,
 		Role:             nodeRole,
-		DataDir:          filepath.Join(dataDir, "cluster"),
+		DataDir:          filepath.Join(cfg.DataDir, "cluster"),
 		Peers:            peers,
 		Seed:             seeding,
-		FlushInterval:    raftFlush,
-		SegmentBytes:     raftSegBytes,
-		HeartbeatTimeout: raftHeartbeat,
-		ElectionTimeout:  raftElection,
+		FlushInterval:    cfg.RaftFlushInterval,
+		SegmentBytes:     cfg.RaftSegmentBytes,
+		HeartbeatTimeout: cfg.RaftHeartbeatTimeout,
+		ElectionTimeout:  cfg.RaftElectionTimeout,
 	}, eng, logger)
 	if err != nil {
 		return fmt.Errorf("raft node: %w", err)
@@ -263,16 +210,16 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 
 	// Runtime join: every non-author node — voter joiner AND learner alike —
 	// offers itself through the -join list until the leader admits it (into
-	// the raft configuration or the directory, by its own -role). A clear
+	// the raft configuration or the directory, by its own -cfg.Role). A clear
 	// refusal is fatal: the id or the address belongs to somebody else and
 	// no retry fixes that, so the process exits (fail-fast).
 	var joinErr chan error
 	if seeding {
 		joinErr = make(chan error, 1)
-		go func() { joinErr <- eng.NewJoiner(targets, adoptInterval, nodeRole).Run(ctx) }()
+		go func() { joinErr <- eng.NewJoiner(targets, cfg.AdoptInterval, nodeRole).Run(ctx) }()
 	}
 
-	srv := api.NewServer(cluster.HostPort(adminAddr), api.New(eng, store), logger)
+	srv := api.NewServer(cluster.HostPort(cfg.AdminAddr), api.New(eng, store), logger)
 	errCh := make(chan error, 2)
 	go func() { errCh <- srv.ListenAndServe() }()
 
@@ -280,8 +227,8 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 	// cap is operator-configurable (-grpc-max-msg-size, default 4MiB): a
 	// BatchAppend must fit one batch inside it, both directions.
 	grpcOpts := []grpc.ServerOption{
-		grpc.MaxRecvMsgSize(int(grpcMaxMsgBytes)),
-		grpc.MaxSendMsgSize(int(grpcMaxMsgBytes)),
+		grpc.MaxRecvMsgSize(int(cfg.GRPCMaxMsgBytes)),
+		grpc.MaxSendMsgSize(int(cfg.GRPCMaxMsgBytes)),
 		// Liveness pings, both directions, on the client surface. The
 		// enforcement policy exists so the server does NOT GOAWAY the
 		// pkg/client's 5s idle pings (the default 5m min would kill healthy
@@ -290,26 +237,26 @@ func run(nodeID, adminAddr, clientAddr, peerAddr, dataDir, peersCSV, joinAddr, r
 		// in-flight batches then fail fast and free the handler instead of
 		// holding a half-open stream until the call timeout.
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-			MinTime:             5 * time.Second,
+			MinTime:             config.GRPCKeepaliveMinTime,
 			PermitWithoutStream: true,
 		}),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
-			Time:    30 * time.Second,
-			Timeout: 10 * time.Second,
+			Time:    config.GRPCKeepaliveTime,
+			Timeout: config.GRPCKeepaliveTimeout,
 		}),
 	}
 	grpcSrv := grpc.NewServer(grpcOpts...)
-	grpcapi.NewServer(eng, store, logger, clientAddr).Register(grpcSrv)
-	grpcLis, err := net.Listen("tcp", cluster.HostPort(clientAddr))
+	grpcapi.NewServer(eng, store, logger, cfg.ClientAddr).Register(grpcSrv)
+	grpcLis, err := net.Listen("tcp", cluster.HostPort(cfg.ClientAddr))
 	if err != nil {
-		return fmt.Errorf("client listen %s: %w", clientAddr, err)
+		return fmt.Errorf("client listen %s: %w", cfg.ClientAddr, err)
 	}
 	go func() { errCh <- grpcSrv.Serve(grpcLis) }()
 
 	// The replica count is not a field here: it is derived from the member
 	// count by the controller and logged when it changes.
 	logger.Info("pushupes node started",
-		"admin", adminAddr, "client", clientAddr, "peer", peerAddr, "slots", slotCount)
+		"admin", cfg.AdminAddr, "client", cfg.ClientAddr, "peer", cfg.PeerAddr, "slots", int(cfg.SlotCount))
 
 	// Serve until a signal, a server error, or a fatal join refusal. The join
 	// answer arrives ONCE: the admitted (nil) case clears the channel and the
@@ -335,7 +282,7 @@ serve:
 	}
 
 	// graceful drain: stop accepting, flush the WAL, leave Raft
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
 	defer cancel()
 	grpcSrv.GracefulStop()
 	return srv.Shutdown(shutdownCtx)
@@ -537,131 +484,4 @@ func bootstrapEligible(nodeID string, peers []cluster.Peer, explicit bool) bool 
 		return true
 	}
 	return canonicalFirstPeer(peers) == nodeID
-}
-
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}
-
-// envDurationOr reads a Go duration (30s, 2m, 1h) from the environment,
-// falling back to def. A malformed value is fatal instead of silently falling
-// back to the default: an operator typo in a knob that decides when data gets
-// deleted must not be hidden.
-func envDurationOr(k string, def time.Duration) time.Duration {
-	v := os.Getenv(k)
-	if v == "" {
-		return def
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid %s=%q: %v (want a duration like 30s, 2m, 0 to disable)\n", k, v, err)
-		os.Exit(2)
-	}
-	return d
-}
-
-// envInt64Or reads an integer sized in records from the environment,
-// falling back to def. A malformed or non-integer value is fatal rather
-// than silently defaulting: a typo in a tuning knob should be loud.
-func envIntOr(k string, def int) int {
-	v := os.Getenv(k)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid %s=%q: %v (want an integer like 4)\n", k, v, err)
-		os.Exit(2)
-	}
-	return n
-}
-
-func envInt64Or(k string, def int64) int64 {
-	v := os.Getenv(k)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid %s=%q: %v (want an integer like 1000, or 0 to disable)\n", k, v, err)
-		os.Exit(2)
-	}
-	return n
-}
-
-// envByteSizeOr reads a byte size (-segment-bytes, -grpc-max-msg-size,
-// -raft-segment-bytes) from the environment, falling back to def. It accepts
-// the same forms as the flags themselves — a plain byte count or a suffixed
-// size (256MiB, 1GiB) — so an operator can write the env var the way the flag
-// is documented; a malformed value is fatal like the other env readers.
-func envByteSizeOr(k string, def int64) int64 {
-	v := os.Getenv(k)
-	if v == "" {
-		return def
-	}
-	n, err := parseByteSize(v)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid %s=%q: %v (want bytes or a size like 256MiB/1GiB)\n", k, v, err)
-		os.Exit(2)
-	}
-	return n
-}
-
-// byteSize is a flag.Value for -segment-bytes: it accepts a plain byte count
-// (268435456) or a suffixed size (256MiB, 1GiB), so the flag can be written the
-// way the sizing rule is stated. Ki/Mi/Gi are powers of two, K/M/G are powers
-// of ten.
-type byteSize int64
-
-func (b *byteSize) String() string { return humanBytes(int64(*b)) }
-
-func (b *byteSize) Set(s string) error {
-	n, err := parseByteSize(s)
-	if err != nil {
-		return err
-	}
-	*b = byteSize(n)
-	return nil
-}
-
-func parseByteSize(s string) (int64, error) {
-	t := strings.TrimSpace(s)
-	if t == "" {
-		return 0, fmt.Errorf("empty size")
-	}
-	num, mult := t, int64(1)
-	for _, suf := range []struct {
-		name string
-		mult int64
-	}{
-		{"KiB", 1 << 10}, {"MiB", 1 << 20}, {"GiB", 1 << 30}, {"TiB", 1 << 40},
-		{"KB", 1000}, {"MB", 1000 * 1000}, {"GB", 1000 * 1000 * 1000},
-	} {
-		if len(t) > len(suf.name) && strings.EqualFold(t[len(t)-len(suf.name):], suf.name) {
-			num, mult = t[:len(t)-len(suf.name)], suf.mult
-			break
-		}
-	}
-	v, err := strconv.ParseInt(strings.TrimSpace(num), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("not a size: %q (use a byte count like 268435456, or a suffix like 256MiB or 1GiB)", s)
-	}
-	if v < 0 {
-		return 0, fmt.Errorf("size must not be negative: %q", s)
-	}
-	return v * mult, nil
-}
-
-func humanBytes(n int64) string {
-	switch {
-	case n >= 1<<30 && n%(1<<30) == 0:
-		return fmt.Sprintf("%dGiB", n>>30)
-	case n >= 1<<20 && n%(1<<20) == 0:
-		return fmt.Sprintf("%dMiB", n>>20)
-	default:
-		return strconv.FormatInt(n, 10)
-	}
 }

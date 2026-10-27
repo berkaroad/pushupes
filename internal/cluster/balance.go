@@ -20,6 +20,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/berkaroad/pushupes/internal/config"
 )
 
 // Leader rebalance ("回切"): after a node dies, the failover sweep moves all
@@ -64,51 +66,6 @@ import (
 //   - a failed move is logged and simply re-planned next round; a slow target
 //     that keeps failing catch-up costs nothing but a round, which is the
 //     natural backoff — there is no failure counter to maintain.
-const (
-	// DefaultRebalanceInterval is how often the controller re-checks the
-	// ring layout. The layout only ever needs healing after a failover or a
-	// late-joined replica catches up; a fast tick matters because the batch
-	// (not the tick) is the throughput knob the operator thinks about.
-	DefaultRebalanceInterval = 2 * time.Second
-	// DefaultStartupGrace is how long a control node's first start holds the
-	// liveness verdict for registered data nodes that have not answered a probe
-	// yet (-startup-grace). On a whole-cluster restart the layout on disk is
-	// already the intended one while the data nodes themselves are still coming
-	// up; without the wait the sweep marks every lagging node down within
-	// seconds and the failover piles its slots onto the first node that answers
-	// — measured on a staged restart: 1024 slots on one data node 3.1s in, then
-	// ~34 minutes of serial hand-backs to undo. The wait ends early as soon as
-	// every covered node has answered; a node that stays silent past it is
-	// judged exactly as before.
-	DefaultStartupGrace = 90 * time.Second
-	// rebalanceCommitsPerRound is how many layout commits one controller round
-	// executes: exactly one. A commit's fence freezes one slot's writes, so a
-	// strictly serial commit loop keeps the frozen-slot count at one and the
-	// write-latency noise bounded to a single slot; convergence is paced by
-	// the round interval instead (a node that led 512 slots — half of the
-	// 1024-slot table, the most any one node leads under the two-replica
-	// ring — returns in 512 rounds, and a factor decrease reclaims one
-	// surplus seat per round).
-	rebalanceCommitsPerRound = 1
-	// drainCommitsPerRound widens the serial loop while any member is
-	// marked draining: the commits STILL run one by one inside the round
-	// (the fence only ever freezes one slot at a time), but a drain waits
-	// one round per hand-over instead of one tick per hand-over — even a
-	// node leading the worst-case 512 slots (half of the 1024-slot table,
-	// the most any one node leads under the two-replica ring) drains in
-	// seconds, not hours.
-	drainCommitsPerRound = 64
-	// reclaimBudget bounds one reclaim sweep. The sweep retires every surplus
-	// seat it can inside the budget and the next round continues, so a factor
-	// decrease on a large table converges in a round or two instead of one seat
-	// per round (1024 slots at one seat per interval is about half an hour). It must
-	// stay under the round interval so a sweep cannot run back to back with the
-	// next round.
-	reclaimBudget = 1 * time.Second
-	// reclaimProbeConcurrency bounds the copy checks in flight in one sweep. Each
-	// probe is a peer round trip, so the sweep must not open one per surplus seat.
-	reclaimProbeConcurrency = 16
-)
 
 // SetRebalanceConfig wires the -rebalance-interval knob. An interval <= 0
 // disables the rebalancer; startup validation rejects negative values, so 0 is
@@ -133,15 +90,6 @@ func (e *Engine) rebalanceMayRun(tbl *Table, draining bool) bool {
 func (e *Engine) rebalanceEnabled() bool {
 	return e.rebalanceInterval > 0
 }
-
-// drainTick is the pace a scale-down forces. The rebalancer normally sleeps
-// when the operator turned it off (interval 0) — but a drain mark is the
-// operator asking the cluster to MOVE data, and nobody else does that work:
-// stopping the loop here would leave every DELETE parked in "draining"
-// forever on a rebalance-off cluster. So a drain outranks the switch, and
-// outranks the configured interval when that one is slower: the rounds of a
-// handover run back to back at drainTick until the node is empty.
-const drainTick = 2 * time.Second
 
 // RunRebalancer is the leader-rebalance loop: one round every
 // rebalanceInterval while this node holds the Raft leadership. Launched from
@@ -175,13 +123,13 @@ func (e *Engine) RunRebalancer(ctx context.Context) {
 			return
 		}
 		interval := e.rebalanceInterval
-		if draining && (!e.rebalanceEnabled() || interval > drainTick) {
+		if draining && (!e.rebalanceEnabled() || interval > config.DrainTick) {
 			// A drain outranks the configured pace: handover rounds run
-			// back to back at drainTick until the node is empty. With the
+			// back to back at config.DrainTick until the node is empty. With the
 			// switch off the configured interval is 0 — a bare `>` test
 			// against it would NewTimer(0) straight into a busy loop, so
-			// the disabled case takes drainTick unconditionally.
-			interval = drainTick
+			// the disabled case takes config.DrainTick unconditionally.
+			interval = config.DrainTick
 		}
 		timer := time.NewTimer(interval)
 		select {
@@ -193,9 +141,9 @@ func (e *Engine) RunRebalancer(ctx context.Context) {
 		if e.node == nil || !e.node.IsLeader() {
 			continue
 		}
-		limit := rebalanceCommitsPerRound
+		limit := config.RebalanceCommitsPerRound
 		if draining {
-			limit = drainCommitsPerRound // a scale-down in progress sets the pace
+			limit = config.DrainCommitsPerRound // a scale-down in progress sets the pace
 		}
 		// Start-up grace: while the window is open, no hand-over starts. The
 		// layout has not moved yet (the verdicts that would move it are held —
@@ -343,15 +291,11 @@ func (e *Engine) rebalanceRound(ctx context.Context, limit int) int {
 // source's LEO with a different directory) is rebuilt — the source re-ships the
 // whole slot under the commit fence — and a move that aborts is re-planned. Both
 // used to happen again the very next round, i.e. a full slot snapshot every
-// DefaultRebalanceInterval for as long as the target cannot converge. Failed
+// config.RebalanceInterval for as long as the target cannot converge. Failed
 // attempts therefore back off per slot: the first retry is the next round (as
 // before), and each further one doubles up to a cap. The record is keyed on the
 // move's endpoints, so a failover (a different from/to) gets a fresh try — it
 // is a different move, not a retry.
-const (
-	rebalanceRetryBase = DefaultRebalanceInterval
-	rebalanceRetryMax  = time.Minute
-)
 
 type rebalanceAttempt struct {
 	from, to  string
@@ -362,27 +306,15 @@ type rebalanceAttempt struct {
 // rebalanceRetryDelay is the wait after the given attempt number: 2s, 4s, 8s,
 // ... capped. Pure, so the escalation is assertable on its own.
 func rebalanceRetryDelay(attempts int) time.Duration {
-	d := rebalanceRetryBase
+	d := config.RebalanceRetryBase
 	for i := 1; i < attempts; i++ {
 		d *= 2
-		if d >= rebalanceRetryMax {
-			return rebalanceRetryMax
+		if d >= config.RebalanceRetryMax {
+			return config.RebalanceRetryMax
 		}
 	}
 	return d
 }
-
-// rebalanceRetryReady reports whether this move may be attempted now. Read-only:
-// it never counts an attempt, so a slot that is merely WAITING (its target still
-// catching up) does not accumulate backoff.
-// divergedConfirmWindow is how long a copy must keep reading as diverged (same
-// log end offset, different directory) before a round acts on it. A copy's
-// directory lags its log end offset for a moment while an apply batch lands,
-// and that reads exactly like a fork: measured on a rejoining node, two slots
-// read diverged with no repair action, and the same data read clean a minute
-// later. Dropping on one reading would make the node pull the whole slot again
-// for nothing.
-const divergedConfirmWindow = 2 * time.Second
 
 // confirmDiverged records this reading and reports whether the copy has been
 // reading as diverged long enough to drop it. The window lives on the engine so
@@ -520,17 +452,17 @@ func probeParked(parked map[string]bool, p *Placement, drop string) bool {
 // reclaimRound retires the surplus replica seats a re-layout left behind: a
 // re-layout only ADDS seats (Table.applyReplanSlots), so a set left oversized by
 // a factor change converges here. One call sweeps every surplus slot it can
-// within reclaimBudget rather than one seat per round, with three guards so the
+// within config.ReclaimBudget rather than one seat per round, with three guards so the
 // sweep cannot turn into a stall:
 //
-//   - a deadline (reclaimBudget): the round stops on time and the next one
+//   - a deadline (config.ReclaimBudget): the round stops on time and the next one
 //     continues where it left off;
 //   - a per-peer circuit breaker: a peer that fails a probe is parked for the
 //     rest of the round, so one unreachable node costs one timeout instead of
 //     one per seat it holds — the failure mode a serial one-seat-per-round loop
 //     was accidentally protected from;
 //   - a bounded probe pool plus one table command per node: the copy checks run
-//     reclaimProbeConcurrency at a time, and the removals for one seat travel in
+//     config.ReclaimProbeConcurrency at a time, and the removals for one seat travel in
 //     a single command (OpSlotRemoveReplica carries a slot list), so a
 //     1024-seat reclaim costs a handful of Raft entries, not thousands.
 //
@@ -574,13 +506,13 @@ func (e *Engine) reclaimRound(ctx context.Context) int {
 	sort.Slice(cands, func(i, j int) bool { return cands[i].slot < cands[j].slot })
 
 	// Phase 1: prove the surplus redundant, in a bounded pool.
-	deadline := time.Now().Add(reclaimBudget)
+	deadline := time.Now().Add(config.ReclaimBudget)
 	redundant := make([]bool, len(cands))
 	var (
 		mu   sync.Mutex
 		down = map[string]bool{} // peers parked for the rest of this round
 		wg   sync.WaitGroup
-		sem  = make(chan struct{}, reclaimProbeConcurrency)
+		sem  = make(chan struct{}, config.ReclaimProbeConcurrency)
 	)
 	for i := range cands {
 		if ctx.Err() != nil || time.Now().After(deadline) {
@@ -759,7 +691,7 @@ func (e *Engine) slotStateAt(ctx context.Context, slot int32, addr string) (slot
 // a lost leadership) just retry next tick.
 // wakeDrainRunner starts the on-demand drain loop if one is needed and not
 // already running: the switch is off (the ordinary loop returned long ago),
-// the table carries a drain mark, and no runner is up. It paces at drainTick
+// the table carries a drain mark, and no runner is up. It paces at config.DrainTick
 // — the same tempo a marked drain holds the enabled loop to — and exits by
 // itself once the table has no draining node left (removed, or withdrawn by
 // a re-admission). Cheap to call every controller tick: the guard reads an
@@ -795,13 +727,13 @@ func (e *Engine) wakeDrainRunner() {
 		ctx := context.Background()
 		for e.TableSnapshot().HasDraining() {
 			if e.node != nil && e.node.IsLeader() {
-				e.rebalanceRound(ctx, drainCommitsPerRound)
+				e.rebalanceRound(ctx, config.DrainCommitsPerRound)
 				e.finishPendingRemovals(ctx)
 			}
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(drainTick):
+			case <-time.After(config.DrainTick):
 			}
 		}
 	}()

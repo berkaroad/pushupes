@@ -44,13 +44,6 @@ import (
 	"math/bits"
 )
 
-const (
-	bloomK              = 3  // hash probes per entry
-	bloomBitsPerEntry   = 16 // ~0.5% false positives at k=3 (full filter)
-	bloomFirstCapacity  = 1 << 10
-	bloomFilterMaxBytes = 1 << 24
-)
-
 // bloomBits is one fixed-size filter.
 type bloomBits struct {
 	bits    []uint64

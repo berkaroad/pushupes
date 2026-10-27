@@ -36,13 +36,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
-)
-
-const (
-	registerRetryFast   = time.Second
-	registerRetrySteady = 10 * time.Second
-	registerRPCTimeout  = 5 * time.Second
 )
 
 // Registration announces one node's own data-plane addresses.
@@ -69,7 +64,7 @@ func (r *Registration) validate() error {
 // sendRegistration delivers a registration to a peer's peer-plane address:
 // if that peer is the leader it commits, otherwise it relays onward.
 func (e *Engine) sendRegistration(ctx context.Context, peerAddr string, reg *Registration) error {
-	cctx, cancel := context.WithTimeout(ctx, registerRPCTimeout)
+	cctx, cancel := context.WithTimeout(ctx, config.RegisterRPCTimeout)
 	defer cancel()
 	c, err := e.peerRPC(peerAddr)
 	if err != nil {
@@ -107,7 +102,7 @@ func (e *Engine) acceptRegistration(reg *Registration) error {
 		if _, ok := e.TableSnapshot().Peers[reg.ID]; !ok {
 			return fmt.Errorf("register: %s is not in the directory yet; the cluster joins it first", reg.ID)
 		}
-		// Registrations are retried on a steady heartbeat (registerRetrySteady,
+		// Registrations are retried on a steady heartbeat (config.RegisterRetrySteady,
 		// every 10s), so an announcement that matches what the table already
 		// holds is the common case — and committing it would only advance the
 		// Raft commit index, which the console renders as a "commit" number
@@ -248,7 +243,7 @@ func (a *RegisterAnnouncer) Run(ctx context.Context) {
 	if len(a.targets()) == 0 {
 		return // nobody to announce to: single node, and the controller join carries our addresses
 	}
-	interval := registerRetryFast
+	interval := config.RegisterRetryFast
 	for {
 		select {
 		case <-ctx.Done():
@@ -256,7 +251,7 @@ func (a *RegisterAnnouncer) Run(ctx context.Context) {
 		case <-time.After(interval):
 		}
 		if a.done() {
-			interval = registerRetrySteady
+			interval = config.RegisterRetrySteady
 		}
 		a.announceOnce(ctx)
 	}

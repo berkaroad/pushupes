@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+
+	"github.com/berkaroad/pushupes/internal/config"
 )
 
 // TestApplyFetchItemsParallelKeepsSlotsIndependent drives the pooled apply with
@@ -30,7 +32,7 @@ func TestApplyFetchItemsParallelKeepsSlotsIndependent(t *testing.T) {
 	join(t, leader, "node-1", "127.0.0.1:1")
 	applyCmd(t, leader, &Command{Op: OpPlanSlots})
 
-	slots := applyParallelMin + 4 // always above the threshold: the round takes the pool path
+	slots := config.ApplyParallelMin + 4 // always above the threshold: the round takes the pool path
 	aggs := make([]string, slots)
 	pays := make([][]byte, slots)
 	for s := 0; s < slots; s++ {

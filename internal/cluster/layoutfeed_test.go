@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 	"github.com/berkaroad/pushupes/internal/raft"
 )
@@ -152,7 +153,7 @@ func TestLayoutFeedRedirectsAwayFromAFollower(t *testing.T) {
 // backlog is what makes the control plane's memory a function of one data
 // node's health, and a re-sync costs it one reconnect.
 func TestLayoutFeedCutsASlowSubscriber(t *testing.T) {
-	ctl := newFakeControl(t, testEntries(layoutBufFrames+maxLayoutBatch+10)...)
+	ctl := newFakeControl(t, testEntries(config.LayoutBufFrames+config.MaxLayoutBatch+10)...)
 	h := newTestHub(t, ctl)
 	s := h.attach(layoutRequest{LearnerID: "node-9"})
 	s.mu.Lock()
@@ -167,12 +168,12 @@ func TestLayoutFeedCutsASlowSubscriber(t *testing.T) {
 		}
 	}
 	if lastErr != errSlowSubscriber {
-		t.Fatalf("fill ended with %v, want the slow-subscriber drop once %d frames are queued", lastErr, layoutBufFrames)
+		t.Fatalf("fill ended with %v, want the slow-subscriber drop once %d frames are queued", lastErr, config.LayoutBufFrames)
 	}
 	// Nobody is draining: the buffer must be full and the frames must stay
 	// bounded (that bound is the whole point of the drop).
-	if len(s.ch) > layoutBufFrames {
-		t.Fatalf("queued %d frames, buffer is %d", len(s.ch), layoutBufFrames)
+	if len(s.ch) > config.LayoutBufFrames {
+		t.Fatalf("queued %d frames, buffer is %d", len(s.ch), config.LayoutBufFrames)
 	}
 }
 

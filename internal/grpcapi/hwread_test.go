@@ -65,7 +65,7 @@ func TestLeaderReadIsNotCappedByHighWatermark(t *testing.T) {
 	follower := ""
 	for i := 0; i < 4096 && agg == ""; i++ {
 		id := "hw-agg-" + itoa(i)
-		s := data.SlotOf(id, data.DefaultSlotCount)
+		s := data.SlotOf(id, 8)
 		p, ok := tbl.Slots[s]
 		if !ok || p.Leader != "node-1" {
 			continue

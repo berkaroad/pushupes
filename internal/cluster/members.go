@@ -39,16 +39,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 	"github.com/berkaroad/pushupes/internal/raft"
 )
-
-// AddMemberTimeout bounds one runtime membership change.
-const AddMemberTimeout = 30 * time.Second
-
-// DefaultAdoptInterval is how often a node that is not a member yet retries
-// offering itself through -join.
-const DefaultAdoptInterval = 3 * time.Second
 
 // ErrBadMember is a membership change the operator has to fix (missing id,
 // address already in use, removing the last voter).
@@ -253,7 +247,7 @@ func (e *Engine) finishRemoval(ctx context.Context, id string) error {
 		e.loggerf("learner %s revoked from the directory; its seats re-plan to the remaining holders", id)
 		return nil
 	}
-	if err := e.node.RemoveMember(id, AddMemberTimeout); err != nil {
+	if err := e.node.RemoveMember(id, config.AddMemberTimeout); err != nil {
 		if errors.Is(err, raft.ErrNotLeader) {
 			cid, caddr := e.Controller()
 			return &NotControllerError{LeaderID: cid, AdminAddr: caddr}
@@ -352,7 +346,7 @@ func (e *refusedError) Unwrap() error { return ErrBadMember }
 // relays it onward. offerAddr is the JOINING node's peer address (what the
 // leader adds); targetAddr is the member being asked (which may be any node).
 func (e *Engine) sendAdoption(ctx context.Context, id, offerAddr, targetAddr, role string) error {
-	cctx, cancel := context.WithTimeout(ctx, registerRPCTimeout)
+	cctx, cancel := context.WithTimeout(ctx, config.RegisterRPCTimeout)
 	defer cancel()
 	c, err := e.peerRPC(targetAddr)
 	if err != nil {
@@ -390,7 +384,7 @@ type Joiner struct {
 // offer.
 func (e *Engine) NewJoiner(targets []string, interval time.Duration, role string) *Joiner {
 	if interval <= 0 {
-		interval = DefaultAdoptInterval
+		interval = config.AdoptInterval
 	}
 	cleaned := make([]string, 0, len(targets))
 	seen := map[string]bool{}
@@ -496,7 +490,7 @@ func (e *Engine) acceptAdoption(ctx context.Context, ad *Adoption) error {
 				if p, ok := e.TableSnapshot().Peers[ad.ID]; ok && p.AdminAddr != "" {
 					return fmt.Errorf("%w: %s already serves as a voter at %s; it now announces %s", ErrBadMember, ad.ID, v.Addr, addr)
 				}
-				if err := e.node.UpdatePeer(ad.ID, addr, AddMemberTimeout); err != nil {
+				if err := e.node.UpdatePeer(ad.ID, addr, config.AddMemberTimeout); err != nil {
 					if errors.Is(err, raft.ErrNotLeader) {
 						cid, caddr := e.Controller()
 						return &NotControllerError{LeaderID: cid, AdminAddr: caddr}
@@ -510,7 +504,7 @@ func (e *Engine) acceptAdoption(ctx context.Context, ad *Adoption) error {
 			}
 			return nil
 		}
-		if err := e.node.AddMember(ad.ID, addr, AddMemberTimeout); err != nil {
+		if err := e.node.AddMember(ad.ID, addr, config.AddMemberTimeout); err != nil {
 			if errors.Is(err, raft.ErrNotLeader) {
 				cid, caddr := e.Controller()
 				return &NotControllerError{LeaderID: cid, AdminAddr: caddr}

@@ -42,6 +42,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	"github.com/berkaroad/pushupes/internal/raft"
 )
 
@@ -55,18 +56,6 @@ const (
 	layoutSnapshot
 	layoutRedirect
 )
-
-// layoutBufFrames bounds one subscriber's buffer, in frames. A tick pushes at
-// most a batch of entries plus a commit, so this holds several ticks of
-// backlog: enough to absorb a learner that is merely busy, small enough that a
-// learner which stopped reading is cut (and re-syncs) instead of growing the
-// leader's heap.
-const layoutBufFrames = 256
-
-// maxLayoutBatch bounds how many entries one fill sends a subscriber: the
-// same order as the consensus layer's append batch, because the learner is
-// asked to keep up with the same log the voters do.
-const maxLayoutBatch = 64
 
 // errSlowSubscriber marks a subscriber dropped for not draining its buffer.
 var errSlowSubscriber = errors.New("layout feed: subscriber too slow")
@@ -279,7 +268,7 @@ func (h *layoutHub) fill(s *layoutSub) error {
 	if s.cursor == 0 {
 		s.cursor = 1
 	}
-	sl, err := h.e.node.LayoutSlice(s.cursor-1, s.term, maxLayoutBatch)
+	sl, err := h.e.node.LayoutSlice(s.cursor-1, s.term, config.MaxLayoutBatch)
 	if err != nil {
 		return err
 	}
@@ -345,7 +334,7 @@ func (h *layoutHub) remember(s *layoutSub, f *layoutFrame) {
 func (h *layoutHub) attach(req layoutRequest) *layoutSub {
 	s := &layoutSub{
 		id:       req.LearnerID,
-		ch:       make(chan *layoutFrame, layoutBufFrames),
+		ch:       make(chan *layoutFrame, config.LayoutBufFrames),
 		done:     make(chan struct{}),
 		cursor:   0,
 		term:     req.FromTerm,

@@ -66,6 +66,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/berkaroad/pushupes/internal/config"
 )
 
 // ownerFileName is the per-slot provenance record inside the slot dir.
@@ -420,17 +422,12 @@ type PendingSlotView struct {
 	OwnerTopo   string `json:"owner_topology,omitempty"`
 }
 
-// ownerRefreshInterval bounds how long a placement change may go unstamped;
-// the apply path signals the loop directly, so this is the safety net for a
-// WAL appearing without a table change (first write into a fresh seat).
-const ownerRefreshInterval = 2 * time.Second
-
 // runOwnerFence maintains owner.json and the pending set (see the file
 // comment). It is signal-driven (every applied table change kicks it) with a
 // slow ticker behind, and it only ever WRITES when the implied record
 // differs, so a steady-state cluster performs no file IO per round.
 func (e *Engine) runOwnerFence(ctx context.Context) {
-	tick := time.NewTicker(ownerRefreshInterval)
+	tick := time.NewTicker(config.OwnerRefreshInterval)
 	defer tick.Stop()
 	e.refreshOwners()
 	for {

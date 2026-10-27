@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	"github.com/berkaroad/pushupes/internal/storage"
 )
 
@@ -28,18 +29,18 @@ import (
 // window is rejected — and the cleanup cannot be turned off at all, because a
 // surplus copy left on disk forever is how a node fills up.
 func TestDropRetentionDefaultAndResolution(t *testing.T) {
-	if DefaultDropRetention != 30*time.Second {
-		t.Fatalf("DefaultDropRetention = %s, want 30s", DefaultDropRetention)
+	if config.DropAfter != 30*time.Second {
+		t.Fatalf("config.DropAfter = %s, want 30s", config.DropAfter)
 	}
 	e, _ := newTestEngine(t, "node-1")
-	if got := e.DropRetention(); got != DefaultDropRetention {
-		t.Fatalf("engine default retention = %s, want %s", got, DefaultDropRetention)
+	if got := e.DropRetention(); got != config.DropAfter {
+		t.Fatalf("engine default retention = %s, want %s", got, config.DropAfter)
 	}
 	cases := []struct {
 		in   time.Duration
 		want time.Duration
 	}{
-		{0, DefaultDropRetention},
+		{0, config.DropAfter},
 		{time.Second, time.Second},
 		{2 * time.Minute, 2 * time.Minute},
 		{time.Hour, time.Hour},
@@ -57,8 +58,8 @@ func TestDropRetentionDefaultAndResolution(t *testing.T) {
 	}
 	// The engine never ends up without a usable window, whatever it is handed.
 	e.SetDropRetention(0)
-	if got := e.DropRetention(); got != DefaultDropRetention {
-		t.Fatalf("SetDropRetention(0) = %s, want the default %s", got, DefaultDropRetention)
+	if got := e.DropRetention(); got != config.DropAfter {
+		t.Fatalf("SetDropRetention(0) = %s, want the default %s", got, config.DropAfter)
 	}
 	e.SetDropRetention(2 * time.Minute)
 	if got := e.DropRetention(); got != 2*time.Minute {

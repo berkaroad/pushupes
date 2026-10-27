@@ -17,6 +17,8 @@ package cluster
 import (
 	"net"
 	"testing"
+
+	"github.com/berkaroad/pushupes/internal/config"
 )
 
 // TestRegistrationMarksARecoveredPeerUp pins the recovery fast path: the
@@ -40,7 +42,7 @@ func TestRegistrationMarksARecoveredPeerUp(t *testing.T) {
 		t.Fatalf("setup: cache a peer conn: %v", err)
 	}
 	e.failMu.Lock()
-	e.failStreak["node-2"] = livenessFailThreshold + 2
+	e.failStreak["node-2"] = config.LivenessFailThreshold + 2
 	e.failMu.Unlock()
 
 	reg := &Registration{ID: "node-2", AdminAddr: addr, ClientAddr: addr, Role: RoleLearner}
@@ -70,7 +72,7 @@ func TestRegistrationKeepsAnUnreachablePeerDown(t *testing.T) {
 	applyCmd(t, e, &Command{Op: OpPlanSlots})
 	applyCmd(t, e, &Command{Op: OpMarkDown, NodeID: "node-3"})
 	e.failMu.Lock()
-	e.failStreak["node-3"] = livenessFailThreshold + 2
+	e.failStreak["node-3"] = config.LivenessFailThreshold + 2
 	e.failMu.Unlock()
 
 	reg := &Registration{ID: "node-3", AdminAddr: deadPeerAddr("node-3"), ClientAddr: deadPeerAddr("node-3"), Role: RoleLearner}

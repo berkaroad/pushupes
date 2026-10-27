@@ -17,6 +17,8 @@ package cluster
 import (
 	"net"
 	"testing"
+
+	"github.com/berkaroad/pushupes/internal/config"
 )
 
 // newPeerHarness serves the engine's PeerService on a loopback TCP port and
@@ -32,8 +34,8 @@ func newPeerHarness(t *testing.T, e *Engine) string {
 	mux := &peerMux{
 		listener:  ln.(*net.TCPListener),
 		advertise: ln.Addr().(*net.TCPAddr),
-		raftCh:    make(chan acceptResult, peerAcceptQueue),
-		grpcCh:    make(chan acceptResult, peerAcceptQueue),
+		raftCh:    make(chan acceptResult, config.PeerAcceptQueue),
+		grpcCh:    make(chan acceptResult, config.PeerAcceptQueue),
 		closed:    make(chan struct{}),
 	}
 	go mux.demux()

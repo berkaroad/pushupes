@@ -21,10 +21,6 @@ import (
 	"sync/atomic"
 )
 
-// scatterMaxIOV is Linux's IOV_MAX: one pwritev(2) accepts at most this many
-// segments, so records with long event lists are written in batches.
-const scatterMaxIOV = 1024
-
 // errScatterUnsupported is returned when the filesystem (or kernel) refuses
 // scatter/gather writes; the WAL then uses a contiguous WriteAt instead.
 var errScatterUnsupported = errors.New("scatter/gather writes unsupported")

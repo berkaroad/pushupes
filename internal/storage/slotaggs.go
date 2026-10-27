@@ -50,8 +50,6 @@ type aggEntry struct {
 	lastUnix int64
 }
 
-const seqChunkMax = 1024 // 8 KiB per chunk once an aggregate is past 336 seqs
-
 // seqChunkPos maps a list index to its chunk and offset inside it.
 func seqChunkPos(i int) (ci, off int) {
 	switch {

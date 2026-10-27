@@ -46,39 +46,8 @@ const (
 	WALMagic     = "ESWL"
 	WALFormatVer = int8(1)
 	WALHeaderLen = 20
-	// indexIntervalB is how sparsely seq -> file offset is remembered in memory
-	// and in the segment's .spx file. It is a seek hint: a lookup lands at the
-	// nearest earlier entry and walks frames forward, so the interval bounds
-	// how many frames a seek decodes — including the replica-fetch read path,
-	// which seeks from the sparse hint to the slot's tail on every round.
-	//
-	// One entry costs 16 B, so the interval sets what the table holds: one
-	// entry per interval of data, i.e. 16 B per 64 KiB, which is 0.25 B per
-	// 1 KiB record and ~253 MiB on a 1 TiB node. A coarser interval trades
-	// that memory back for a longer walk per seek.
-	indexIntervalB = int64(64 << 10) // one entry per 64KiB
-)
-
-// DefaultSegmentBytes is the 64MiB roll threshold from the design: on the
-// planned node (4 cores / 16GiB / 1TiB, records typically 1-4KiB) the live
-// tail is 8 B/record per HOT slot and every slot on a single-data-node
-// cluster is hot — 64MiB keeps the unsealed-seq term at ~0.25GiB for 1KiB
-// records (DESIGN §7.2). Small segments cost segment count, WAL fds and
-// index files; the planned historical-segment merge reclaims the segment
-// count once it lands, which is why the default sits at the small end now.
-const DefaultSegmentBytes = int64(64 * 1024 * 1024)
-
-// A configured segment size must be a whole number of SegmentBytesMultiple
-// bytes, between MinSegmentBytes and MaxSegmentBytes. The floor exists because
-// a smaller segment buys nothing — per-slot state, index files and file
-// descriptors all scale with the segment count, while the memory a segment
-// holds is bounded by its size either way. The ceiling exists because one
-// segment's index files, its seal-time frame walk and the per-aggregate seq
-// list it keeps in memory are all proportional to it.
-const (
-	SegmentBytesMultiple = int64(64 << 20)
-	MinSegmentBytes      = SegmentBytesMultiple
-	MaxSegmentBytes      = int64(2 << 30)
+	// indexIntervalB (the sparse seq -> offset hint) and the segment sizing
+	// bounds live in config.go with the rest of the layer's numbers.
 )
 
 // ValidateSegmentBytes reports whether n is a usable segment size. The service
@@ -690,13 +659,8 @@ func (s *Segment) rebuildIndex(limit int64) error {
 }
 
 // LoadSegment opens a segment and rebuilds its sparse index, scanning and
-// truncating any torn tail at the end of the file.
-// minRecordLen / maxRecordLen bound a plausible frame length prefix; anything
-// else is a torn tail (the same bounds the per-record readers use).
-const (
-	minRecordLen = 30
-	maxRecordLen = 64 << 20
-)
+// truncating any torn tail at the end of the file. A frame length prefix
+// outside minRecordLen..maxRecordLen is a torn tail (see config.go).
 
 var (
 	errShortTail    = errors.New("storage: record runs past the end of the segment")
@@ -721,8 +685,6 @@ type frameWalker struct {
 	// through release when the walk ends.
 	pooled bool
 }
-
-const frameWindow = 1 << 20
 
 func newFrameWalker(f *os.File, from, end int64) *frameWalker {
 	return &frameWalker{f: f, pos: from, end: end, buf: make([]byte, frameWindow), done: from}

@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/berkaroad/pushupes/internal/cluster"
+	"github.com/berkaroad/pushupes/internal/config"
 	"github.com/berkaroad/pushupes/internal/data"
 	"github.com/berkaroad/pushupes/internal/storage"
 )
@@ -384,7 +385,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	worst := 0
 	if v := r.URL.Query().Get("worst"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1024 {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= config.StatsWorstLimit {
 			worst = n
 		}
 	}
@@ -413,7 +414,7 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "to_node required")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 60_000_000_000) // 60s
+	ctx, cancel := context.WithTimeout(r.Context(), config.AdminMigrateTimeout)
 	defer cancel()
 	if err := s.Engine.MigrateSlot(ctx, int32(slot), req.ToNode); err != nil {
 		if refuseNotController(w, r, err) {
@@ -449,7 +450,7 @@ func (s *Server) handleRemoveReplica(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "node required")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30_000_000_000) // 30s
+	ctx, cancel := context.WithTimeout(r.Context(), config.AdminRemoveReplicaTimeout)
 	defer cancel()
 	if err := s.Engine.RemoveReplica(ctx, int32(slot), req.Node); err != nil {
 		if refuseNotController(w, r, err) {
@@ -591,7 +592,7 @@ func (s *Server) handleCancelDrain(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "id required")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), cluster.AddMemberTimeout+5_000_000_000)
+	ctx, cancel := context.WithTimeout(r.Context(), config.AddMemberTimeout+5_000_000_000)
 	defer cancel()
 	status, err := s.Engine.CancelDrain(ctx, id)
 	if err != nil {
@@ -623,7 +624,7 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "id required")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), cluster.AddMemberTimeout+5_000_000_000)
+	ctx, cancel := context.WithTimeout(r.Context(), config.AddMemberTimeout+5_000_000_000)
 	defer cancel()
 	status, err := s.Engine.RemoveMember(ctx, id)
 	if err != nil {

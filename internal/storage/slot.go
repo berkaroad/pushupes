@@ -46,14 +46,10 @@ type FlushPolicy struct {
 	Parallelism int
 }
 
-// DefaultFlushInterval is the shipped timed-flush cadence: a slot with pending
-// records fsyncs at least this often. It bounds how much of the WAL a crash can
-// lose, at the price of one fsync per open slot per interval.
-const DefaultFlushInterval = 100 * time.Millisecond
-
-// DefaultFlushPolicy fsyncs every 1000 records or every DefaultFlushInterval.
+// DefaultFlushPolicy fsyncs every DefaultFlushMessages records or every
+// DefaultFlushInterval, whichever comes first (both in config.go).
 func DefaultFlushPolicy() FlushPolicy {
-	return FlushPolicy{IntervalMessages: 1000, Interval: DefaultFlushInterval}
+	return FlushPolicy{IntervalMessages: DefaultFlushMessages, Interval: DefaultFlushInterval}
 }
 
 // AppendOutcome is the result of a slot-level append, carrying the business
@@ -533,8 +529,6 @@ func (s *Slot) indexMetaLocked(seq uint64, m data.RecordMeta) {
 // strandedPerAgg bounds the memory of withheld frames per aggregate: past it
 // arrivals behave exactly as before (withhold, do not remember) — the set is
 // a salvage of realistically-scrumbled chains, not a second index.
-const strandedPerAgg = 1 << 16
-
 type strandedFrame struct {
 	seq  uint64
 	unix int64

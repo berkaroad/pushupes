@@ -76,15 +76,6 @@ func (n *Node) Members() []Voter {
 	return out
 }
 
-// learnerCatchUpBudget bounds the learner phase: long enough for a node with a
-// wall of log to catch up over a healthy link, short enough that a node which
-// will never answer cannot hold an operator's change open.
-const learnerCatchUpBudget = 20 * time.Second
-
-// confSweepInterval is how often the run loop checks whether a membership
-// change has blown its deadline.
-const confSweepInterval = 200 * time.Millisecond
-
 // confWaiter is a membership change waiting for its entry to be applied. The
 // loop answers it from onConfCommitted; the deadline is swept by the loop so a
 // change that never commits still surfaces to its caller.

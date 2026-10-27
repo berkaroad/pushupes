@@ -19,6 +19,8 @@ import (
 	"testing"
 
 	"github.com/berkaroad/pushupes/internal/cluster"
+	"github.com/berkaroad/pushupes/internal/raft"
+	"github.com/berkaroad/pushupes/internal/storage"
 )
 
 func TestParsePeers(t *testing.T) {
@@ -217,52 +219,33 @@ func TestMembershipPlan(t *testing.T) {
 	}
 }
 
-// The env readers must accept exactly what the flags accept: a knob an
-// operator can write on the command line has to be writable through the
-// environment the same way, which for a size knob means the suffixed forms
-// (256MiB), not only a raw byte count.
-func TestEnvByteSizeOr(t *testing.T) {
-	const key = "PUSHUPES_SEGMENT_BYTES"
-	if got := envByteSizeOr(key, 42); got != 42 {
-		t.Fatalf("unset: got %d, want the default 42", got)
+// defaultConfig is what main hands the flags: the knobs internal/config owns at
+// their shipped values, and every layer-owned default taken from the package
+// whose contract it belongs to. A field left at zero here would silently turn a
+// feature off, so the seeded configuration must validate.
+func TestDefaultConfig(t *testing.T) {
+	cfg := defaultConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("the shipped configuration must validate: %v", err)
 	}
-	for _, tc := range []struct {
-		val  string
-		want int64
-	}{
-		{"268435456", 268435456},
-		{"256MiB", 256 << 20},
-		{"1GiB", 1 << 30},
-	} {
-		t.Setenv(key, tc.val)
-		if got := envByteSizeOr(key, 0); got != tc.want {
-			t.Errorf("%s=%q: got %d, want %d", key, tc.val, got, tc.want)
-		}
+	if cfg.SegmentBytes != storage.DefaultSegmentBytes ||
+		cfg.FlushMessages != storage.DefaultFlushMessages ||
+		cfg.FlushInterval != storage.DefaultFlushInterval ||
+		cfg.FlushParallelism != storage.DefaultFlushParallelism {
+		t.Errorf("storage knobs are not the storage layer's defaults: %+v", cfg)
 	}
-	// Same input, same bytes as the flag's own value parser.
-	var b byteSize
-	if err := b.Set("256MiB"); err != nil {
-		t.Fatal(err)
+	if cfg.SlotCount != storage.DefaultSlotCount {
+		t.Errorf("slot count = %d, want the storage layer's %d", cfg.SlotCount, storage.DefaultSlotCount)
 	}
-	t.Setenv(key, "256MiB")
-	if got := envByteSizeOr(key, 0); got != int64(b) {
-		t.Fatalf("env %d != flag %d for the same size", got, int64(b))
+	if cfg.ReplicaPolicy != string(cluster.DefaultReplicaPolicy) {
+		t.Errorf("replica policy = %q, want cluster's %q", cfg.ReplicaPolicy, cluster.DefaultReplicaPolicy)
 	}
-}
-
-// envInt64Or backs -flush-messages: the default when unset, the record count
-// when set, and 0 meaning "off" without being mistaken for "unset".
-func TestEnvInt64Or(t *testing.T) {
-	const key = "PUSHUPES_FLUSH_MESSAGES"
-	if got := envInt64Or(key, 1000); got != 1000 {
-		t.Fatalf("unset: got %d, want the default 1000", got)
+	if cfg.RaftFlushInterval != raft.DefaultFlushInterval || cfg.RaftSegmentBytes != raft.DefaultSegmentBytes {
+		t.Errorf("consensus WAL knobs = %s/%d, want raft's %s/%d", cfg.RaftFlushInterval, cfg.RaftSegmentBytes,
+			raft.DefaultFlushInterval, raft.DefaultSegmentBytes)
 	}
-	t.Setenv(key, "2000")
-	if got := envInt64Or(key, 1000); got != 2000 {
-		t.Fatalf("set: got %d, want 2000", got)
-	}
-	t.Setenv(key, "0")
-	if got := envInt64Or(key, 1000); got != 0 {
-		t.Fatalf("0 must mean off, got %d", got)
+	if cfg.RaftHeartbeatTimeout != raft.DefaultHeartbeatTimeout || cfg.RaftElectionTimeout != raft.DefaultElectionTimeout {
+		t.Errorf("raft timings = %s/%s, want %s/%s", cfg.RaftHeartbeatTimeout, cfg.RaftElectionTimeout,
+			raft.DefaultHeartbeatTimeout, raft.DefaultElectionTimeout)
 	}
 }

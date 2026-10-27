@@ -78,15 +78,6 @@ func (st *Store) SlotGauges() (bytes []int64, streams []int) {
 	return bytes, streams
 }
 
-const (
-	// DefaultStreamPage is the page size when the caller does not ask.
-	DefaultStreamPage = 200
-	// MaxStreamPage bounds one response: a page is a console view, and the
-	// selection cost is O(aggregates in the slot) no matter how big the page
-	// is, so a runaway limit would only add serialisation work.
-	MaxStreamPage = 1000
-)
-
 // StreamPage lists one page of a slot's event streams, ordered by aggregate id,
 // starting after the `after` cursor ("" starts at the beginning). Slots this
 // node has not opened come back with Loaded=false and no page.

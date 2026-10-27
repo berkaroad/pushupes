@@ -52,6 +52,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	pushupesv1 "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1"
 	"github.com/berkaroad/pushupes/internal/raft"
 )
@@ -78,20 +79,6 @@ const (
 	// replayed). The bytes are gzipped table data — a few KB — so the cache
 	// costs one small write per flush.
 	layoutStateFile = "layout-state.bin"
-
-	// layoutApplyFlush bounds how often the resume point is written: often
-	// enough that a restart re-reads a recent index, rare enough that a burst
-	// of table commands is not a burst of fsyncs. A crash that loses the last
-	// few applies costs a replay of entries this node may already have applied
-	// — safe because every command is deterministic and idempotent (see
-	// layoutfeed.go).
-	layoutApplyFlush = 64
-
-	// layoutArchiveReset is how long a subscription must have lived before it
-	// counts as "this address works" and the reconnect backoff resets.
-	layoutArchiveReset = 30 * time.Second
-
-	layoutDialTimeout = 10 * time.Second
 )
 
 // layoutFeedState is the on-disk resume point: the index (in the JSON file)
@@ -210,7 +197,7 @@ func (l *learnerNode) forgetResumePoint() {
 
 func (l *learnerNode) saveState(force bool) {
 	l.mu.Lock()
-	if !force && l.applied < l.flushedIndex+layoutApplyFlush && time.Since(l.flushedAt) < 2*time.Second {
+	if !force && l.applied < l.flushedIndex+config.LayoutApplyFlush && time.Since(l.flushedAt) < 2*time.Second {
 		l.mu.Unlock()
 		return
 	}
@@ -305,7 +292,7 @@ func (l *learnerNode) run() {
 		if err != nil {
 			l.warn("layout feed: subscription ended: %v", err)
 		}
-		if time.Since(startedAt) >= layoutArchiveReset {
+		if time.Since(startedAt) >= config.LayoutArchiveReset {
 			attempt = 0
 		}
 		attempt++
@@ -344,7 +331,7 @@ func (l *learnerNode) subscribe() error {
 		// the group, not about this address: go back to the outer loop (which
 		// re-derives the target list, including a new leader if we learned
 		// one) rather than walking the rest of the seed list.
-		if time.Since(startedAt) >= layoutArchiveReset {
+		if time.Since(startedAt) >= config.LayoutArchiveReset {
 			return err
 		}
 		select {
@@ -429,7 +416,7 @@ func (l *learnerNode) stream(addr string) error {
 	// the shape that expresses both (canceling after the first frame — the
 	// obvious-looking version — tears down the very stream that just proved
 	// the address works).
-	dialTimer := time.AfterFunc(layoutDialTimeout, cancel)
+	dialTimer := time.AfterFunc(config.LayoutDialTimeout, cancel)
 	first := true
 	for {
 		f, err := stream.Recv()

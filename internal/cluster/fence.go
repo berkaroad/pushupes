@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/berkaroad/pushupes/internal/config"
 	"github.com/berkaroad/pushupes/internal/data"
 )
 
@@ -50,47 +51,9 @@ import (
 //
 // The fence is always bounded: the drain and the catch-up wait each have a
 // deadline, the controller bounds the RPC, and a watchdog force-releases the
-// fence past fenceMaxHold so a lost controller can never wedge a slot's
+// fence past config.FenceMaxHold so a lost controller can never wedge a slot's
 // writes. Any timeout aborts the migration cleanly (rollback to stable) and the
 // source keeps leading.
-const (
-	// fenceDrainTimeout bounds waiting for in-flight appends to finish while
-	// the fence is being taken. A write already accepted holds the fence for
-	// its whole local append (including the watermark wait), so this
-	// must exceed a healthy wait and stays far below the 10s client deadline.
-	fenceDrainTimeout = 2 * time.Second
-	// fenceCatchUpTimeout bounds how long the source holds the fence waiting
-	// for the target to confirm the frozen tail. The common case is "already
-	// caught up" (the best-effort mirror and the fetch loop keep the target
-	// within a few ms) and returns almost immediately; this is the fallback.
-	fenceCatchUpTimeout = 3 * time.Second
-	// fenceDurableTimeout bounds the target's flush. The fence holds the slot's
-	// writes for its duration, so a target that cannot get the tail on disk
-	// fails the hand-over (release + backoff) rather than wedging the slot.
-	fenceDurableTimeout = 3 * time.Second
-	// fenceMaxHold is the source-side watchdog: a fence is force-released
-	// after this long even if no controller action ever arrives, so a crashed
-	// controller cannot block a slot's writes forever.
-	fenceMaxHold = 8 * time.Second
-	// fenceRPCTimeout is the controller-side bound on the FenceSlot call: it
-	// covers the drain + catch-up on the source plus one RPC margin.
-	fenceRPCTimeout = fenceDrainTimeout + fenceCatchUpTimeout + time.Second
-	// fencePushBatch caps one tail-push read (frames are streamed in batches).
-	fencePushBatch = 4 << 20
-
-	// fenceTargetGateTimeout bounds how long the source keeps a COMMITTED
-	// fence's writers blocked while waiting for the migration target to apply
-	// the leader move (see holdFenceUntilTargetLeader). The target applies it
-	// within a Raft round trip (a few ms); this is the fallback when the target
-	// is slow or unreachable, and stays well inside the 10s client deadline and
-	// the fence's own watchdog (fenceMaxHold).
-	fenceTargetGateTimeout = 1 * time.Second
-	// fenceTargetGatePoll is the interval between two target-readiness probes.
-	fenceTargetGatePoll = 2 * time.Millisecond
-	// fenceTargetGateRPCTimeout bounds one readiness probe (a hung target must
-	// not stretch the gate past its deadline).
-	fenceTargetGateRPCTimeout = 500 * time.Millisecond
-)
 
 // slotFence is the per-slot write gate. One instance exists per slot for the
 // life of the engine (preallocated) so a writer can never race the creation of
@@ -233,7 +196,7 @@ func (e *Engine) enterWriteFence(slot int32) func() {
 }
 
 // acquireSlotFence takes the fence for a slot: it flags the slot closed so new
-// appends block, then waits (bounded by fenceDrainTimeout) for the in-flight
+// appends block, then waits (bounded by config.FenceDrainTimeout) for the in-flight
 // appends to drain so the caller can sample a frozen LEO. On a drain timeout
 // the fence is released and an error returned; the migration then aborts.
 func (e *Engine) acquireSlotFence(ctx context.Context, slot int32) error {
@@ -250,7 +213,7 @@ func (e *Engine) acquireSlotFence(ctx context.Context, slot int32) error {
 	f.gateArmed = false
 	f.heldSince = time.Now()
 	f.done = make(chan struct{})
-	f.deadline = time.Now().Add(fenceMaxHold)
+	f.deadline = time.Now().Add(config.FenceMaxHold)
 	if f.hold == 0 {
 		f.drained = nil
 	} else {
@@ -265,7 +228,7 @@ func (e *Engine) acquireSlotFence(ctx context.Context, slot int32) error {
 	if drained == nil {
 		return nil // nothing in flight: the LEO is already frozen
 	}
-	dctx, cancel := context.WithTimeout(ctx, fenceDrainTimeout)
+	dctx, cancel := context.WithTimeout(ctx, config.FenceDrainTimeout)
 	defer cancel()
 	select {
 	case <-drained:
@@ -311,14 +274,14 @@ func (e *Engine) releaseSlotFence(slot int32) {
 // migration target has applied the leader move. The source keeps blocking
 // writers (as the fence always does — they are never failed) until the target's
 // own table names the target as the slot's leader at an epoch not older than
-// the one the source committed, or until fenceTargetGateTimeout elapses. Only
+// the one the source committed, or until config.FenceTargetGateTimeout elapses. Only
 // then is the fence released, so a writer woken here is redirected to a target
 // that will serve it instead of bouncing back here (the MOVED/ASK ping-pong
 // that failed clients with a small redirect budget).
 //
 // Idempotent per fence hold (gateArmed) and stale-safe: the goroutine releases
 // only the exact hold it was armed for, and the fence watchdog still
-// force-releases past fenceMaxHold, so a slow or lost target can never wedge
+// force-releases past config.FenceMaxHold, so a slow or lost target can never wedge
 // the slot's writes.
 func (e *Engine) holdFenceUntilTargetLeader(slot int32, from, target string, epoch int64) {
 	// from is the leader the fence is moving AWAY from; kept in the signature
@@ -338,11 +301,11 @@ func (e *Engine) holdFenceUntilTargetLeader(slot int32, from, target string, epo
 
 	go func() {
 		start := time.Now()
-		deadline := start.Add(fenceTargetGateTimeout)
+		deadline := start.Add(config.FenceTargetGateTimeout)
 		ready := false
 		for {
 			if addr := e.peerAddr(target); addr != "" {
-				ctx, cancel := context.WithTimeout(context.Background(), fenceTargetGateRPCTimeout)
+				ctx, cancel := context.WithTimeout(context.Background(), config.FenceTargetGateRPCTimeout)
 				leader, ep, err := e.peerSlotLeader(ctx, addr, slot)
 				cancel()
 				if err == nil && leader == target && ep >= epoch {
@@ -353,7 +316,7 @@ func (e *Engine) holdFenceUntilTargetLeader(slot int32, from, target string, epo
 			if !time.Now().Before(deadline) {
 				break
 			}
-			time.Sleep(fenceTargetGatePoll)
+			time.Sleep(config.FenceTargetGatePoll)
 		}
 		// NOTE (dg8 investigation): this node IS the old leader — reaching
 		// this gate means its own table already applied the move, so there
@@ -372,7 +335,7 @@ func (e *Engine) holdFenceUntilTargetLeader(slot int32, from, target string, epo
 		// receives (the residual 1001, and a forked copy). So also wait for
 		// the local demotion, bounded by the same gate deadline.
 		for e.Leads(slot) && time.Now().Before(deadline) {
-			time.Sleep(fenceTargetGatePoll)
+			time.Sleep(config.FenceTargetGatePoll)
 		}
 		if e.Leads(slot) {
 			e.logger.Warn("migration write fence: local demotion has not applied; releasing anyway (write path holds each writer until it does)",
@@ -402,7 +365,7 @@ func (e *Engine) holdFenceUntilTargetLeader(slot int32, from, target string, epo
 // later deadline) is never released early by a stale watchdog.
 func (e *Engine) armFenceWatchdog(slot int32, f *slotFence) {
 	go func() {
-		t := time.NewTimer(fenceMaxHold)
+		t := time.NewTimer(config.FenceMaxHold)
 		defer t.Stop()
 		<-t.C
 		f.mu.Lock()
@@ -554,7 +517,7 @@ func (e *Engine) pushFencedTail(ctx context.Context, slot int32, leo uint64, tar
 	if err := e.verifyTargetHoldsSource(ctx, slot, addr, to); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(fenceCatchUpTimeout)
+	deadline := time.Now().Add(config.FenceCatchUpTimeout)
 	for {
 		tgtLEO, err := e.remoteLEO(ctx, addr, slot)
 		if err != nil {
@@ -628,7 +591,7 @@ func (e *Engine) verifyNoCompetingLeader(ctx context.Context, slot int32, frozen
 		if addr == "" {
 			continue
 		}
-		cctx, cancel := context.WithTimeout(ctx, fenceTargetGateRPCTimeout)
+		cctx, cancel := context.WithTimeout(ctx, config.FenceTargetGateRPCTimeout)
 		leader, epoch, err := e.peerSlotLeader(cctx, addr, slot)
 		cancel()
 		if err != nil {
@@ -639,7 +602,7 @@ func (e *Engine) verifyNoCompetingLeader(ctx context.Context, slot int32, frozen
 		if leader != replica || epoch < myEpoch {
 			continue
 		}
-		cctx2, cancel2 := context.WithTimeout(ctx, fenceTargetGateRPCTimeout)
+		cctx2, cancel2 := context.WithTimeout(ctx, config.FenceTargetGateRPCTimeout)
 		peerLEO, lerr := e.remoteLEO(cctx2, addr, slot)
 		cancel2()
 		if lerr != nil {
@@ -656,7 +619,7 @@ func (e *Engine) verifyNoCompetingLeader(ctx context.Context, slot int32, frozen
 }
 
 func (e *Engine) confirmTargetDurable(ctx context.Context, addr string, slot int32, leo uint64, to string) error {
-	deadline := time.Now().Add(fenceDurableTimeout)
+	deadline := time.Now().Add(config.FenceDurableTimeout)
 	var last uint64
 	for {
 		dur, err := e.peerDurableLEO(ctx, addr, slot)
@@ -684,7 +647,7 @@ func (e *Engine) confirmTargetDurable(ctx context.Context, addr string, slot int
 func (e *Engine) pushFrames(ctx context.Context, toAddr string, slot int32, fromSeq, toSeq uint64) error {
 	seq := fromSeq
 	for seq <= toSeq {
-		_, next, payload, err := e.store.ReadSlotBytes(slot, seq, toSeq+1, fencePushBatch)
+		_, next, payload, err := e.store.ReadSlotBytes(slot, seq, toSeq+1, config.FencePushBatch)
 		if err != nil {
 			return err
 		}
@@ -723,7 +686,7 @@ func (e *Engine) fenceSource(ctx context.Context, from string, slot int32, targe
 	if addr == "" {
 		return 0, fmt.Errorf("fence: no address for source %s", from)
 	}
-	fctx, cancel := context.WithTimeout(ctx, fenceRPCTimeout)
+	fctx, cancel := context.WithTimeout(ctx, config.FenceRPCTimeout)
 	defer cancel()
 	return e.peerFence(fctx, addr, slot, target)
 }
