@@ -78,12 +78,17 @@ type Client struct {
 	// from the caller's static entry list) stops burning Attempts on
 	// dial timeouts. Entries are immutable after New, so a plain map under
 	// its own mutex is enough.
-	penaltyMu   sync.Mutex
-	penalty     map[string]time.Time
-	redirects   atomic.Uint64
-	flowPauses  atomic.Uint64
-	refreshStop chan struct{}
-	refreshOnce sync.Once
+	penaltyMu sync.Mutex
+	penalty   map[string]time.Time
+	redirects atomic.Uint64
+	// lastRouteKick coalesces 1010-driven route refreshes: one per burst.
+	lastRouteKick atomic.Int64
+	// groupMismatches counts 1010 answers (stale layout_epoch) — the signal that
+	// this client's routing table is behind a generation switch.
+	groupMismatches atomic.Uint64
+	flowPauses      atomic.Uint64
+	refreshStop     chan struct{}
+	refreshOnce     sync.Once
 }
 
 // New dials the given client-plane (gRPC) addresses and seeds the routing
@@ -139,6 +144,12 @@ func New(nodes []string, cfg *Config) (*Client, error) {
 // constant.
 func (c *Client) SlotCount() int { return c.routes.slotCountNow() }
 
+// SlotOf routes an aggregate id exactly as this client does: by the served slot
+// generation when one is on, by the flat hash otherwise. Tools and benchmarks
+// use it instead of re-deriving the rule (and getting it wrong once a
+// generation is active).
+func (c *Client) SlotOf(aggID string) int32 { return c.slotOf(aggID) }
+
 // Redirects counts the MOVED/ASK answers the write path has patched into
 // the local table since New — a nonzero count on a healthy cluster means
 // the refresh period is too long for the churn, not an error.
@@ -150,6 +161,11 @@ func (c *Client) Redirects() uint64 { return c.redirects.Load() }
 // refusing this client's writes — the library is absorbing it as waiting,
 // not surfacing it as an error.
 func (c *Client) FlowPauses() uint64 { return c.flowPauses.Load() }
+
+// GroupMismatches counts the 1010 (GROUP_MISMATCH) answers this client handled:
+// each one is a recorded write refused because the routing table predated a
+// generation switch, and each was retried after a refresh.
+func (c *Client) GroupMismatches() uint64 { return c.groupMismatches.Load() }
 
 // Close stops the route refresh loop and releases every cached connection.
 func (c *Client) Close() error {
@@ -432,7 +448,10 @@ func (c *Client) sendGroup(ctx context.Context, attempt int, addr string,
 		}
 	}
 	cctx, cancel := context.WithTimeout(ctx, c.cfg.CallTimeout)
-	resp, err := c.event(addr).BatchAppend(cctx, &pushupesv1.BatchAppendRequest{Records: batch})
+	resp, err := c.event(addr).BatchAppend(cctx, &pushupesv1.BatchAppendRequest{
+		Records:     batch,
+		LayoutEpoch: c.routes.epochNow(),
+	})
 	cancel()
 	if err != nil {
 		lastErr = err
@@ -481,6 +500,12 @@ func (c *Client) sendGroup(ctx context.Context, attempt int, addr string,
 				c.routes.patch(c.slotOf(recs[i].AggregateId), hostPort(r.Response.GetNode()))
 			}
 			c.redirects.Add(1)
+			next = append(next, i)
+		case ErrIDGroupMismatch:
+			// The cluster switched slot generations: refresh the routing table
+			// (coalesced) and re-send these records under the new layout.
+			c.groupMismatches.Add(1)
+			c.kickRoutes()
 			next = append(next, i)
 		case ErrIDFlowControl:
 			throttled = append(throttled, i)
@@ -824,9 +849,16 @@ type routeTable struct {
 	mu        sync.RWMutex
 	slotCount int      // len(bySlot): the cluster's slot count, from the table itself
 	bySlot    []string // slot -> leader client addr ("host:port")
-	entries   []string // every known node addr, the round-robin fallback set
-	cursor    int      // last entry addr that answered a fetch
-	client    *Client
+	// The served slot generation (DESIGN §4.5): generation g owns
+	// [2^g, 2^(g+1)), so groupBase == groupSize == 2^g and an aggregate routes
+	// with LogicalSlotOf. groupSize 0 = no generation on: the flat
+	// hash%slotCount rule, which is what a pre-generation cluster answers.
+	groupBase   int32
+	groupSize   int32
+	layoutEpoch uint64
+	entries     []string // every known node addr, the round-robin fallback set
+	cursor      int      // last entry addr that answered a fetch
+	client      *Client
 	// wake asks the refresh loop to fetch NOW, not on the next ticker
 	// beat: when an address is declared unhealthy the cached table is
 	// known-stale (a scale-down just moved its slots), and the blind
@@ -845,12 +877,22 @@ func (rt *routeTable) fetch() error {
 		if err != nil {
 			continue
 		}
+		// A cluster always serves a segment now. A table without one is not ready
+		// (the plan has not run, or this answering node is a control-plane member
+		// that never received a layout): say so instead of routing by a rule the
+		// cluster does not use.
+		if resp.GetGroupSize() <= 0 {
+			return fmt.Errorf("prefetch routes: the cluster serves no slot generation yet")
+		}
 		bySlot := make([]string, len(resp.SlotNodeIndex))
 		for slot, idx := range resp.SlotNodeIndex {
 			bySlot[slot] = hostPort(resp.NodeClientAddrs[idx])
 		}
 		rt.mu.Lock()
 		rt.slotCount = len(bySlot)
+		rt.groupBase = resp.GetGroupBase()
+		rt.groupSize = resp.GetGroupSize()
+		rt.layoutEpoch = resp.GetLayoutEpoch()
 		rt.bySlot = bySlot
 		rt.cursor = i
 		rt.mu.Unlock()
@@ -882,12 +924,26 @@ func (rt *routeTable) slotCountNow() int {
 	return rt.slotCount
 }
 
-// slotOf routes an aggregate id with the shared algorithm over the CURRENT
-// table's slot count.
+// slotOf routes an aggregate id onto a LOGICAL slot of the current generation
+// (0 .. group_size-1). Routing stops there: the physical id is the server's
+// business (physical = group_base + logical), so a client keeps working across a
+// generation switch without ever learning where the new segment sits.
 func (rt *routeTable) slotOf(agg string) int32 {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
-	return SlotOf(agg, rt.slotCount)
+	if rt.groupSize <= 0 {
+		// No segment means the table is not ready; the caller must not route. The
+		// fetch below refuses such a table, so this is a defensive floor.
+		return -1
+	}
+	return LogicalSlotOf(agg, int(rt.groupSize))
+}
+
+// epochNow is the layout epoch this client routes by (0 = no table fetched).
+func (rt *routeTable) epochNow() uint64 {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.layoutEpoch
 }
 
 // addrFor answers the cached leader of a slot; fallback picks the
@@ -931,6 +987,23 @@ func (rt *routeTable) patch(slot int32, addr string) {
 }
 
 func (c *Client) slotOf(agg string) int32 { return c.routes.slotOf(agg) }
+
+// kickRoutes pulls a fresh routing table after a 1010 (the cluster moved to a
+// generation this client does not route by). Bursts coalesce: the first
+// refusal of a wave fetches, the rest of the wave rides the same table.
+func (c *Client) kickRoutes() {
+	now := time.Now().UnixNano()
+	for {
+		last := c.lastRouteKick.Load()
+		if now-last < int64(100*time.Millisecond) {
+			return
+		}
+		if c.lastRouteKick.CompareAndSwap(last, now) {
+			c.routes.fetch()
+			return
+		}
+	}
+}
 
 // Liveness-ping cadence for the client surface, matching what the server's
 // keepalive enforcement policy allows (cmd/pushupes: MinTime covers the

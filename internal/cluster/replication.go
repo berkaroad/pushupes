@@ -48,8 +48,17 @@ type epochHW struct {
 // watermark per slot. Event data never enters Raft — it is replicated by
 // a dedicated seq-based fetch protocol.
 type Engine struct {
-	node  consensus
-	store *storage.Store
+	// groupMig is the generation migration in flight (or the last one finished):
+	// a segment move takes hours, so it runs in the background and the operator
+	// watches it through the admin status instead of a blocking request.
+	groupMigMu sync.Mutex
+	groupMig   *GroupMigrationStatus
+	// tableChanged is closed and replaced on every applied layout command. Writes
+	// that arrive for a staged (importing) slot park on it instead of being
+	// refused — or written into the segment that is leaving.
+	tableChanged chan struct{}
+	node         consensus
+	store        *storage.Store
 	// One drain-driver seat (balance.go): the disabled RunRebalancer loop
 	// claims it when it starts over a marked table, wakeDrainRunner claims it
 	// for a drain marked after the loop returned. Whoever holds it runs the
@@ -272,6 +281,10 @@ type Engine struct {
 	// change it is the admin endpoint (SetReplicaPolicy) — a restart of an
 	// existing node never re-seeds it.
 	bootPolicy ReplicaPolicy
+	// bootGroup is the -slot-group seed: it applies to the FIRST plan only
+	// (see SetBootGroup). The served generation lives in the replicated table
+	// afterwards.
+	bootGroup SlotGroup
 
 	// retry backoff for hand-overs that do not stick (balance.go): one record
 	// per slot, keyed on the move's endpoints. Without it a target that cannot
@@ -562,7 +575,11 @@ func NewEngine(node consensus, store *storage.Store, self string, logger *slog.L
 		// long-poll fetch round plus progress/replication/leo probes —
 		// gRPC multiplexes them over the single cached conn (the old HTTP
 		// transport needed a large idle-conn pool to avoid re-dial churn).
-		peers:           newPeerClient(),
+		peers: newPeerClient(),
+		// groupMig holds the running (or last) generation migration; see
+		// groupmigrate.go. Nil until the first StartGroupExpand.
+		groupMig:        nil,
+		tableChanged:    make(chan struct{}),
 		repl:            map[int32]*slotRepl{},
 		sessions:        map[string]*fetchSession{},
 		sessKick:        make(chan struct{}, 1),
@@ -637,6 +654,13 @@ func (e *Engine) ApplyCommand(cmd []byte) ([]byte, error) {
 	e.tableMu.Lock()
 	err = e.table.Apply(c)
 	e.tableGen++
+	// Wake anything parked on the layout: a write that arrived for a slot the
+	// generation migration has staged waits here, and this is the moment it learns
+	// whether the switch landed.
+	if e.tableChanged != nil {
+		close(e.tableChanged)
+		e.tableChanged = make(chan struct{})
+	}
 	e.tableMu.Unlock()
 	if err != nil {
 		return nil, err
@@ -901,6 +925,34 @@ func (e *Engine) HandleSlotLeader(slot int32) (string, int64) {
 // SlotOf routes an aggregate to its slot.
 func (e *Engine) SlotOf(aggregateID string) int32 { return e.store.SlotOf(aggregateID) }
 
+// GroupSpec returns the slot generation the replicated table currently serves.
+// Size 0 means the flat pre-generation layout.
+func (e *Engine) GroupSpec() SlotGroup {
+	e.tableMu.RLock()
+	g := SlotGroup{Gen: e.table.GroupGen, Base: e.table.GroupBase, Size: e.table.GroupSize, Epoch: e.table.LayoutEpoch}
+	e.tableMu.RUnlock()
+	return g
+}
+
+// SlotForAgg routes an aggregate id under a generation. The base IS the size,
+// so the size alone decides the range; with no generation on it falls back to
+// the flat hash over the whole table, which is what every cluster did before
+// generations existed.
+func SlotForAgg(aggregateID string, g SlotGroup, slotCount int32) int32 {
+	if g.Size <= 0 {
+		// A table with no segment should not exist any more (NewTable seeds the
+		// zero-based one). Refuse to invent a route: the caller's write is going to
+		// be refused upstream anyway, and a made-up slot would be worse.
+		return -1
+	}
+	return g.Base + data.LogicalSlotOf(aggregateID, int(g.Size))
+}
+
+// SlotOfAgg routes one aggregate under the table's current generation.
+func (e *Engine) SlotOfAgg(aggregateID string) int32 {
+	return SlotForAgg(aggregateID, e.GroupSpec(), e.store.SlotCount)
+}
+
 // syncMigrationState drives the post-handover cleanup countdown (localdrop.go)
 // from the table's replica-set membership.
 //
@@ -1074,6 +1126,18 @@ func (e *Engine) SubmitAppend(ctx context.Context, rec *data.EventRecord) (resp 
 	defer leave()
 	e.awaitLocalDemotion(slot)
 	fenced := time.Now()
+	if traceWrites {
+		// Diagnostic only (PUSHUPES_TRACE_WRITES): records when a write passed the
+		// gate and when it was answered, so a lost record can be placed against the
+		// migration's freeze/switch timeline.
+		defer func() {
+			e.logger.Info("write_trace", "op", "write_trace", "slot", slot,
+				"agg", rec.AggregateID, "cmd", rec.CommandID, "ver", rec.Version,
+				"waited_ms", fenced.Sub(start).Milliseconds(),
+				"total_ms", time.Since(start).Milliseconds(),
+				"err", err != nil, "status", respStatus(resp))
+		}()
+	}
 	e.noteCall(start, fenced, 1, false)
 	defer func() {
 		redir := redirected(err)
@@ -1083,6 +1147,32 @@ func (e *Engine) SubmitAppend(ctx context.Context, rec *data.EventRecord) (resp 
 		}
 	}()
 	return e.submitAppendLocked(ctx, rec, slot)
+}
+
+// retiredSlotRefusal answers a write that arrives for a slot of a segment this
+// cluster has already left. Without it the "unassigned slot serves locally"
+// branch (a single-node convenience) would append those records to a retired
+// segment and acknowledge them — the exact shape that lost the tails of a
+// generation migration.
+//
+// The answer is 1010, not 1003: the client must refresh its routing table (the
+// slot id it computed is from an old generation), and 1003 would only tell it to
+// retry the same slot somewhere else.
+func (e *Engine) retiredSlotRefusal(slot int32) *data.AppendResponse {
+	e.tableMu.RLock()
+	base, size := e.table.GroupBase, e.table.GroupSize
+	e.tableMu.RUnlock()
+	if size <= 0 {
+		return nil
+	}
+	b, _, ok := segmentOf(slot)
+	if !ok || b >= base {
+		return nil // the served segment, or one we have not moved to yet
+	}
+	return &data.AppendResponse{
+		ErrID: data.ErrIDGroupMismatch,
+		Err:   "slot belongs to a retired segment: refresh the layout",
+	}
 }
 
 // controlOnlyRefusal answers the append THIS node must not serve: a slot the
@@ -1126,6 +1216,9 @@ func (e *Engine) submitAppendLocked(ctx context.Context, rec *data.EventRecord, 
 	}
 	e.tableMu.RUnlock()
 	if !ok {
+		if refusal := e.retiredSlotRefusal(slot); refusal != nil {
+			return refusal, nil
+		}
 		if refusal := e.controlOnlyRefusal(slot); refusal != nil {
 			return refusal, nil
 		}
@@ -1134,6 +1227,30 @@ func (e *Engine) submitAppendLocked(ctx context.Context, rec *data.EventRecord, 
 	}
 
 	switch {
+	case pState == SlotSealingOut && pLeader == e.self:
+		// A generation migration is sealing this slot: the record belongs to the
+		// destination segment now. Point the client at the destination leader (ASK,
+		// 1004) — it parks there until the switch, then re-sends under the new
+		// layout. Falling through to the local append would keep the source growing
+		// and strand exactly these records.
+		if dst, ok := e.StagingSlotOf(rec.AggregateID); ok {
+			e.tableMu.RLock()
+			dstLeader := ""
+			if dp, ok := e.table.Slots[dst]; ok {
+				dstLeader = dp.Leader
+			}
+			e.tableMu.RUnlock()
+			if addr := e.clientAddr(dstLeader); addr != "" {
+				return &data.AppendResponse{
+					ErrID: data.ErrIDMigrating,
+					Err:   "slot is sealing into the next segment",
+					Node:  addr,
+				}, nil
+			}
+		}
+		// No destination to point at (a sealing slot always has one; this is the
+		// defensive half): keep serving locally rather than failing the write.
+		return e.localAppend(slot, rec)
 	case pState == SlotMigratingOut && pLeader == e.self:
 		// The source stays leader for the whole commit window and keeps
 		// serving writes: they queue behind the commit fence and are released
@@ -1355,7 +1472,7 @@ func (e *Engine) landLocalAppend(slot int32, rec *data.EventRecord) (*data.Appen
 			Slot:   slot,
 		}, nil
 	}
-	out, err := e.store.Append(rec)
+	out, err := e.store.AppendToSlot(slot, rec)
 	if err != nil {
 		return nil, err
 	}
@@ -1420,6 +1537,21 @@ func (e *Engine) SubmitBatch(ctx context.Context, slot int32, recs []*data.Event
 	defer leave()
 	e.awaitLocalDemotion(slot)
 	fenced := time.Now()
+	if traceWrites {
+		defer func() {
+			for i, rec := range recs {
+				st := "none"
+				if i < len(out) {
+					st = respStatus(out[i])
+				}
+				e.logger.Info("write_trace", "op", "write_trace", "slot", slot,
+					"agg", rec.AggregateID, "cmd", rec.CommandID, "ver", rec.Version, "batch", true,
+					"waited_ms", fenced.Sub(start).Milliseconds(),
+					"total_ms", time.Since(start).Milliseconds(),
+					"err", err != nil, "status", st)
+			}
+		}()
+	}
 	e.noteCall(start, fenced, len(recs), true)
 	defer func() {
 		redir := redirected(err)
@@ -1446,6 +1578,14 @@ func (e *Engine) SubmitBatch(ctx context.Context, slot int32, recs []*data.Event
 
 	switch {
 	case !ok:
+		if refusal := e.retiredSlotRefusal(slot); refusal != nil {
+			out := make([]*data.AppendResponse, len(recs))
+			for i := range out {
+				r := *refusal
+				out[i] = &r
+			}
+			return out, nil
+		}
 		if refusal := e.controlOnlyRefusal(slot); refusal != nil {
 			// One answer per record (they are independent wire responses).
 			out := make([]*data.AppendResponse, len(recs))
@@ -2511,6 +2651,12 @@ func (e *Engine) layoutFeed() *layoutHub {
 // the policy lives in the replicated table and SetReplicaPolicy (the admin
 // endpoint's entry) is the only way to change it.
 func (e *Engine) SetBootPolicy(p ReplicaPolicy) { e.bootPolicy = p }
+
+// SetBootGroup records the -slot-group seed for a brand-new cluster. It is
+// applied by the first plan (which carries it into the replicated table) and
+// ignored afterwards: the served generation is replicated state, and switching
+// it is an operator action, not a restart flag.
+func (e *Engine) SetBootGroup(g SlotGroup) { e.bootGroup = g }
 
 // SetReplicaPolicy is the cluster's policy entry point: it changes the
 // replica strategy tier — low (one copy per slot), medium (two, the default),
@@ -4382,7 +4528,11 @@ func (e *Engine) RunController(ctx context.Context) {
 				// Clients get the explicit "no data nodes" answer at the write
 				// path; the first hosting registration arms the plan.
 				if len(pool) > 0 {
-					e.submit(&Command{Op: OpPlanSlots})
+					cmd := &Command{Op: OpPlanSlots}
+					if e.bootGroup.Size > 0 {
+						cmd.GroupGen, cmd.GroupBase, cmd.GroupSize = e.bootGroup.Gen, e.bootGroup.Base, e.bootGroup.Size
+					}
+					e.submit(cmd)
 				}
 			} else if probe := tbl.Clone(); probe.applyReplanSlots() {
 				e.submit(&Command{Op: OpReplanSlots})
@@ -4826,4 +4976,18 @@ func (e *Engine) SlotSize(slot int32) int64 {
 		return 0
 	}
 	return e.store.SlotDiskBytes(slot)
+}
+
+// traceWrites enables the write-side diagnostic (PUSHUPES_TRACE_WRITES). It logs
+// one line per append — slot, aggregate, command id, how long the write blocked on
+// the migration gate — which is what places a record that went missing across a
+// generation migration against the freeze/switch timeline. Off by default: the
+// logging halves throughput, so it must never be on for a measurement run.
+var traceWrites = os.Getenv("PUSHUPES_TRACE_WRITES") != ""
+
+func respStatus(r *data.AppendResponse) string {
+	if r == nil {
+		return "none"
+	}
+	return r.Status
 }

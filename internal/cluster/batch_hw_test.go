@@ -36,11 +36,12 @@ func leadSlot0(t *testing.T, e *Engine) {
 	// tests exercise the batch/watermark path, not the replica-count policy).
 	pinReplicas(t, e, 2)
 	applyCmd(t, e, &Command{Op: OpPlanSlots})
-	if p, _ := e.TableSnapshot().Slots[0]; p.Leader != "node-1" {
-		applyCmd(t, e, &Command{Op: OpLeaderMove, Slots: []int32{0}, NewLeader: "node-1"})
+	const slot = int32(0)
+	if p, _ := e.TableSnapshot().Slots[slot]; p.Leader != "node-1" {
+		applyCmd(t, e, &Command{Op: OpLeaderMove, Slots: []int32{slot}, NewLeader: "node-1"})
 	}
-	if p, _ := e.TableSnapshot().Slots[0]; p.Leader != "node-1" || len(p.Replicas) <= 1 {
-		t.Fatalf("setup: slot 0 not local-led with replicas: %+v", p)
+	if p, _ := e.TableSnapshot().Slots[slot]; p.Leader != "node-1" || len(p.Replicas) <= 1 {
+		t.Fatalf("setup: slot %d not local-led with replicas: %+v", slot, p)
 	}
 }
 

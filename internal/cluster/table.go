@@ -18,6 +18,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // SlotState is the lifecycle state of one slot in the assignment table.
@@ -30,6 +32,15 @@ const (
 	SlotMigratingOut SlotState = "migrating_out"
 	// SlotImportingIn: target side; accepts forwarded writes, not clients.
 	SlotImportingIn SlotState = "importing_in"
+	// SlotSealingOut: source side of a GENERATION migration, once the destination
+	// segment is within sealGap records of the source. The slot still serves reads
+	// and still receives the replays, and any record already inside the write
+	// fence lands normally — but new client writes are answered 1004 ASK pointing
+	// at the destination slot, so the source log stops growing on its own. That is
+	// what makes "the source is quiet" a state instead of a sampling guess: the
+	// switch is taken when the record gap reaches zero, not when two readings of
+	// the log end offset happen to match.
+	SlotSealingOut SlotState = "sealing_out"
 	// SlotBackingUp: migration committed; old copy kept until retention.
 	SlotBackingUp SlotState = "backing_up"
 )
@@ -102,6 +113,24 @@ func sameMembers(a, b []string) bool {
 type Table struct {
 	SlotCount int32 `json:"slot_count"`
 	Replicas  int   `json:"replicas"`
+	// GroupGen / GroupBase / GroupSize / LayoutEpoch describe the slot
+	// generation the cluster serves (DESIGN §4.5, §7.2.7): generation g owns
+	// [2^g, 2^(g+1)), so GroupBase == GroupSize == 2^g and business routing is
+	// slot = size + hash&(size-1). GroupSize == 0 means no generation has been
+	// switched on yet (the pre-generation full-table layout); GroupGen is 0
+	// then too, and the encoder writes zeros so a v9 snapshot of such a table
+	// round-trips as the same thing. LayoutEpoch increments on every
+	// generation switch; clients carry it on BatchAppend and are told to
+	// refresh their routes when it no longer matches.
+	//
+	// NOT WIRED YET: PlanSlots still assigns every one of SlotCount slots and
+	// the routing call sites still use the flat hash. The fields are replicated
+	// and snapshot-encoded so the layout switch has its state in place (see
+	// docs/slot-group-layout.md, step D).
+	GroupGen    int    `json:"group_gen"`
+	GroupBase   int32  `json:"group_base"`
+	GroupSize   int32  `json:"group_size"`
+	LayoutEpoch uint64 `json:"layout_epoch"`
 	// Policy is the cluster-wide replica strategy tier behind Replicas; the
 	// controller re-derives Replicas from it (MIN with the data-node count)
 	// every round, so the factor tracks both the policy and the membership.
@@ -142,6 +171,10 @@ type Table struct {
 // defaults to medium; a table that tracks a tier is built with
 // NewTableWithPolicy, which derives the factor from the policy.
 func NewTable(slotCount int32, replicaFactor int) *Table {
+	// A table always serves a segment (there is no "no generation" shape any more):
+	// the default is the zero-based one, i.e. the whole table, which is exactly the
+	// layout a fresh cluster had before generations existed. A real bootstrap
+	// replaces it with the 2^g generation the node was started for (OpPlanSlots).
 	return &Table{
 		SlotCount: slotCount,
 		Replicas:  replicaFactor,
@@ -149,6 +182,9 @@ func NewTable(slotCount int32, replicaFactor int) *Table {
 		Peers:     map[string]Peer{},
 		Slots:     map[int32]*Placement{},
 		CommitLEO: map[int32]uint64{},
+		GroupGen:  -1,
+		GroupBase: 0,
+		GroupSize: slotCount,
 	}
 }
 
@@ -167,6 +203,10 @@ func NewTableWithPolicy(slotCount int32, policy ReplicaPolicy) *Table {
 		Peers:     map[string]Peer{},
 		Slots:     map[int32]*Placement{},
 		CommitLEO: map[int32]uint64{},
+		// Same default segment as NewTable: a table always serves one.
+		GroupGen:  -1,
+		GroupBase: 0,
+		GroupSize: slotCount,
 	}
 }
 
@@ -185,6 +225,12 @@ func tableReplicaShortfall(t *Table) bool {
 func (t *Table) Clone() *Table {
 	out := NewTableWithPolicy(t.SlotCount, t.Policy)
 	out.Replicas = t.Replicas
+	// The generation is replicated state like any other field: a clone that
+	// dropped it would route the next append into the wrong segment.
+	out.GroupGen = t.GroupGen
+	out.GroupBase = t.GroupBase
+	out.GroupSize = t.GroupSize
+	out.LayoutEpoch = t.LayoutEpoch
 	// Topology: the cluster generation is part of the replicated state like
 	// any other field — a clone that dropped it would fence every copy the
 	// holder of the clone leads.
@@ -211,6 +257,43 @@ func (t *Table) Clone() *Table {
 		}
 	}
 	return out
+}
+
+// validateGroup checks the replicated generation fields. Base is stored only
+// so a corrupt snapshot cannot silently route into the wrong range: it must
+// equal the size, and the size must be the power of two its generation names.
+// The segment has to fit the fixed table (a generation of 2^g occupies
+// [2^g, 2^(g+1))), which also keeps the reserved slot-000 out of it.
+func (t *Table) validateGroup() error {
+	if t.GroupSize == 0 {
+		if t.GroupBase != 0 || t.GroupGen != 0 {
+			return fmt.Errorf("table: generation fields set with size 0 (gen=%d base=%d)", t.GroupGen, t.GroupBase)
+		}
+		return nil
+	}
+	if t.GroupSize < 0 || t.GroupSize&(t.GroupSize-1) != 0 {
+		return fmt.Errorf("table: generation size %d is not a power of two", t.GroupSize)
+	}
+	// A zero-based segment (base 0, the whole table) is what a test table and the
+	// development shape serve: it makes "every slot id participates" expressible
+	// without a second routing rule. Production generations are 2^g (base == size).
+	if t.GroupBase == 0 {
+		if t.GroupGen != -1 || t.GroupSize != t.SlotCount {
+			return fmt.Errorf("table: zero-based segment must cover the %d-slot table (gen=%d size=%d)",
+				t.SlotCount, t.GroupGen, t.GroupSize)
+		}
+		return nil
+	}
+	if t.GroupBase != t.GroupSize {
+		return fmt.Errorf("table: generation base %d != size %d", t.GroupBase, t.GroupSize)
+	}
+	if t.GroupGen < 0 || 1<<uint(t.GroupGen) != int(t.GroupSize) {
+		return fmt.Errorf("table: generation %d does not match size %d", t.GroupGen, t.GroupSize)
+	}
+	if t.GroupSize > t.SlotCount/2 {
+		return fmt.Errorf("table: generation size %d exceeds half the %d-slot table", t.GroupSize, t.SlotCount)
+	}
+	return nil
 }
 
 // PeerIDs returns the sorted member list.
@@ -319,20 +402,49 @@ func (t *Table) ReplicasOf(slot int32) []string {
 	return p.Replicas
 }
 
-// PlanSlots spreads all slots over the given nodes (walking assignment):
-// slot s prefers node s%N and takes the next replicaFactor
-// nodes forward. replicaFactor 0 or >N means all nodes.
-func PlanSlots(nodes []string, slotCount int32, replicaFactor int) map[int32]*Placement {
-	out := make(map[int32]*Placement, slotCount)
-	if len(nodes) == 0 {
+// SlotGroup is the slot generation the table serves (DESIGN §4.5, §7.2.7):
+// generation g owns the slot range [2^g, 2^(g+1)), so Base == Size == 2^g.
+// Size 0 means no generation has been switched on — routing then falls back to
+// the flat hash over the whole table, the pre-generation rule.
+type SlotGroup struct {
+	Gen   int
+	Base  int32
+	Size  int32
+	Epoch uint64
+}
+
+// Physical converts a logical slot id (0 .. Size-1) into the table's slot id.
+// The client plane speaks logical ids only: it never learns the base, and the
+// base is exactly what tells two generations apart on the same disk layout.
+func (g SlotGroup) Physical(logical int32) int32 { return g.Base + logical }
+
+// Logical converts a table slot id back into the generation's logical id. A
+// slot outside the segment keeps its raw id — that cannot happen for a slot the
+// segment owns, and returning the raw value makes a bug visible instead of
+// silently pointing at the wrong row.
+func (g SlotGroup) Logical(physical int32) int32 {
+	if physical < g.Base || physical >= g.Base+g.Size {
+		return physical
+	}
+	return physical - g.Base
+}
+
+// PlanSlotsInRange spreads the slots of one generation segment [from, until)
+// over the given nodes: slot s prefers nodes[(s-from)%N] and takes the next
+// replicaFactor nodes forward. The walking assignment is relative to the
+// segment so a generation's leaders do not depend on where its base sits in
+// the table.
+func PlanSlotsInRange(nodes []string, from, until int32, replicaFactor int) map[int32]*Placement {
+	out := make(map[int32]*Placement, until-from)
+	if len(nodes) == 0 || until <= from {
 		return out
 	}
 	rf := replicaFactor
 	if rf <= 0 || rf > len(nodes) {
 		rf = len(nodes)
 	}
-	for s := int32(0); s < slotCount; s++ {
-		start := int(s) % len(nodes)
+	for s := from; s < until; s++ {
+		start := int(s-from) % len(nodes)
 		replicas := make([]string, 0, rf)
 		for i := 0; i < rf; i++ {
 			replicas = append(replicas, nodes[(start+i)%len(nodes)])
@@ -342,77 +454,90 @@ func PlanSlots(nodes []string, slotCount int32, replicaFactor int) map[int32]*Pl
 	return out
 }
 
-// layoutStale reports whether the replica sets no longer match the member
-// directory. Three shapes arm the re-layout:
-//
-//   - a stable slot whose set size is not the derived replica factor: the
-//     fingerprint of a factor change that has not been reconciled yet (a member
-//     left, so the factor dropped and the sets now hold surplus seats; or a
-//     member joined, so the factor rose and they hold too few);
-//   - a member the ring plan gives a seat to that holds no replica seat in ANY
-//     stable slot: the layout has left a member out entirely. That is the shape
-//     of every membership change — every policy names a fixed number of
-//     copies (1 / 2 / 3, or a direct factor), so membership alone only ever
-//     moves the MIN side down — and it strands the new member exactly as a
-//     factor change does: the ring's expected leader for its slots is not a
-//     replica, and the rebalancer only ever hands leadership to an existing
-//     replica, so it can never act on them (observed: a low-policy cluster
-//     bootstrapped as one node and grown to three never moves a single slot off
-//     node-1, and a 2-member cluster grown to three never gives node-3 a single
-//     seat);
-//   - at factor 1, a stable slot whose leader is not the ring's expected
-//     leader: a single-copy set has no spare seat to hold the ring's leader as
-//     a follower, so the two shapes above can both miss a slot that is merely
-//     in the wrong place — a hand-picked migration committed off the ring
-//     leaves the set back at the factor once the surplus reclaim has taken the
-//     old seat off, with nobody left out.
-//
-// applyReplanSlots then ADDS the ring's seats every stable slot is missing;
-// that re-seat is the only thing that can put the ring's expected leader into a
-// set, and the rebalancer needs it there before it may hand the slot over.
-func (t *Table) layoutStale() bool {
-	for _, p := range t.Slots {
-		if p.State == SlotStable && len(p.Replicas) != t.Replicas {
-			return true
+// planSlots lays out the slots this table serves: the generation's segment
+// when one is switched on, the whole table otherwise (the pre-generation
+// layout every table starts as).
+func (t *Table) planSlots(nodes []string) map[int32]*Placement {
+	if t.GroupSize <= 0 {
+		// Unreachable: every table is built with a segment (NewTable seeds the
+		// zero-based one) and validation enforces it. Returning nothing beats
+		// inventing a layout if that invariant ever breaks.
+		return map[int32]*Placement{}
+	}
+	return PlanSlotsInRange(nodes, t.GroupBase, t.GroupBase+t.GroupSize, t.Replicas)
+}
+
+// segmentStaged reports whether a generation migration has already planned the
+// given segment: every slot of it exists and is importing_in, which is the state
+// OpStageGroup puts them in. The switch uses this to decide between promoting the
+// staged layout (records already replayed into it) and planning a fresh one.
+func (t *Table) segmentStaged(base, size int32) bool {
+	if size <= 0 {
+		return false
+	}
+	for s := base; s < base+size; s++ {
+		p, ok := t.Slots[s]
+		if !ok || p.State != SlotImportingIn {
+			return false
 		}
 	}
-	nodes := t.HostingIDs()
+	return true
+}
+
+// ringLeader is the node the walking assignment gives one slot, in the same
+// segment-relative frame planSlots uses: the leader rebalancer must agree with
+// the plan or every round would hand a slot back to a node the plan does not
+// want.
+func (t *Table) ringLeader(nodes []string, slot int32) string {
 	if len(nodes) == 0 {
+		return ""
+	}
+	off := slot
+	if t.GroupSize > 0 {
+		off = slot - t.GroupBase
+	}
+	if off < 0 {
+		return ""
+	}
+	return nodes[int(off)%len(nodes)]
+}
+
+// ParseSlotGroup turns "g3" (or "3") into the generation it names. The number
+// is the generation index: g0 = 1 slot, g10 = 1024. The segment [2^g, 2^(g+1))
+// must fit inside the table, which is why the table is twice the largest
+// generation (DESIGN §7.2.7).
+func ParseSlotGroup(name string, slotCount int32) (SlotGroup, error) {
+	txt := strings.TrimSpace(strings.ToLower(name))
+	txt = strings.TrimPrefix(txt, "g")
+	g, err := strconv.Atoi(txt)
+	if err != nil || g < 0 || g > 10 {
+		return SlotGroup{}, fmt.Errorf("slot group %q: want g0..g10", name)
+	}
+	size := int32(1) << uint(g)
+	if size > slotCount/2 {
+		return SlotGroup{}, fmt.Errorf("slot group %q: segment size %d does not fit a %d-slot table", name, size, slotCount)
+	}
+	return SlotGroup{Gen: g, Base: size, Size: size, Epoch: 1}, nil
+}
+
+// layoutStale reports whether the layout no longer satisfies DESIGN §4.5: a
+// stable slot that does not hold its share of distinct candidate seats, or a
+// candidate whose seat count sits outside the floor/ceil band.
+//
+// It is one question asked of one function — "does DesiredSeats have anything
+// to do" — so the arming criterion and the movement it arms can never disagree.
+// The old shape-by-shape check was three hand-written criteria; each new seat
+// rule (factor 1, a member with no seat at all, a set that shrank) had to add
+// its own, and a criterion that the re-layout did not actually fix kept firing.
+//
+// The even-pool gate is applied HERE because this is the only automatic arming
+// path: gating one criterion elsewhere would leave the others to re-arm the
+// replan immediately (DESIGN §4.5 偶数闸作用域).
+func (t *Table) layoutStale() bool {
+	if !t.gateOpen() {
 		return false
 	}
-	planned := PlanSlots(nodes, t.SlotCount, t.Replicas)
-	prescribed := make(map[string]bool, len(nodes))
-	for _, p := range planned {
-		for _, r := range p.Replicas {
-			prescribed[r] = true
-		}
-	}
-	seated := make(map[string]bool, len(nodes))
-	for _, p := range t.Slots {
-		if p.State != SlotStable {
-			continue
-		}
-		for _, r := range p.Replicas {
-			seated[r] = true
-		}
-	}
-	for id := range prescribed {
-		if !seated[id] {
-			return true
-		}
-	}
-	if t.Replicas != 1 {
-		return false
-	}
-	for s, p := range t.Slots {
-		if p.State != SlotStable {
-			continue
-		}
-		if want := planned[s]; want != nil && p.Leader != want.Leader {
-			return true
-		}
-	}
-	return false
+	return !t.DesiredSeats().Empty()
 }
 
 // applyReplanSlots re-derives the slot layout on the current member directory:
@@ -457,14 +582,15 @@ func (t *Table) applyReplanSlots() bool {
 	if len(nodes) == 0 {
 		return false
 	}
-	planned := PlanSlots(nodes, t.SlotCount, t.Replicas)
-	stale := t.layoutStale()
+	planned := t.planSlots(nodes)
+	plan := t.DesiredSeats()
 	changed := false
+	membersMoved := !sameMembers(t.PlanMembers, nodes)
 	for s, p := range planned {
 		cur, ok := t.Slots[s]
 		if !ok {
 			// A slot the table assigns for the first time gets the ring's own
-			// seats, so they read as load like any other ring grant.
+			// seats, so they read as load like any other first plan.
 			stampRingGrants(p)
 			t.Slots[s] = p
 			changed = true
@@ -487,35 +613,41 @@ func (t *Table) applyReplanSlots() bool {
 			cur.Epoch++
 			changed = true
 		}
-		if !stale {
+	}
+	// Seats come from the minimal-movement plan, not from the ring: the ring
+	// re-derives every set, which is right for a first plan and wrong for a
+	// membership change (it would move ~K·RF/N seats instead of the deficit).
+	// A re-seat never REMOVES a seat — the mirror direction is the reclaim
+	// round, which runs against real copies (surplusSeatForReplan) once the
+	// kept copies are in sync; dropping a seat here would take the slot's only
+	// caught-up copy out of the set while the replacement was still empty.
+	slotIDs := make([]int32, 0, len(plan.Add))
+	for s := range plan.Add {
+		slotIDs = append(slotIDs, s)
+	}
+	sort.Slice(slotIDs, func(i, j int) bool { return slotIDs[i] < slotIDs[j] })
+	for _, s := range slotIDs {
+		cur, ok := t.Slots[s]
+		if !ok || cur.State != SlotStable {
 			continue
 		}
-		grown := unionReplicas(cur.Replicas, p.Replicas)
-		if len(grown) != len(cur.Replicas) {
-			// Label what this replan grants: running while the member
-			// directory differs from the one the last plan ran under, every
-			// seat it adds is the ring settling a new set of members (a join,
-			// a rejoin, a departure that re-spread the shares) — load, and the
-			// whole ring has to converge, so it all leads. Only a replan under
-			// an unchanged directory adds pure redundancy.
-			kind := SeatGrantFactor
-			if !sameMembers(t.PlanMembers, nodes) {
-				kind = SeatGrantRing
+		kind := SeatGrantFactor
+		if membersMoved {
+			kind = SeatGrantRing
+		}
+		if cur.SeatGrant == nil {
+			cur.SeatGrant = map[string]string{}
+		}
+		for _, add := range plan.Add[s] {
+			if replicaListHas(cur.Replicas, add) {
+				continue
 			}
-			if cur.SeatGrant == nil {
-				cur.SeatGrant = map[string]string{}
-			}
-			for _, r := range grown {
-				if containsNode(cur.Replicas, r) {
-					continue
-				}
-				cur.SeatGrant[r] = kind
-			}
-			cur.Replicas = grown
+			cur.Replicas = append(cur.Replicas, add)
+			cur.SeatGrant[add] = kind
 			changed = true
 		}
 	}
-	if !sameMembers(t.PlanMembers, nodes) {
+	if membersMoved {
 		t.PlanMembers = append([]string(nil), t.HostingIDs()...) // full pool (see OpPlanSlots)
 		changed = true
 	}
@@ -534,6 +666,233 @@ func unionReplicas(cur, want []string) []string {
 		}
 	}
 	return out
+}
+
+// refillAfterLeave re-seats the slots a just-removed member held, exactly as
+// far as the factor needs (DESIGN §4.5 删除成员 ③): each short slot takes the
+// candidate carrying the fewest seats that is not already in the set (the
+// replica set never names a node twice, and the leader is a set member, so the
+// "not co-located with the leader" rule is the same check).
+//
+// Deterministic by construction: the seat census is taken once, slots are
+// visited by ascending id and candidates by sorted id, so every node replaying
+// the leave command computes the same seats. Only the slots that lost a seat
+// are visited — this is a re-fill, not the layout re-plan, and it never
+// touches a slot the departed node was not part of.
+func (t *Table) refillAfterLeave() {
+	nodes := t.planCandidates()
+	if len(nodes) == 0 {
+		return // nothing to seat on; the slot is re-seated when a data node joins
+	}
+	want := t.Replicas
+	if len(nodes) < want {
+		want = len(nodes) // I1a: serve with one copy per node
+	}
+	seats := make(map[string]int, len(nodes))
+	for _, id := range nodes {
+		seats[id] = 0
+	}
+	var short []int32
+	stable := 0
+	for s, p := range t.Slots {
+		for _, r := range p.Replicas {
+			if _, ok := seats[r]; ok {
+				seats[r]++
+			}
+		}
+		if p.State != SlotStable {
+			continue
+		}
+		stable++
+		if len(p.Replicas) < want {
+			short = append(short, s)
+		}
+	}
+	sort.Slice(short, func(i, j int) bool { return short[i] < short[j] })
+	if len(short) == 0 {
+		return
+	}
+
+	// The leave has to land on the layout the next replan would compute, or the
+	// removal arms one more round of movement — and on an even pool that round
+	// really runs, moving seats nobody asked to move. "The replan's layout" for a
+	// census is exact, not greedy: the total is fixed at stable × want, so every
+	// node lands on floor and the remainder goes to the nodes already carrying
+	// the most (that is the smallest movement). A plain "fewest seats first" fill
+	// drifts by one on every tie and leaves the table stale.
+	total := stable * want
+	base, rem := total/len(nodes), total%len(nodes)
+	bySeats := append([]string(nil), nodes...)
+	sort.SliceStable(bySeats, func(i, j int) bool {
+		if seats[bySeats[i]] != seats[bySeats[j]] {
+			return seats[bySeats[i]] > seats[bySeats[j]]
+		}
+		return bySeats[i] < bySeats[j]
+	})
+	quota := make(map[string]int, len(nodes))
+	for _, id := range nodes {
+		quota[id] = base
+	}
+	for i := 0; i < rem; i++ {
+		quota[bySeats[i]]++
+	}
+
+	// Each node's remaining claim on the freed seats. Spending this counter (not
+	// a live "who is emptiest" comparison) is what makes the result exact: a
+	// greedy compare re-picks the same node whenever its gap ties with another,
+	// which is how a leave ends up one seat short and arms a replan.
+	demand := make(map[string]int, len(nodes))
+	for _, id := range nodes {
+		if d := quota[id] - seats[id]; d > 0 {
+			demand[id] = d
+		}
+	}
+	added := make(map[int32][]string, len(short))
+	for _, s := range short {
+		p := t.Slots[s]
+		for len(p.Replicas) < want {
+			pick := ""
+			for _, id := range nodes {
+				if replicaListHas(p.Replicas, id) || demand[id] <= 0 {
+					continue
+				}
+				if pick == "" || demand[id] > demand[pick] || (demand[id] == demand[pick] && id < pick) {
+					pick = id
+				}
+			}
+			if pick == "" {
+				// Every claim is spent (or the holder already seats this slot):
+				// complete the set from the emptiest remaining node so the factor
+				// never dips, even if that leaves the census one off.
+				for _, id := range nodes {
+					if replicaListHas(p.Replicas, id) {
+						continue
+					}
+					if pick == "" || seats[id] < seats[pick] {
+						pick = id
+					}
+				}
+			}
+			if pick == "" {
+				break
+			}
+			p.Replicas = append(p.Replicas, pick)
+			if p.SeatGrant == nil {
+				p.SeatGrant = map[string]string{}
+			}
+			p.SeatGrant[pick] = SeatGrantRing
+			added[s] = append(added[s], pick)
+			seats[pick]++
+			if demand[pick] > 0 {
+				demand[pick]--
+			}
+		}
+	}
+
+	// A claim can be unreachable for the slots that are short: the last slot may
+	// already seat the only node still owed one, and every established seat the
+	// over-quota node holds may be a leadership or a co-seat with the starved one.
+	// Even it out here, because the alternative is leaving the census off by one
+	// and arming a replan the operator never asked for. Order matters: a seat this
+	// refill just added (a new follower, nothing to move) first, then an
+	// established follower seat, and only then a leader's seat — that last case
+	// hands leadership to another copy of the same slot first (metadata only, the
+	// epoch bump is the fence), which is the same hand-over the rebalancer would
+	// have performed a round later.
+	for pass := 0; pass < len(short); pass++ {
+		rich, poor := "", ""
+		for _, id := range nodes {
+			if seats[id] > quota[id] && (rich == "" || seats[id] > seats[rich]) {
+				rich = id
+			}
+			if seats[id] < quota[id] && (poor == "" || seats[id] < seats[poor]) {
+				poor = id
+			}
+		}
+		if rich == "" || poor == "" {
+			break
+		}
+		swap := func(s int32, mayMoveLeader bool) bool {
+			p := t.Slots[s]
+			if p == nil || p.State != SlotStable {
+				return false
+			}
+			if !replicaListHas(p.Replicas, rich) || replicaListHas(p.Replicas, poor) {
+				return false
+			}
+			if p.Leader == rich {
+				if !mayMoveLeader {
+					return false
+				}
+				next := ""
+				for _, r := range p.Replicas {
+					if r != rich {
+						next = r
+						break
+					}
+				}
+				if next == "" {
+					return false
+				}
+				p.Leader = next
+				p.Epoch++
+			}
+			for i, r := range p.Replicas {
+				if r == rich {
+					p.Replicas[i] = poor
+					break
+				}
+			}
+			if p.SeatGrant != nil {
+				delete(p.SeatGrant, rich)
+				p.SeatGrant[poor] = SeatGrantRing
+			}
+			seats[rich]--
+			seats[poor]++
+			return true
+		}
+		ordered := func() []int32 {
+			out := make([]int32, 0, len(t.Slots))
+			for s := range t.Slots {
+				out = append(out, s)
+			}
+			sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+			return out
+		}
+		done := false
+		// 1) seats this refill added.
+		fresh := make([]int32, 0, len(added))
+		for s := range added {
+			fresh = append(fresh, s)
+		}
+		sort.Slice(fresh, func(i, j int) bool { return fresh[i] < fresh[j] })
+		for _, s := range fresh {
+			if swap(s, false) {
+				done = true
+				break
+			}
+		}
+		// 2) established follower seats, then 3) leader seats.
+		if !done {
+			for _, s := range ordered() {
+				if swap(s, false) {
+					done = true
+					break
+				}
+			}
+		}
+		if !done {
+			for _, s := range ordered() {
+				if swap(s, true) {
+					done = true
+					break
+				}
+			}
+		}
+		if !done {
+			break
+		}
+	}
 }
 
 // surplusSeatForReplan picks the seat a re-layout may drop once the kept copies
@@ -570,6 +929,12 @@ type LeaderMove struct {
 	Slot int32
 	From string
 	To   string
+	// Balance marks a move whose only purpose is the leader census (DESIGN
+	// §4.5 I2): the target already holds a seat, and the move happens only when
+	// that copy is CAUGHT UP. A balancing move never stages a new copy and never
+	// repairs a diverged one — it costs a fence, not a slot transfer, which is
+	// the whole reason it may run on its own schedule.
+	Balance bool
 }
 
 // PlanLeaderRebalance computes the leader layout the ring policy prescribes
@@ -599,6 +964,11 @@ type LeaderMove struct {
 // Non-stable slots are owned by a live migration — never touched.
 func PlanLeaderRebalance(t *Table) []LeaderMove {
 	nodes := t.OnlinePeerIDs()
+	// Leadership targets come from the same plan the seats do (DESIGN §4.5):
+	// balancing seats against one anchor and leaders against another is how a
+	// cluster ends up chasing its own layout every round.
+	plan := t.DesiredSeats()
+	lead, leadBalance := plan.Lead, plan.LeadBalance
 	// The ring half of the plan needs two live hosts to have anything to
 	// say (one candidate = it already leads what it leads). The DRAIN half
 	// does not: when the pool shrinks to "only the node being drained is
@@ -649,11 +1019,24 @@ func PlanLeaderRebalance(t *Table) []LeaderMove {
 		if drainPool {
 			continue // non-draining leader, ring has no say at pool size 1
 		}
-		want := nodes[int(s)%len(nodes)]
+		// The anchor is the seat plan, not the ring: the target replica sets
+		// are the ones DesiredSeats laid out, so the leader it wants is a member
+		// of the set by construction (the ring's pick often is not any more).
+		// Only the plan speaks. The ring used to be the fallback anchor, and it
+		// cannot be any more: the ring names a leader for every slot, the plan
+		// only names the ones that must move, and the two disagree the moment
+		// replica sets stop matching the ring — which is the normal state under
+		// minimal movement. Keeping the ring as a fallback made the two chase
+		// each other (a balancing hand-over on slot s, then the ring pulling it
+		// back next round, forever).
+		want := lead[s]
+		if want == "" {
+			continue
+		}
 		if p.Leader == want || !replicaListHas(p.Replicas, want) {
 			continue
 		}
-		out = append(out, LeaderMove{Slot: s, From: p.Leader, To: want})
+		out = append(out, LeaderMove{Slot: s, From: p.Leader, To: want, Balance: leadBalance[s]})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Slot < out[j].Slot })
 	return out
@@ -715,6 +1098,18 @@ const (
 	// the layout feed) reads one cluster-wide value instead of whichever
 	// voter happens to be leading.
 	OpSetTopology = "set_topology"
+	// OpSetGroup switches the served slot generation (DESIGN §4.5, §7.2.7). The
+	// controller refuses it while the current generation holds records — the
+	// segment migration has to move them first — so a committed OpSetGroup is
+	// always a switch from an empty segment to a fresh one. Apply re-plans the
+	// new segment and bumps LayoutEpoch, which is what clients compare against.
+	OpSetGroup = "set_group"
+	// OpStageGroup plans the DESTINATION segment of a generation migration
+	// (DESIGN §4.5.8) without switching to it: the slots appear in the table as
+	// importing_in — they have a leader and can take replayed records, but the
+	// routing still names the current segment, so no client can reach them yet.
+	// The switch itself is still OpSetGroup, taken once the replay has landed.
+	OpStageGroup = "stage_group"
 )
 
 // Command is one replicated metadata mutation.
@@ -731,6 +1126,13 @@ type Command struct {
 	NewLeader   string    `json:"new_leader,omitempty"`
 	State       SlotState `json:"state,omitempty"`
 	MigratingTo string    `json:"migrating_to,omitempty"`
+	// GroupGen / GroupBase / GroupSize carry the slot generation when the
+	// FIRST plan (bootstrap) establishes it. A zero GroupSize means "no
+	// generation here": a replan never changes the served generation, and a
+	// later switch is an OpSetGroup's job.
+	GroupGen  int   `json:"group_gen,omitempty"`
+	GroupBase int32 `json:"group_base,omitempty"`
+	GroupSize int32 `json:"group_size,omitempty"`
 	// For OpMarkDown: the controller's per-slot failover pick (slot -> leader),
 	// computed from the replicas' reported LEOs — the freshest live replica holds
 	// what was acknowledged, and the table itself cannot know that (no offsets in
@@ -887,6 +1289,15 @@ func (t *Table) Apply(c *Command) error {
 				p.Epoch++
 			}
 		}
+		// ③ Seats the departing node held are re-filled on the same command
+		// (DESIGN §4.5 删除成员). Leaving them short would hold the replica
+		// factor down until the next layout round, and a slot that had no
+		// second copy left would be serving on one machine in the meantime.
+		// Only the slots that named the departed node are touched: no other
+		// slot moves, and this is not the layout re-plan, so it does not count
+		// against the even-pool gate (the removal itself is an operator
+		// action, and waiting for an even pool would strand a dead node).
+		t.refillAfterLeave()
 	case OpMarkDown:
 		// The liveness verdict of the controller, replicated. The directory
 		// entry STAYS (addresses and replica-set membership included): the
@@ -954,7 +1365,20 @@ func (t *Table) Apply(c *Command) error {
 		if len(nodes) == 0 {
 			return fmt.Errorf("plan_slots: no data-plane members (every directory entry is a voter)")
 		}
-		t.Slots = PlanSlots(nodes, t.SlotCount, t.Replicas)
+		// A bootstrap plan may carry the generation (Engine.SetBootGroup): apply
+		// it BEFORE laying the slots out, so the first plan covers the
+		// generation's segment instead of the whole table. Only an empty table
+		// adopts it; a replan never does.
+		if c.GroupSize > 0 && len(t.Slots) == 0 {
+			t.GroupGen, t.GroupBase, t.GroupSize = c.GroupGen, c.GroupBase, c.GroupSize
+			if t.LayoutEpoch == 0 {
+				t.LayoutEpoch = 1
+			}
+			if err := t.validateGroup(); err != nil {
+				return err
+			}
+		}
+		t.Slots = t.planSlots(nodes)
 		for _, p := range t.Slots {
 			stampRingGrants(p)
 		}
@@ -965,6 +1389,72 @@ func (t *Table) Apply(c *Command) error {
 		// new replan, every gate stuck unsettled, the drain's own handover
 		// rounds starved. Filtering changes WHO RECEIVES seats, not who the
 		// directory HOLDS.
+		t.PlanMembers = append([]string(nil), t.HostingIDs()...)
+	case OpStageGroup:
+		if c.GroupSize <= 0 {
+			return fmt.Errorf("stage_group: size %d must be positive", c.GroupSize)
+		}
+		if c.GroupSize <= t.GroupSize {
+			return fmt.Errorf("stage_group: %d is not larger than the served segment %d", c.GroupSize, t.GroupSize)
+		}
+		nodes := t.planCandidates()
+		if len(nodes) == 0 {
+			return fmt.Errorf("stage_group: no data-plane members")
+		}
+		planned := PlanSlotsInRange(nodes, c.GroupBase, c.GroupBase+c.GroupSize, t.Replicas)
+		for s, p := range planned {
+			if _, exists := t.Slots[s]; exists {
+				continue // already staged (a retried command)
+			}
+			// Importing: the slot has a writer and takes replayed records, but it
+			// is not part of the served segment, so client routing cannot find it.
+			p.State = SlotImportingIn
+			stampRingGrants(p)
+			t.Slots[s] = p
+		}
+	case OpSetGroup:
+		if c.GroupSize <= 0 {
+			return fmt.Errorf("set_group: size %d must be positive", c.GroupSize)
+		}
+		if t.GroupGen == c.GroupGen && t.GroupBase == c.GroupBase && t.GroupSize == c.GroupSize {
+			return nil // idempotent replay of the switch that already landed
+		}
+		prevGen, prevBase, prevSize := t.GroupGen, t.GroupBase, t.GroupSize
+		t.GroupGen, t.GroupBase, t.GroupSize = c.GroupGen, c.GroupBase, c.GroupSize
+		if err := t.validateGroup(); err != nil {
+			t.GroupGen, t.GroupBase, t.GroupSize = prevGen, prevBase, prevSize
+			return err
+		}
+		t.LayoutEpoch++
+		nodes := t.planCandidates()
+		if len(nodes) == 0 {
+			return fmt.Errorf("set_group: no data-plane members (every directory entry is a voter)")
+		}
+		if t.segmentStaged(c.GroupBase, c.GroupSize) {
+			// A generated migration staged this segment: its slots already hold the
+			// replayed records, so the switch PROMOTES them instead of planning a
+			// fresh layout. Re-planning here would hand each slot to whatever node
+			// the ring names now and throw away the copies the replay just wrote.
+			for s, p := range t.Slots {
+				if s >= c.GroupBase && s < c.GroupBase+c.GroupSize && p.State == SlotImportingIn {
+					p.State = SlotStable
+				}
+			}
+			// The segment being left stops being part of the table. Its data is
+			// reclaimed afterwards, slot by slot, by the retiring half of the
+			// migration (a table entry that lingered would keep the old slots in
+			// every layout computation: seat plans, reclaim, health scans).
+			for s := range t.Slots {
+				if prevSize > 0 && s >= prevBase && s < prevBase+prevSize {
+					delete(t.Slots, s)
+				}
+			}
+		} else {
+			t.Slots = t.planSlots(nodes)
+			for _, p := range t.Slots {
+				stampRingGrants(p)
+			}
+		}
 		t.PlanMembers = append([]string(nil), t.HostingIDs()...)
 	case OpReplanSlots:
 		// Converge the layout on the current member directory: fill in any

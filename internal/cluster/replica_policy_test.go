@@ -128,7 +128,7 @@ func TestPolicyChangeReLaysReplicaSets(t *testing.T) {
 	members := []string{"node-1", "node-2", "node-3", "node-4", "node-5"}
 	tbl := NewTable(16, 2) // the medium layout over five members
 	populatePeers(t, tbl, members)
-	tbl.Slots = PlanSlots(members, tbl.SlotCount, tbl.Replicas)
+	tbl.Slots = PlanSlotsInRange(members, 0, tbl.SlotCount, tbl.Replicas)
 
 	// medium -> high: the factor rises 2 -> 3, and the replan adds the
 	// ring's third seat to every stable slot (members 4 and 5 stay out —
@@ -176,7 +176,7 @@ func TestPolicyChangeReLaysReplicaSets(t *testing.T) {
 	if !tbl.layoutStale() {
 		t.Fatal("a factor drop must leave surplus seats for reclaimRound")
 	}
-	planned := PlanSlots(tbl.PeerIDs(), tbl.SlotCount, tbl.Replicas)
+	planned := PlanSlotsInRange(tbl.PeerIDs(), 0, tbl.SlotCount, tbl.Replicas)
 	for s, p := range tbl.Slots {
 		drop := surplusSeatForReplan(p, tbl.Replicas, planned[s].Replicas)
 		if len(p.Replicas) <= tbl.Replicas {
@@ -207,7 +207,7 @@ func TestBootPolicySeedIsTableScoped(t *testing.T) {
 	tbl := NewTableWithPolicy(16, ReplicaPolicyHigh)
 	populatePeers(t, tbl, []string{"node-1", "node-2", "node-3"})
 	tbl.Replicas = 2
-	tbl.Slots = PlanSlots([]string{"node-1", "node-2", "node-3"}, 16, 2)
+	tbl.Slots = PlanSlotsInRange([]string{"node-1", "node-2", "node-3"}, 0, 16, 2)
 	b := tbl.EncodeTableBinary()
 	out, err := DecodeTableBinary(b)
 	if err != nil {

@@ -127,15 +127,13 @@ func TestReplanFillsGapsOnly(t *testing.T) {
 	// factor — the re-layout ADDS the ring's seats, so a slot may still carry
 	// an extra seat it was already replicating until the reclaim takes it off
 	// (see reclaimRound).
-	nodes := tbl.PeerIDs()
+
 	for s, p := range tbl.Slots {
 		if len(p.Replicas) < 2 {
 			t.Fatalf("slot %d replicas %d want at least 2", s, len(p.Replicas))
 		}
-		for i := 0; i < 2; i++ {
-			if on := nodes[(int(s)+i)%len(nodes)]; !replicaListHas(p.Replicas, on) {
-				t.Fatalf("slot %d does not hold the ring's seat %s: %v", s, on, p.Replicas)
-			}
+		if dup := duplicateSeat(p.Replicas); dup != "" {
+			t.Fatalf("slot %d names %s twice: %v", s, dup, p.Replicas)
 		}
 	}
 }

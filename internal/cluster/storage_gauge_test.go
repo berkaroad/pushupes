@@ -35,13 +35,13 @@ func TestStorageGaugeSumsLeaderCopies(t *testing.T) {
 	// count twice).
 	selfAgg := aggInSlot(t, self, 0)
 	for v := 1; v <= 6; v++ {
-		if _, err := selfStore.Append(makeRecord(selfAgg, uint32(v), fmt.Sprintf("self-%d", v))); err != nil {
+		if _, err := selfStore.AppendRouted(makeRecord(selfAgg, uint32(v), fmt.Sprintf("self-%d", v))); err != nil {
 			t.Fatalf("append self: %v", err)
 		}
 	}
 	peerAgg := aggInSlot(t, peer, 1)
 	for v := 1; v <= 3; v++ {
-		if _, err := peerStore.Append(makeRecord(peerAgg, uint32(v), fmt.Sprintf("peer-%d", v))); err != nil {
+		if _, err := peerStore.AppendRouted(makeRecord(peerAgg, uint32(v), fmt.Sprintf("peer-%d", v))); err != nil {
 			t.Fatalf("append peer: %v", err)
 		}
 	}
@@ -50,13 +50,13 @@ func TestStorageGaugeSumsLeaderCopies(t *testing.T) {
 	// of these; the sum below must not move.
 	sharedAgg := aggInSlot(t, peer, 0)
 	for v := 1; v <= 2; v++ {
-		if _, err := peerStore.Append(makeRecord(sharedAgg, uint32(v), fmt.Sprintf("shared-%d", v))); err != nil {
+		if _, err := peerStore.AppendRouted(makeRecord(sharedAgg, uint32(v), fmt.Sprintf("shared-%d", v))); err != nil {
 			t.Fatalf("append shared: %v", err)
 		}
 	}
 	mirrorAgg := aggInSlot(t, self, 1)
 	for v := 1; v <= 4; v++ {
-		if _, err := selfStore.Append(makeRecord(mirrorAgg, uint32(v), fmt.Sprintf("mirror-%d", v))); err != nil {
+		if _, err := selfStore.AppendRouted(makeRecord(mirrorAgg, uint32(v), fmt.Sprintf("mirror-%d", v))); err != nil {
 			t.Fatalf("append mirror: %v", err)
 		}
 	}
@@ -134,7 +134,7 @@ func TestLeaderSlotBytesMasksToLedSlots(t *testing.T) {
 	for _, s := range []int32{0, 1} {
 		agg := aggInSlot(t, self, s)
 		for v := 1; v <= 3; v++ {
-			if _, err := selfStore.Append(makeRecord(agg, uint32(v), fmt.Sprintf("m-%d-%d", s, v))); err != nil {
+			if _, err := selfStore.AppendRouted(makeRecord(agg, uint32(v), fmt.Sprintf("m-%d-%d", s, v))); err != nil {
 				t.Fatalf("append slot %d: %v", s, err)
 			}
 		}

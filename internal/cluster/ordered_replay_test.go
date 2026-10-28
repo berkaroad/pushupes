@@ -80,17 +80,17 @@ func TestSequentialReplayClosesTheGap(t *testing.T) {
 	// Source layout: agg v1..v3 (seqs 1..3), partner v1..v5 (seqs 4..8),
 	// agg v4..v5 (seqs 9..10).
 	for v := uint32(1); v <= 3; v++ {
-		if _, err := srcStore.Append(rec(agg, v)); err != nil {
+		if _, err := srcStore.AppendRouted(rec(agg, v)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for v := uint32(1); v <= 5; v++ {
-		if _, err := srcStore.Append(rec(partner, v)); err != nil {
+		if _, err := srcStore.AppendRouted(rec(partner, v)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for v := uint32(4); v <= 5; v++ {
-		if _, err := srcStore.Append(rec(agg, v)); err != nil {
+		if _, err := srcStore.AppendRouted(rec(agg, v)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -153,15 +153,15 @@ func TestSequentialReplayClosesTheGap(t *testing.T) {
 		}
 	}
 
-	tgtTail, err := tgtStore.TailVersionOf(agg, 0)
+	tgtTail, err := tgtStore.TailVersionOfRouted(agg, 0)
 	if err != nil {
 		t.Fatalf("target tail after ordered replay: %v", err)
 	}
-	tgtRecs, _, err := tgtStore.ReadAggregate(agg, 1, 0, 0)
+	tgtRecs, _, err := tgtStore.ReadAggregateRouted(agg, 1, 0, 0)
 	if err != nil {
 		t.Fatalf("target read after ordered replay: %v", err)
 	}
-	srcTail, _ := srcStore.TailVersionOf(agg, 0)
+	srcTail, _ := srcStore.TailVersionOfRouted(agg, 0)
 	t.Logf("after ordered replay: target tail=%d records=%d (source tail=%d)",
 		tgtTail, len(tgtRecs), srcTail)
 

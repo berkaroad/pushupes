@@ -53,7 +53,7 @@ func TestScanHeadersMatchesFullScan(t *testing.T) {
 			AggregateID: agg, Version: 1, CommandID: fmt.Sprintf("hdr-%d", i),
 			Events: evs,
 		}
-		out, err := st.Append(rec)
+		out, err := st.AppendRouted(rec)
 		if err != nil {
 			t.Fatal(err)
 		}

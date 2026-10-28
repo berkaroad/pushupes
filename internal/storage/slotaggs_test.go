@@ -38,7 +38,7 @@ func TestAggSeqChunksAndBounds(t *testing.T) {
 	// 16 + 64 + 256 + 1024 + 1024 entries, so this crosses four boundaries.
 	const n = 2000
 	for v := uint32(1); v <= n; v++ {
-		if _, err := st.Append(&data.EventRecord{
+		if _, err := st.AppendRouted(&data.EventRecord{
 			AggregateID: agg, Version: v, CommandID: fmt.Sprintf("arena-%d", v),
 			Events: []data.Event{{Type: "t", Body: []byte("x")}},
 		}); err != nil {
@@ -92,7 +92,7 @@ func TestAggSeqChunksAndBounds(t *testing.T) {
 	twinB := ""
 	for i := 0; i < 10000 && twinB == ""; i++ {
 		cand := fmt.Sprintf("twin-%d", i)
-		if cand != twinA && data.SlotOf(cand, int(st.SlotCount)) == twin {
+		if cand != twinA && data.LogicalSlotOf(cand, int(st.SlotCount)) == twin {
 			twinB = cand
 		}
 	}
@@ -102,7 +102,7 @@ func TestAggSeqChunksAndBounds(t *testing.T) {
 	const twinVersions = 40
 	for v := 1; v <= twinVersions; v++ {
 		for _, id := range []string{twinA, twinB} {
-			if _, err := st.Append(&data.EventRecord{
+			if _, err := st.AppendRouted(&data.EventRecord{
 				AggregateID: id, Version: uint32(v), CommandID: fmt.Sprintf("twin-cmd-%s-%d", id, v),
 				Events: []data.Event{{Type: "t", Body: []byte("y")}},
 			}); err != nil {
@@ -134,7 +134,7 @@ func TestAggSeqChunksAndBounds(t *testing.T) {
 
 	// A slot that holds one record must not reserve a full-size chunk.
 	small := int32(3)
-	if _, err := st.Append(&data.EventRecord{
+	if _, err := st.AppendRouted(&data.EventRecord{
 		AggregateID: aggInSlotForTest(t, st, small), Version: 1, CommandID: "tiny",
 		Events: []data.Event{{Type: "t", Body: []byte("x")}},
 	}); err != nil {

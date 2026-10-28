@@ -40,14 +40,23 @@ import (
 
 const (
 	tableMagic = "PTAB"
-	// tableVer (v8) appends the slot commit floors (Table.CommitLEO) after
-	// the planned-member directory: the floor is the bound that holds a
-	// freshly promoted leader until its copy reaches the tail the handover
-	// confirmed — if it does not survive the snapshot, every node that
-	// restarts through one loses the bound silently (live-cluster forensics
-	// read "all floors zero" on a decoded mirror: that was this gap, not a
-	// floorless history).
-	tableVer = byte(8)
+	// tableVerGroup (v9) appends the served slot generation (Table.GroupGen /
+	// GroupBase / GroupSize / LayoutEpoch) after the commit floors: a node
+	// restored from a snapshot must route into the same generation the cluster
+	// agreed on, and a snapshot that dropped it would silently fall back to the
+	// pre-generation layout.
+	tableVerGroup = byte(9)
+	// tableVer is the record version the encoder writes.
+	tableVer = tableVerGroup
+	// tableVerFloors (v8) appends the slot commit floors (Table.CommitLEO) after
+	// the planned-member directory: the floor is the bound that holds a freshly
+	// promoted leader until its copy reaches the tail the handover confirmed —
+	// if it does not survive the snapshot, every node that restarts through one
+	// loses the bound silently (live-cluster forensics read "all floors zero" on
+	// a decoded mirror: that was this gap, not a floorless history). It stays a
+	// separate constant because the decoder's "has floors" test must not follow
+	// tableVer upward.
+	tableVerFloors = byte(8)
 	// tableVerTopology (v7) adds the cluster's consensus generation to the
 	// header (Table.Topology): a node that joins from a snapshot has to learn
 	// it, or its owner fence would compare provenance records against nothing
@@ -81,6 +90,7 @@ var stateCodes = map[SlotState]byte{
 	SlotMigratingOut: 1,
 	SlotImportingIn:  2,
 	SlotBackingUp:    3,
+	SlotSealingOut:   4,
 }
 
 func stateFromCode(c byte) (SlotState, error) {
@@ -268,6 +278,13 @@ func (t *Table) EncodeTableBinary() []byte {
 		n = binary.PutUvarint(tmp[:], t.CommitLEO[int32(s)])
 		body.Write(tmp[:n])
 	}
+	// v9: the served slot generation. All four fields are written even when the
+	// generation is off (zeros), so the record shape does not depend on state.
+	putU32(&body, uint32(t.GroupGen))
+	putU32(&body, uint32(t.GroupBase))
+	putU32(&body, uint32(t.GroupSize))
+	n = binary.PutUvarint(tmp[:], t.LayoutEpoch)
+	body.Write(tmp[:n])
 
 	var out bytes.Buffer
 	zw := gzip.NewWriter(&out)
@@ -295,7 +312,8 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 		return nil, fmt.Errorf("table: bad snapshot magic/version")
 	}
 	withTopology := hdr[4] >= tableVerTopology // v7 and later carry the generation in the header
-	withFloors := hdr[4] >= tableVer           // v8 and later carry the commit floors
+	withFloors := hdr[4] >= tableVerFloors     // v8 and later carry the commit floors
+	withGroup := hdr[4] >= tableVerGroup       // v9 and later carry the slot generation
 	policyInHeader := hdr[4] != tableVerPolicy // v4 and later carry the tier in the header
 	withGrants := hdr[4] >= tableVerGrant      // v5 and later carry the seat grants
 	var tmp4 [4]byte
@@ -533,6 +551,31 @@ func DecodeTableBinary(b []byte) (*Table, error) {
 				t.CommitLEO = map[int32]uint64{}
 			}
 			t.CommitLEO[int32(s)] = leo
+		}
+	}
+	if withGroup {
+		g, err := readU32()
+		if err != nil {
+			return nil, err
+		}
+		b, err := readU32()
+		if err != nil {
+			return nil, err
+		}
+		sz, err := readU32()
+		if err != nil {
+			return nil, err
+		}
+		epoch, err := binary.ReadUvarint(r)
+		if err != nil {
+			return nil, err
+		}
+		t.GroupGen = int(int32(g))
+		t.GroupBase = int32(b)
+		t.GroupSize = int32(sz)
+		t.LayoutEpoch = epoch
+		if err := t.validateGroup(); err != nil {
+			return nil, err
 		}
 	}
 	return t, nil

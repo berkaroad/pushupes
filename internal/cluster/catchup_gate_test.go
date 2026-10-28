@@ -79,17 +79,17 @@ func TestCatchUpGateAcceptsInvisibleRecords(t *testing.T) {
 
 	// Source: agg v1..v3, then partner v1..v5, then agg v4..v5 at the top.
 	for v := uint32(1); v <= 3; v++ {
-		if _, err := srcStore.Append(rec(agg, v)); err != nil {
+		if _, err := srcStore.AppendRouted(rec(agg, v)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for v := uint32(1); v <= 5; v++ {
-		if _, err := srcStore.Append(rec(partner, v)); err != nil {
+		if _, err := srcStore.AppendRouted(rec(partner, v)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for v := uint32(4); v <= 5; v++ {
-		if _, err := srcStore.Append(rec(agg, v)); err != nil {
+		if _, err := srcStore.AppendRouted(rec(agg, v)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -163,15 +163,15 @@ func TestCatchUpGateAcceptsInvisibleRecords(t *testing.T) {
 
 	// The observable cause: the records are on the target's disk while its
 	// directory does not serve them.
-	srcTail, err := srcStore.TailVersionOf(agg, 0)
+	srcTail, err := srcStore.TailVersionOfRouted(agg, 0)
 	if err != nil {
 		t.Fatalf("source tail: %v", err)
 	}
-	tgtTail, err := tgtStore.TailVersionOf(agg, 0)
+	tgtTail, err := tgtStore.TailVersionOfRouted(agg, 0)
 	if err != nil {
 		t.Fatalf("target tail: %v", err)
 	}
-	tgtRecs, _, err := tgtStore.ReadAggregate(agg, 1, 0, 0)
+	tgtRecs, _, err := tgtStore.ReadAggregateRouted(agg, 1, 0, 0)
 	if err != nil {
 		t.Fatalf("target read: %v", err)
 	}

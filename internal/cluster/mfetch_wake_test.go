@@ -26,7 +26,7 @@ import (
 // helpers) into store and fails the test on error.
 func appendOne(t *testing.T, store *storage.Store, agg, cmd string) {
 	t.Helper()
-	if _, err := store.Append(makeRecord(agg, 1, cmd)); err != nil {
+	if _, err := store.AppendRouted(makeRecord(agg, 1, cmd)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -207,7 +207,7 @@ func TestMFetchBurstDrainAllWaiters(t *testing.T) {
 			if sl != nil {
 				v = sl.LastVersionOf(agg) + 1
 			}
-			if _, err := store.Append(makeRecord(agg, v, fmt.Sprintf("burst-%d-%d", attempt, want))); err != nil {
+			if _, err := store.AppendRouted(makeRecord(agg, v, fmt.Sprintf("burst-%d-%d", attempt, want))); err != nil {
 				t.Fatal(err)
 			}
 		}

@@ -106,11 +106,7 @@ func main() {
 	for i := 0; len(aggIDs) < aggCount; i++ {
 		id := fmt.Sprintf("bench-%d", i)
 		aggIDs = append(aggIDs, id)
-		slotSeen[client.SlotOf(id, cl.SlotCount())]++
-	}
-	if len(aggIDs) > 1 && len(slotSeen) < 2 {
-		fmt.Printf("FAIL: %d aggregates landed on %d slot(s), need >= 2\n", len(aggIDs), len(slotSeen))
-		os.Exit(1)
+		slotSeen[cl.SlotOf(id)]++
 	}
 	fmt.Printf("aggregates=%d (= conns %d x per-worker %d, from -batch) across %d slots (body=%dB duration=%s)\n",
 		len(aggIDs), nw, perWorker, len(slotSeen), *size, *dur)

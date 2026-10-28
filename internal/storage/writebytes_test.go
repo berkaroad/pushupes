@@ -42,7 +42,7 @@ func TestWriteByteCountsTracksDurableWrites(t *testing.T) {
 	slot := st.SlotOf(rec.AggregateID)
 	wantFrame := uint64(rec.EncodedSize())
 
-	out, err := st.Append(rec)
+	out, err := st.AppendRouted(rec)
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestWriteByteCountsTracksDurableWrites(t *testing.T) {
 
 	// A rejected append (version conflict) moves no bytes.
 	conflict := recFor(rec.AggregateID, 1, "cmd-dup-version")
-	if _, err := st.Append(conflict); err != nil {
+	if _, err := st.AppendRouted(conflict); err != nil {
 		t.Fatalf("conflict append: %v", err)
 	}
 	if got := st.WriteByteCounts()[slot]; got != wantFrame {
@@ -63,7 +63,7 @@ func TestWriteByteCountsTracksDurableWrites(t *testing.T) {
 	}
 
 	// An exists replay (same command id) is not a new durable write either.
-	if _, err := st.Append(rec); err != nil {
+	if _, err := st.AppendRouted(rec); err != nil {
 		t.Fatalf("replay append: %v", err)
 	}
 	if got := st.WriteByteCounts()[slot]; got != wantFrame {
@@ -135,7 +135,7 @@ func TestClientWriteCountsOnlyClientPath(t *testing.T) {
 
 	// The client path moves both families.
 	rec := recFor("agg-client-only", 1, "cmd-c1")
-	out, err := st.Append(rec)
+	out, err := st.AppendRouted(rec)
 	if err != nil || out.Status != data.StatusSuccess {
 		t.Fatalf("client append: err=%v status=%v", err, out.Status)
 	}
@@ -170,7 +170,7 @@ func TestClientWriteCountsOnlyClientPath(t *testing.T) {
 
 	// A rejected version conflict on the client path counts nowhere — the
 	// split must not quietly become "every Append call counts".
-	if _, err := st.Append(recFor(rec.AggregateID, 1, "cmd-dup")); err != nil {
+	if _, err := st.AppendRouted(recFor(rec.AggregateID, 1, "cmd-dup")); err != nil {
 		t.Fatalf("conflict append: %v", err)
 	}
 	if st.ClientWriteCounts()[slot] != 1 || st.ClientWriteByteCounts()[slot] != uint64(rec.EncodedSize()) {
@@ -213,7 +213,7 @@ func TestDurableCountersSeededFromCopy(t *testing.T) {
 
 	rec := recFor(zzFreshSlot(st), 1, "cmd-r1")
 	s1 := st.SlotOf(rec.AggregateID)
-	if _, err := st.Append(rec); err != nil {
+	if _, err := st.AppendRouted(rec); err != nil {
 		t.Fatalf("client append: %v", err)
 	}
 	rec2 := recFor(zzFreshSlot(st, s1), 1, "cmd-r2")
@@ -277,7 +277,7 @@ func TestDurableCountersSeededFromCopy(t *testing.T) {
 	}
 	// And new frames advance FROM the seed, not beside it.
 	next := recFor(rec.AggregateID, 2, "cmd-r4")
-	if _, err := st2.Append(next); err != nil {
+	if _, err := st2.AppendRouted(next); err != nil {
 		t.Fatalf("append after reopen: %v", err)
 	}
 	if got := st2.WriteCounts()[s1]; got != beforeW[s1]+1 {

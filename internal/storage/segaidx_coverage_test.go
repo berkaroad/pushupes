@@ -38,7 +38,7 @@ func TestReloadWithoutIndexThenSealKeepsVersionsReadable(t *testing.T) {
 	const slotBytes = int64(4 << 10) // tiny segments: several seals
 	const slotCount = int32(8)
 	const agg = "agg-alpha"
-	slot := data.SlotOf(agg, int(slotCount))
+	slot := data.LogicalSlotOf(agg, int(slotCount))
 	dirName := fmt.Sprintf("slot-%03d", slot)
 
 	st, err := OpenStore(srcDir, slotCount, slotBytes, FlushPolicy{Interval: time.Millisecond})
@@ -123,7 +123,7 @@ func TestReloadWithoutIndexThenSealKeepsVersionsReadable(t *testing.T) {
 // (version 9507, only 5225 resolvable, no error).
 func TestAggregateVersionDesyncIsNotSilent(t *testing.T) {
 	st, _ := newTestStore(t, 8, DefaultSegmentBytes)
-	sl, err := st.Slot(data.SlotOf("agg-desync", 8))
+	sl, err := st.Slot(data.LogicalSlotOf("agg-desync", 8))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -123,14 +125,32 @@ func openStoreMode(dir string, slotCount int32, segmentBytes int64, flush FlushP
 		id   int32
 		path string
 	}
+	// One readdir instead of one stat per slot: the table is fixed at 2048 slots
+	// (DESIGN §7.2.7) but a node only ever holds the slots its segment assigns it
+	// — a dozen at the small generations, a few hundred at the largest, and never
+	// the whole table. Statting every id turned a handful of directories into
+	// thousands of syscalls on every start, and worse, it told the filesystem
+	// about slot ids the cluster has not used in this generation at all.
 	var tasks []task
-	for i := int32(0); i < slotCount; i++ {
-		path := st.slotDir(i)
-		if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if !strings.HasPrefix(name, "slot-") {
+				continue
+			}
+			id64, perr := strconv.ParseInt(strings.TrimPrefix(name, "slot-"), 10, 32)
+			if perr != nil || id64 < 0 || id64 >= int64(slotCount) {
+				continue
+			}
+			path := st.slotDir(int32(id64))
 			if hasWALFiles(path) {
-				tasks = append(tasks, task{i, path})
+				tasks = append(tasks, task{int32(id64), path})
 			}
 		}
+		sort.Slice(tasks, func(i, j int) bool { return tasks[i].id < tasks[j].id })
 	}
 	// Phase 2: open/rebuild them with a bounded worker pool. The first
 	// error wins; callers treat a failed open as fatal startup anyway.
@@ -309,7 +329,7 @@ func (st *Store) seedDurableCounters(s *Slot) {
 
 // SlotOf routes an aggregate ID to its slot.
 func (st *Store) SlotOf(aggregateID string) int32 {
-	return data.SlotOf(aggregateID, int(st.SlotCount))
+	return data.LogicalSlotOf(aggregateID, int(st.SlotCount))
 }
 
 // Slot returns slot i, creating its WAL lazily.
@@ -348,9 +368,11 @@ func (st *Store) SlotIfLoaded(i int32) (*Slot, error) {
 	return st.slots[i].Load(), nil
 }
 
-// Append routes by aggregate_id and applies the business rules.
-func (st *Store) Append(rec *data.EventRecord) (*AppendOutcome, error) {
-	slotID := st.SlotOf(rec.AggregateID)
+// AppendToSlot writes one record into a specific slot. The slot is decided by
+// the caller — the cluster routes by the served slot generation (DESIGN §4.5) —
+// and never by the store: a store-side route would write a different slot than
+// the one the engine fenced, checked for emptiness and waited a watermark on.
+func (st *Store) AppendToSlot(slotID int32, rec *data.EventRecord) (*AppendOutcome, error) {
 	slot, err := st.Slot(slotID)
 	if err != nil {
 		return nil, err
@@ -364,6 +386,19 @@ func (st *Store) Append(rec *data.EventRecord) (*AppendOutcome, error) {
 		st.markDirty(slotID)
 	}
 	return out, err
+}
+
+// AppendRouted is the FLAT-route convenience for tests and tooling: it routes by
+// data.SlotOf over the whole table and delegates to AppendToSlot.
+//
+// The engine must never call it — nor any other *Routed helper below. A
+// production write already carries the slot the served generation chose, and a
+// store that re-derives it writes into a different slot than the one the engine
+// fenced and waited a watermark on (that mismatch is what made a whole cluster's
+// writes time out at 1007 during the generation rollout). The discipline is
+// enforced by TestEngineNeverUsesFlatRouting in internal/cluster.
+func (st *Store) AppendRouted(rec *data.EventRecord) (*AppendOutcome, error) {
+	return st.AppendToSlot(st.SlotOf(rec.AggregateID), rec)
 }
 
 // AppendAtSeq writes a leader-assigned record into a specific slot (replica
@@ -599,9 +634,10 @@ func (st *Store) ClientWriteByteCounts() []uint64 {
 
 // ReadAggregate reads up to limit records of one aggregate from a version,
 // capped at uptoSeq (0 = LEO). Returns records, their seqs, and the next
-// version to read.
-func (st *Store) ReadAggregate(aggregateID string, fromVersion uint32, limit, uptoSeq uint64) ([]*data.EventRecord, []uint64, error) {
-	slot, err := st.Slot(st.SlotOf(aggregateID))
+// version to read. The slot is the caller's — routing belongs to the cluster
+// (the served generation), never to the store.
+func (st *Store) ReadAggregate(slotID int32, aggregateID string, fromVersion uint32, limit, uptoSeq uint64) ([]*data.EventRecord, []uint64, error) {
+	slot, err := st.Slot(slotID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -609,13 +645,23 @@ func (st *Store) ReadAggregate(aggregateID string, fromVersion uint32, limit, up
 	return recs, seqs, err
 }
 
+// ReadAggregateRouted is the flat-route convenience for tests and tooling.
+func (st *Store) ReadAggregateRouted(aggregateID string, fromVersion uint32, limit, uptoSeq uint64) ([]*data.EventRecord, []uint64, error) {
+	return st.ReadAggregate(st.SlotOf(aggregateID), aggregateID, fromVersion, limit, uptoSeq)
+}
+
 // RecordByCommand looks a record up by idempotency key (within its slot).
-func (st *Store) RecordByCommand(aggregateID, commandID string) (*data.EventRecord, uint64, error) {
-	slot, err := st.Slot(st.SlotOf(aggregateID))
+func (st *Store) RecordByCommand(slotID int32, aggregateID, commandID string) (*data.EventRecord, uint64, error) {
+	slot, err := st.Slot(slotID)
 	if err != nil {
 		return nil, 0, err
 	}
 	return slot.RecordByCommand(commandID)
+}
+
+// RecordByCommandRouted is the flat-route convenience for tests and tooling.
+func (st *Store) RecordByCommandRouted(aggregateID, commandID string) (*data.EventRecord, uint64, error) {
+	return st.RecordByCommand(st.SlotOf(aggregateID), aggregateID, commandID)
 }
 
 // TailVersionOf returns the latest version of one aggregate that is visible
@@ -628,12 +674,17 @@ func (st *Store) RecordByCommand(aggregateID, commandID string) (*data.EventReco
 // seq exceeds uptoSeq, so a partially visible tail reports exactly the same
 // value a bounded ReadStream would return rather than an unclipped directory
 // count. 0 means "no records visible".
-func (st *Store) TailVersionOf(aggregateID string, uptoSeq uint64) (uint32, error) {
-	slot, err := st.Slot(st.SlotOf(aggregateID))
+func (st *Store) TailVersionOf(slotID int32, aggregateID string, uptoSeq uint64) (uint32, error) {
+	slot, err := st.Slot(slotID)
 	if err != nil {
 		return 0, err
 	}
 	return slot.TailVersion(aggregateID, uptoSeq)
+}
+
+// TailVersionOfRouted is the flat-route convenience for tests and tooling.
+func (st *Store) TailVersionOfRouted(aggregateID string, uptoSeq uint64) (uint32, error) {
+	return st.TailVersionOf(st.SlotOf(aggregateID), aggregateID, uptoSeq)
 }
 
 // VersionAtOrBeforeTime returns the highest version of one aggregate whose
@@ -642,12 +693,17 @@ func (st *Store) TailVersionOf(aggregateID string, uptoSeq uint64) (uint32, erro
 // slot's durable LEO). This is the point-in-time anchor behind the gRPC
 // ReadVersionByTime: a client resolves the version, then replays with
 // ReadAggregate.
-func (st *Store) VersionAtOrBeforeTime(aggregateID string, beforeOrAtUnix int64, uptoSeq uint64) (uint32, error) {
-	slot, err := st.Slot(st.SlotOf(aggregateID))
+func (st *Store) VersionAtOrBeforeTime(slotID int32, aggregateID string, beforeOrAtUnix int64, uptoSeq uint64) (uint32, error) {
+	slot, err := st.Slot(slotID)
 	if err != nil {
 		return 0, err
 	}
 	return slot.VersionAtOrBeforeTime(aggregateID, beforeOrAtUnix, uptoSeq)
+}
+
+// VersionAtOrBeforeTimeRouted is the flat-route convenience for tests and tooling.
+func (st *Store) VersionAtOrBeforeTimeRouted(aggregateID string, beforeOrAtUnix int64, uptoSeq uint64) (uint32, error) {
+	return st.VersionAtOrBeforeTime(st.SlotOf(aggregateID), aggregateID, beforeOrAtUnix, uptoSeq)
 }
 
 // VersionOf reports one aggregate's claimed chain tail (0 when unknown).

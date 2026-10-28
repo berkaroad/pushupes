@@ -26,7 +26,7 @@ import (
 // version+1, so callers walk them in order).
 func appendVersion(t *testing.T, st *Store, agg string, version uint32, cmd string) {
 	t.Helper()
-	if _, err := st.Append(&data.EventRecord{
+	if _, err := st.AppendRouted(&data.EventRecord{
 		AggregateID: agg, Version: version, CommandID: cmd,
 		Events: []data.Event{{Type: "t", Body: []byte("x")}},
 	}); err != nil {
@@ -352,11 +352,11 @@ func TestStreamPageReportsLastUnix(t *testing.T) {
 	agg := aggInSlotForTest(t, st, slot)
 	other := nextAggInSlot(t, st, slot, agg)
 	for v := uint32(1); v <= 5; v++ {
-		if _, err := st.Append(recAt(agg, v, int64(1700000000+v))); err != nil {
+		if _, err := st.AppendRouted(recAt(agg, v, int64(1700000000+v))); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := st.Append(recAt(other, 1, 1700000999)); err != nil {
+	if _, err := st.AppendRouted(recAt(other, 1, 1700000999)); err != nil {
 		t.Fatal(err)
 	}
 

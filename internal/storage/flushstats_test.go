@@ -52,7 +52,7 @@ func TestFlushStatsTracksDirtyAndFsyncs(t *testing.T) {
 
 	rec := recFor("agg-flushstats", 1, "cmd-1")
 	slot := st.SlotOf(rec.AggregateID)
-	out, err := st.Append(rec)
+	out, err := st.AppendRouted(rec)
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestFlushStatsBusySlotIsReportedNotWaitedOn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("slot: %v", err)
 	}
-	if _, err := st.Append(rec); err != nil {
+	if _, err := st.AppendRouted(rec); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 
@@ -155,7 +155,7 @@ func TestFlushStatsExposureClockRestarts(t *testing.T) {
 	}
 	for i := 0; i < 3; i++ {
 		rec := recFor("agg-exposure", uint32(i+1), fmt.Sprintf("cmd-exposure-%d", i))
-		if _, err := st.Append(rec); err != nil {
+		if _, err := st.AppendRouted(rec); err != nil {
 			t.Fatalf("append %d: %v", i, err)
 		}
 		if got := st.FlushStats(); got.OldestUnflushedAgeS <= 0 {

@@ -112,7 +112,7 @@ func TestBloomWatermarkSurvivesReopen(t *testing.T) {
 	st := openStoreAt(t, dir)
 	slot := st.SlotOf(agg)
 	for i := 0; i < copies; i++ {
-		if _, err := st.Append(&data.EventRecord{
+		if _, err := st.AppendRouted(&data.EventRecord{
 			AggregateID: agg, Version: uint32(i + 1),
 			CommandID: fmt.Sprintf("%s-cmd-%d", agg, i),
 			Events:    []data.Event{{Type: "E", Body: []byte("x")}},

@@ -30,7 +30,7 @@ func seeded() *Config {
 	c.FlushMessages = 1000
 	c.FlushInterval = 100 * time.Millisecond
 	c.FlushParallelism = 1
-	c.SlotCount = 1024
+	c.SlotCount = 2048
 	c.RaftFlushInterval = 100 * time.Millisecond
 	c.RaftSegmentBytes = 64 << 20
 	return c

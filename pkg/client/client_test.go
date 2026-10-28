@@ -55,7 +55,15 @@ type fakeNode struct {
 func (f *fakeNode) PrefetchRoutes(_ context.Context, _ *pushupesv1.PrefetchRoutesRequest) (*pushupesv1.PrefetchRoutesResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := &pushupesv1.PrefetchRoutesResponse{NodeClientAddrs: append([]string{}, f.addrs...)}
+	out := &pushupesv1.PrefetchRoutesResponse{
+		NodeClientAddrs: append([]string{}, f.addrs...),
+		// A table always serves a segment; this fixture serves the zero-based one
+		// (the whole 8-slot table), which keeps the per-slot expectations intact.
+		GroupGen:    -1,
+		GroupBase:   0,
+		GroupSize:   8,
+		LayoutEpoch: 1,
+	}
 	for slot := int32(0); slot < 8; slot++ {
 		out.SlotNodeIndex = append(out.SlotNodeIndex, int32(f.leaders[slot]))
 	}
@@ -109,7 +117,7 @@ func (f *fakeNode) ReadTails(_ context.Context, req *pushupesv1.ReadTailsRequest
 	out := &pushupesv1.ReadTailsResponse{}
 	for _, id := range req.AggregateIds {
 		res := &pushupesv1.ReadTailsResult{AggregateId: id}
-		if slot := SlotOf(id, 8); leaders[slot] != f.idx {
+		if slot := LogicalSlotOf(id, 8); leaders[slot] != f.idx {
 			res.ErrId = ErrIDSlotNotLocal
 			res.Slot = slot
 			res.Node = f.addrs[leaders[slot]]
@@ -224,7 +232,7 @@ func TestClientFlowControlRetriesUntilClean(t *testing.T) {
 }
 
 // TestClientFlowControlGateIsPerNode proves the pause is scoped to the
-// throttled node: while node 0 (slot 0 leader, "a-*" aggregates) is in
+// throttled node: while node 0 (slot 2 leader, "bench-0" aggregate) is in
 // backpressure, writes routed to node 1 (slot 1 leader, "b-*" aggregates)
 // must flow through untouched — a gate is one node's ledger, and parking
 // a healthy node's writers would turn one throttle into a client-wide
@@ -233,11 +241,11 @@ func TestClientFlowControlGateIsPerNode(t *testing.T) {
 	nodes, addrs := fakeCluster(t, 2)
 	// pick two aggregates whose slots land on DIFFERENT nodes, then the
 	// throttled node is A's leader, wherever the table puts it.
-	if SlotOf("a-x", 8)%2 == SlotOf("b-x", 8)%2 {
-		t.Fatalf("fixture assumption broken: a-x slot %d, b-x slot %d share a node", SlotOf("a-x", 8), SlotOf("b-x", 8))
+	if LogicalSlotOf("a-x", 8)%2 == LogicalSlotOf("b-x", 8)%2 {
+		t.Fatalf("fixture assumption broken: a-x slot %d, b-x slot %d share a node", LogicalSlotOf("a-x", 8), LogicalSlotOf("b-x", 8))
 	}
-	a := nodes[SlotOf("a-x", 8)%2] // the throttled node (A's leader)
-	b := nodes[SlotOf("b-x", 8)%2] // the healthy node (B's leader)
+	a := nodes[LogicalSlotOf("a-x", 8)%2] // the throttled node (A's leader)
+	b := nodes[LogicalSlotOf("b-x", 8)%2] // the healthy node (B's leader)
 	a.onAppend = func(n int, req *pushupesv1.BatchAppendRequest) *pushupesv1.BatchAppendResponse {
 		return throttleResp(req) // A's node never recovers during the window
 	}
@@ -310,7 +318,7 @@ func TestClientFlowControlGateIsPerNode(t *testing.T) {
 // this test, not by accident of grouping.
 func TestClientBatchAppendSendsNodesConcurrently(t *testing.T) {
 	nodes, addrs := fakeCluster(t, 2)
-	a, b := nodes[SlotOf("a-x", 8)%2], nodes[SlotOf("b-x", 8)%2]
+	a, b := nodes[LogicalSlotOf("a-x", 8)%2], nodes[LogicalSlotOf("b-x", 8)%2]
 	var bMu sync.Mutex
 	var tB time.Time
 	a.onAppend = func(n int, req *pushupesv1.BatchAppendRequest) *pushupesv1.BatchAppendResponse {
@@ -475,8 +483,8 @@ func TestClientSeedsRoutingAndWritesLeadersDirectly(t *testing.T) {
 	if got := c.SlotCount(); got != 8 {
 		t.Fatalf("slot count: %d, want 8 (the answer's length is the count)", got)
 	}
-	// "a" -> slot SlotOf("a",8)=0 -> node 0; "agg-1" -> slot 7 -> node 1.
-	recs := []*pushupesv1.AppendRequest{rec("a"), rec("agg-1")}
+	// "bench-0" -> slot FlatSlotOf("bench-0",8)=2 -> node 0; "agg-1" -> slot 7 -> node 1.
+	recs := []*pushupesv1.AppendRequest{rec("bench-0"), rec("agg-1")}
 	resps, err := c.BatchAppend(context.Background(), recs)
 	if err != nil {
 		t.Fatal(err)
@@ -487,7 +495,7 @@ func TestClientSeedsRoutingAndWritesLeadersDirectly(t *testing.T) {
 		}
 	}
 	// one RPC per leader, each carrying exactly its routed record
-	if got := nodes[0].calls(); len(got) != 1 || len(got[0].Records) != 1 || got[0].Records[0].AggregateId != "a" {
+	if got := nodes[0].calls(); len(got) != 1 || len(got[0].Records) != 1 || got[0].Records[0].AggregateId != "bench-0" {
 		t.Fatalf("node0 calls: %+v", got)
 	}
 	if got := nodes[1].calls(); len(got) != 1 || len(got[0].Records) != 1 || got[0].Records[0].AggregateId != "agg-1" {
@@ -500,7 +508,7 @@ func TestClientSeedsRoutingAndWritesLeadersDirectly(t *testing.T) {
 
 func TestClientFollowsMovedPatchesRow(t *testing.T) {
 	nodes, addrs := fakeCluster(t, 2)
-	// node 0 answers slot 0's write with MOVED -> node 1, exactly once.
+	// node 0 answers slot 2's write with MOVED -> node 1, exactly once.
 	nodes[0].mu.Lock()
 	nodes[0].onAppend = func(n int, req *pushupesv1.BatchAppendRequest) *pushupesv1.BatchAppendResponse {
 		if n == 0 {
@@ -525,7 +533,7 @@ func TestClientFollowsMovedPatchesRow(t *testing.T) {
 	}
 	defer c.Close()
 
-	resps, err := c.BatchAppend(context.Background(), []*pushupesv1.AppendRequest{rec("a")})
+	resps, err := c.BatchAppend(context.Background(), []*pushupesv1.AppendRequest{rec("bench-0")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,7 +545,7 @@ func TestClientFollowsMovedPatchesRow(t *testing.T) {
 	}
 	// the patched row held: a second write lands on node 1 without node 0
 	// seeing it at all
-	if _, err := c.BatchAppend(context.Background(), []*pushupesv1.AppendRequest{rec("a")}); err != nil {
+	if _, err := c.BatchAppend(context.Background(), []*pushupesv1.AppendRequest{rec("bench-0")}); err != nil {
 		t.Fatal(err)
 	}
 	if len(nodes[0].calls()) != 1 {
@@ -580,7 +588,7 @@ func TestClientRedirectExhaustedAnswersNil(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	resps, _ := c.BatchAppend(context.Background(), []*pushupesv1.AppendRequest{rec("a")})
+	resps, _ := c.BatchAppend(context.Background(), []*pushupesv1.AppendRequest{rec("bench-0")})
 	if resps[0] != nil {
 		t.Fatalf("exhausted retries must answer nil, got %+v", resps[0])
 	}
@@ -673,16 +681,16 @@ func TestClientReadRedirectFollow(t *testing.T) {
 	nodes[0].onReadStream = func(n int, req *pushupesv1.ReadStreamRequest) *pushupesv1.ReadStreamResponse {
 		if n == 1 {
 			return &pushupesv1.ReadStreamResponse{
-				ErrId: ErrIDSlotNotLocal, Slot: SlotOf("a", 8), Node: addrs[1],
+				ErrId: ErrIDSlotNotLocal, Slot: LogicalSlotOf("a", 8), Node: addrs[1],
 			}
 		}
 		return nil
 	}
-	rs, err := c.ReadStream(context.Background(), "a", 1, 0)
+	rs, err := c.ReadStream(context.Background(), "bench-0", 1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rs.ErrId != 0 || len(rs.Records) != 1 || rs.Records[0].AggregateId != "a" {
+	if rs.ErrId != 0 || len(rs.Records) != 1 || rs.Records[0].AggregateId != "bench-0" {
 		t.Fatalf("read did not self-heal: %+v", rs)
 	}
 	if nodes[0].readCalls != 1 || nodes[1].readCalls != 1 {
@@ -710,7 +718,7 @@ func TestClientReadRedirectExhausted(t *testing.T) {
 			return &pushupesv1.ReadStreamResponse{ErrId: ErrIDSlotNotLocal, Node: other}
 		}
 	}
-	if _, err := c.ReadStream(context.Background(), "a", 1, 0); err == nil {
+	if _, err := c.ReadStream(context.Background(), "bench-0", 1, 0); err == nil {
 		t.Fatal("an exhausted redirect loop must answer an error, not a response")
 	}
 }
@@ -764,7 +772,7 @@ func TestClientConnsAreShared(t *testing.T) {
 	}
 	defer c.Close()
 	before := len(c.conns)
-	if _, err := c.BatchAppend(context.Background(), []*pushupesv1.AppendRequest{rec("a")}); err != nil {
+	if _, err := c.BatchAppend(context.Background(), []*pushupesv1.AppendRequest{rec("bench-0")}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.ReadTails(context.Background(), []string{"a"}); err != nil {

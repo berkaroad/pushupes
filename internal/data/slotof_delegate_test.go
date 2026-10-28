@@ -21,16 +21,16 @@ import (
 	"github.com/berkaroad/pushupes/pkg/client"
 )
 
-// TestSlotOfDelegatesToClient pins the shared-algorithm contract: the server
-// routes by exactly the function clients compute with (pkg/client), over the
-// same slot count. If this ever disagrees, a client's PrefetchRoutes row and
-// the server's placement say different nodes — every write pays a redirect.
-func TestSlotOfDelegatesToClient(t *testing.T) {
-	for cnt := 1; cnt <= 32; cnt++ {
+// TestLogicalSlotOfDelegatesToClient pins the shared-algorithm contract: the
+// server routes by exactly the function clients compute with (pkg/client), over
+// the same generation size. If this ever disagrees, a client's PrefetchRoutes row
+// and the server's placement name different nodes — every write pays a redirect.
+func TestLogicalSlotOfDelegatesToClient(t *testing.T) {
+	for _, cnt := range []int{1, 2, 4, 8, 16, 32} {
 		for i := 0; i < 200; i++ {
 			id := fmt.Sprintf("agg-%d", i)
-			if got, want := SlotOf(id, cnt), client.SlotOf(id, cnt); got != want {
-				t.Fatalf("SlotOf(%q, %d): server %d, client %d", id, cnt, got, want)
+			if got, want := LogicalSlotOf(id, cnt), client.LogicalSlotOf(id, cnt); got != want {
+				t.Fatalf("LogicalSlotOf(%q, %d): server %d, client %d", id, cnt, got, want)
 			}
 		}
 	}

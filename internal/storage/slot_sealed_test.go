@@ -33,11 +33,11 @@ func TestSealedAggregateIndexServesEveryVersion(t *testing.T) {
 	const slotBytes = int64(8 << 10) // small segments: several seals
 	flush := FlushPolicy{Interval: time.Millisecond}
 	aggA := "agg-alpha"
-	slot := data.SlotOf(aggA, 8)
+	slot := data.LogicalSlotOf(aggA, 8)
 	aggs := []string{aggA}
 	for i := 0; i < 10000 && len(aggs) < 3; i++ {
 		cand := fmt.Sprintf("agg-beta-%d", i)
-		if data.SlotOf(cand, 8) == slot {
+		if data.LogicalSlotOf(cand, 8) == slot {
 			aggs = append(aggs, cand)
 		}
 	}
@@ -52,7 +52,7 @@ func TestSealedAggregateIndexServesEveryVersion(t *testing.T) {
 	body := strings.Repeat("x", 80)
 	for v := 1; v <= versions; v++ {
 		for _, agg := range aggs {
-			if _, err := st.Append(&data.EventRecord{
+			if _, err := st.AppendRouted(&data.EventRecord{
 				AggregateID: agg,
 				Version:     uint32(v),
 				CommandID:   fmt.Sprintf("cmd-%s-%d", agg, v),

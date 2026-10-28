@@ -39,7 +39,7 @@ func TestSealedCommandIndexServesColdLookups(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		sl, err := st.Slot(data.SlotOf(agg, 4))
+		sl, err := st.Slot(data.LogicalSlotOf(agg, 4))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -51,7 +51,7 @@ func TestSealedCommandIndexServesColdLookups(t *testing.T) {
 				CommandID:   fmt.Sprintf("cmd-%d", i),
 				Events:      []data.Event{{Type: "t", Body: []byte(strings.Repeat("x", 60))}},
 			}
-			if _, err := st.Append(rec); err != nil {
+			if _, err := st.AppendRouted(rec); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -67,7 +67,7 @@ func TestSealedCommandIndexServesColdLookups(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { st.Close() })
-		sl, err := st.SlotIfLoaded(data.SlotOf(agg, 4))
+		sl, err := st.SlotIfLoaded(data.LogicalSlotOf(agg, 4))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -116,14 +116,14 @@ func TestSealedCommandIndexServesColdLookups(t *testing.T) {
 	// Delete the command indexes: a start rewrites them, and cold lookups work
 	// again. A non-repairing start leaves them absent (a running node does not
 	// re-index history), so the lookup finds nothing until the next start.
-	removeCmdIndexes(t, dir, data.SlotOf(agg, 4))
+	removeCmdIndexes(t, dir, data.LogicalSlotOf(agg, 4))
 	running := open(false)
 	running.blms = emptyTestBloom(t)
 	if rec, _, err := running.RecordByCommand("cmd-1"); err != nil || rec != nil {
 		t.Fatalf("without an index a running node should find nothing: rec=%v err=%v", rec, err)
 	}
 	repaired := open(true)
-	if got := countCmdIndexes(t, dir, data.SlotOf(agg, 4)); got == 0 {
+	if got := countCmdIndexes(t, dir, data.LogicalSlotOf(agg, 4)); got == 0 {
 		t.Fatal("startup did not write the missing command index")
 	}
 	repaired.blms = emptyTestBloom(t)
@@ -132,7 +132,7 @@ func TestSealedCommandIndexServesColdLookups(t *testing.T) {
 	}
 
 	// Damage a block: a start must notice and rewrite it rather than serve it.
-	damageCmdIndexBlock(t, dir, data.SlotOf(agg, 4))
+	damageCmdIndexBlock(t, dir, data.LogicalSlotOf(agg, 4))
 	built := segCmdBuilt.Load()
 	healed := open(true)
 	if segCmdBuilt.Load() == built {

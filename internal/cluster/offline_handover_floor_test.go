@@ -31,7 +31,7 @@ func TestOfflineSourceHandoverRejectsBehindTarget(t *testing.T) {
 		e3, st3 := newTestEngine(t, "node-3")
 		agg := aggInSlot(t, e3, 0)
 		for v := 1; v <= 5; v++ {
-			if _, err := st3.Append(makeRecord(agg, uint32(v), fmt.Sprintf("n3-%d", v))); err != nil {
+			if _, err := st3.AppendRouted(makeRecord(agg, uint32(v), fmt.Sprintf("n3-%d", v))); err != nil {
 				t.Fatal(err)
 			}
 		}

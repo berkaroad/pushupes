@@ -19,20 +19,25 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	PeerService_Ping_FullMethodName              = "/pushupes.v1.PeerService/Ping"
-	PeerService_Register_FullMethodName          = "/pushupes.v1.PeerService/Register"
-	PeerService_Adopt_FullMethodName             = "/pushupes.v1.PeerService/Adopt"
-	PeerService_MFetch_FullMethodName            = "/pushupes.v1.PeerService/MFetch"
-	PeerService_ReplicaProgress_FullMethodName   = "/pushupes.v1.PeerService/ReplicaProgress"
-	PeerService_Replicate_FullMethodName         = "/pushupes.v1.PeerService/Replicate"
-	PeerService_SlotLeo_FullMethodName           = "/pushupes.v1.PeerService/SlotLeo"
-	PeerService_FenceSlot_FullMethodName         = "/pushupes.v1.PeerService/FenceSlot"
-	PeerService_SlotLeader_FullMethodName        = "/pushupes.v1.PeerService/SlotLeader"
-	PeerService_DropSlot_FullMethodName          = "/pushupes.v1.PeerService/DropSlot"
-	PeerService_ReportUnreachable_FullMethodName = "/pushupes.v1.PeerService/ReportUnreachable"
-	PeerService_SlotLeos_FullMethodName          = "/pushupes.v1.PeerService/SlotLeos"
-	PeerService_SlotSizes_FullMethodName         = "/pushupes.v1.PeerService/SlotSizes"
-	PeerService_WatchLayout_FullMethodName       = "/pushupes.v1.PeerService/WatchLayout"
+	PeerService_Ping_FullMethodName               = "/pushupes.v1.PeerService/Ping"
+	PeerService_Register_FullMethodName           = "/pushupes.v1.PeerService/Register"
+	PeerService_Adopt_FullMethodName              = "/pushupes.v1.PeerService/Adopt"
+	PeerService_MFetch_FullMethodName             = "/pushupes.v1.PeerService/MFetch"
+	PeerService_ReplicaProgress_FullMethodName    = "/pushupes.v1.PeerService/ReplicaProgress"
+	PeerService_Replicate_FullMethodName          = "/pushupes.v1.PeerService/Replicate"
+	PeerService_ReplicateAggregate_FullMethodName = "/pushupes.v1.PeerService/ReplicateAggregate"
+	PeerService_SlotStreams_FullMethodName        = "/pushupes.v1.PeerService/SlotStreams"
+	PeerService_ReplayInto_FullMethodName         = "/pushupes.v1.PeerService/ReplayInto"
+	PeerService_SlotLeo_FullMethodName            = "/pushupes.v1.PeerService/SlotLeo"
+	PeerService_FenceSlot_FullMethodName          = "/pushupes.v1.PeerService/FenceSlot"
+	PeerService_FreezeSlot_FullMethodName         = "/pushupes.v1.PeerService/FreezeSlot"
+	PeerService_ThawSlot_FullMethodName           = "/pushupes.v1.PeerService/ThawSlot"
+	PeerService_SlotLeader_FullMethodName         = "/pushupes.v1.PeerService/SlotLeader"
+	PeerService_DropSlot_FullMethodName           = "/pushupes.v1.PeerService/DropSlot"
+	PeerService_ReportUnreachable_FullMethodName  = "/pushupes.v1.PeerService/ReportUnreachable"
+	PeerService_SlotLeos_FullMethodName           = "/pushupes.v1.PeerService/SlotLeos"
+	PeerService_SlotSizes_FullMethodName          = "/pushupes.v1.PeerService/SlotSizes"
+	PeerService_WatchLayout_FullMethodName        = "/pushupes.v1.PeerService/WatchLayout"
 )
 
 // PeerServiceClient is the client API for PeerService service.
@@ -67,6 +72,19 @@ type PeerServiceClient interface {
 	// Replicate pushes one leader-assigned record to the migration target
 	// during the forwarding window (idempotent at seq).
 	Replicate(ctx context.Context, in *ReplicateRequest, opts ...grpc.CallOption) (*ReplicateResponse, error)
+	// ReplicateAggregate streams one aggregate's records out of a slot, so a
+	// generation migration can replay them into the slot the new segment routes
+	// them to. The CALLER pulls (the destination asks the source); the cursor is
+	// the aggregate version, which is what makes the replay resumable.
+	ReplicateAggregate(ctx context.Context, in *ReplicateAggregateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ReplicateAggregateResponse], error)
+	// SlotStreams lists the aggregates a slot holds, which is what a generation
+	// migration needs before it can replay: it walks the source slot's streams and
+	// asks the destination to pull each one.
+	SlotStreams(ctx context.Context, in *SlotStreamsRequest, opts ...grpc.CallOption) (*SlotStreamsResponse, error)
+	// ReplayInto asks the DESTINATION to pull one aggregate out of a source slot
+	// and land it in a local slot. The bytes flow peer-to-peer; the controller only
+	// pairs the two ends.
+	ReplayInto(ctx context.Context, in *ReplayIntoRequest, opts ...grpc.CallOption) (*ReplayIntoResponse, error)
 	// SlotLeo answers a single slot's log end offset (migration catch-up).
 	SlotLeo(ctx context.Context, in *SlotLeoRequest, opts ...grpc.CallOption) (*SlotLeoResponse, error)
 	// FenceSlot is the migration commit fence: the source stops accepting new
@@ -77,6 +95,13 @@ type PeerServiceClient interface {
 	// applied, and is force-released after a bound so a lost controller cannot
 	// wedge the slot's writes.
 	FenceSlot(ctx context.Context, in *FenceSlotRequest, opts ...grpc.CallOption) (*FenceSlotResponse, error)
+	// FreezeSlot closes a slot's write gate and keeps it closed until ThawSlot:
+	// a generation migration freezes the whole source segment, replays the tails,
+	// switches, and only then thaws (the slots are gone from the table by then).
+	// It is NOT FenceSlot: that one freezes in order to hand leadership over and
+	// waits for the demotion, which is a different contract.
+	FreezeSlot(ctx context.Context, in *FreezeSlotRequest, opts ...grpc.CallOption) (*FreezeSlotResponse, error)
+	ThawSlot(ctx context.Context, in *ThawSlotRequest, opts ...grpc.CallOption) (*ThawSlotResponse, error)
 	// SlotLeader answers THIS node's local view of one slot: which node it
 	// believes leads it and at which epoch. The migration source uses it to gate
 	// the commit-fence release on the target having actually applied the leader
@@ -121,7 +146,7 @@ type PeerServiceClient interface {
 	// and closes the stream when the caller falls too far behind to keep in a
 	// bounded buffer: the caller reconnects, reports what it applied, and is
 	// either caught up incrementally or handed an image.
-	WatchLayout(ctx context.Context, in *WatchLayoutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LayoutFrame], error)
+	WatchLayout(ctx context.Context, in *WatchLayoutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchLayoutResponse], error)
 }
 
 type peerServiceClient struct {
@@ -192,6 +217,45 @@ func (c *peerServiceClient) Replicate(ctx context.Context, in *ReplicateRequest,
 	return out, nil
 }
 
+func (c *peerServiceClient) ReplicateAggregate(ctx context.Context, in *ReplicateAggregateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ReplicateAggregateResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &PeerService_ServiceDesc.Streams[0], PeerService_ReplicateAggregate_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ReplicateAggregateRequest, ReplicateAggregateResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PeerService_ReplicateAggregateClient = grpc.ServerStreamingClient[ReplicateAggregateResponse]
+
+func (c *peerServiceClient) SlotStreams(ctx context.Context, in *SlotStreamsRequest, opts ...grpc.CallOption) (*SlotStreamsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SlotStreamsResponse)
+	err := c.cc.Invoke(ctx, PeerService_SlotStreams_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *peerServiceClient) ReplayInto(ctx context.Context, in *ReplayIntoRequest, opts ...grpc.CallOption) (*ReplayIntoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReplayIntoResponse)
+	err := c.cc.Invoke(ctx, PeerService_ReplayInto_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *peerServiceClient) SlotLeo(ctx context.Context, in *SlotLeoRequest, opts ...grpc.CallOption) (*SlotLeoResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SlotLeoResponse)
@@ -206,6 +270,26 @@ func (c *peerServiceClient) FenceSlot(ctx context.Context, in *FenceSlotRequest,
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(FenceSlotResponse)
 	err := c.cc.Invoke(ctx, PeerService_FenceSlot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *peerServiceClient) FreezeSlot(ctx context.Context, in *FreezeSlotRequest, opts ...grpc.CallOption) (*FreezeSlotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FreezeSlotResponse)
+	err := c.cc.Invoke(ctx, PeerService_FreezeSlot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *peerServiceClient) ThawSlot(ctx context.Context, in *ThawSlotRequest, opts ...grpc.CallOption) (*ThawSlotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ThawSlotResponse)
+	err := c.cc.Invoke(ctx, PeerService_ThawSlot_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -262,13 +346,13 @@ func (c *peerServiceClient) SlotSizes(ctx context.Context, in *SlotSizesRequest,
 	return out, nil
 }
 
-func (c *peerServiceClient) WatchLayout(ctx context.Context, in *WatchLayoutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LayoutFrame], error) {
+func (c *peerServiceClient) WatchLayout(ctx context.Context, in *WatchLayoutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchLayoutResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PeerService_ServiceDesc.Streams[0], PeerService_WatchLayout_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &PeerService_ServiceDesc.Streams[1], PeerService_WatchLayout_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[WatchLayoutRequest, LayoutFrame]{ClientStream: stream}
+	x := &grpc.GenericClientStream[WatchLayoutRequest, WatchLayoutResponse]{ClientStream: stream}
 	if err := x.ClientStream.SendMsg(in); err != nil {
 		return nil, err
 	}
@@ -279,7 +363,7 @@ func (c *peerServiceClient) WatchLayout(ctx context.Context, in *WatchLayoutRequ
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type PeerService_WatchLayoutClient = grpc.ServerStreamingClient[LayoutFrame]
+type PeerService_WatchLayoutClient = grpc.ServerStreamingClient[WatchLayoutResponse]
 
 // PeerServiceServer is the server API for PeerService service.
 // All implementations must embed UnimplementedPeerServiceServer
@@ -313,6 +397,19 @@ type PeerServiceServer interface {
 	// Replicate pushes one leader-assigned record to the migration target
 	// during the forwarding window (idempotent at seq).
 	Replicate(context.Context, *ReplicateRequest) (*ReplicateResponse, error)
+	// ReplicateAggregate streams one aggregate's records out of a slot, so a
+	// generation migration can replay them into the slot the new segment routes
+	// them to. The CALLER pulls (the destination asks the source); the cursor is
+	// the aggregate version, which is what makes the replay resumable.
+	ReplicateAggregate(*ReplicateAggregateRequest, grpc.ServerStreamingServer[ReplicateAggregateResponse]) error
+	// SlotStreams lists the aggregates a slot holds, which is what a generation
+	// migration needs before it can replay: it walks the source slot's streams and
+	// asks the destination to pull each one.
+	SlotStreams(context.Context, *SlotStreamsRequest) (*SlotStreamsResponse, error)
+	// ReplayInto asks the DESTINATION to pull one aggregate out of a source slot
+	// and land it in a local slot. The bytes flow peer-to-peer; the controller only
+	// pairs the two ends.
+	ReplayInto(context.Context, *ReplayIntoRequest) (*ReplayIntoResponse, error)
 	// SlotLeo answers a single slot's log end offset (migration catch-up).
 	SlotLeo(context.Context, *SlotLeoRequest) (*SlotLeoResponse, error)
 	// FenceSlot is the migration commit fence: the source stops accepting new
@@ -323,6 +420,13 @@ type PeerServiceServer interface {
 	// applied, and is force-released after a bound so a lost controller cannot
 	// wedge the slot's writes.
 	FenceSlot(context.Context, *FenceSlotRequest) (*FenceSlotResponse, error)
+	// FreezeSlot closes a slot's write gate and keeps it closed until ThawSlot:
+	// a generation migration freezes the whole source segment, replays the tails,
+	// switches, and only then thaws (the slots are gone from the table by then).
+	// It is NOT FenceSlot: that one freezes in order to hand leadership over and
+	// waits for the demotion, which is a different contract.
+	FreezeSlot(context.Context, *FreezeSlotRequest) (*FreezeSlotResponse, error)
+	ThawSlot(context.Context, *ThawSlotRequest) (*ThawSlotResponse, error)
 	// SlotLeader answers THIS node's local view of one slot: which node it
 	// believes leads it and at which epoch. The migration source uses it to gate
 	// the commit-fence release on the target having actually applied the leader
@@ -367,7 +471,7 @@ type PeerServiceServer interface {
 	// and closes the stream when the caller falls too far behind to keep in a
 	// bounded buffer: the caller reconnects, reports what it applied, and is
 	// either caught up incrementally or handed an image.
-	WatchLayout(*WatchLayoutRequest, grpc.ServerStreamingServer[LayoutFrame]) error
+	WatchLayout(*WatchLayoutRequest, grpc.ServerStreamingServer[WatchLayoutResponse]) error
 	mustEmbedUnimplementedPeerServiceServer()
 }
 
@@ -396,11 +500,26 @@ func (UnimplementedPeerServiceServer) ReplicaProgress(context.Context, *ReplicaP
 func (UnimplementedPeerServiceServer) Replicate(context.Context, *ReplicateRequest) (*ReplicateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Replicate not implemented")
 }
+func (UnimplementedPeerServiceServer) ReplicateAggregate(*ReplicateAggregateRequest, grpc.ServerStreamingServer[ReplicateAggregateResponse]) error {
+	return status.Error(codes.Unimplemented, "method ReplicateAggregate not implemented")
+}
+func (UnimplementedPeerServiceServer) SlotStreams(context.Context, *SlotStreamsRequest) (*SlotStreamsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SlotStreams not implemented")
+}
+func (UnimplementedPeerServiceServer) ReplayInto(context.Context, *ReplayIntoRequest) (*ReplayIntoResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReplayInto not implemented")
+}
 func (UnimplementedPeerServiceServer) SlotLeo(context.Context, *SlotLeoRequest) (*SlotLeoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SlotLeo not implemented")
 }
 func (UnimplementedPeerServiceServer) FenceSlot(context.Context, *FenceSlotRequest) (*FenceSlotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method FenceSlot not implemented")
+}
+func (UnimplementedPeerServiceServer) FreezeSlot(context.Context, *FreezeSlotRequest) (*FreezeSlotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FreezeSlot not implemented")
+}
+func (UnimplementedPeerServiceServer) ThawSlot(context.Context, *ThawSlotRequest) (*ThawSlotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ThawSlot not implemented")
 }
 func (UnimplementedPeerServiceServer) SlotLeader(context.Context, *SlotLeaderRequest) (*SlotLeaderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SlotLeader not implemented")
@@ -417,7 +536,7 @@ func (UnimplementedPeerServiceServer) SlotLeos(context.Context, *SlotLeosRequest
 func (UnimplementedPeerServiceServer) SlotSizes(context.Context, *SlotSizesRequest) (*SlotSizesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SlotSizes not implemented")
 }
-func (UnimplementedPeerServiceServer) WatchLayout(*WatchLayoutRequest, grpc.ServerStreamingServer[LayoutFrame]) error {
+func (UnimplementedPeerServiceServer) WatchLayout(*WatchLayoutRequest, grpc.ServerStreamingServer[WatchLayoutResponse]) error {
 	return status.Error(codes.Unimplemented, "method WatchLayout not implemented")
 }
 func (UnimplementedPeerServiceServer) mustEmbedUnimplementedPeerServiceServer() {}
@@ -549,6 +668,53 @@ func _PeerService_Replicate_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PeerService_ReplicateAggregate_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ReplicateAggregateRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(PeerServiceServer).ReplicateAggregate(m, &grpc.GenericServerStream[ReplicateAggregateRequest, ReplicateAggregateResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PeerService_ReplicateAggregateServer = grpc.ServerStreamingServer[ReplicateAggregateResponse]
+
+func _PeerService_SlotStreams_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SlotStreamsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerServiceServer).SlotStreams(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerService_SlotStreams_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerServiceServer).SlotStreams(ctx, req.(*SlotStreamsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PeerService_ReplayInto_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReplayIntoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerServiceServer).ReplayInto(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerService_ReplayInto_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerServiceServer).ReplayInto(ctx, req.(*ReplayIntoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _PeerService_SlotLeo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SlotLeoRequest)
 	if err := dec(in); err != nil {
@@ -581,6 +747,42 @@ func _PeerService_FenceSlot_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(PeerServiceServer).FenceSlot(ctx, req.(*FenceSlotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PeerService_FreezeSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FreezeSlotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerServiceServer).FreezeSlot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerService_FreezeSlot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerServiceServer).FreezeSlot(ctx, req.(*FreezeSlotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PeerService_ThawSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ThawSlotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerServiceServer).ThawSlot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerService_ThawSlot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerServiceServer).ThawSlot(ctx, req.(*ThawSlotRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -680,11 +882,11 @@ func _PeerService_WatchLayout_Handler(srv interface{}, stream grpc.ServerStream)
 	if err := stream.RecvMsg(m); err != nil {
 		return err
 	}
-	return srv.(PeerServiceServer).WatchLayout(m, &grpc.GenericServerStream[WatchLayoutRequest, LayoutFrame]{ServerStream: stream})
+	return srv.(PeerServiceServer).WatchLayout(m, &grpc.GenericServerStream[WatchLayoutRequest, WatchLayoutResponse]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type PeerService_WatchLayoutServer = grpc.ServerStreamingServer[LayoutFrame]
+type PeerService_WatchLayoutServer = grpc.ServerStreamingServer[WatchLayoutResponse]
 
 // PeerService_ServiceDesc is the grpc.ServiceDesc for PeerService service.
 // It's only intended for direct use with grpc.RegisterService,
@@ -718,12 +920,28 @@ var PeerService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _PeerService_Replicate_Handler,
 		},
 		{
+			MethodName: "SlotStreams",
+			Handler:    _PeerService_SlotStreams_Handler,
+		},
+		{
+			MethodName: "ReplayInto",
+			Handler:    _PeerService_ReplayInto_Handler,
+		},
+		{
 			MethodName: "SlotLeo",
 			Handler:    _PeerService_SlotLeo_Handler,
 		},
 		{
 			MethodName: "FenceSlot",
 			Handler:    _PeerService_FenceSlot_Handler,
+		},
+		{
+			MethodName: "FreezeSlot",
+			Handler:    _PeerService_FreezeSlot_Handler,
+		},
+		{
+			MethodName: "ThawSlot",
+			Handler:    _PeerService_ThawSlot_Handler,
 		},
 		{
 			MethodName: "SlotLeader",
@@ -747,6 +965,11 @@ var PeerService_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "ReplicateAggregate",
+			Handler:       _PeerService_ReplicateAggregate_Handler,
+			ServerStreams: true,
+		},
 		{
 			StreamName:    "WatchLayout",
 			Handler:       _PeerService_WatchLayout_Handler,

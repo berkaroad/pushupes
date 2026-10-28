@@ -116,7 +116,7 @@ func TestEmptyShellLeaderAnswersRetryable(t *testing.T) {
 		sr.leo[i] = 0
 	}
 	e.replMu.Unlock()
-	if _, err := e.store.Append(&data.EventRecord{
+	if _, err := e.store.AppendRouted(&data.EventRecord{
 		AggregateID: agg, Version: 1, CommandID: "cmd-1",
 		Events: []data.Event{{Type: "E", Body: []byte("x")}},
 	}); err != nil {

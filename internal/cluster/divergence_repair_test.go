@@ -22,7 +22,7 @@ func TestDivergedReplicaRebuildsAndUnlatches(t *testing.T) {
 
 	agg0 := aggInSlot(t, leader, 0)
 	for v := uint64(1); v <= 3; v++ {
-		if _, err := ldr.Append(makeRecord(agg0, uint32(v), fmt.Sprintf("rb-%d", v))); err != nil {
+		if _, err := ldr.AppendRouted(makeRecord(agg0, uint32(v), fmt.Sprintf("rb-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -86,7 +86,7 @@ func TestDivergedReplicaRebuildsAndUnlatches(t *testing.T) {
 	}
 
 	// And the rebuilt copy serves reads like any replica: the agg is whole.
-	records, _, err := fdr.ReadAggregate(agg0, 1, 10, 0)
+	records, _, err := fdr.ReadAggregateRouted(agg0, 1, 10, 0)
 	if err != nil || len(records) != 3 {
 		t.Fatalf("rebuilt copy must serve all versions: records=%d err=%v", len(records), err)
 	}
@@ -101,7 +101,7 @@ func TestDivergedLeaderDoesNotDiscardItsOwnLog(t *testing.T) {
 	applyCmd(t, e, &Command{Op: OpPlanSlots})
 	agg0 := aggInSlot(t, e, 0)
 	for v := uint64(1); v <= 2; v++ {
-		if _, err := dr.Append(makeRecord(agg0, uint32(v), fmt.Sprintf("ld-%d", v))); err != nil {
+		if _, err := dr.AppendRouted(makeRecord(agg0, uint32(v), fmt.Sprintf("ld-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}

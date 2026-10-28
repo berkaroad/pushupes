@@ -38,7 +38,7 @@ func TestApplyFetchItemsParallelKeepsSlotsIndependent(t *testing.T) {
 	for s := 0; s < slots; s++ {
 		aggs[s] = aggInSlot(t, leader, int32(s))
 		for v := uint64(1); v <= 3; v++ {
-			if _, err := ldr.Append(makeRecord(aggs[s], uint32(v), fmt.Sprintf("s%d-%d", s, v))); err != nil {
+			if _, err := ldr.AppendRouted(makeRecord(aggs[s], uint32(v), fmt.Sprintf("s%d-%d", s, v))); err != nil {
 				t.Fatal(err)
 			}
 		}

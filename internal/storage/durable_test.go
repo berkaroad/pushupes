@@ -43,7 +43,7 @@ func TestAckGateTimedWindowLandsTheClaim(t *testing.T) {
 	var slot int32
 	var last uint64
 	for i := 1; i <= 3; i++ {
-		out, err := st.Append(mkRec("agg-dur", uint32(i), "cmd-dur"))
+		out, err := st.AppendRouted(mkRec("agg-dur", uint32(i), "cmd-dur"))
 		if err != nil {
 			t.Fatalf("append %d: %v", i, err)
 		}
@@ -65,7 +65,7 @@ func TestAckGateWaiterKicksDisabledPolicy(t *testing.T) {
 	// completed. Success therefore proves the kick path fired a real flush —
 	// the reopen control below reads the claim off the disk, not memory.
 	st := openDurStore(t, t.TempDir(), FlushPolicy{})
-	out, err := st.Append(mkRec("agg-kick", 1, "cmd-kick"))
+	out, err := st.AppendRouted(mkRec("agg-kick", 1, "cmd-kick"))
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestAckGateWaiterFiresItsOwnRound(t *testing.T) {
 	// uncovered. The positive half: once an acknowledgement parks, the waiter
 	// makes the slot due NOW, so the ack pays fsync time, not the interval.
 	st := openDurStore(t, t.TempDir(), FlushPolicy{IntervalMessages: 1 << 40, Interval: time.Minute})
-	out, err := st.Append(mkRec("agg-slow", 1, "cmd-slow"))
+	out, err := st.AppendRouted(mkRec("agg-slow", 1, "cmd-slow"))
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestDurableWatermarkSeededFromOpenCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}
-	out, err := st.Append(mkRec("agg-reopen", 1, "cmd-reopen"))
+	out, err := st.AppendRouted(mkRec("agg-reopen", 1, "cmd-reopen"))
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}

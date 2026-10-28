@@ -108,7 +108,7 @@ func TestAppendFrameAtSeqSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	local := mkRec("agg-reopen", 2, "cmd-r2")
-	if _, err := st.Append(local); err != nil {
+	if _, err := st.AppendRouted(local); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Close(); err != nil {

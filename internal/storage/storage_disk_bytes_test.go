@@ -49,7 +49,7 @@ func TestSlotDiskBytesCoversLoadedAndColdCopies(t *testing.T) {
 		CommandID:   "cmd-1",
 		Events:      []data.Event{{Type: "T", Body: []byte("{}")}},
 	}
-	if _, err := st.Append(rec); err != nil {
+	if _, err := st.AppendRouted(rec); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	// Appends sit in the segment's write buffer until they are flushed; the

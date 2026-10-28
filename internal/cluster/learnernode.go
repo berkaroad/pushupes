@@ -438,7 +438,7 @@ func (l *learnerNode) stream(addr string) error {
 // cursor belongs to the old one).
 var errResubscribe = errors.New("resubscribe")
 
-func (l *learnerNode) onFrame(f *pushupesv1.LayoutFrame) error {
+func (l *learnerNode) onFrame(f *pushupesv1.WatchLayoutResponse) error {
 	switch f.GetKind() {
 	case layoutHello:
 		return l.onHello(f)
@@ -467,7 +467,7 @@ func (l *learnerNode) onFrame(f *pushupesv1.LayoutFrame) error {
 	}
 }
 
-func (l *learnerNode) onHello(f *pushupesv1.LayoutFrame) error {
+func (l *learnerNode) onHello(f *pushupesv1.WatchLayoutResponse) error {
 	l.mu.Lock()
 	prevTopology, applied := l.topology, l.applied
 	l.leaderID, l.leaderPeer = f.GetLeaderId(), HostPort(f.GetLeaderPeerAddr())
@@ -510,7 +510,7 @@ func (l *learnerNode) onHello(f *pushupesv1.LayoutFrame) error {
 	return nil
 }
 
-func (l *learnerNode) onSnapshot(f *pushupesv1.LayoutFrame) error {
+func (l *learnerNode) onSnapshot(f *pushupesv1.WatchLayoutResponse) error {
 	var err error
 	if len(f.GetData()) == 0 {
 		// "Nothing to install" is a real answer: the control plane cannot place
@@ -534,7 +534,7 @@ func (l *learnerNode) onSnapshot(f *pushupesv1.LayoutFrame) error {
 	return nil
 }
 
-func (l *learnerNode) onEntry(f *pushupesv1.LayoutFrame) error {
+func (l *learnerNode) onEntry(f *pushupesv1.WatchLayoutResponse) error {
 	l.mu.Lock()
 	applied := l.applied
 	l.mu.Unlock()

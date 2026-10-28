@@ -279,7 +279,7 @@ type AppendRequest struct {
 	UnixTime      int64                  `protobuf:"varint,3,opt,name=unix_time,json=unixTime,proto3" json:"unix_time,omitempty"`   // 0 = server clock
 	CommandId     string                 `protobuf:"bytes,4,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"` // idempotency key
 	Events        []*Event               `protobuf:"bytes,5,rep,name=events,proto3" json:"events,omitempty"`
-	Compression   Compression            `protobuf:"varint,7,opt,name=compression,proto3,enum=pushupes.v1.Compression" json:"compression,omitempty"` // body codec as prepared by the writer
+	Compression   Compression            `protobuf:"varint,6,opt,name=compression,proto3,enum=pushupes.v1.Compression" json:"compression,omitempty"` // body codec as prepared by the writer
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -361,14 +361,17 @@ type AppendResponse struct {
 	Status AppendResponse_Status  `protobuf:"varint,1,opt,name=status,proto3,enum=pushupes.v1.AppendResponse_Status" json:"status,omitempty"`
 	ErrId  uint32                 `protobuf:"varint,2,opt,name=err_id,json=errId,proto3" json:"err_id,omitempty"` // wire error table (pkg/client/errs.go): 1001 conflict, 1003 MOVED,
 	// 1004 ASK, 1007 ack timeout, 1008 replica catching up, 1009 no data plane...
-	Message        string  `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
-	CurrentVersion uint32  `protobuf:"varint,4,opt,name=current_version,json=currentVersion,proto3" json:"current_version,omitempty"` // set on 1001 for client self-heal
-	Seq            uint64  `protobuf:"varint,5,opt,name=seq,proto3" json:"seq,omitempty"`
-	Slot           int32   `protobuf:"varint,6,opt,name=slot,proto3" json:"slot,omitempty"`    // routing slot (authoritative even on redirects)
-	Node           string  `protobuf:"bytes,7,opt,name=node,proto3" json:"node,omitempty"`     // redirect target "host:port" for MOVED (1003) / ASK (1004)
-	Record         *Record `protobuf:"bytes,8,opt,name=record,proto3" json:"record,omitempty"` // set on STATUS_EXISTS only (the stored duplicate)
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	Message        string `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
+	CurrentVersion uint32 `protobuf:"varint,4,opt,name=current_version,json=currentVersion,proto3" json:"current_version,omitempty"` // set on 1001 for client self-heal
+	Seq            uint64 `protobuf:"varint,5,opt,name=seq,proto3" json:"seq,omitempty"`
+	// slot is a LOGICAL slot id (0 .. group_size-1) of the generation this node
+	// serves; the physical table slot is group_base + slot. The client plane never
+	// sees the physical id space.
+	Slot          int32   `protobuf:"varint,6,opt,name=slot,proto3" json:"slot,omitempty"`    // routing slot, logical (authoritative even on redirects)
+	Node          string  `protobuf:"bytes,7,opt,name=node,proto3" json:"node,omitempty"`     // redirect target "host:port" for MOVED (1003) / ASK (1004)
+	Record        *Record `protobuf:"bytes,8,opt,name=record,proto3" json:"record,omitempty"` // set on STATUS_EXISTS only (the stored duplicate)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *AppendResponse) Reset() {
@@ -461,8 +464,12 @@ func (x *AppendResponse) GetRecord() *Record {
 // is the gRPC message limit, which the operator configures
 // (-grpc-max-msg-size, default 4MiB). An empty batch returns empty results.
 type BatchAppendRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Records       []*AppendRequest       `protobuf:"bytes,1,rep,name=records,proto3" json:"records,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Records []*AppendRequest       `protobuf:"bytes,1,rep,name=records,proto3" json:"records,omitempty"`
+	// layout_epoch echoes PrefetchRoutes' value. 0 means "no opinion" (a client
+	// that has not fetched a table yet); a non-zero mismatch answers 1010 for
+	// every record and nothing is written.
+	LayoutEpoch   uint64 `protobuf:"varint,2,opt,name=layout_epoch,json=layoutEpoch,proto3" json:"layout_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -502,6 +509,13 @@ func (x *BatchAppendRequest) GetRecords() []*AppendRequest {
 		return x.Records
 	}
 	return nil
+}
+
+func (x *BatchAppendRequest) GetLayoutEpoch() uint64 {
+	if x != nil {
+		return x.LayoutEpoch
+	}
+	return 0
 }
 
 // BatchAppendResult pairs one aggregate with its append outcome.
@@ -651,15 +665,31 @@ type PrefetchRoutesResponse struct {
 	// node_client_addrs are the cluster members' client-plane ("host:port")
 	// addrs, de-duplicated in first-appearance order.
 	NodeClientAddrs []string `protobuf:"bytes,1,rep,name=node_client_addrs,json=nodeClientAddrs,proto3" json:"node_client_addrs,omitempty"`
-	// slot_node_index is DENSE over slots: index s is the slot-s leader's
-	// position in node_client_addrs, for every s in 0..len-1. Its length is
-	// the cluster's slot count — the value is cluster state and reaches the
-	// client here, never as a client-side constant. Slots the answering node
-	// cannot map to a live client_addr (unassigned, or a leader whose
-	// registration has not landed yet) fall back to the answering node's own
-	// entry, the same local-serve rule SubmitBatch applies to such slots, so
-	// the array never has holes and needs no sentinel handling.
+	// slot_node_index is DENSE over LOGICAL slots: index l is the leader of
+	// logical slot l — i.e. of the physical table slot group_base + l — as a
+	// position in node_client_addrs, for every l in 0..len-1. Its length is the
+	// generation's size (group_size), not the table's slot count: the client
+	// plane indexes by logical id and never sees the physical id space, so the
+	// array stays small as generations grow and one client binary serves any
+	// base. Entries the answering node cannot map to a live client_addr
+	// (unassigned, or a leader whose registration has not landed yet) fall back
+	// to the answering node's own entry, the same local-serve rule SubmitBatch
+	// applies to such slots, so the array never has holes and needs no sentinel
+	// handling.
 	SlotNodeIndex []int32 `protobuf:"varint,2,rep,packed,name=slot_node_index,json=slotNodeIndex,proto3" json:"slot_node_index,omitempty"`
+	// The served slot generation (DESIGN §4.5, §7.2.7): generation g owns the
+	// physical range [2^g, 2^(g+1)), i.e. group_base == group_size == 2^g, and a
+	// client routes an aggregate onto a LOGICAL slot, which is the slot within the
+	// group: logical = hash&(size-1), physical = group_base + logical
+	// (pkg/client LogicalSlotOf). group_size == 0 means no generation is served:
+	// the cluster is not ready and the client refuses to route.
+	GroupGen  int32 `protobuf:"varint,3,opt,name=group_gen,json=groupGen,proto3" json:"group_gen,omitempty"`
+	GroupBase int32 `protobuf:"varint,4,opt,name=group_base,json=groupBase,proto3" json:"group_base,omitempty"`
+	GroupSize int32 `protobuf:"varint,5,opt,name=group_size,json=groupSize,proto3" json:"group_size,omitempty"`
+	// layout_epoch increments on every generation switch. A client echoes it on
+	// BatchAppend; a mismatch answers 1010 (GROUP_MISMATCH) and the client
+	// refreshes this table before retrying.
+	LayoutEpoch   uint64 `protobuf:"varint,6,opt,name=layout_epoch,json=layoutEpoch,proto3" json:"layout_epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -706,6 +736,34 @@ func (x *PrefetchRoutesResponse) GetSlotNodeIndex() []int32 {
 		return x.SlotNodeIndex
 	}
 	return nil
+}
+
+func (x *PrefetchRoutesResponse) GetGroupGen() int32 {
+	if x != nil {
+		return x.GroupGen
+	}
+	return 0
+}
+
+func (x *PrefetchRoutesResponse) GetGroupBase() int32 {
+	if x != nil {
+		return x.GroupBase
+	}
+	return 0
+}
+
+func (x *PrefetchRoutesResponse) GetGroupSize() int32 {
+	if x != nil {
+		return x.GroupSize
+	}
+	return 0
+}
+
+func (x *PrefetchRoutesResponse) GetLayoutEpoch() uint64 {
+	if x != nil {
+		return x.LayoutEpoch
+	}
+	return 0
 }
 
 type ReadStreamRequest struct {
@@ -780,8 +838,8 @@ type ReadStreamResponse struct {
 	// no records. err_id 0 means this node answered. Clients refresh their
 	// routing row from the answer and retry (pkg/client does this per call).
 	ErrId         uint32 `protobuf:"varint,4,opt,name=err_id,json=errId,proto3" json:"err_id,omitempty"`
-	Slot          int32  `protobuf:"varint,5,opt,name=slot,proto3" json:"slot,omitempty"`
-	Node          string `protobuf:"bytes,6,opt,name=node,proto3" json:"node,omitempty"` // redirect target "host:port" when err_id is 1003
+	Slot          int32  `protobuf:"varint,5,opt,name=slot,proto3" json:"slot,omitempty"` // logical slot id: physical = group_base + slot
+	Node          string `protobuf:"bytes,6,opt,name=node,proto3" json:"node,omitempty"`  // redirect target "host:port" when err_id is 1003
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -911,7 +969,7 @@ type ReadTailsResult struct {
 	AggregateId   string                 `protobuf:"bytes,1,opt,name=aggregate_id,json=aggregateId,proto3" json:"aggregate_id,omitempty"` // echo, like BatchAppendResult
 	Version       uint32                 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"`
 	ErrId         uint32                 `protobuf:"varint,3,opt,name=err_id,json=errId,proto3" json:"err_id,omitempty"`
-	Slot          int32                  `protobuf:"varint,4,opt,name=slot,proto3" json:"slot,omitempty"`
+	Slot          int32                  `protobuf:"varint,4,opt,name=slot,proto3" json:"slot,omitempty"` // logical slot id: physical = group_base + slot
 	Node          string                 `protobuf:"bytes,5,opt,name=node,proto3" json:"node,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1094,7 +1152,7 @@ type ReadByCommandResponse struct {
 	// Redirect in-band, exactly as ReadStreamResponse: err_id 1003 + slot +
 	// the leader's client-plane node when this node cannot serve the slot.
 	ErrId         uint32 `protobuf:"varint,3,opt,name=err_id,json=errId,proto3" json:"err_id,omitempty"`
-	Slot          int32  `protobuf:"varint,4,opt,name=slot,proto3" json:"slot,omitempty"`
+	Slot          int32  `protobuf:"varint,4,opt,name=slot,proto3" json:"slot,omitempty"` // logical slot id: physical = group_base + slot
 	Node          string `protobuf:"bytes,5,opt,name=node,proto3" json:"node,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1227,7 +1285,7 @@ type ReadVersionByTimeResponse struct {
 	// Redirect in-band, exactly as ReadStreamResponse: err_id 1003 + slot +
 	// the leader's client-plane node when this node cannot serve the slot.
 	ErrId         uint32 `protobuf:"varint,2,opt,name=err_id,json=errId,proto3" json:"err_id,omitempty"`
-	Slot          int32  `protobuf:"varint,3,opt,name=slot,proto3" json:"slot,omitempty"`
+	Slot          int32  `protobuf:"varint,3,opt,name=slot,proto3" json:"slot,omitempty"` // logical slot id: physical = group_base + slot
 	Node          string `protobuf:"bytes,4,opt,name=node,proto3" json:"node,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1309,7 +1367,7 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\x03seq\x18\x06 \x01(\x04R\x03seq\x12\x1e\n" +
 	"\n" +
 	"compressed\x18\a \x01(\bR\n" +
-	"compressed\"\xf6\x01\n" +
+	"compressed\"\xf0\x01\n" +
 	"\rAppendRequest\x12!\n" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1b\n" +
@@ -1317,7 +1375,7 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\n" +
 	"command_id\x18\x04 \x01(\tR\tcommandId\x12*\n" +
 	"\x06events\x18\x05 \x03(\v2\x12.pushupes.v1.EventR\x06events\x12:\n" +
-	"\vcompression\x18\a \x01(\x0e2\x18.pushupes.v1.CompressionR\vcompressionJ\x04\b\x06\x10\a\"\xe7\x02\n" +
+	"\vcompression\x18\x06 \x01(\x0e2\x18.pushupes.v1.CompressionR\vcompression\"\xe7\x02\n" +
 	"\x0eAppendResponse\x12:\n" +
 	"\x06status\x18\x01 \x01(\x0e2\".pushupes.v1.AppendResponse.StatusR\x06status\x12\x15\n" +
 	"\x06err_id\x18\x02 \x01(\rR\x05errId\x12\x18\n" +
@@ -1331,18 +1389,25 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\x12STATUS_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eSTATUS_SUCCESS\x10\x01\x12\x11\n" +
 	"\rSTATUS_EXISTS\x10\x02\x12\x0f\n" +
-	"\vSTATUS_FAIL\x10\x03\"J\n" +
+	"\vSTATUS_FAIL\x10\x03\"m\n" +
 	"\x12BatchAppendRequest\x124\n" +
-	"\arecords\x18\x01 \x03(\v2\x1a.pushupes.v1.AppendRequestR\arecords\"o\n" +
+	"\arecords\x18\x01 \x03(\v2\x1a.pushupes.v1.AppendRequestR\arecords\x12!\n" +
+	"\flayout_epoch\x18\x02 \x01(\x04R\vlayoutEpoch\"o\n" +
 	"\x11BatchAppendResult\x12!\n" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x127\n" +
 	"\bresponse\x18\x02 \x01(\v2\x1b.pushupes.v1.AppendResponseR\bresponse\"O\n" +
 	"\x13BatchAppendResponse\x128\n" +
 	"\aresults\x18\x01 \x03(\v2\x1e.pushupes.v1.BatchAppendResultR\aresults\"\x17\n" +
-	"\x15PrefetchRoutesRequest\"l\n" +
+	"\x15PrefetchRoutesRequest\"\xea\x01\n" +
 	"\x16PrefetchRoutesResponse\x12*\n" +
 	"\x11node_client_addrs\x18\x01 \x03(\tR\x0fnodeClientAddrs\x12&\n" +
-	"\x0fslot_node_index\x18\x02 \x03(\x05R\rslotNodeIndex\"o\n" +
+	"\x0fslot_node_index\x18\x02 \x03(\x05R\rslotNodeIndex\x12\x1b\n" +
+	"\tgroup_gen\x18\x03 \x01(\x05R\bgroupGen\x12\x1d\n" +
+	"\n" +
+	"group_base\x18\x04 \x01(\x05R\tgroupBase\x12\x1d\n" +
+	"\n" +
+	"group_size\x18\x05 \x01(\x05R\tgroupSize\x12!\n" +
+	"\flayout_epoch\x18\x06 \x01(\x04R\vlayoutEpoch\"o\n" +
 	"\x11ReadStreamRequest\x12!\n" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x12!\n" +
 	"\ffrom_version\x18\x02 \x01(\rR\vfromVersion\x12\x14\n" +

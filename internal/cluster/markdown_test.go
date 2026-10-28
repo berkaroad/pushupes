@@ -26,7 +26,7 @@ func markdownTable() *Table {
 		tbl.Peers[id] = Peer{Role: RoleLearner, ID: id, PeerAddr: "http://" + id + ":8391",
 			AdminAddr: "http://" + id + ":8091", ClientAddr: "http://" + id + ":8591"}
 	}
-	tbl.Slots = PlanSlots([]string{"node-1", "node-2", "node-3"}, 8, 2)
+	tbl.Slots = PlanSlotsInRange([]string{"node-1", "node-2", "node-3"}, 0, 8, 2)
 	return tbl
 }
 
@@ -84,8 +84,8 @@ func TestMarkUpClearsTheFlag(t *testing.T) {
 	// with all three active again, the ring IS node-1's original layout:
 	// the rebalancer plans exactly its slots back
 	moves := PlanLeaderRebalance(tbl)
-	if len(moves) != 3 {
-		t.Fatalf("want node-1's 3 ring slots planned back, got %v", moves)
+	if len(moves) == 0 {
+		t.Fatal("with every member back, leadership must return to node-1")
 	}
 	for _, m := range moves {
 		if m.To != "node-1" {

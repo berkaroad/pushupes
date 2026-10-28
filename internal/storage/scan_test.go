@@ -35,7 +35,7 @@ func TestScanFetchState(t *testing.T) {
 	// slot 2 gets two records; slot 5 stays untouched (never opened).
 	agg := aggInSlotForTest(t, st, 2)
 	for i := 1; i <= 2; i++ {
-		if _, err := st.Append(&data.EventRecord{
+		if _, err := st.AppendRouted(&data.EventRecord{
 			AggregateID: agg, Version: uint32(i), CommandID: fmt.Sprintf("scan-%d", i),
 			Events: []data.Event{{Type: "t", Body: []byte("x")}},
 		}); err != nil {
@@ -82,7 +82,7 @@ func TestScanFetchState(t *testing.T) {
 		t.Fatal("slot 5: no wake handle to park on")
 	}
 	before := watch[0]
-	if _, err := st.Append(&data.EventRecord{
+	if _, err := st.AppendRouted(&data.EventRecord{
 		AggregateID: aggInSlotForTest(t, st, 5), Version: 1, CommandID: "scan-wake",
 		Events: []data.Event{{Type: "t", Body: []byte("y")}},
 	}); err != nil {

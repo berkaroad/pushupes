@@ -37,4 +37,5 @@ const (
 	ErrIDAckTimeout        = 1007 // watermark deadline expired: the record IS in the leader's WAL, retry answers exists
 	ErrIDReplicaCatchingUp = 1008 // this node leads the slot but holds no usable copy yet; nothing was written
 	ErrIDNoDataPlane       = 1009 // control-plane-only member, layout unplanned; nothing was written, retrying cannot help
+	ErrIDGroupMismatch     = 1010 // the request's layout_epoch is stale: refresh PrefetchRoutes and retry
 )

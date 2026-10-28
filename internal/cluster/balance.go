@@ -217,6 +217,13 @@ func (e *Engine) rebalanceRound(ctx context.Context, limit int) int {
 			done++
 			continue
 		}
+		// A balancing move (leader census only) never asks for a copy: if the
+		// target is not already seated the move is simply not this round's —
+		// staging would turn a metadata hand-over into a slot transfer, which is
+		// exactly the cost the balancing path is supposed to avoid.
+		if m.Balance && !replicaListHas(cur.Replicas, m.To) {
+			continue
+		}
 		// 1) stage: a target outside the replica set has no copy to catch up
 		// from. Joining it to the set is the cheap half of the handover and it
 		// is what starts the fetch; the commit waits for a later round. No
@@ -243,6 +250,13 @@ func (e *Engine) rebalanceRound(ctx context.Context, limit int) int {
 			continue // peer-plane error: it will either heal or be caught next round
 		}
 		if diverged {
+			// Rebuilding a forked copy is a slot transfer; a balancing move may
+			// not buy one. Leave the fork to the ring-anchored path and the
+			// operator, and let the census converge on the slots whose copies are
+			// healthy.
+			if m.Balance {
+				continue
+			}
 			// One reading is not evidence: confirm it next round first, so a
 			// directory still settling behind its log end offset is not
 			// mistaken for a fork (see confirmDiverged).
@@ -475,20 +489,22 @@ func (e *Engine) reclaimRound(ctx context.Context) int {
 	if len(tbl.Peers) < 2 || !layoutSettled(tbl) {
 		return 0
 	}
-	planned := PlanSlots(tbl.HostingIDs(), tbl.SlotCount, tbl.Replicas)
+	plan := tbl.DesiredSeats()
 	now := time.Now()
 	var cands []reclaimCandidate
 	for s, p := range tbl.Slots {
-		want := planned[s]
-		if want == nil {
-			// No hosting member plans this slot: the pool is empty (every
-			// member is control-plane only). Nothing comes off — a dropped
-			// seat must be redundant against the seats that STAY, and with no
-			// hosting member there is no such seat. The bytes outlive the
-			// layout; the slot is re-seated when a data-plane node arrives.
+		want := tbl.desiredReplicas(plan, s)
+		if len(want) == 0 {
+			// No candidate holds or should hold this slot: the pool is empty
+			// (every member is control-plane only), or this slot's seats all
+			// sit on nodes the layout no longer names. Nothing comes off — a
+			// dropped seat must be redundant against the seats that STAY, and
+			// with no such seat there is nothing to be redundant against. The
+			// bytes outlive the layout; the slot is re-seated when a data-plane
+			// node arrives.
 			continue
 		}
-		drop := surplusSeatForReplan(p, tbl.Replicas, want.Replicas)
+		drop := surplusSeatForReplan(p, tbl.Replicas, want)
 		if drop == "" {
 			continue
 		}

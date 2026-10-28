@@ -212,12 +212,31 @@ func (s *Server) batchSlot(ctx context.Context, slot int32, reqs []*pushupesv1.A
 		return out
 	}
 	for k, i := range live {
-		out[i] = convertAppend(resps[k])
+		out[i] = convertAppend(resps[k], s.engine.GroupSpec())
 	}
 	return out
 }
 
 // ---- BatchAppend -------------------------------------------------------------
+
+// batchRejection answers BatchAppend's pre-execution refusal: a stale
+// layout_epoch (1010 — the client routes by a generation this cluster no longer
+// serves: refresh PrefetchRoutes and retry). errID 0 means the batch may execute.
+// layout_epoch 0 is "no opinion": a client that never fetched a routing table
+// keeps working.
+func batchRejection(epoch uint64, spec cluster.SlotGroup) (int, string) {
+	// A cluster always serves a generation now: there is no flat fallback left for
+	// a table that has none. Reaching here with Size 0 means the plan has not run
+	// yet (or the node is a control-plane member that never received one), and
+	// writing would put records in slots no layout owns.
+	if spec.Size <= 0 {
+		return data.ErrIDGroupMismatch, "no slot generation is served yet"
+	}
+	if epoch != 0 && epoch != spec.Epoch {
+		return data.ErrIDGroupMismatch, "layout_epoch mismatch"
+	}
+	return 0, ""
+}
 
 // BatchAppend appends records in one call — the only write entry on the
 // client plane, so a single write is a batch of one record. Each record gets its own
@@ -254,6 +273,44 @@ func (s *Server) BatchAppend(ctx context.Context, req *pushupesv1.BatchAppendReq
 		return out, nil
 	}
 
+	// Layout gate first: a stale layout_epoch means the client routes by a
+	// generation this cluster no longer serves (1010: refresh PrefetchRoutes and
+	// retry), and a slot_override outside the reserved slot is a client bug
+	// (1011: retrying cannot help). Both are answerable per record and neither
+	// executes anything. layout_epoch 0 means "no opinion" and is accepted, so a
+	// client that never fetched a table keeps working.
+	spec := s.engine.GroupSpec()
+	if errID, msg := batchRejection(req.LayoutEpoch, spec); errID != 0 {
+		for i, r := range req.Records {
+			out.Results[i] = &pushupesv1.BatchAppendResult{
+				AggregateId: r.AggregateId,
+				Response:    s.fail(errID, msg, 0, 0, ""),
+			}
+		}
+		return out, nil
+	}
+	// Sealing window: while a generation migration is filling the next segment,
+	// the destination slots are staged (importing_in) and the source slots answer
+	// ASK. A client that follows that ASK lands HERE, on the destination leader,
+	// before the switch — parking the request is what makes the source log stop
+	// growing without refusing the write: we wait for the layout to switch and then
+	// answer 1010, which tells the client to refresh its table and re-send into the
+	// new (now servable) segment.
+	for _, r := range req.Records {
+		if dst, ok := s.engine.StagingSlotOf(r.AggregateId); ok && s.engine.Leads(dst) {
+			if !s.engine.AwaitImportSettled(ctx, dst) {
+				return nil, status.Error(codes.Canceled, "layout change pending; retry")
+			}
+			for i, rr := range req.Records {
+				out.Results[i] = &pushupesv1.BatchAppendResult{
+					AggregateId: rr.AggregateId,
+					Response:    s.fail(data.ErrIDGroupMismatch, "generation switch landed; refresh the layout", 0, 0, ""),
+				}
+			}
+			return out, nil
+		}
+	}
+
 	// Duplicate-aggregate detection first (map iteration order is random,
 	// so detection must not depend on execution order): every record whose
 	// aggregate_id appears more than once in the batch fails without
@@ -279,7 +336,7 @@ func (s *Server) BatchAppend(ctx context.Context, req *pushupesv1.BatchAppendReq
 			}
 			continue
 		}
-		slot := s.store.SlotOf(r.AggregateId)
+		slot := cluster.SlotForAgg(r.AggregateId, spec, s.store.SlotCount)
 		g := bySlot[slot]
 		if g == nil {
 			g = &slotGroup{slot: slot}
@@ -314,11 +371,18 @@ func (s *Server) BatchAppend(ctx context.Context, req *pushupesv1.BatchAppendReq
 // names in between.
 func (s *Server) PrefetchRoutes(ctx context.Context, req *pushupesv1.PrefetchRoutesRequest) (*pushupesv1.PrefetchRoutesResponse, error) {
 	rows := s.engine.SlotRouteTable()
+	spec := s.engine.GroupSpec()
 	out := &pushupesv1.PrefetchRoutesResponse{
-		// slot_node_index is dense over slots: its length IS the cluster's
-		// slot count, which the client reads back from here instead of
-		// hard-coding a constant it has no business knowing.
-		SlotNodeIndex: make([]int32, len(rows)),
+		// slot_node_index is dense over LOGICAL slots: index l carries the leader
+		// of logical slot l, i.e. physical slot group_base + l. Its length is the
+		// generation's size — a client never sees the physical id space, so the
+		// array stays small as generations grow and the same client code runs
+		// against any base.
+		SlotNodeIndex: make([]int32, spec.Size),
+		GroupGen:      int32(spec.Gen),
+		GroupBase:     spec.Base,
+		GroupSize:     spec.Size,
+		LayoutEpoch:   spec.Epoch,
 	}
 	// Addresses de-duplicate in first-appearance order; the fallback entry
 	// (unassigned slot, or a leader whose registration has not landed) is
@@ -334,23 +398,31 @@ func (s *Server) PrefetchRoutes(ctx context.Context, req *pushupesv1.PrefetchRou
 		out.NodeClientAddrs = append(out.NodeClientAddrs, addr)
 		return i
 	}
-	for slot, addr := range rows {
+	for logical := int32(0); logical < spec.Size; logical++ {
+		addr := rows[spec.Physical(logical)]
 		if addr == "" {
 			addr = s.selfClientAddr
 		}
-		out.SlotNodeIndex[slot] = add(cluster.HostPort(addr))
+		out.SlotNodeIndex[logical] = add(cluster.HostPort(addr))
 	}
 	return out, nil
 }
 
-func convertAppend(r *data.AppendResponse) *pushupesv1.AppendResponse {
+// logicalSlot maps a table (physical) slot id onto the client plane's logical
+// id space: the client only ever sees 0 .. group_size-1, and the generation's
+// base turns that back into a table slot here on the server.
+func (s *Server) logicalSlot(physical int32) int32 {
+	return s.engine.GroupSpec().Logical(physical)
+}
+
+func convertAppend(r *data.AppendResponse, spec cluster.SlotGroup) *pushupesv1.AppendResponse {
 	out := &pushupesv1.AppendResponse{
 		Status:         appendStatus(r.Status),
 		ErrId:          uint32(r.ErrID),
 		Message:        r.Err,
 		CurrentVersion: r.CurrentVersion,
 		Seq:            r.Seq,
-		Slot:           r.Slot,
+		Slot:           spec.Logical(r.Slot),
 		Node:           r.Node,
 	}
 	if r.Record != nil {
@@ -378,7 +450,7 @@ func (s *Server) fail(errID int, msg string, currentVersion uint32, slot int32, 
 		ErrId:          uint32(errID),
 		Message:        msg,
 		CurrentVersion: currentVersion,
-		Slot:           slot,
+		Slot:           s.logicalSlot(slot),
 		Node:           node,
 	}
 }
@@ -402,7 +474,7 @@ func (s *Server) ReadStream(ctx context.Context, req *pushupesv1.ReadStreamReque
 	if from == 0 {
 		from = 1
 	}
-	slot := s.store.SlotOf(req.AggregateId)
+	slot := s.engine.SlotOfAgg(req.AggregateId)
 
 	// Read admission: redirect when this node cannot be trusted to answer
 	// locally (a non-holder, or a replica whose sync with the slot's current
@@ -414,7 +486,7 @@ func (s *Server) ReadStream(ctx context.Context, req *pushupesv1.ReadStreamReque
 	uptoSeq, serveEmpty, redirect, _ := s.engine.LocalRead(slot)
 	if redirect != "" {
 		return &pushupesv1.ReadStreamResponse{
-			ErrId: uint32(data.ErrIDSlotNotLocal), Slot: slot, Node: redirect,
+			ErrId: uint32(data.ErrIDSlotNotLocal), Slot: s.logicalSlot(slot), Node: redirect,
 		}, nil
 	}
 	var (
@@ -423,7 +495,7 @@ func (s *Server) ReadStream(ctx context.Context, req *pushupesv1.ReadStreamReque
 		err  error
 	)
 	if !serveEmpty {
-		recs, seqs, err = s.store.ReadAggregate(req.AggregateId, from, req.Limit, uptoSeq)
+		recs, seqs, err = s.store.ReadAggregate(slot, req.AggregateId, from, req.Limit, uptoSeq)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "read: %v", err)
 		}
@@ -489,7 +561,7 @@ func (s *Server) ReadTails(ctx context.Context, req *pushupesv1.ReadTailsRequest
 		if id == "" {
 			continue // answered with version 0, same as before
 		}
-		slot := s.store.SlotOf(id)
+		slot := s.engine.SlotOfAgg(id)
 		v := seen[slot]
 		if v == nil {
 			uptoSeq, serveEmpty, redirect, _ := s.engine.LocalRead(slot)
@@ -505,7 +577,7 @@ func (s *Server) ReadTails(ctx context.Context, req *pushupesv1.ReadTailsRequest
 		if v.serveEmpty {
 			continue // admitted but nothing confirmed: version 0
 		}
-		version, err := s.store.TailVersionOf(id, v.bound)
+		version, err := s.store.TailVersionOf(v.slot, id, v.bound)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "read tails: %v", err)
 		}
@@ -520,11 +592,11 @@ func (s *Server) ReadByCommand(ctx context.Context, req *pushupesv1.ReadByComman
 	if req.AggregateId == "" || req.CommandId == "" {
 		return nil, status.Error(codes.InvalidArgument, "aggregate_id and command_id required")
 	}
-	slot := s.store.SlotOf(req.AggregateId)
+	slot := s.engine.SlotOfAgg(req.AggregateId)
 	uptoSeq, serveEmpty, redirect, _ := s.engine.LocalRead(slot)
 	if redirect != "" {
 		return &pushupesv1.ReadByCommandResponse{
-			ErrId: uint32(data.ErrIDSlotNotLocal), Slot: slot, Node: redirect,
+			ErrId: uint32(data.ErrIDSlotNotLocal), Slot: s.logicalSlot(slot), Node: redirect,
 		}, nil
 	}
 	var (
@@ -540,7 +612,7 @@ func (s *Server) ReadByCommand(ctx context.Context, req *pushupesv1.ReadByComman
 		if bound == 0 {
 			bound = s.store.LastSeqOf(slot)
 		}
-		rec, seq, err = s.store.RecordByCommand(req.AggregateId, req.CommandId)
+		rec, seq, err = s.store.RecordByCommand(slot, req.AggregateId, req.CommandId)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "by-command: %v", err)
 		}
@@ -569,17 +641,17 @@ func (s *Server) ReadVersionByTime(ctx context.Context, req *pushupesv1.ReadVers
 	if req.AggregateId == "" {
 		return nil, status.Error(codes.InvalidArgument, "aggregate_id required")
 	}
-	slot := s.store.SlotOf(req.AggregateId)
+	slot := s.engine.SlotOfAgg(req.AggregateId)
 	uptoSeq, serveEmpty, redirect, _ := s.engine.LocalRead(slot)
 	if redirect != "" {
 		return &pushupesv1.ReadVersionByTimeResponse{
-			ErrId: uint32(data.ErrIDSlotNotLocal), Slot: slot, Node: redirect,
+			ErrId: uint32(data.ErrIDSlotNotLocal), Slot: s.logicalSlot(slot), Node: redirect,
 		}, nil
 	}
 	var err error
 	v := uint32(0)
 	if !serveEmpty {
-		v, err = s.store.VersionAtOrBeforeTime(req.AggregateId, req.UnixTime, uptoSeq)
+		v, err = s.store.VersionAtOrBeforeTime(slot, req.AggregateId, req.UnixTime, uptoSeq)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "version by time: %v", err)
 		}

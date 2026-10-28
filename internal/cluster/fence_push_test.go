@@ -84,7 +84,7 @@ func TestFencePushDoesNotStrandTargetAggregate(t *testing.T) {
 	// Source: v1..v3 of `agg`, then a run of `partner` to push the slot LEO
 	// well past agg's own seqs.
 	for v := 1; v <= 3; v++ {
-		if _, err := srcStore.Append(&data.EventRecord{
+		if _, err := srcStore.AppendRouted(&data.EventRecord{
 			AggregateID: agg, Version: uint32(v),
 			CommandID: agg + "-c" + strconv.Itoa(v),
 			Events:    []data.Event{{Type: "E", Body: []byte("x")}},
@@ -93,7 +93,7 @@ func TestFencePushDoesNotStrandTargetAggregate(t *testing.T) {
 		}
 	}
 	for v := 1; v <= 5; v++ {
-		if _, err := srcStore.Append(&data.EventRecord{
+		if _, err := srcStore.AppendRouted(&data.EventRecord{
 			AggregateID: partner, Version: uint32(v),
 			CommandID: partner + "-c" + strconv.Itoa(v),
 			Events:    []data.Event{{Type: "E", Body: []byte("x")}},
@@ -106,7 +106,7 @@ func TestFencePushDoesNotStrandTargetAggregate(t *testing.T) {
 	// target's stream for `agg` is empty. This is the shape the fence can
 	// actually deliver: the slot counter moved on, the aggregate did not.
 	for v := 4; v <= 5; v++ {
-		if _, err := srcStore.Append(&data.EventRecord{
+		if _, err := srcStore.AppendRouted(&data.EventRecord{
 			AggregateID: agg, Version: uint32(v),
 			CommandID: agg + "-c" + strconv.Itoa(v),
 			Events:    []data.Event{{Type: "E", Body: []byte("x")}},
@@ -152,18 +152,18 @@ func TestFencePushDoesNotStrandTargetAggregate(t *testing.T) {
 	// can walk: either the record arrived at its next version, or it did not
 	// arrive at all. What must NOT happen is a directory claiming a version it
 	// cannot serve, which makes every read of that aggregate fail.
-	tgtTail, err := tgtStore.TailVersionOf(agg, 0)
+	tgtTail, err := tgtStore.TailVersionOfRouted(agg, 0)
 	if err != nil {
 		t.Fatalf("target aggregate unreadable after the push: %v", err)
 	}
-	recs, _, err := tgtStore.ReadAggregate(agg, 1, 0, 0)
+	recs, _, err := tgtStore.ReadAggregateRouted(agg, 1, 0, 0)
 	if err != nil {
 		t.Fatalf("target read of %s failed after the push: %v", agg, err)
 	}
 	t.Logf("after push: target tail=%d readable_records=%d", tgtTail, len(recs))
 	// Is the target's `partner` stream duplicated? Its tail vs what it can serve.
-	partnerTail, _ := tgtStore.TailVersionOf(partner, 0)
-	pRecs, _, _ := tgtStore.ReadAggregate(partner, 1, 0, 0)
+	partnerTail, _ := tgtStore.TailVersionOfRouted(partner, 0)
+	pRecs, _, _ := tgtStore.ReadAggregateRouted(partner, 1, 0, 0)
 	t.Logf("  partner: tail=%d readable=%d (v1..v5 written once by the harness)", partnerTail, len(pRecs))
 	if partnerTail != 5 {
 		t.Errorf("partner tail on the target = %d, want 5: the fence re-pushed records the "+
@@ -206,7 +206,7 @@ func (e *Engine) registerPeerForTest(t *testing.T, id, peerAddr string) {
 // cannot answer.
 func tailOf(t *testing.T, st *storage.Store, agg string) int {
 	t.Helper()
-	v, err := st.TailVersionOf(agg, 0)
+	v, err := st.TailVersionOfRouted(agg, 0)
 	if err != nil {
 		return -1
 	}

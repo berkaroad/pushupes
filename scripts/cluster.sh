@@ -259,6 +259,9 @@ start_node() {
   local node_role
   node_role="$(node_n_role "$n")"
   extra+=(-role "$node_role")
+  if [[ -n "${SLOT_GROUP:-}" ]]; then
+    extra+=(-slot-group "$SLOT_GROUP")
+  fi
   # 入群声明二选一（pushupes 自身强制互斥）：AUTHOR=1 的节点是初始配置撰写者，
   # 带 -peers 文档；其余所有节点（voter joiner 与 learner）带 -join 控制面地址
   # 列表，按 adopt 周期轮转自报——加入数据面节点不需要任何 admin 调用。

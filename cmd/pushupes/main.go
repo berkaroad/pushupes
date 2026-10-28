@@ -138,6 +138,17 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	// hand it to NewNode and wire the node back in.
 	eng := cluster.NewEngine(nil, store, cfg.NodeID, logger)
 	eng.SetDropRetention(dropRetention)
+	// -slot-group is a seed too: a malformed value is a startup error, and a
+	// valid one reaches the replicated table only through a brand-new cluster's
+	// first plan.
+	bootGroup, err := cluster.ParseSlotGroup(cfg.SlotGroup, int32(cfg.SlotCount))
+	if err != nil {
+		return fmt.Errorf("-slot-group: %w", err)
+	}
+	eng.SetBootGroup(bootGroup)
+	logger.Info("slot generation seed for a new cluster",
+		"slot_group", cfg.SlotGroup, "gen", bootGroup.Gen,
+		"base", bootGroup.Base, "size", bootGroup.Size)
 	// -replica-policy is a seed, not a live knob: an invalid value is a
 	// startup error (same fail-fast rule as -drop-after), and a valid one is
 	// applied by the controller ONLY on a brand-new cluster's first plan. An

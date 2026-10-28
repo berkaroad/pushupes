@@ -39,7 +39,7 @@ func TestReplStatsTracksStuckWatermarkAndParkedRounds(t *testing.T) {
 	e.tableMu.Unlock()
 
 	agg := aggInSlot(t, e, 3)
-	if _, err := store.Append(makeRecord(agg, 1, "c1")); err != nil {
+	if _, err := store.AppendRouted(makeRecord(agg, 1, "c1")); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 
@@ -80,7 +80,7 @@ func TestReplStatsTracksStuckWatermarkAndParkedRounds(t *testing.T) {
 	}
 
 	// A new record must end the park through the store wake, not the deadline.
-	if _, err := store.Append(makeRecord(agg, 2, "c2")); err != nil {
+	if _, err := store.AppendRouted(makeRecord(agg, 2, "c2")); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	select {

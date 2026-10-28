@@ -31,6 +31,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -176,6 +177,127 @@ func (s *peerServer) Replicate(_ context.Context, req *pushupesv1.ReplicateReque
 	return &pushupesv1.ReplicateResponse{}, nil
 }
 
+// ReplicateAggregate streams one aggregate's records out of a slot so a
+// generation migration can replay them into the slot the new segment routes them
+// to (DESIGN §4.5.8). The caller pulls: the DESTINATION asks the source, which
+// keeps the flow control on the side that has to store the bytes.
+//
+// Records leave encoded and in version order, and the cursor is the aggregate
+// version — not a slot offset — because that is the only identity that survives
+// the re-routing: one source slot's aggregates scatter across several
+// destination slots, and a replay that resumed on a byte offset would be
+// meaningless on the other side. The last chunk carries NextVersion = 0.
+func (s *peerServer) ReplicateAggregate(req *pushupesv1.ReplicateAggregateRequest, stream pushupesv1.PeerService_ReplicateAggregateServer) error {
+	const defRecords, defBytes = 256, 1 << 20
+	maxRecords := int(req.GetMaxRecords())
+	if maxRecords <= 0 {
+		maxRecords = defRecords
+	}
+	maxBytes := int(req.GetMaxBytes())
+	if maxBytes <= 0 {
+		maxBytes = defBytes
+	}
+	from := uint32(req.GetFromVersion())
+	if from == 0 {
+		from = 1
+	}
+	for {
+		recs, _, err := s.e.store.ReadAggregate(req.GetSlot(), req.GetAggregateId(), from, uint64(maxRecords), req.GetUptoSeq())
+		if err != nil {
+			return err
+		}
+		if len(recs) == 0 {
+			return nil // nothing (left) to replay: the aggregate is done
+		}
+		chunk := &pushupesv1.ReplicateAggregateResponse{}
+		size := 0
+		var buf []byte
+		for i, rec := range recs {
+			buf = rec.EncodeBinary(buf[:0])
+			if i > 0 && size+len(buf) > maxBytes {
+				recs = recs[:i] // the byte budget ends the chunk here
+				break
+			}
+			size += len(buf)
+			chunk.Records = append(chunk.Records, append([]byte(nil), buf...))
+		}
+		// The cursor always advances past what was sent: the caller asks again and
+		// learns the aggregate is finished from an EMPTY stream, not from a guess
+		// about short reads (a short chunk can also come from the byte budget).
+		chunk.Versions = uint32(len(chunk.Records))
+		last := recs[len(chunk.Records)-1].Version
+		chunk.NextVersion = last + 1
+		if err := stream.Send(chunk); err != nil {
+			return err
+		}
+		from = last + 1
+	}
+}
+
+// SlotStreams lists a slot's aggregates (paged), so a generation migration can
+// walk the source slot without holding the whole aggregate directory in memory:
+// a slot at the calibration target holds ~1e7 streams.
+func (s *peerServer) SlotStreams(_ context.Context, req *pushupesv1.SlotStreamsRequest) (*pushupesv1.SlotStreamsResponse, error) {
+	limit := int(req.GetLimit())
+	if limit <= 0 {
+		limit = 512
+	}
+	page, err := s.e.store.StreamPage(req.GetSlot(), req.GetAfter(), limit)
+	if err != nil {
+		return nil, err
+	}
+	out := &pushupesv1.SlotStreamsResponse{NextAfter: page.NextAfter}
+	for _, st := range page.Streams {
+		out.Aggregates = append(out.Aggregates, st.AggregateID)
+	}
+	return out, nil
+}
+
+// ReplayInto makes THIS node pull one aggregate from a source slot and land it in
+// a local slot (the destination side of a generation migration).
+//
+// The pull direction matters: the destination owns the write and therefore the
+// pacing, and the source needs no knowledge of the new layout. The replay is
+// idempotent per (aggregate, version) — see replayChunkInto — so a call that
+// fails half way can simply be repeated.
+func (s *peerServer) ReplayInto(ctx context.Context, req *pushupesv1.ReplayIntoRequest) (*pushupesv1.ReplayIntoResponse, error) {
+	if req.GetSrcAddr() == "" || req.GetAggregateId() == "" {
+		return nil, fmt.Errorf("replay_into: src_addr and aggregate_id are required")
+	}
+	cli, err := s.e.peers.client(req.GetSrcAddr())
+	if err != nil {
+		return nil, fmt.Errorf("replay_into: dial %s: %w", req.GetSrcAddr(), err)
+	}
+	stream, err := cli.ReplicateAggregate(ctx, &pushupesv1.ReplicateAggregateRequest{
+		Slot:        req.GetSrcSlot(),
+		AggregateId: req.GetAggregateId(),
+		FromVersion: req.GetFromVersion(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("replay_into: open stream from %s: %w", req.GetSrcAddr(), err)
+	}
+	landed := 0
+	next := req.GetFromVersion()
+	for {
+		chunk, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("replay_into: recv from %s: %w", req.GetSrcAddr(), err)
+		}
+		n, err := s.e.replayChunkInto(req.GetDstSlot(), chunk.GetRecords())
+		if err != nil {
+			return nil, err
+		}
+		landed += n
+		if chunk.GetNextVersion() != 0 {
+			next = chunk.GetNextVersion()
+		}
+	}
+	return &pushupesv1.ReplayIntoResponse{Landed: uint32(landed), NextVersion: next}, nil
+}
+
 func (s *peerServer) SlotLeo(_ context.Context, req *pushupesv1.SlotLeoRequest) (*pushupesv1.SlotLeoResponse, error) {
 	leo, aggregates, versions, resolvable := s.e.HandleSlotLeo(req.Slot)
 	resp := &pushupesv1.SlotLeoResponse{
@@ -190,6 +312,33 @@ func (s *peerServer) SlotLeo(_ context.Context, req *pushupesv1.SlotLeoRequest) 
 		resp.DurableLeo = dur
 	}
 	return resp, nil
+}
+
+// FreezeSlot holds a slot's write gate closed until ThawSlot. The freeze waits
+// for the writes already in flight, so the LEO it returns is the log the caller
+// can replay from without racing anyone.
+func (s *peerServer) FreezeSlot(ctx context.Context, req *pushupesv1.FreezeSlotRequest) (*pushupesv1.FreezeSlotResponse, error) {
+	if !s.e.Leads(req.GetSlot()) {
+		return nil, fmt.Errorf("freeze slot %d: this node does not lead it", req.GetSlot())
+	}
+	if err := s.e.acquireSlotFence(ctx, req.GetSlot()); err != nil {
+		return nil, err
+	}
+	return &pushupesv1.FreezeSlotResponse{Leo: s.e.store.LastSeqOf(req.GetSlot())}, nil
+}
+
+// ThawSlot releases a frozen slot — but only once this node's APPLIED table has
+// moved on. Releasing first would let the writers that were blocked on the gate
+// wake up, read their still-local view ("I lead this slot"), and append to the
+// old segment: those records are acknowledged and then thrown away by the
+// retirement. The data plane applies the switch a beat after the Raft commit, so
+// the controller retries this until it succeeds.
+func (s *peerServer) ThawSlot(_ context.Context, req *pushupesv1.ThawSlotRequest) (*pushupesv1.ThawSlotResponse, error) {
+	if p, ok := s.e.slotPlacement(req.GetSlot()); ok && p.Leader == s.e.self {
+		return nil, fmt.Errorf("thaw slot %d: this node still leads it (the layout switch has not been applied here yet)", req.GetSlot())
+	}
+	s.e.releaseSlotFence(req.GetSlot())
+	return &pushupesv1.ThawSlotResponse{}, nil
 }
 
 func (s *peerServer) FenceSlot(ctx context.Context, req *pushupesv1.FenceSlotRequest) (*pushupesv1.FenceSlotResponse, error) {
@@ -516,7 +665,7 @@ func (s *peerServer) SlotSizes(_ context.Context, req *pushupesv1.SlotSizesReque
 // naming where to go — and the stream ends when the caller falls too far
 // behind to keep in a bounded buffer, which is the caller's cue to reconnect
 // and re-sync from its applied index.
-func (s *peerServer) WatchLayout(req *pushupesv1.WatchLayoutRequest, stream grpc.ServerStreamingServer[pushupesv1.LayoutFrame]) error {
+func (s *peerServer) WatchLayout(req *pushupesv1.WatchLayoutRequest, stream grpc.ServerStreamingServer[pushupesv1.WatchLayoutResponse]) error {
 	if req.GetLearnerId() == "" {
 		return fmt.Errorf("cluster: WatchLayout needs a learner id")
 	}
@@ -530,8 +679,8 @@ func (s *peerServer) WatchLayout(req *pushupesv1.WatchLayoutRequest, stream grpc
 
 // toPBFrame puts one feed step on the wire. kind/entry_kind are carried as
 // numbers so the two sides can grow without a shared enum.
-func toPBFrame(f *layoutFrame) *pushupesv1.LayoutFrame {
-	out := &pushupesv1.LayoutFrame{
+func toPBFrame(f *layoutFrame) *pushupesv1.WatchLayoutResponse {
+	out := &pushupesv1.WatchLayoutResponse{
 		Kind:           f.Kind,
 		Index:          f.Index,
 		Term:           f.Term,

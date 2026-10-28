@@ -43,6 +43,7 @@ const (
 	ErrIDAckTimeout        = client.ErrIDAckTimeout        // 1007 watermark deadline; the record is in the leader's WAL
 	ErrIDReplicaCatchingUp = client.ErrIDReplicaCatchingUp // 1008 leader holds no usable copy yet; retry later
 	ErrIDNoDataPlane       = client.ErrIDNoDataPlane       // 1009 control-plane-only node; the layout is unplanned
+	ErrIDGroupMismatch     = client.ErrIDGroupMismatch     // 1010 stale layout_epoch; refresh PrefetchRoutes and retry
 )
 
 // ---- Domain errors --------------------------------------------------------

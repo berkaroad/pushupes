@@ -53,7 +53,7 @@ func TestReadRangeBatchIsSeqContiguous(t *testing.T) {
 				CommandID: fmt.Sprintf("c-%d", v),
 				Events:    []data.Event{{Type: "E", Body: []byte("payload-body")}},
 			}
-			if _, err := st.Append(rec); err != nil {
+			if _, err := st.AppendRouted(rec); err != nil {
 				t.Fatalf("append v%d: %v", v, err)
 			}
 		}

@@ -40,22 +40,22 @@ import (
 // roll threshold and the bounds a configured segment size must satisfy.
 const (
 	// DefaultSlotCount is the fixed number of slots in the cluster.
-	// 1024 = 2^10 is sized for the split data plane: at the target ceiling of 256
-	// data nodes every node still holds 4 slots, so placement and migration stay
-	// granular at full scale. Data-node counts are even, and every power of two up
-	// to 256 divides 1024 exactly — those topologies give each node the same slot
-	// count (ring placement keeps any other N within one slot of the mean). It is
-	// also far above the expected node count: cheap slot metadata, fine-grained
-	// placement and migration units. The planned node (4 cores / 16GiB / 1TiB,
-	// records typically 1-4KiB) sizes this together with the segment default:
-	// every slot costs a long-poll and a WAL, the count and its ceiling are one
-	// decision, taken together in DESIGN §7.2.
+	//
+	// 2048 = 2^11 is the slot-generation budget (DESIGN §7.2.7): generation g
+	// owns [2^g, 2^(g+1)) and routes with slot = 2^g + hash&(2^g-1), so the
+	// generations sum to 1+2+…+1024 = 2047 slots plus slot-000, the reserved
+	// performance slot business routing can never produce. The full deployment
+	// is 1024 data nodes with one active slot each (generation g10 = slots
+	// 1024..2047). The earlier generations are the budget an expansion keeps
+	// alive at the same time as its target — source segment plus target
+	// segment — which is why the table is twice the largest generation instead
+	// of equal to it.
 	//
 	// This is server-side cluster state. The client contract (pkg/client) carries
 	// the routing ALGORITHM — the one thing a client must compute identically —
-	// while the slot count reaches clients through PrefetchRoutes, so it can
-	// change without stranding any client build.
-	DefaultSlotCount = 1024
+	// while the generation and the slot count reach clients through
+	// PrefetchRoutes, so they can change without stranding any client build.
+	DefaultSlotCount = 2048
 
 	// A configured segment size must be a power of two between MinSegmentBytes
 	// and MaxSegmentBytes: 256MiB, 512MiB, 1GiB, 2GiB, one doubling per step.

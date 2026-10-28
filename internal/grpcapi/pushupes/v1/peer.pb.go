@@ -98,7 +98,7 @@ func (x *WatchLayoutRequest) GetTopology() string {
 }
 
 // LayoutFrame is one step of the feed. kind selects which fields carry.
-type LayoutFrame struct {
+type WatchLayoutResponse struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Kind           uint32                 `protobuf:"varint,1,opt,name=kind,proto3" json:"kind,omitempty"`
 	Index          uint64                 `protobuf:"varint,2,opt,name=index,proto3" json:"index,omitempty"`                                          // ENTRY/SNAPSHOT: the index this frame puts the caller at
@@ -116,20 +116,20 @@ type LayoutFrame struct {
 	sizeCache      protoimpl.SizeCache
 }
 
-func (x *LayoutFrame) Reset() {
-	*x = LayoutFrame{}
+func (x *WatchLayoutResponse) Reset() {
+	*x = WatchLayoutResponse{}
 	mi := &file_pushupes_v1_peer_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *LayoutFrame) String() string {
+func (x *WatchLayoutResponse) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*LayoutFrame) ProtoMessage() {}
+func (*WatchLayoutResponse) ProtoMessage() {}
 
-func (x *LayoutFrame) ProtoReflect() protoreflect.Message {
+func (x *WatchLayoutResponse) ProtoReflect() protoreflect.Message {
 	mi := &file_pushupes_v1_peer_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -141,89 +141,89 @@ func (x *LayoutFrame) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use LayoutFrame.ProtoReflect.Descriptor instead.
-func (*LayoutFrame) Descriptor() ([]byte, []int) {
+// Deprecated: Use WatchLayoutResponse.ProtoReflect.Descriptor instead.
+func (*WatchLayoutResponse) Descriptor() ([]byte, []int) {
 	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{1}
 }
 
-func (x *LayoutFrame) GetKind() uint32 {
+func (x *WatchLayoutResponse) GetKind() uint32 {
 	if x != nil {
 		return x.Kind
 	}
 	return 0
 }
 
-func (x *LayoutFrame) GetIndex() uint64 {
+func (x *WatchLayoutResponse) GetIndex() uint64 {
 	if x != nil {
 		return x.Index
 	}
 	return 0
 }
 
-func (x *LayoutFrame) GetTerm() uint64 {
+func (x *WatchLayoutResponse) GetTerm() uint64 {
 	if x != nil {
 		return x.Term
 	}
 	return 0
 }
 
-func (x *LayoutFrame) GetData() []byte {
+func (x *WatchLayoutResponse) GetData() []byte {
 	if x != nil {
 		return x.Data
 	}
 	return nil
 }
 
-func (x *LayoutFrame) GetCommitIndex() uint64 {
+func (x *WatchLayoutResponse) GetCommitIndex() uint64 {
 	if x != nil {
 		return x.CommitIndex
 	}
 	return 0
 }
 
-func (x *LayoutFrame) GetLeaderId() string {
+func (x *WatchLayoutResponse) GetLeaderId() string {
 	if x != nil {
 		return x.LeaderId
 	}
 	return ""
 }
 
-func (x *LayoutFrame) GetLeaderPeerAddr() string {
+func (x *WatchLayoutResponse) GetLeaderPeerAddr() string {
 	if x != nil {
 		return x.LeaderPeerAddr
 	}
 	return ""
 }
 
-func (x *LayoutFrame) GetTopology() string {
+func (x *WatchLayoutResponse) GetTopology() string {
 	if x != nil {
 		return x.Topology
 	}
 	return ""
 }
 
-func (x *LayoutFrame) GetVoters() []*LayoutVoter {
+func (x *WatchLayoutResponse) GetVoters() []*LayoutVoter {
 	if x != nil {
 		return x.Voters
 	}
 	return nil
 }
 
-func (x *LayoutFrame) GetFirstIndex() uint64 {
+func (x *WatchLayoutResponse) GetFirstIndex() uint64 {
 	if x != nil {
 		return x.FirstIndex
 	}
 	return 0
 }
 
-func (x *LayoutFrame) GetEntryKind() uint32 {
+func (x *WatchLayoutResponse) GetEntryKind() uint32 {
 	if x != nil {
 		return x.EntryKind
 	}
 	return 0
 }
 
-func (x *LayoutFrame) GetReason() string {
+func (x *WatchLayoutResponse) GetReason() string {
 	if x != nil {
 		return x.Reason
 	}
@@ -1323,6 +1323,594 @@ func (*ReplicateResponse) Descriptor() ([]byte, []int) {
 	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{21}
 }
 
+type FreezeSlotRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Slot          int32                  `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FreezeSlotRequest) Reset() {
+	*x = FreezeSlotRequest{}
+	mi := &file_pushupes_v1_peer_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FreezeSlotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FreezeSlotRequest) ProtoMessage() {}
+
+func (x *FreezeSlotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_peer_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FreezeSlotRequest.ProtoReflect.Descriptor instead.
+func (*FreezeSlotRequest) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *FreezeSlotRequest) GetSlot() int32 {
+	if x != nil {
+		return x.Slot
+	}
+	return 0
+}
+
+type FreezeSlotResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Leo           uint64                 `protobuf:"varint,1,opt,name=leo,proto3" json:"leo,omitempty"` // the log end offset the freeze settled on
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FreezeSlotResponse) Reset() {
+	*x = FreezeSlotResponse{}
+	mi := &file_pushupes_v1_peer_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FreezeSlotResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FreezeSlotResponse) ProtoMessage() {}
+
+func (x *FreezeSlotResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_peer_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FreezeSlotResponse.ProtoReflect.Descriptor instead.
+func (*FreezeSlotResponse) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *FreezeSlotResponse) GetLeo() uint64 {
+	if x != nil {
+		return x.Leo
+	}
+	return 0
+}
+
+type ThawSlotRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Slot          int32                  `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ThawSlotRequest) Reset() {
+	*x = ThawSlotRequest{}
+	mi := &file_pushupes_v1_peer_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ThawSlotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ThawSlotRequest) ProtoMessage() {}
+
+func (x *ThawSlotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_peer_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ThawSlotRequest.ProtoReflect.Descriptor instead.
+func (*ThawSlotRequest) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *ThawSlotRequest) GetSlot() int32 {
+	if x != nil {
+		return x.Slot
+	}
+	return 0
+}
+
+type ThawSlotResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ThawSlotResponse) Reset() {
+	*x = ThawSlotResponse{}
+	mi := &file_pushupes_v1_peer_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ThawSlotResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ThawSlotResponse) ProtoMessage() {}
+
+func (x *ThawSlotResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_peer_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ThawSlotResponse.ProtoReflect.Descriptor instead.
+func (*ThawSlotResponse) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{25}
+}
+
+type ReplicateAggregateRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Slot          int32                  `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"` // source slot
+	AggregateId   string                 `protobuf:"bytes,2,opt,name=aggregate_id,json=aggregateId,proto3" json:"aggregate_id,omitempty"`
+	FromVersion   uint32                 `protobuf:"varint,3,opt,name=from_version,json=fromVersion,proto3" json:"from_version,omitempty"` // inclusive cursor; 0 means the first version
+	MaxRecords    uint32                 `protobuf:"varint,4,opt,name=max_records,json=maxRecords,proto3" json:"max_records,omitempty"`    // per chunk, 0 = server default
+	MaxBytes      uint64                 `protobuf:"varint,5,opt,name=max_bytes,json=maxBytes,proto3" json:"max_bytes,omitempty"`          // per chunk, 0 = server default
+	UptoSeq       uint64                 `protobuf:"varint,6,opt,name=upto_seq,json=uptoSeq,proto3" json:"upto_seq,omitempty"`             // replay only records at or below this slot seq (0 = LEO)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReplicateAggregateRequest) Reset() {
+	*x = ReplicateAggregateRequest{}
+	mi := &file_pushupes_v1_peer_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReplicateAggregateRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReplicateAggregateRequest) ProtoMessage() {}
+
+func (x *ReplicateAggregateRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_peer_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReplicateAggregateRequest.ProtoReflect.Descriptor instead.
+func (*ReplicateAggregateRequest) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *ReplicateAggregateRequest) GetSlot() int32 {
+	if x != nil {
+		return x.Slot
+	}
+	return 0
+}
+
+func (x *ReplicateAggregateRequest) GetAggregateId() string {
+	if x != nil {
+		return x.AggregateId
+	}
+	return ""
+}
+
+func (x *ReplicateAggregateRequest) GetFromVersion() uint32 {
+	if x != nil {
+		return x.FromVersion
+	}
+	return 0
+}
+
+func (x *ReplicateAggregateRequest) GetMaxRecords() uint32 {
+	if x != nil {
+		return x.MaxRecords
+	}
+	return 0
+}
+
+func (x *ReplicateAggregateRequest) GetMaxBytes() uint64 {
+	if x != nil {
+		return x.MaxBytes
+	}
+	return 0
+}
+
+func (x *ReplicateAggregateRequest) GetUptoSeq() uint64 {
+	if x != nil {
+		return x.UptoSeq
+	}
+	return 0
+}
+
+type ReplicateAggregateResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Records       [][]byte               `protobuf:"bytes,1,rep,name=records,proto3" json:"records,omitempty"`                             // encoded EventRecord blobs, in version order
+	NextVersion   uint32                 `protobuf:"varint,2,opt,name=next_version,json=nextVersion,proto3" json:"next_version,omitempty"` // version to resume from; 0 = the aggregate is done
+	Versions      uint32                 `protobuf:"varint,3,opt,name=versions,proto3" json:"versions,omitempty"`                          // versions replayed in this chunk
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReplicateAggregateResponse) Reset() {
+	*x = ReplicateAggregateResponse{}
+	mi := &file_pushupes_v1_peer_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReplicateAggregateResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReplicateAggregateResponse) ProtoMessage() {}
+
+func (x *ReplicateAggregateResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_peer_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReplicateAggregateResponse.ProtoReflect.Descriptor instead.
+func (*ReplicateAggregateResponse) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *ReplicateAggregateResponse) GetRecords() [][]byte {
+	if x != nil {
+		return x.Records
+	}
+	return nil
+}
+
+func (x *ReplicateAggregateResponse) GetNextVersion() uint32 {
+	if x != nil {
+		return x.NextVersion
+	}
+	return 0
+}
+
+func (x *ReplicateAggregateResponse) GetVersions() uint32 {
+	if x != nil {
+		return x.Versions
+	}
+	return 0
+}
+
+type ReplicateAggregateDone struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReplicateAggregateDone) Reset() {
+	*x = ReplicateAggregateDone{}
+	mi := &file_pushupes_v1_peer_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReplicateAggregateDone) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReplicateAggregateDone) ProtoMessage() {}
+
+func (x *ReplicateAggregateDone) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_peer_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReplicateAggregateDone.ProtoReflect.Descriptor instead.
+func (*ReplicateAggregateDone) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{28}
+}
+
+type SlotStreamsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Slot          int32                  `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
+	After         string                 `protobuf:"bytes,2,opt,name=after,proto3" json:"after,omitempty"`  // cursor: aggregate id to resume after
+	Limit         int32                  `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"` // 0 = server default
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SlotStreamsRequest) Reset() {
+	*x = SlotStreamsRequest{}
+	mi := &file_pushupes_v1_peer_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SlotStreamsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SlotStreamsRequest) ProtoMessage() {}
+
+func (x *SlotStreamsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_peer_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SlotStreamsRequest.ProtoReflect.Descriptor instead.
+func (*SlotStreamsRequest) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *SlotStreamsRequest) GetSlot() int32 {
+	if x != nil {
+		return x.Slot
+	}
+	return 0
+}
+
+func (x *SlotStreamsRequest) GetAfter() string {
+	if x != nil {
+		return x.After
+	}
+	return ""
+}
+
+func (x *SlotStreamsRequest) GetLimit() int32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+type SlotStreamsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Aggregates    []string               `protobuf:"bytes,1,rep,name=aggregates,proto3" json:"aggregates,omitempty"`
+	NextAfter     string                 `protobuf:"bytes,2,opt,name=next_after,json=nextAfter,proto3" json:"next_after,omitempty"` // "" = no more pages
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SlotStreamsResponse) Reset() {
+	*x = SlotStreamsResponse{}
+	mi := &file_pushupes_v1_peer_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SlotStreamsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SlotStreamsResponse) ProtoMessage() {}
+
+func (x *SlotStreamsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_peer_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SlotStreamsResponse.ProtoReflect.Descriptor instead.
+func (*SlotStreamsResponse) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *SlotStreamsResponse) GetAggregates() []string {
+	if x != nil {
+		return x.Aggregates
+	}
+	return nil
+}
+
+func (x *SlotStreamsResponse) GetNextAfter() string {
+	if x != nil {
+		return x.NextAfter
+	}
+	return ""
+}
+
+type ReplayIntoRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SrcSlot       int32                  `protobuf:"varint,1,opt,name=src_slot,json=srcSlot,proto3" json:"src_slot,omitempty"`
+	SrcAddr       string                 `protobuf:"bytes,2,opt,name=src_addr,json=srcAddr,proto3" json:"src_addr,omitempty"` // peer-plane address of a node holding the source slot
+	DstSlot       int32                  `protobuf:"varint,3,opt,name=dst_slot,json=dstSlot,proto3" json:"dst_slot,omitempty"`
+	AggregateId   string                 `protobuf:"bytes,4,opt,name=aggregate_id,json=aggregateId,proto3" json:"aggregate_id,omitempty"`
+	FromVersion   uint32                 `protobuf:"varint,5,opt,name=from_version,json=fromVersion,proto3" json:"from_version,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReplayIntoRequest) Reset() {
+	*x = ReplayIntoRequest{}
+	mi := &file_pushupes_v1_peer_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReplayIntoRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReplayIntoRequest) ProtoMessage() {}
+
+func (x *ReplayIntoRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_peer_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReplayIntoRequest.ProtoReflect.Descriptor instead.
+func (*ReplayIntoRequest) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *ReplayIntoRequest) GetSrcSlot() int32 {
+	if x != nil {
+		return x.SrcSlot
+	}
+	return 0
+}
+
+func (x *ReplayIntoRequest) GetSrcAddr() string {
+	if x != nil {
+		return x.SrcAddr
+	}
+	return ""
+}
+
+func (x *ReplayIntoRequest) GetDstSlot() int32 {
+	if x != nil {
+		return x.DstSlot
+	}
+	return 0
+}
+
+func (x *ReplayIntoRequest) GetAggregateId() string {
+	if x != nil {
+		return x.AggregateId
+	}
+	return ""
+}
+
+func (x *ReplayIntoRequest) GetFromVersion() uint32 {
+	if x != nil {
+		return x.FromVersion
+	}
+	return 0
+}
+
+type ReplayIntoResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Landed        uint32                 `protobuf:"varint,1,opt,name=landed,proto3" json:"landed,omitempty"`                              // records written into dst_slot by this call
+	NextVersion   uint32                 `protobuf:"varint,2,opt,name=next_version,json=nextVersion,proto3" json:"next_version,omitempty"` // resume point (0 = nothing was replayed)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReplayIntoResponse) Reset() {
+	*x = ReplayIntoResponse{}
+	mi := &file_pushupes_v1_peer_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReplayIntoResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReplayIntoResponse) ProtoMessage() {}
+
+func (x *ReplayIntoResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pushupes_v1_peer_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReplayIntoResponse.ProtoReflect.Descriptor instead.
+func (*ReplayIntoResponse) Descriptor() ([]byte, []int) {
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *ReplayIntoResponse) GetLanded() uint32 {
+	if x != nil {
+		return x.Landed
+	}
+	return 0
+}
+
+func (x *ReplayIntoResponse) GetNextVersion() uint32 {
+	if x != nil {
+		return x.NextVersion
+	}
+	return 0
+}
+
 type SlotLeoRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Slot  int32                  `protobuf:"varint,1,opt,name=slot,proto3" json:"slot,omitempty"`
@@ -1340,7 +1928,7 @@ type SlotLeoRequest struct {
 
 func (x *SlotLeoRequest) Reset() {
 	*x = SlotLeoRequest{}
-	mi := &file_pushupes_v1_peer_proto_msgTypes[22]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1352,7 +1940,7 @@ func (x *SlotLeoRequest) String() string {
 func (*SlotLeoRequest) ProtoMessage() {}
 
 func (x *SlotLeoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_peer_proto_msgTypes[22]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1365,7 +1953,7 @@ func (x *SlotLeoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SlotLeoRequest.ProtoReflect.Descriptor instead.
 func (*SlotLeoRequest) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{22}
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *SlotLeoRequest) GetSlot() int32 {
@@ -1414,7 +2002,7 @@ type SlotLeoResponse struct {
 
 func (x *SlotLeoResponse) Reset() {
 	*x = SlotLeoResponse{}
-	mi := &file_pushupes_v1_peer_proto_msgTypes[23]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1426,7 +2014,7 @@ func (x *SlotLeoResponse) String() string {
 func (*SlotLeoResponse) ProtoMessage() {}
 
 func (x *SlotLeoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_peer_proto_msgTypes[23]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1439,7 +2027,7 @@ func (x *SlotLeoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SlotLeoResponse.ProtoReflect.Descriptor instead.
 func (*SlotLeoResponse) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{23}
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *SlotLeoResponse) GetLeo() uint64 {
@@ -1494,7 +2082,7 @@ type FenceSlotRequest struct {
 
 func (x *FenceSlotRequest) Reset() {
 	*x = FenceSlotRequest{}
-	mi := &file_pushupes_v1_peer_proto_msgTypes[24]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1506,7 +2094,7 @@ func (x *FenceSlotRequest) String() string {
 func (*FenceSlotRequest) ProtoMessage() {}
 
 func (x *FenceSlotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_peer_proto_msgTypes[24]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1519,7 +2107,7 @@ func (x *FenceSlotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FenceSlotRequest.ProtoReflect.Descriptor instead.
 func (*FenceSlotRequest) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{24}
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *FenceSlotRequest) GetSlot() int32 {
@@ -1545,7 +2133,7 @@ type FenceSlotResponse struct {
 
 func (x *FenceSlotResponse) Reset() {
 	*x = FenceSlotResponse{}
-	mi := &file_pushupes_v1_peer_proto_msgTypes[25]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1557,7 +2145,7 @@ func (x *FenceSlotResponse) String() string {
 func (*FenceSlotResponse) ProtoMessage() {}
 
 func (x *FenceSlotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_peer_proto_msgTypes[25]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1570,7 +2158,7 @@ func (x *FenceSlotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FenceSlotResponse.ProtoReflect.Descriptor instead.
 func (*FenceSlotResponse) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{25}
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *FenceSlotResponse) GetLeo() uint64 {
@@ -1590,7 +2178,7 @@ type SlotLeaderRequest struct {
 
 func (x *SlotLeaderRequest) Reset() {
 	*x = SlotLeaderRequest{}
-	mi := &file_pushupes_v1_peer_proto_msgTypes[26]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1602,7 +2190,7 @@ func (x *SlotLeaderRequest) String() string {
 func (*SlotLeaderRequest) ProtoMessage() {}
 
 func (x *SlotLeaderRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_peer_proto_msgTypes[26]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1615,7 +2203,7 @@ func (x *SlotLeaderRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SlotLeaderRequest.ProtoReflect.Descriptor instead.
 func (*SlotLeaderRequest) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{26}
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *SlotLeaderRequest) GetSlot() int32 {
@@ -1638,7 +2226,7 @@ type SlotLeaderResponse struct {
 
 func (x *SlotLeaderResponse) Reset() {
 	*x = SlotLeaderResponse{}
-	mi := &file_pushupes_v1_peer_proto_msgTypes[27]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1650,7 +2238,7 @@ func (x *SlotLeaderResponse) String() string {
 func (*SlotLeaderResponse) ProtoMessage() {}
 
 func (x *SlotLeaderResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_peer_proto_msgTypes[27]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1663,7 +2251,7 @@ func (x *SlotLeaderResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SlotLeaderResponse.ProtoReflect.Descriptor instead.
 func (*SlotLeaderResponse) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{27}
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *SlotLeaderResponse) GetLeader() string {
@@ -1692,7 +2280,7 @@ type DropSlotRequest struct {
 
 func (x *DropSlotRequest) Reset() {
 	*x = DropSlotRequest{}
-	mi := &file_pushupes_v1_peer_proto_msgTypes[28]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1704,7 +2292,7 @@ func (x *DropSlotRequest) String() string {
 func (*DropSlotRequest) ProtoMessage() {}
 
 func (x *DropSlotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_peer_proto_msgTypes[28]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1717,7 +2305,7 @@ func (x *DropSlotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DropSlotRequest.ProtoReflect.Descriptor instead.
 func (*DropSlotRequest) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{28}
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *DropSlotRequest) GetSlot() int32 {
@@ -1742,7 +2330,7 @@ type DropSlotResponse struct {
 
 func (x *DropSlotResponse) Reset() {
 	*x = DropSlotResponse{}
-	mi := &file_pushupes_v1_peer_proto_msgTypes[29]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1754,7 +2342,7 @@ func (x *DropSlotResponse) String() string {
 func (*DropSlotResponse) ProtoMessage() {}
 
 func (x *DropSlotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pushupes_v1_peer_proto_msgTypes[29]
+	mi := &file_pushupes_v1_peer_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1767,7 +2355,7 @@ func (x *DropSlotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DropSlotResponse.ProtoReflect.Descriptor instead.
 func (*DropSlotResponse) Descriptor() ([]byte, []int) {
-	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{29}
+	return file_pushupes_v1_peer_proto_rawDescGZIP(), []int{40}
 }
 
 var File_pushupes_v1_peer_proto protoreflect.FileDescriptor
@@ -1781,8 +2369,8 @@ const file_pushupes_v1_peer_proto_rawDesc = "" +
 	"\n" +
 	"from_index\x18\x02 \x01(\x04R\tfromIndex\x12\x1b\n" +
 	"\tfrom_term\x18\x03 \x01(\x04R\bfromTerm\x12\x1a\n" +
-	"\btopology\x18\x04 \x01(\tR\btopology\"\xef\x02\n" +
-	"\vLayoutFrame\x12\x12\n" +
+	"\btopology\x18\x04 \x01(\tR\btopology\"\xf7\x02\n" +
+	"\x13WatchLayoutResponse\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\rR\x04kind\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\x04R\x05index\x12\x12\n" +
 	"\x04term\x18\x03 \x01(\x04R\x04term\x12\x12\n" +
@@ -1860,7 +2448,46 @@ const file_pushupes_v1_peer_proto_rawDesc = "" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x10\n" +
 	"\x03seq\x18\x02 \x01(\x04R\x03seq\x12\x18\n" +
 	"\apayload\x18\x03 \x01(\fR\apayload\"\x13\n" +
-	"\x11ReplicateResponse\":\n" +
+	"\x11ReplicateResponse\"'\n" +
+	"\x11FreezeSlotRequest\x12\x12\n" +
+	"\x04slot\x18\x01 \x01(\x05R\x04slot\"&\n" +
+	"\x12FreezeSlotResponse\x12\x10\n" +
+	"\x03leo\x18\x01 \x01(\x04R\x03leo\"%\n" +
+	"\x0fThawSlotRequest\x12\x12\n" +
+	"\x04slot\x18\x01 \x01(\x05R\x04slot\"\x12\n" +
+	"\x10ThawSlotResponse\"\xce\x01\n" +
+	"\x19ReplicateAggregateRequest\x12\x12\n" +
+	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12!\n" +
+	"\faggregate_id\x18\x02 \x01(\tR\vaggregateId\x12!\n" +
+	"\ffrom_version\x18\x03 \x01(\rR\vfromVersion\x12\x1f\n" +
+	"\vmax_records\x18\x04 \x01(\rR\n" +
+	"maxRecords\x12\x1b\n" +
+	"\tmax_bytes\x18\x05 \x01(\x04R\bmaxBytes\x12\x19\n" +
+	"\bupto_seq\x18\x06 \x01(\x04R\auptoSeq\"u\n" +
+	"\x1aReplicateAggregateResponse\x12\x18\n" +
+	"\arecords\x18\x01 \x03(\fR\arecords\x12!\n" +
+	"\fnext_version\x18\x02 \x01(\rR\vnextVersion\x12\x1a\n" +
+	"\bversions\x18\x03 \x01(\rR\bversions\"\x18\n" +
+	"\x16ReplicateAggregateDone\"T\n" +
+	"\x12SlotStreamsRequest\x12\x12\n" +
+	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x14\n" +
+	"\x05after\x18\x02 \x01(\tR\x05after\x12\x14\n" +
+	"\x05limit\x18\x03 \x01(\x05R\x05limit\"T\n" +
+	"\x13SlotStreamsResponse\x12\x1e\n" +
+	"\n" +
+	"aggregates\x18\x01 \x03(\tR\n" +
+	"aggregates\x12\x1d\n" +
+	"\n" +
+	"next_after\x18\x02 \x01(\tR\tnextAfter\"\xaa\x01\n" +
+	"\x11ReplayIntoRequest\x12\x19\n" +
+	"\bsrc_slot\x18\x01 \x01(\x05R\asrcSlot\x12\x19\n" +
+	"\bsrc_addr\x18\x02 \x01(\tR\asrcAddr\x12\x19\n" +
+	"\bdst_slot\x18\x03 \x01(\x05R\adstSlot\x12!\n" +
+	"\faggregate_id\x18\x04 \x01(\tR\vaggregateId\x12!\n" +
+	"\ffrom_version\x18\x05 \x01(\rR\vfromVersion\"O\n" +
+	"\x12ReplayIntoResponse\x12\x16\n" +
+	"\x06landed\x18\x01 \x01(\rR\x06landed\x12!\n" +
+	"\fnext_version\x18\x02 \x01(\rR\vnextVersion\":\n" +
 	"\x0eSlotLeoRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x14\n" +
 	"\x05flush\x18\x02 \x01(\bR\x05flush\"\xa0\x01\n" +
@@ -1888,23 +2515,30 @@ const file_pushupes_v1_peer_proto_rawDesc = "" +
 	"\x0fDropSlotRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x12\n" +
 	"\x04node\x18\x02 \x01(\tR\x04node\"\x12\n" +
-	"\x10DropSlotResponse2\xaf\b\n" +
+	"\x10DropSlotResponse2\xd9\v\n" +
 	"\vPeerService\x12;\n" +
 	"\x04Ping\x12\x18.pushupes.v1.PingRequest\x1a\x19.pushupes.v1.PingResponse\x12G\n" +
 	"\bRegister\x12\x1c.pushupes.v1.RegisterRequest\x1a\x1d.pushupes.v1.RegisterResponse\x12>\n" +
 	"\x05Adopt\x12\x19.pushupes.v1.AdoptRequest\x1a\x1a.pushupes.v1.AdoptResponse\x12A\n" +
 	"\x06MFetch\x12\x1a.pushupes.v1.MFetchRequest\x1a\x1b.pushupes.v1.MFetchResponse\x12\\\n" +
 	"\x0fReplicaProgress\x12#.pushupes.v1.ReplicaProgressRequest\x1a$.pushupes.v1.ReplicaProgressResponse\x12J\n" +
-	"\tReplicate\x12\x1d.pushupes.v1.ReplicateRequest\x1a\x1e.pushupes.v1.ReplicateResponse\x12D\n" +
+	"\tReplicate\x12\x1d.pushupes.v1.ReplicateRequest\x1a\x1e.pushupes.v1.ReplicateResponse\x12g\n" +
+	"\x12ReplicateAggregate\x12&.pushupes.v1.ReplicateAggregateRequest\x1a'.pushupes.v1.ReplicateAggregateResponse0\x01\x12P\n" +
+	"\vSlotStreams\x12\x1f.pushupes.v1.SlotStreamsRequest\x1a .pushupes.v1.SlotStreamsResponse\x12M\n" +
+	"\n" +
+	"ReplayInto\x12\x1e.pushupes.v1.ReplayIntoRequest\x1a\x1f.pushupes.v1.ReplayIntoResponse\x12D\n" +
 	"\aSlotLeo\x12\x1b.pushupes.v1.SlotLeoRequest\x1a\x1c.pushupes.v1.SlotLeoResponse\x12J\n" +
 	"\tFenceSlot\x12\x1d.pushupes.v1.FenceSlotRequest\x1a\x1e.pushupes.v1.FenceSlotResponse\x12M\n" +
+	"\n" +
+	"FreezeSlot\x12\x1e.pushupes.v1.FreezeSlotRequest\x1a\x1f.pushupes.v1.FreezeSlotResponse\x12G\n" +
+	"\bThawSlot\x12\x1c.pushupes.v1.ThawSlotRequest\x1a\x1d.pushupes.v1.ThawSlotResponse\x12M\n" +
 	"\n" +
 	"SlotLeader\x12\x1e.pushupes.v1.SlotLeaderRequest\x1a\x1f.pushupes.v1.SlotLeaderResponse\x12G\n" +
 	"\bDropSlot\x12\x1c.pushupes.v1.DropSlotRequest\x1a\x1d.pushupes.v1.DropSlotResponse\x12b\n" +
 	"\x11ReportUnreachable\x12%.pushupes.v1.ReportUnreachableRequest\x1a&.pushupes.v1.ReportUnreachableResponse\x12G\n" +
 	"\bSlotLeos\x12\x1c.pushupes.v1.SlotLeosRequest\x1a\x1d.pushupes.v1.SlotLeosResponse\x12J\n" +
-	"\tSlotSizes\x12\x1d.pushupes.v1.SlotSizesRequest\x1a\x1e.pushupes.v1.SlotSizesResponse\x12J\n" +
-	"\vWatchLayout\x12\x1f.pushupes.v1.WatchLayoutRequest\x1a\x18.pushupes.v1.LayoutFrame0\x01BGZEgithub.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1;pushupesv1b\x06proto3"
+	"\tSlotSizes\x12\x1d.pushupes.v1.SlotSizesRequest\x1a\x1e.pushupes.v1.SlotSizesResponse\x12R\n" +
+	"\vWatchLayout\x12\x1f.pushupes.v1.WatchLayoutRequest\x1a .pushupes.v1.WatchLayoutResponse0\x01BGZEgithub.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1;pushupesv1b\x06proto3"
 
 var (
 	file_pushupes_v1_peer_proto_rawDescOnce sync.Once
@@ -1918,41 +2552,52 @@ func file_pushupes_v1_peer_proto_rawDescGZIP() []byte {
 	return file_pushupes_v1_peer_proto_rawDescData
 }
 
-var file_pushupes_v1_peer_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
+var file_pushupes_v1_peer_proto_msgTypes = make([]protoimpl.MessageInfo, 41)
 var file_pushupes_v1_peer_proto_goTypes = []any{
-	(*WatchLayoutRequest)(nil),        // 0: pushupes.v1.WatchLayoutRequest
-	(*LayoutFrame)(nil),               // 1: pushupes.v1.LayoutFrame
-	(*LayoutVoter)(nil),               // 2: pushupes.v1.LayoutVoter
-	(*PingRequest)(nil),               // 3: pushupes.v1.PingRequest
-	(*PingResponse)(nil),              // 4: pushupes.v1.PingResponse
-	(*ReportUnreachableRequest)(nil),  // 5: pushupes.v1.ReportUnreachableRequest
-	(*ReportUnreachableResponse)(nil), // 6: pushupes.v1.ReportUnreachableResponse
-	(*SlotLeosRequest)(nil),           // 7: pushupes.v1.SlotLeosRequest
-	(*SlotLeosResponse)(nil),          // 8: pushupes.v1.SlotLeosResponse
-	(*SlotSizesRequest)(nil),          // 9: pushupes.v1.SlotSizesRequest
-	(*SlotSizesResponse)(nil),         // 10: pushupes.v1.SlotSizesResponse
-	(*RegisterRequest)(nil),           // 11: pushupes.v1.RegisterRequest
-	(*RegisterResponse)(nil),          // 12: pushupes.v1.RegisterResponse
-	(*AdoptRequest)(nil),              // 13: pushupes.v1.AdoptRequest
-	(*AdoptResponse)(nil),             // 14: pushupes.v1.AdoptResponse
-	(*FetchItem)(nil),                 // 15: pushupes.v1.FetchItem
-	(*MFetchRequest)(nil),             // 16: pushupes.v1.MFetchRequest
-	(*MFetchResponse)(nil),            // 17: pushupes.v1.MFetchResponse
-	(*ReplicaProgressRequest)(nil),    // 18: pushupes.v1.ReplicaProgressRequest
-	(*ReplicaProgressResponse)(nil),   // 19: pushupes.v1.ReplicaProgressResponse
-	(*ReplicateRequest)(nil),          // 20: pushupes.v1.ReplicateRequest
-	(*ReplicateResponse)(nil),         // 21: pushupes.v1.ReplicateResponse
-	(*SlotLeoRequest)(nil),            // 22: pushupes.v1.SlotLeoRequest
-	(*SlotLeoResponse)(nil),           // 23: pushupes.v1.SlotLeoResponse
-	(*FenceSlotRequest)(nil),          // 24: pushupes.v1.FenceSlotRequest
-	(*FenceSlotResponse)(nil),         // 25: pushupes.v1.FenceSlotResponse
-	(*SlotLeaderRequest)(nil),         // 26: pushupes.v1.SlotLeaderRequest
-	(*SlotLeaderResponse)(nil),        // 27: pushupes.v1.SlotLeaderResponse
-	(*DropSlotRequest)(nil),           // 28: pushupes.v1.DropSlotRequest
-	(*DropSlotResponse)(nil),          // 29: pushupes.v1.DropSlotResponse
+	(*WatchLayoutRequest)(nil),         // 0: pushupes.v1.WatchLayoutRequest
+	(*WatchLayoutResponse)(nil),        // 1: pushupes.v1.WatchLayoutResponse
+	(*LayoutVoter)(nil),                // 2: pushupes.v1.LayoutVoter
+	(*PingRequest)(nil),                // 3: pushupes.v1.PingRequest
+	(*PingResponse)(nil),               // 4: pushupes.v1.PingResponse
+	(*ReportUnreachableRequest)(nil),   // 5: pushupes.v1.ReportUnreachableRequest
+	(*ReportUnreachableResponse)(nil),  // 6: pushupes.v1.ReportUnreachableResponse
+	(*SlotLeosRequest)(nil),            // 7: pushupes.v1.SlotLeosRequest
+	(*SlotLeosResponse)(nil),           // 8: pushupes.v1.SlotLeosResponse
+	(*SlotSizesRequest)(nil),           // 9: pushupes.v1.SlotSizesRequest
+	(*SlotSizesResponse)(nil),          // 10: pushupes.v1.SlotSizesResponse
+	(*RegisterRequest)(nil),            // 11: pushupes.v1.RegisterRequest
+	(*RegisterResponse)(nil),           // 12: pushupes.v1.RegisterResponse
+	(*AdoptRequest)(nil),               // 13: pushupes.v1.AdoptRequest
+	(*AdoptResponse)(nil),              // 14: pushupes.v1.AdoptResponse
+	(*FetchItem)(nil),                  // 15: pushupes.v1.FetchItem
+	(*MFetchRequest)(nil),              // 16: pushupes.v1.MFetchRequest
+	(*MFetchResponse)(nil),             // 17: pushupes.v1.MFetchResponse
+	(*ReplicaProgressRequest)(nil),     // 18: pushupes.v1.ReplicaProgressRequest
+	(*ReplicaProgressResponse)(nil),    // 19: pushupes.v1.ReplicaProgressResponse
+	(*ReplicateRequest)(nil),           // 20: pushupes.v1.ReplicateRequest
+	(*ReplicateResponse)(nil),          // 21: pushupes.v1.ReplicateResponse
+	(*FreezeSlotRequest)(nil),          // 22: pushupes.v1.FreezeSlotRequest
+	(*FreezeSlotResponse)(nil),         // 23: pushupes.v1.FreezeSlotResponse
+	(*ThawSlotRequest)(nil),            // 24: pushupes.v1.ThawSlotRequest
+	(*ThawSlotResponse)(nil),           // 25: pushupes.v1.ThawSlotResponse
+	(*ReplicateAggregateRequest)(nil),  // 26: pushupes.v1.ReplicateAggregateRequest
+	(*ReplicateAggregateResponse)(nil), // 27: pushupes.v1.ReplicateAggregateResponse
+	(*ReplicateAggregateDone)(nil),     // 28: pushupes.v1.ReplicateAggregateDone
+	(*SlotStreamsRequest)(nil),         // 29: pushupes.v1.SlotStreamsRequest
+	(*SlotStreamsResponse)(nil),        // 30: pushupes.v1.SlotStreamsResponse
+	(*ReplayIntoRequest)(nil),          // 31: pushupes.v1.ReplayIntoRequest
+	(*ReplayIntoResponse)(nil),         // 32: pushupes.v1.ReplayIntoResponse
+	(*SlotLeoRequest)(nil),             // 33: pushupes.v1.SlotLeoRequest
+	(*SlotLeoResponse)(nil),            // 34: pushupes.v1.SlotLeoResponse
+	(*FenceSlotRequest)(nil),           // 35: pushupes.v1.FenceSlotRequest
+	(*FenceSlotResponse)(nil),          // 36: pushupes.v1.FenceSlotResponse
+	(*SlotLeaderRequest)(nil),          // 37: pushupes.v1.SlotLeaderRequest
+	(*SlotLeaderResponse)(nil),         // 38: pushupes.v1.SlotLeaderResponse
+	(*DropSlotRequest)(nil),            // 39: pushupes.v1.DropSlotRequest
+	(*DropSlotResponse)(nil),           // 40: pushupes.v1.DropSlotResponse
 }
 var file_pushupes_v1_peer_proto_depIdxs = []int32{
-	2,  // 0: pushupes.v1.LayoutFrame.voters:type_name -> pushupes.v1.LayoutVoter
+	2,  // 0: pushupes.v1.WatchLayoutResponse.voters:type_name -> pushupes.v1.LayoutVoter
 	15, // 1: pushupes.v1.MFetchResponse.items:type_name -> pushupes.v1.FetchItem
 	3,  // 2: pushupes.v1.PeerService.Ping:input_type -> pushupes.v1.PingRequest
 	11, // 3: pushupes.v1.PeerService.Register:input_type -> pushupes.v1.RegisterRequest
@@ -1960,30 +2605,40 @@ var file_pushupes_v1_peer_proto_depIdxs = []int32{
 	16, // 5: pushupes.v1.PeerService.MFetch:input_type -> pushupes.v1.MFetchRequest
 	18, // 6: pushupes.v1.PeerService.ReplicaProgress:input_type -> pushupes.v1.ReplicaProgressRequest
 	20, // 7: pushupes.v1.PeerService.Replicate:input_type -> pushupes.v1.ReplicateRequest
-	22, // 8: pushupes.v1.PeerService.SlotLeo:input_type -> pushupes.v1.SlotLeoRequest
-	24, // 9: pushupes.v1.PeerService.FenceSlot:input_type -> pushupes.v1.FenceSlotRequest
-	26, // 10: pushupes.v1.PeerService.SlotLeader:input_type -> pushupes.v1.SlotLeaderRequest
-	28, // 11: pushupes.v1.PeerService.DropSlot:input_type -> pushupes.v1.DropSlotRequest
-	5,  // 12: pushupes.v1.PeerService.ReportUnreachable:input_type -> pushupes.v1.ReportUnreachableRequest
-	7,  // 13: pushupes.v1.PeerService.SlotLeos:input_type -> pushupes.v1.SlotLeosRequest
-	9,  // 14: pushupes.v1.PeerService.SlotSizes:input_type -> pushupes.v1.SlotSizesRequest
-	0,  // 15: pushupes.v1.PeerService.WatchLayout:input_type -> pushupes.v1.WatchLayoutRequest
-	4,  // 16: pushupes.v1.PeerService.Ping:output_type -> pushupes.v1.PingResponse
-	12, // 17: pushupes.v1.PeerService.Register:output_type -> pushupes.v1.RegisterResponse
-	14, // 18: pushupes.v1.PeerService.Adopt:output_type -> pushupes.v1.AdoptResponse
-	17, // 19: pushupes.v1.PeerService.MFetch:output_type -> pushupes.v1.MFetchResponse
-	19, // 20: pushupes.v1.PeerService.ReplicaProgress:output_type -> pushupes.v1.ReplicaProgressResponse
-	21, // 21: pushupes.v1.PeerService.Replicate:output_type -> pushupes.v1.ReplicateResponse
-	23, // 22: pushupes.v1.PeerService.SlotLeo:output_type -> pushupes.v1.SlotLeoResponse
-	25, // 23: pushupes.v1.PeerService.FenceSlot:output_type -> pushupes.v1.FenceSlotResponse
-	27, // 24: pushupes.v1.PeerService.SlotLeader:output_type -> pushupes.v1.SlotLeaderResponse
-	29, // 25: pushupes.v1.PeerService.DropSlot:output_type -> pushupes.v1.DropSlotResponse
-	6,  // 26: pushupes.v1.PeerService.ReportUnreachable:output_type -> pushupes.v1.ReportUnreachableResponse
-	8,  // 27: pushupes.v1.PeerService.SlotLeos:output_type -> pushupes.v1.SlotLeosResponse
-	10, // 28: pushupes.v1.PeerService.SlotSizes:output_type -> pushupes.v1.SlotSizesResponse
-	1,  // 29: pushupes.v1.PeerService.WatchLayout:output_type -> pushupes.v1.LayoutFrame
-	16, // [16:30] is the sub-list for method output_type
-	2,  // [2:16] is the sub-list for method input_type
+	26, // 8: pushupes.v1.PeerService.ReplicateAggregate:input_type -> pushupes.v1.ReplicateAggregateRequest
+	29, // 9: pushupes.v1.PeerService.SlotStreams:input_type -> pushupes.v1.SlotStreamsRequest
+	31, // 10: pushupes.v1.PeerService.ReplayInto:input_type -> pushupes.v1.ReplayIntoRequest
+	33, // 11: pushupes.v1.PeerService.SlotLeo:input_type -> pushupes.v1.SlotLeoRequest
+	35, // 12: pushupes.v1.PeerService.FenceSlot:input_type -> pushupes.v1.FenceSlotRequest
+	22, // 13: pushupes.v1.PeerService.FreezeSlot:input_type -> pushupes.v1.FreezeSlotRequest
+	24, // 14: pushupes.v1.PeerService.ThawSlot:input_type -> pushupes.v1.ThawSlotRequest
+	37, // 15: pushupes.v1.PeerService.SlotLeader:input_type -> pushupes.v1.SlotLeaderRequest
+	39, // 16: pushupes.v1.PeerService.DropSlot:input_type -> pushupes.v1.DropSlotRequest
+	5,  // 17: pushupes.v1.PeerService.ReportUnreachable:input_type -> pushupes.v1.ReportUnreachableRequest
+	7,  // 18: pushupes.v1.PeerService.SlotLeos:input_type -> pushupes.v1.SlotLeosRequest
+	9,  // 19: pushupes.v1.PeerService.SlotSizes:input_type -> pushupes.v1.SlotSizesRequest
+	0,  // 20: pushupes.v1.PeerService.WatchLayout:input_type -> pushupes.v1.WatchLayoutRequest
+	4,  // 21: pushupes.v1.PeerService.Ping:output_type -> pushupes.v1.PingResponse
+	12, // 22: pushupes.v1.PeerService.Register:output_type -> pushupes.v1.RegisterResponse
+	14, // 23: pushupes.v1.PeerService.Adopt:output_type -> pushupes.v1.AdoptResponse
+	17, // 24: pushupes.v1.PeerService.MFetch:output_type -> pushupes.v1.MFetchResponse
+	19, // 25: pushupes.v1.PeerService.ReplicaProgress:output_type -> pushupes.v1.ReplicaProgressResponse
+	21, // 26: pushupes.v1.PeerService.Replicate:output_type -> pushupes.v1.ReplicateResponse
+	27, // 27: pushupes.v1.PeerService.ReplicateAggregate:output_type -> pushupes.v1.ReplicateAggregateResponse
+	30, // 28: pushupes.v1.PeerService.SlotStreams:output_type -> pushupes.v1.SlotStreamsResponse
+	32, // 29: pushupes.v1.PeerService.ReplayInto:output_type -> pushupes.v1.ReplayIntoResponse
+	34, // 30: pushupes.v1.PeerService.SlotLeo:output_type -> pushupes.v1.SlotLeoResponse
+	36, // 31: pushupes.v1.PeerService.FenceSlot:output_type -> pushupes.v1.FenceSlotResponse
+	23, // 32: pushupes.v1.PeerService.FreezeSlot:output_type -> pushupes.v1.FreezeSlotResponse
+	25, // 33: pushupes.v1.PeerService.ThawSlot:output_type -> pushupes.v1.ThawSlotResponse
+	38, // 34: pushupes.v1.PeerService.SlotLeader:output_type -> pushupes.v1.SlotLeaderResponse
+	40, // 35: pushupes.v1.PeerService.DropSlot:output_type -> pushupes.v1.DropSlotResponse
+	6,  // 36: pushupes.v1.PeerService.ReportUnreachable:output_type -> pushupes.v1.ReportUnreachableResponse
+	8,  // 37: pushupes.v1.PeerService.SlotLeos:output_type -> pushupes.v1.SlotLeosResponse
+	10, // 38: pushupes.v1.PeerService.SlotSizes:output_type -> pushupes.v1.SlotSizesResponse
+	1,  // 39: pushupes.v1.PeerService.WatchLayout:output_type -> pushupes.v1.WatchLayoutResponse
+	21, // [21:40] is the sub-list for method output_type
+	2,  // [2:21] is the sub-list for method input_type
 	2,  // [2:2] is the sub-list for extension type_name
 	2,  // [2:2] is the sub-list for extension extendee
 	0,  // [0:2] is the sub-list for field type_name
@@ -2000,7 +2655,7 @@ func file_pushupes_v1_peer_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pushupes_v1_peer_proto_rawDesc), len(file_pushupes_v1_peer_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   30,
+			NumMessages:   41,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

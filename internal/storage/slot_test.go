@@ -48,7 +48,7 @@ func newTestStore(t *testing.T, slotCount int32, segBytes int64) (*Store, string
 func TestAppendIdempotent(t *testing.T) {
 	st, _ := newTestStore(t, 128, DefaultSegmentBytes)
 
-	out, err := st.Append(mkRec("agg-1", 1, "cmd-a"))
+	out, err := st.AppendRouted(mkRec("agg-1", 1, "cmd-a"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestAppendIdempotent(t *testing.T) {
 	}
 
 	// Replay the same command (even with a conflicting version): exists wins.
-	out2, err := st.Append(mkRec("agg-1", 99, "cmd-a"))
+	out2, err := st.AppendRouted(mkRec("agg-1", 99, "cmd-a"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestAppendVersionRules(t *testing.T) {
 	st, _ := newTestStore(t, 128, DefaultSegmentBytes)
 
 	// new aggregate must start at 1
-	out, err := st.Append(mkRec("agg-x", 5, "cmd-0"))
+	out, err := st.AppendRouted(mkRec("agg-x", 5, "cmd-0"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,33 +85,33 @@ func TestAppendVersionRules(t *testing.T) {
 		t.Fatalf("expected fail/1001/cur=0, got %+v", out)
 	}
 
-	if _, err := st.Append(mkRec("agg-x", 1, "cmd-1")); err != nil {
+	if _, err := st.AppendRouted(mkRec("agg-x", 1, "cmd-1")); err != nil {
 		t.Fatal(err)
 	}
 	// skip 2 -> fail
-	out, _ = st.Append(mkRec("agg-x", 3, "cmd-2"))
+	out, _ = st.AppendRouted(mkRec("agg-x", 3, "cmd-2"))
 	if out.Status != data.StatusFail || out.ErrID != data.ErrIDVersionConflict || out.CurrentVersion != 1 {
 		t.Fatalf("expected fail/1001/cur=1, got %+v", out)
 	}
 	// old version -> fail
-	out, _ = st.Append(mkRec("agg-x", 1, "cmd-3"))
+	out, _ = st.AppendRouted(mkRec("agg-x", 1, "cmd-3"))
 	if out.Status != data.StatusFail || out.ErrID != data.ErrIDVersionConflict {
 		t.Fatalf("expected fail on old version, got %+v", out)
 	}
 	// correct increment -> success
-	out, _ = st.Append(mkRec("agg-x", 2, "cmd-4"))
+	out, _ = st.AppendRouted(mkRec("agg-x", 2, "cmd-4"))
 	if out.Status != data.StatusSuccess {
 		t.Fatalf("expected success, got %+v", out)
 	}
 }
 
 func TestSlotRouting(t *testing.T) {
-	if data.SlotOf("a", 128) != data.SlotOf("a", 128) {
+	if data.LogicalSlotOf("a", 128) != data.LogicalSlotOf("a", 128) {
 		t.Fatal("routing not deterministic")
 	}
 	seen := map[int32]bool{}
 	for i := 0; i < 5000; i++ {
-		s := data.SlotOf(fmt.Sprintf("agg-%d", i), 128)
+		s := data.LogicalSlotOf(fmt.Sprintf("agg-%d", i), 128)
 		if s < 0 || s >= 128 {
 			t.Fatalf("slot out of range: %d", s)
 		}
@@ -128,7 +128,7 @@ func TestRollAndReadAcrossSegments(t *testing.T) {
 	st, _ := newTestStore(t, 128, seg)
 
 	for i := uint64(1); i <= 300; i++ {
-		out, err := st.Append(mkRec("agg-r", uint32(i), fmt.Sprintf("cmd-%d", i)))
+		out, err := st.AppendRouted(mkRec("agg-r", uint32(i), fmt.Sprintf("cmd-%d", i)))
 		if err != nil || out.Status != data.StatusSuccess {
 			t.Fatalf("append %d: %+v %v", i, out, err)
 		}
@@ -139,7 +139,7 @@ func TestRollAndReadAcrossSegments(t *testing.T) {
 		t.Fatalf("expected multiple segments, got %d", slot.SegmentCount())
 	}
 
-	recs, seqs, err := st.ReadAggregate("agg-r", 1, 0, 0)
+	recs, seqs, err := st.ReadAggregateRouted("agg-r", 1, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestRollAndReadAcrossSegments(t *testing.T) {
 		t.Fatalf("seqs wrong: %d..%d", seqs[0], seqs[len(seqs)-1])
 	}
 	// window read
-	recs, _, err = st.ReadAggregate("agg-r", 100, 10, 0)
+	recs, _, err = st.ReadAggregateRouted("agg-r", 100, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func TestRollAndReadAcrossSegments(t *testing.T) {
 		t.Fatalf("window read wrong: %d %+v", len(recs), recs[0])
 	}
 	// HW cap: records beyond uptoSeq invisible
-	recs, _, err = st.ReadAggregate("agg-r", 1, 0, 150)
+	recs, _, err = st.ReadAggregateRouted("agg-r", 1, 0, 150)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestRollAndReadAcrossSegments(t *testing.T) {
 func TestReadRange(t *testing.T) {
 	st, dir := newTestStore(t, 128, 4096)
 	for i := uint64(1); i <= 300; i++ {
-		if _, err := st.Append(mkRec("agg-f", uint32(i), fmt.Sprintf("cmd-f-%d", i))); err != nil {
+		if _, err := st.AppendRouted(mkRec("agg-f", uint32(i), fmt.Sprintf("cmd-f-%d", i))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -217,7 +217,7 @@ func TestRecoveryAndTornTail(t *testing.T) {
 	}
 	slotID := st.SlotOf("agg-c")
 	for i := uint64(1); i <= 50; i++ {
-		if _, err := st.Append(mkRec("agg-c", uint32(i), fmt.Sprintf("cmd-c-%d", i))); err != nil {
+		if _, err := st.AppendRouted(mkRec("agg-c", uint32(i), fmt.Sprintf("cmd-c-%d", i))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -244,12 +244,12 @@ func TestRecoveryAndTornTail(t *testing.T) {
 	if slot2.CurrentVersion("agg-c") != 50 {
 		t.Fatalf("recovery version=%d want 50", slot2.CurrentVersion("agg-c"))
 	}
-	out, _ := st2.Append(mkRec("agg-c", 1, "cmd-c-1"))
+	out, _ := st2.AppendRouted(mkRec("agg-c", 1, "cmd-c-1"))
 	if out.Status != data.StatusExists || out.Seq != 1 {
 		t.Fatalf("cmd index lost: %+v", out)
 	}
 	// new append continues contiguously
-	out, _ = st2.Append(mkRec("agg-c", 51, "cmd-c-51"))
+	out, _ = st2.AppendRouted(mkRec("agg-c", 51, "cmd-c-51"))
 	if out.Status != data.StatusSuccess || out.Seq != 51 {
 		t.Fatalf("post-recovery append: %+v", out)
 	}
@@ -291,7 +291,7 @@ func TestAppendAtSeq(t *testing.T) {
 
 func TestBadRequests(t *testing.T) {
 	st, _ := newTestStore(t, 128, DefaultSegmentBytes)
-	out, err := st.Append(&data.EventRecord{AggregateID: "a", Version: 1, CommandID: "c"})
+	out, err := st.AppendRouted(&data.EventRecord{AggregateID: "a", Version: 1, CommandID: "c"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +311,7 @@ func TestAuxOnlyDirIsNotACopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Append(mkRec("aux-1", 1, "aux-c1")); err != nil {
+	if _, err := st.AppendRouted(mkRec("aux-1", 1, "aux-c1")); err != nil {
 		t.Fatal(err)
 	}
 	walSlot := st.SlotOf("aux-1")

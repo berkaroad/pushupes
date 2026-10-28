@@ -73,8 +73,7 @@ message AppendRequest {
   int64 unix_time = 3; // 0 = server clock
   string command_id = 4; // idempotency key
   repeated Event events = 5;
-  reserved 6; // append success always means: high watermark covers it
-  Compression compression = 7; // body codec as prepared by the writer
+  Compression compression = 6; // body codec as prepared by the writer
 }
 
 message AppendResponse {
@@ -90,7 +89,10 @@ message AppendResponse {
   string message = 3;
   uint32 current_version = 4; // set on 1001 for client self-heal
   uint64 seq = 5;
-  int32 slot = 6; // routing slot (authoritative even on redirects)
+  // slot is a LOGICAL slot id (0 .. group_size-1) of the generation this node
+  // serves; the physical table slot is group_base + slot. The client plane never
+  // sees the physical id space.
+  int32 slot = 6; // routing slot, logical (authoritative even on redirects)
   string node = 7; // redirect target "host:port" for MOVED (1003) / ASK (1004)
   Record record = 8; // set on STATUS_EXISTS only (the stored duplicate)
 }
@@ -100,6 +102,10 @@ message AppendResponse {
 // (-grpc-max-msg-size, default 4MiB). An empty batch returns empty results.
 message BatchAppendRequest {
   repeated AppendRequest records = 1;
+  // layout_epoch echoes PrefetchRoutes' value. 0 means "no opinion" (a client
+  // that has not fetched a table yet); a non-zero mismatch answers 1010 for
+  // every record and nothing is written.
+  uint64 layout_epoch = 2;
 }
 
 // BatchAppendResult pairs one aggregate with its append outcome.
@@ -127,15 +133,31 @@ message PrefetchRoutesResponse {
   // node_client_addrs are the cluster members' client-plane ("host:port")
   // addrs, de-duplicated in first-appearance order.
   repeated string node_client_addrs = 1;
-  // slot_node_index is DENSE over slots: index s is the slot-s leader's
-  // position in node_client_addrs, for every s in 0..len-1. Its length is
-  // the cluster's slot count — the value is cluster state and reaches the
-  // client here, never as a client-side constant. Slots the answering node
-  // cannot map to a live client_addr (unassigned, or a leader whose
-  // registration has not landed yet) fall back to the answering node's own
-  // entry, the same local-serve rule SubmitBatch applies to such slots, so
-  // the array never has holes and needs no sentinel handling.
+  // slot_node_index is DENSE over LOGICAL slots: index l is the leader of
+  // logical slot l — i.e. of the physical table slot group_base + l — as a
+  // position in node_client_addrs, for every l in 0..len-1. Its length is the
+  // generation's size (group_size), not the table's slot count: the client
+  // plane indexes by logical id and never sees the physical id space, so the
+  // array stays small as generations grow and one client binary serves any
+  // base. Entries the answering node cannot map to a live client_addr
+  // (unassigned, or a leader whose registration has not landed yet) fall back
+  // to the answering node's own entry, the same local-serve rule SubmitBatch
+  // applies to such slots, so the array never has holes and needs no sentinel
+  // handling.
   repeated int32 slot_node_index = 2;
+  // The served slot generation (DESIGN §4.5, §7.2.7): generation g owns the
+  // physical range [2^g, 2^(g+1)), i.e. group_base == group_size == 2^g, and a
+  // client routes an aggregate onto a LOGICAL slot, which is the slot within the
+  // group: logical = hash&(size-1), physical = group_base + logical
+  // (pkg/client LogicalSlotOf). group_size == 0 means no generation is served:
+  // the cluster is not ready and the client refuses to route.
+  int32 group_gen = 3;
+  int32 group_base = 4;
+  int32 group_size = 5;
+  // layout_epoch increments on every generation switch. A client echoes it on
+  // BatchAppend; a mismatch answers 1010 (GROUP_MISMATCH) and the client
+  // refreshes this table before retrying.
+  uint64 layout_epoch = 6;
 }
 
 message ReadStreamRequest {
@@ -155,7 +177,7 @@ message ReadStreamResponse {
   // no records. err_id 0 means this node answered. Clients refresh their
   // routing row from the answer and retry (pkg/client does this per call).
   uint32 err_id = 4;
-  int32 slot = 5;
+  int32 slot = 5; // logical slot id: physical = group_base + slot
   string node = 6; // redirect target "host:port" when err_id is 1003
 }
 
@@ -171,7 +193,7 @@ message ReadTailsResult {
   string aggregate_id = 1; // echo, like BatchAppendResult
   uint32 version = 2;
   uint32 err_id = 3;
-  int32 slot = 4;
+  int32 slot = 4; // logical slot id: physical = group_base + slot
   string node = 5;
 }
 
@@ -199,7 +221,7 @@ message ReadByCommandResponse {
   // Redirect in-band, exactly as ReadStreamResponse: err_id 1003 + slot +
   // the leader's client-plane node when this node cannot serve the slot.
   uint32 err_id = 3;
-  int32 slot = 4;
+  int32 slot = 4; // logical slot id: physical = group_base + slot
   string node = 5;
 }
 
@@ -217,6 +239,6 @@ message ReadVersionByTimeResponse {
   // Redirect in-band, exactly as ReadStreamResponse: err_id 1003 + slot +
   // the leader's client-plane node when this node cannot serve the slot.
   uint32 err_id = 2;
-  int32 slot = 3;
+  int32 slot = 3; // logical slot id: physical = group_base + slot
   string node = 4;
 }

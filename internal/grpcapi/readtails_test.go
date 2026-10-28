@@ -74,7 +74,7 @@ func TestReadTailsMatchesPerAggregateProbe(t *testing.T) {
 	}
 	for _, sh := range shapes {
 		for v := 1; v <= sh.records; v++ {
-			if _, err := store.Append(&data.EventRecord{
+			if _, err := store.AppendRouted(&data.EventRecord{
 				AggregateID: sh.agg, Version: uint32(v),
 				CommandID: sh.agg + "-cmd-" + itoa(v),
 				Events:    []data.Event{{Type: "E", Body: []byte("x")}},
@@ -132,7 +132,7 @@ func TestReadTailsMatchesPerAggregateProbe(t *testing.T) {
 		if res.ErrId != 0 {
 			t.Fatalf("ReadTails[%s] answered err_id %d, want a local version", sh.agg, res.ErrId)
 		}
-		wantTail, err := store.TailVersionOf(sh.agg, 0)
+		wantTail, err := store.TailVersionOfRouted(sh.agg, 0)
 		if err != nil {
 			t.Fatalf("reference tail %s: %v", sh.agg, err)
 		}
@@ -210,7 +210,7 @@ func TestReadTailsClipsAtBound(t *testing.T) {
 
 	const agg = "tails-clip"
 	for v := 1; v <= 5; v++ {
-		if _, err := store.Append(&data.EventRecord{
+		if _, err := store.AppendRouted(&data.EventRecord{
 			AggregateID: agg, Version: uint32(v),
 			CommandID: "clip-cmd-" + itoa(v),
 			Events:    []data.Event{{Type: "E", Body: []byte("x")}},
@@ -227,7 +227,7 @@ func TestReadTailsClipsAtBound(t *testing.T) {
 
 	// Unbounded: the whole tail (each append got its own seq, so versions and
 	// seqs advance together here).
-	full, err := store.TailVersionOf(agg, 0)
+	full, err := store.TailVersionOfRouted(agg, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestReadTailsClipsAtBound(t *testing.T) {
 	// Clip below the tail: the answer must be the last covered version, and it
 	// must match the last version a ReadStream bounded by the same seq returns.
 	for _, cut := range []uint64{1, 2, 3, 4, 5} {
-		got, err := store.TailVersionOf(agg, cut)
+		got, err := store.TailVersionOfRouted(agg, cut)
 		if err != nil {
 			t.Fatalf("clipped tail at %d: %v", cut, err)
 		}

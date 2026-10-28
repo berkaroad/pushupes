@@ -48,13 +48,27 @@ const (
 // Modulo is over uint64, so the slot count is not limited to 65535.
 // Deterministic across processes and restarts on purpose — a routing hash
 // that moved would move data between slots.
-func SlotOf(aggregateID string, slotCount int) int32 {
-	if slotCount <= 0 {
-		panic("slotCount must be positive")
+//
+// LogicalSlotOf routes an aggregate id onto the LOGICAL slot ids of one
+// generation: 0 .. size-1. This is the only router the client plane has — the
+// client never sees the physical id space, so there is no base to pass: the
+// server turns a logical id into a table slot (physical = base + logical).
+//
+// size must be a power of two (every generation is), which is what turns the
+// narrowing into a mask instead of a modulo. size=1 is generation g0: every
+// aggregate routes to logical slot 0 (physical slot-001). A logical id is
+// exactly the zero-based segment's slot, which is why a test table needs no
+// second rule.
+func LogicalSlotOf(aggregateID string, size int) int32 {
+	if size <= 0 {
+		panic("generation size must be positive")
+	}
+	if size&(size-1) != 0 {
+		panic("generation size must be a power of two")
 	}
 	h := fnv.New64a()
 	h.Write([]byte(aggregateID))
-	return int32(mix64(h.Sum64()) % uint64(slotCount))
+	return int32(mix64(h.Sum64()) & uint64(size-1))
 }
 
 func mix64(x uint64) uint64 {

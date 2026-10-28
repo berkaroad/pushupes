@@ -62,8 +62,12 @@ func TestReadsRedirectNotRelay(t *testing.T) {
 	// One slot node-1 leads, one it holds as a proven-synced replica, and
 	// one it holds NOTHING of — the redirect subject.
 	var leadSlot, heldSlot, freeSlot int32 = -1, -1, -1
-	for s := int32(0); s < 8; s++ {
+	// Slot 0 is reserved and therefore never planned: start at 1 and tolerate holes.
+	for s := int32(1); s < 8; s++ {
 		p := tbl.Slots[s]
+		if p == nil {
+			continue
+		}
 		switch {
 		case p.Leader == "node-1":
 			if leadSlot < 0 {
@@ -99,7 +103,7 @@ func TestReadsRedirectNotRelay(t *testing.T) {
 	heldAgg := findAgg(heldSlot)
 
 	// Write something to the led slot so a local answer is not vacuous.
-	if _, err := store.Append(&data.EventRecord{
+	if _, err := store.AppendRouted(&data.EventRecord{
 		AggregateID: leadAgg, Version: 1, CommandID: leadAgg + "-cmd-1",
 		Events: []data.Event{{Type: "E", Body: []byte("x")}},
 	}); err != nil {

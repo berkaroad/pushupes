@@ -64,7 +64,7 @@ func main() {
 	var aggs []string
 	for i := 0; len(aggs) < *conns; i++ {
 		a := fmt.Sprintf("seed-%d-%d", *slot, i)
-		if int(client.SlotOf(a, slotCount)) == *slot {
+		if int(cl.SlotOf(a)) == *slot {
 			aggs = append(aggs, a)
 		}
 	}

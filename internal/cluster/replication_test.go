@@ -103,7 +103,7 @@ func TestFetchPayloadRoundTrip(t *testing.T) {
 	// write 3 records into slot 0 (single-node plan: node-1 leads all)
 	aggX := aggInSlot(t, e, 0)
 	for v := uint64(1); v <= 3; v++ {
-		out, err := st.Append(makeRecord(aggX, uint32(v), fmt.Sprintf("c-%d", v)))
+		out, err := st.AppendRouted(makeRecord(aggX, uint32(v), fmt.Sprintf("c-%d", v)))
 		if err != nil || out.Status != data.StatusSuccess {
 			t.Fatalf("append v%d: %+v %v", v, out, err)
 		}
@@ -139,7 +139,7 @@ func TestFetchPayloadRoundTrip(t *testing.T) {
 	if got := st2.LastSeqOf(0); got != 3 {
 		t.Fatalf("replica LEO %d want 3", got)
 	}
-	recs, _, err := st2.ReadAggregate(aggX, 1, 10, 0)
+	recs, _, err := st2.ReadAggregateRouted(aggX, 1, 10, 0)
 	if err != nil || len(recs) != 3 || recs[0].CommandID != "c-1" {
 		t.Fatalf("replica read: %v %+v", err, recs)
 	}
@@ -157,7 +157,7 @@ func TestNoteReplicaProgressAdvancesHW(t *testing.T) {
 	// 2 records on the leader, in the slot this node leads (0)
 	aggH := aggInSlot(t, e, 0)
 	for v := uint64(1); v <= 2; v++ {
-		if _, err := st.Append(makeRecord(aggH, uint32(v), fmt.Sprintf("h-%d", v))); err != nil {
+		if _, err := st.AppendRouted(makeRecord(aggH, uint32(v), fmt.Sprintf("h-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -172,7 +172,7 @@ func TestNoteReplicaProgressAdvancesHW(t *testing.T) {
 	}
 	// A third record, and the follower reports it late: that lag holds the
 	// watermark back — the promise, not a stall to remove.
-	if _, err := st.Append(makeRecord(aggH, 3, "h-3")); err != nil {
+	if _, err := st.AppendRouted(makeRecord(aggH, 3, "h-3")); err != nil {
 		t.Fatal(err)
 	}
 	e.NoteReplicaProgress(0, "node-2", 2)
@@ -195,7 +195,7 @@ func TestNoteReplicaProgressAdvancesHW(t *testing.T) {
 	if got := e.ISR(0); len(got) != 0 {
 		t.Fatalf("ISR after staleness %v want empty", got)
 	}
-	if _, err := st.Append(makeRecord(aggH, 3, "h-3")); err != nil {
+	if _, err := st.AppendRouted(makeRecord(aggH, 3, "h-3")); err != nil {
 		t.Fatal(err)
 	}
 	e.advanceHW(0)
@@ -346,7 +346,7 @@ func TestMigrationTargetDoesNotGateHW(t *testing.T) {
 	applyCmd(t, e, &Command{Op: OpSlotAddReplica, Slots: []int32{0}, NodeID: "node-3"})
 	agg := aggInSlot(t, e, 0)
 	for v := uint64(1); v <= 5; v++ {
-		if _, err := st.Append(makeRecord(agg, uint32(v), fmt.Sprintf("hw-%d", v))); err != nil {
+		if _, err := st.AppendRouted(makeRecord(agg, uint32(v), fmt.Sprintf("hw-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -363,7 +363,7 @@ func TestMigrationTargetDoesNotGateHW(t *testing.T) {
 	// ordinary lagging replica still holds the watermark back.
 	agg3 := aggInSlot(t, e, 3)
 	for v := uint64(1); v <= 5; v++ {
-		if _, err := st.Append(makeRecord(agg3, uint32(v), fmt.Sprintf("hw3-%d", v))); err != nil {
+		if _, err := st.AppendRouted(makeRecord(agg3, uint32(v), fmt.Sprintf("hw3-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -371,7 +371,7 @@ func TestMigrationTargetDoesNotGateHW(t *testing.T) {
 	// excluded by design (see TestReLayoutSeatDoesNotGateHW). Afterwards a lag
 	// does hold the watermark back.
 	e.NoteReplicaProgress(3, "node-2", 5)
-	if _, err := st.Append(makeRecord(agg3, 6, "hw3-6")); err != nil {
+	if _, err := st.AppendRouted(makeRecord(agg3, 6, "hw3-6")); err != nil {
 		t.Fatal(err)
 	}
 	e.NoteReplicaProgress(3, "node-2", 5)
@@ -399,7 +399,7 @@ func TestHandleFetchAndReplicateOverPeerPlane(t *testing.T) {
 	// seed leader WAL (slot 0 is led by node-1)
 	aggE := aggInSlot(t, leader, 0)
 	for v := uint64(1); v <= 3; v++ {
-		out, _ := ldrStore.Append(makeRecord(aggE, uint32(v), fmt.Sprintf("e-%d", v)))
+		out, _ := ldrStore.AppendRouted(makeRecord(aggE, uint32(v), fmt.Sprintf("e-%d", v)))
 		if out.Status != data.StatusSuccess {
 			t.Fatalf("seed %d: %+v", v, out)
 		}
@@ -456,7 +456,7 @@ func TestFailoverPicksTheFreshestReplica(t *testing.T) {
 			n = 1
 		}
 		for v := 1; v <= n; v++ {
-			if _, err := st.Append(makeRecord(agg, uint32(v), fmt.Sprintf("%s-%d", id, v))); err != nil {
+			if _, err := st.AppendRouted(makeRecord(agg, uint32(v), fmt.Sprintf("%s-%d", id, v))); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -732,7 +732,7 @@ func TestSweepRoundReleasesCaughtUpBuildingSeat(t *testing.T) {
 	// One write, and the follower's report at the leader's LEO puts the seat
 	// in-sync: the baseline the re-mark below must not silently undo.
 	aggH := aggInSlot(t, e, 0)
-	if _, err := st.Append(makeRecord(aggH, 1, "g-1")); err != nil {
+	if _, err := st.AppendRouted(makeRecord(aggH, 1, "g-1")); err != nil {
 		t.Fatal(err)
 	}
 	e.NoteReplicaProgress(0, "node-2", 1)
@@ -778,7 +778,7 @@ func TestTakeoverKeepsBuildingSeatsOutOfTheHW(t *testing.T) {
 	applyCmd(t, e, &Command{Op: OpSlotAddReplica, Slots: []int32{0}, NodeID: "node-3"})
 	agg := aggInSlot(t, e, 0)
 	for v := uint32(1); v <= 5; v++ {
-		if _, err := st.Append(makeRecord(agg, v, fmt.Sprintf("take-%d", v))); err != nil {
+		if _, err := st.AppendRouted(makeRecord(agg, v, fmt.Sprintf("take-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -796,7 +796,7 @@ func TestTakeoverKeepsBuildingSeatsOutOfTheHW(t *testing.T) {
 	// as a real fetch round does — and the next write follows it.
 	e.NoteReplicaProgress(0, "node-3", 0)
 	e.NoteReplicaProgress(0, "node-2", 5)
-	if _, err := st.Append(makeRecord(agg, 6, "take-6")); err != nil {
+	if _, err := st.AppendRouted(makeRecord(agg, 6, "take-6")); err != nil {
 		t.Fatal(err)
 	}
 	e.NoteReplicaProgress(0, "node-2", 6)
@@ -819,14 +819,14 @@ func TestMarkedDownPeerReleasesHW(t *testing.T) {
 
 	agg := aggInSlot(t, e, 0)
 	for v := uint32(1); v <= 5; v++ {
-		if _, err := st.Append(makeRecord(agg, v, fmt.Sprintf("down-%d", v))); err != nil {
+		if _, err := st.AppendRouted(makeRecord(agg, v, fmt.Sprintf("down-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// Catch it up once (a copy being built never gates), then let it fall behind:
 	// an ordinary ISR member gates.
 	e.NoteReplicaProgress(0, "node-2", 5)
-	if _, err := st.Append(makeRecord(agg, 6, "down-6")); err != nil {
+	if _, err := st.AppendRouted(makeRecord(agg, 6, "down-6")); err != nil {
 		t.Fatal(err)
 	}
 	e.NoteReplicaProgress(0, "node-2", 5)
@@ -862,14 +862,14 @@ func TestFollowerSessionLossReleasesHW(t *testing.T) {
 	// slot 0 is led by node-1 with node-2 as its in-sync replica.
 	agg := aggInSlot(t, e, 0)
 	for v := uint32(1); v <= 5; v++ {
-		if _, err := st.Append(makeRecord(agg, v, fmt.Sprintf("loss-%d", v))); err != nil {
+		if _, err := st.AppendRouted(makeRecord(agg, v, fmt.Sprintf("loss-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// node-2 catches up once (a copy still being built never gates), then falls
 	// one record behind: now it is an ordinary ISR member and it gates.
 	e.NoteReplicaProgress(0, "node-2", 5)
-	if _, err := st.Append(makeRecord(agg, 6, "loss-6")); err != nil {
+	if _, err := st.AppendRouted(makeRecord(agg, 6, "loss-6")); err != nil {
 		t.Fatal(err)
 	}
 	e.NoteReplicaProgress(0, "node-2", 5)
@@ -891,7 +891,7 @@ func TestFollowerSessionLossReleasesHW(t *testing.T) {
 	if isr := e.ISR(0); !seatListHas(isr, "node-2") {
 		t.Fatalf("a reconnected replica must read as in-sync again: %v", isr)
 	}
-	if _, err := st.Append(makeRecord(agg, 7, "loss-7")); err != nil {
+	if _, err := st.AppendRouted(makeRecord(agg, 7, "loss-7")); err != nil {
 		t.Fatal(err)
 	}
 	e.NoteReplicaProgress(0, "node-2", 6)
@@ -915,7 +915,7 @@ func TestReLayoutSeatDoesNotGateHW(t *testing.T) {
 	// slot 0 is led by node-1 with node-2 as its in-sync replica.
 	agg := aggInSlot(t, e, 0)
 	for v := uint32(1); v <= 5; v++ {
-		if _, err := st.Append(makeRecord(agg, v, fmt.Sprintf("relayout-%d", v))); err != nil {
+		if _, err := st.AppendRouted(makeRecord(agg, v, fmt.Sprintf("relayout-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -925,14 +925,14 @@ func TestReLayoutSeatDoesNotGateHW(t *testing.T) {
 	// promise). slot 3 is on the same terms.
 	agg3 := aggInSlot(t, e, 3)
 	for v := uint32(1); v <= 5; v++ {
-		if _, err := st.Append(makeRecord(agg3, v, fmt.Sprintf("relayout3-%d", v))); err != nil {
+		if _, err := st.AppendRouted(makeRecord(agg3, v, fmt.Sprintf("relayout3-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// It catches up once (until then it is a copy being built, by design), and
 	// from then on it is an ordinary ISR member: a lag holds the watermark back.
 	e.NoteReplicaProgress(3, "node-2", 5)
-	if _, err := st.Append(makeRecord(agg3, 6, "relayout3-6")); err != nil {
+	if _, err := st.AppendRouted(makeRecord(agg3, 6, "relayout3-6")); err != nil {
 		t.Fatal(err)
 	}
 	e.NoteReplicaProgress(3, "node-2", 5)
@@ -964,7 +964,7 @@ func TestReLayoutSeatDoesNotGateHW(t *testing.T) {
 	}
 
 	// ...and from now on it gates like any other in-sync replica.
-	if _, err := st.Append(makeRecord(agg, 6, "relayout-6")); err != nil {
+	if _, err := st.AppendRouted(makeRecord(agg, 6, "relayout-6")); err != nil {
 		t.Fatal(err)
 	}
 	e.NoteReplicaProgress(0, "node-3", 5)
@@ -991,7 +991,7 @@ func TestBuildingSeatDoesNotParkTheAck(t *testing.T) {
 
 	agg := aggInSlot(t, e, 0)
 	for v := uint32(1); v <= 5; v++ {
-		if _, err := st.Append(makeRecord(agg, v, fmt.Sprintf("park-%d", v))); err != nil {
+		if _, err := st.AppendRouted(makeRecord(agg, v, fmt.Sprintf("park-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1006,7 +1006,7 @@ func TestBuildingSeatDoesNotParkTheAck(t *testing.T) {
 	applyCmd(t, e, &Command{Op: OpSetPolicy, Policy: string(ReplicaPolicyMedium)})
 	applyCmd(t, e, &Command{Op: OpSlotAddReplica, Slots: []int32{0}, NodeID: "node-2"})
 	e.NoteReplicaProgress(0, "node-2", 0)
-	if _, err := st.Append(makeRecord(agg, 6, "park-6")); err != nil {
+	if _, err := st.AppendRouted(makeRecord(agg, 6, "park-6")); err != nil {
 		t.Fatal(err)
 	}
 	start := time.Now()
@@ -1017,7 +1017,7 @@ func TestBuildingSeatDoesNotParkTheAck(t *testing.T) {
 	// Once that copy catches up it IS an ack holder, and an append above its
 	// report gates again: the rule is "wait for ack holders", not "never wait".
 	e.NoteReplicaProgress(0, "node-2", 6)
-	if _, err := st.Append(makeRecord(agg, 7, "park-7")); err != nil {
+	if _, err := st.AppendRouted(makeRecord(agg, 7, "park-7")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := e.waitForHW(context.Background(), 0, 7, 150*time.Millisecond); err == nil {
@@ -1061,14 +1061,14 @@ func TestFetchServesAckCriticalTailBeforeBacklog(t *testing.T) {
 	// The backlog slot: far more records than the round's budget can carry.
 	bulkAgg := aggInSlot(t, e, bulk)
 	for v := uint32(1); v <= 200; v++ {
-		if _, err := st.Append(makeRecord(bulkAgg, v, fmt.Sprintf("bulk-%d", v))); err != nil {
+		if _, err := st.AppendRouted(makeRecord(bulkAgg, v, fmt.Sprintf("bulk-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// The ack-critical slot: three records, and the follower needs the last one.
 	tailAgg := aggInSlot(t, e, tail)
 	for v := uint32(1); v <= 3; v++ {
-		if _, err := st.Append(makeRecord(tailAgg, v, fmt.Sprintf("tail-%d", v))); err != nil {
+		if _, err := st.AppendRouted(makeRecord(tailAgg, v, fmt.Sprintf("tail-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1143,7 +1143,7 @@ func TestFetchServesRingSeatsBeforeFactorSeats(t *testing.T) {
 	for _, s := range []int32{ringSlot, factorSlot} {
 		agg := aggInSlot(t, e, s)
 		for v := uint32(1); v <= 200; v++ {
-			if _, err := st.Append(makeRecord(agg, v, fmt.Sprintf("s%d-%d", s, v))); err != nil {
+			if _, err := st.AppendRouted(makeRecord(agg, v, fmt.Sprintf("s%d-%d", s, v))); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -1187,7 +1187,7 @@ func TestFetchSharesTheBudgetWithARingCatchUp(t *testing.T) {
 	}
 	agg := aggInSlot(t, e, slot)
 	for v := uint32(1); v <= 400; v++ {
-		if _, err := st.Append(makeRecord(agg, v, fmt.Sprintf("s-%d", v))); err != nil {
+		if _, err := st.AppendRouted(makeRecord(agg, v, fmt.Sprintf("s-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1392,7 +1392,7 @@ func TestSyncedLeaderSlotsGauge(t *testing.T) {
 	// the factor — replica set {leader, follower} and in-sync {leader,
 	// follower}.
 	aggH := aggInSlot(t, e, 0)
-	if _, err := st.Append(makeRecord(aggH, 1, "g-1")); err != nil {
+	if _, err := st.AppendRouted(makeRecord(aggH, 1, "g-1")); err != nil {
 		t.Fatal(err)
 	}
 	e.NoteReplicaProgress(0, "node-2", 1)

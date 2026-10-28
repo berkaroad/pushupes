@@ -39,7 +39,7 @@ func TestWriteFenceBlocksAppendsAndDoesNotFailThem(t *testing.T) {
 
 	agg := aggInSlot(t, e, 0)
 	other := aggInSlot(t, e, 3) // a different slot: must stay writable
-	if _, err := st.Append(makeRecord(agg, 1, "w-1")); err != nil {
+	if _, err := st.AppendRouted(makeRecord(agg, 1, "w-1")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -146,7 +146,7 @@ func TestHandleFenceSlotPushesFrozenTailAndHoldsFence(t *testing.T) {
 
 	agg := aggInSlot(t, src, 0)
 	for v := uint64(1); v <= 3; v++ {
-		if out, err := srcStore.Append(makeRecord(agg, uint32(v), fmt.Sprintf("ft-%d", v))); err != nil || out.Status != data.StatusSuccess {
+		if out, err := srcStore.AppendRouted(makeRecord(agg, uint32(v), fmt.Sprintf("ft-%d", v))); err != nil || out.Status != data.StatusSuccess {
 			t.Fatalf("seed v%d: %+v %v", v, out, err)
 		}
 	}
@@ -215,7 +215,7 @@ func TestHandleFenceSlotAbortsOnUnreachableTarget(t *testing.T) {
 	applyCmd(t, src, &Command{Op: OpPlanSlots})
 
 	agg := aggInSlot(t, src, 0)
-	if _, err := srcStore.Append(makeRecord(agg, 1, "ab-1")); err != nil {
+	if _, err := srcStore.AppendRouted(makeRecord(agg, 1, "ab-1")); err != nil {
 		t.Fatal(err)
 	}
 	applyCmd(t, src, &Command{Op: OpSlotState, Slots: []int32{0}, State: SlotMigratingOut, MigratingTo: "node-2"})
@@ -241,7 +241,7 @@ func TestApplyFetchPayloadSkipsForkedSeq(t *testing.T) {
 
 	agg := aggInSlot(t, leader, 0)
 	for v := uint64(1); v <= 3; v++ {
-		if _, err := ldr.Append(makeRecord(agg, uint32(v), fmt.Sprintf("sp-%d", v))); err != nil {
+		if _, err := ldr.AppendRouted(makeRecord(agg, uint32(v), fmt.Sprintf("sp-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -282,10 +282,10 @@ func TestApplyFetchItemsQuarantinesOneSlotKeepsSession(t *testing.T) {
 
 	agg0, agg1 := aggInSlot(t, leader, 0), aggInSlot(t, leader, 1)
 	for v := uint64(1); v <= 3; v++ {
-		if _, err := ldr.Append(makeRecord(agg0, uint32(v), fmt.Sprintf("q0-%d", v))); err != nil {
+		if _, err := ldr.AppendRouted(makeRecord(agg0, uint32(v), fmt.Sprintf("q0-%d", v))); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := ldr.Append(makeRecord(agg1, uint32(v), fmt.Sprintf("q1-%d", v))); err != nil {
+		if _, err := ldr.AppendRouted(makeRecord(agg1, uint32(v), fmt.Sprintf("q1-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}

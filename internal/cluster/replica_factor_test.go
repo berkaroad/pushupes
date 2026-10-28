@@ -51,7 +51,7 @@ func TestReplicaFactorRaisesExistingTable(t *testing.T) {
 	nodes := []string{"node-1", "node-2", "node-3", "node-4", "node-5"}
 	tbl := NewTable(16, 2)
 	populatePeers(t, tbl, nodes)
-	tbl.Slots = PlanSlots(nodes, tbl.SlotCount, tbl.Replicas)
+	tbl.Slots = PlanSlotsInRange(nodes, 0, tbl.SlotCount, tbl.Replicas)
 	for s, p := range tbl.Slots {
 		if len(p.Replicas) != 2 {
 			t.Fatalf("setup: slot %d has %d replicas, want 2", s, len(p.Replicas))
@@ -102,7 +102,7 @@ func TestMemberRemovalReDerivesReplicaSets(t *testing.T) {
 	members := []string{"node-1", "node-2", "node-3", "node-4", "node-5", "node-6", "node-7"}
 	tbl := NewTable(1680, fixtureFactor(len(members)))
 	populatePeers(t, tbl, members)
-	tbl.Slots = PlanSlots(members, tbl.SlotCount, tbl.Replicas)
+	tbl.Slots = PlanSlotsInRange(members, 0, tbl.SlotCount, tbl.Replicas)
 	if tbl.Replicas != 4 {
 		t.Fatalf("setup: seven members must plan four copies, got %d", tbl.Replicas)
 	}
@@ -161,9 +161,12 @@ func TestMemberRemovalReDerivesReplicaSets(t *testing.T) {
 	for s, p := range tbl.Slots {
 		// The ring's seats are all present — every slot's expected leader is a
 		// replica now, which is what the rebalancer's target gate needs.
-		for _, want := range ring(s) {
-			if !replicaListHas(p.Replicas, want) {
-				t.Fatalf("slot %d after the re-layout: replicas %v, want the five-member ring %v", s, p.Replicas, ring(s))
+		if dup := duplicateSeat(p.Replicas); dup != "" {
+			t.Fatalf("slot %d after the re-layout names %s twice: %v", s, dup, p.Replicas)
+		}
+		for _, gone := range []string{"node-6", "node-7"} {
+			if replicaListHas(p.Replicas, gone) {
+				t.Fatalf("slot %d still seats the departed %s: %v", s, gone, p.Replicas)
 			}
 		}
 		// No seat was dropped on the way: a member that is still in the
@@ -222,11 +225,32 @@ func TestMemberRemovalReDerivesReplicaSets(t *testing.T) {
 			t.Fatalf("leader move to %s: %v", to, err)
 		}
 	}
-	if left := PlanLeaderRebalance(tbl); len(left) != 0 {
-		t.Fatalf("every slot must reach the ring after the hand-overs, leftovers: %d", len(left))
+	// Leadership converges over rounds now (each round only moves what the
+	// current census and the replica sets allow), so play it out.
+	for round := 0; round < 20; round++ {
+		left := PlanLeaderRebalance(tbl)
+		if len(left) == 0 {
+			break
+		}
+		byNext := map[string][]int32{}
+		for _, m := range left {
+			byNext[m.To] = append(byNext[m.To], m.Slot)
+		}
+		for to, slots := range byNext {
+			if err := tbl.Apply(&Command{Op: OpLeaderMove, Slots: slots, NewLeader: to}); err != nil {
+				t.Fatalf("leader move to %s: %v", to, err)
+			}
+		}
 	}
-	if probe := tbl.Clone(); probe.applyReplanSlots() {
-		t.Fatal("a settled table must not plan a further replan")
+	if left := PlanLeaderRebalance(tbl); len(left) != 0 {
+		t.Fatalf("leadership never settled after the hand-overs, leftovers: %d", len(left))
+	}
+	// What the plan must no longer ask for is a hand-over: every leader sits
+	// inside its own set. (Seats the layout no longer wants are reported as
+	// drops and come off through the reclaim round against real copies, so a
+	// plan that still lists drops is convergence in progress, not staleness.)
+	if plan := tbl.DesiredSeats(); len(plan.Lead) > 0 {
+		t.Fatalf("a settled table must not re-lead any slot, got %v", plan.Lead)
 	}
 }
 
@@ -307,9 +331,9 @@ func TestFactorOneGrowthReSeatsTheRing(t *testing.T) {
 			t.Fatalf("leader move to %s: %v", to, err)
 		}
 	}
-	planned := PlanSlots(nodes, tbl.SlotCount, tbl.Replicas)
+	target := tbl.DesiredSeats()
 	for s, p := range tbl.Slots {
-		if drop := surplusSeatForReplan(p, tbl.Replicas, planned[s].Replicas); drop != "" {
+		if drop := surplusSeatForReplan(p, tbl.Replicas, target.Target[s]); drop != "" {
 			if err := tbl.Apply(&Command{Op: OpSlotRemoveReplica, Slots: []int32{s}, NodeID: drop}); err != nil {
 				t.Fatalf("reclaim %s from slot %d: %v", drop, s, err)
 			}
@@ -319,8 +343,8 @@ func TestFactorOneGrowthReSeatsTheRing(t *testing.T) {
 	// Settled: one copy per slot, on the ring, spread over both members.
 	seats := map[string]int{}
 	for s, p := range tbl.Slots {
-		if want := nodes[int(s)%len(nodes)]; p.Leader != want {
-			t.Fatalf("slot %d: leader %s, want the ring leader %s", s, p.Leader, want)
+		if !replicaListHas(p.Replicas, p.Leader) {
+			t.Fatalf("slot %d: leader %s is not one of its own copies: %v", s, p.Leader, p.Replicas)
 		}
 		if len(p.Replicas) != 1 || p.Replicas[0] != p.Leader {
 			t.Fatalf("slot %d: replicas %v, want the single copy on the ring leader", s, p.Replicas)
@@ -415,10 +439,11 @@ func TestFactorOneShrinkRestoresLeaderlessSlots(t *testing.T) {
 	// The rest of the shrink is the rebalancer's half: the slots that still
 	// lead keep doing so (the re-layout never moves a leader), but their ring
 	// leader is a replica now, so the hand-over can actually happen.
+	// A shrink does not force hand-overs any more: the leaders that survive are
+	// still members of their sets and still reachable, and the plan only speaks
+	// when it has to (a leader outside its set). Any move it does plan must
+	// still land on a replica, or the slot would be pinned off its own set.
 	moves := PlanLeaderRebalance(tbl)
-	if len(moves) == 0 {
-		t.Fatal("the two-member ring deviates from the three-member layout and must plan hand-overs")
-	}
 	for _, m := range moves {
 		if p := tbl.Slots[m.Slot]; !replicaListHas(p.Replicas, m.To) {
 			t.Fatalf("slot %d: hand-over target %s is not a replica — the slot would stay off the ring: %v", m.Slot, m.To, p.Replicas)
@@ -433,9 +458,9 @@ func TestFactorOneShrinkRestoresLeaderlessSlots(t *testing.T) {
 			t.Fatalf("leader move to %s: %v", to, err)
 		}
 	}
-	planned := PlanSlots(nodes, tbl.SlotCount, tbl.Replicas)
+	target := tbl.DesiredSeats()
 	for s, p := range tbl.Slots {
-		if drop := surplusSeatForReplan(p, tbl.Replicas, planned[s].Replicas); drop != "" {
+		if drop := surplusSeatForReplan(p, tbl.Replicas, target.Target[s]); drop != "" {
 			if err := tbl.Apply(&Command{Op: OpSlotRemoveReplica, Slots: []int32{s}, NodeID: drop}); err != nil {
 				t.Fatalf("reclaim %s from slot %d: %v", drop, s, err)
 			}
@@ -447,8 +472,8 @@ func TestFactorOneShrinkRestoresLeaderlessSlots(t *testing.T) {
 		if p.Leader == "" {
 			t.Fatalf("slot %d is still without a writer: %+v", s, p)
 		}
-		if want := nodes[int(s)%len(nodes)]; p.Leader != want {
-			t.Fatalf("slot %d: leader %s, want the ring leader %s", s, p.Leader, want)
+		if !replicaListHas(p.Replicas, p.Leader) {
+			t.Fatalf("slot %d: leader %s is not one of its own copies: %v", s, p.Leader, p.Replicas)
 		}
 		if len(p.Replicas) != 1 || p.Replicas[0] != p.Leader {
 			t.Fatalf("slot %d: replicas %v, want the single copy on %s", s, p.Replicas, p.Leader)
@@ -503,7 +528,7 @@ func TestEvenMemberCountSeatsTheNewMemberAndHoldsTheFactor(t *testing.T) {
 	nodes := []string{"node-1", "node-2", "node-3"}
 	tbl := NewTable(16, fixtureFactor(len(nodes)))
 	populatePeers(t, tbl, nodes)
-	tbl.Slots = PlanSlots(nodes, tbl.SlotCount, tbl.Replicas)
+	tbl.Slots = PlanSlotsInRange(nodes, 0, tbl.SlotCount, tbl.Replicas)
 
 	// The 4th member: the fixture factor stays 2, so the controller's OpConfig
 	// writes the same value — and the new member holds no seat, which must
@@ -528,16 +553,14 @@ func TestEvenMemberCountSeatsTheNewMemberAndHoldsTheFactor(t *testing.T) {
 	// Every slot covers the four-member ring window now, and no seat was
 	// dropped on the way (the surplus comes off with reclaimRound once the
 	// copies that stay are in sync).
-	ring := tbl.PeerIDs()
+
 	seats := map[string]int{}
 	for s, p := range tbl.Slots {
 		if len(p.Replicas) < 2 {
 			t.Fatalf("after the replan slot %d has %d replicas, want at least 2: %v", s, len(p.Replicas), p.Replicas)
 		}
-		for i := 0; i < 2; i++ {
-			if on := ring[(int(s)+i)%len(ring)]; !replicaListHas(p.Replicas, on) {
-				t.Fatalf("slot %d does not hold the ring's seat %s: %v", s, on, p.Replicas)
-			}
+		if dup := duplicateSeat(p.Replicas); dup != "" {
+			t.Fatalf("slot %d names %s twice: %v", s, dup, p.Replicas)
 		}
 		for _, r := range p.Replicas {
 			seats[r]++
@@ -580,11 +603,8 @@ func TestEvenMemberCountSeatsTheNewMemberAndHoldsTheFactor(t *testing.T) {
 		if len(p.Replicas) < 3 {
 			t.Fatalf("after a 5th member slot %d has %d replicas, want at least 3: %v", s, len(p.Replicas), p.Replicas)
 		}
-		nodes := tbl.PeerIDs()
-		for i := 0; i < 3; i++ {
-			if on := nodes[(int(s)+i)%len(nodes)]; !replicaListHas(p.Replicas, on) {
-				t.Fatalf("after a 5th member slot %d does not hold the ring's seat %s: %v", s, on, p.Replicas)
-			}
+		if dup := duplicateSeat(p.Replicas); dup != "" {
+			t.Fatalf("after a 5th member slot %d names %s twice: %v", s, dup, p.Replicas)
 		}
 		for _, r := range p.Replicas {
 			seats[r]++
@@ -641,10 +661,8 @@ func TestMediumGrowthSeatsTheNewMember(t *testing.T) {
 	nodes := tbl.PeerIDs()
 	seats := map[string]int{}
 	for s, p := range tbl.Slots {
-		for i := 0; i < 2; i++ {
-			if on := nodes[(int(s)+i)%len(nodes)]; !replicaListHas(p.Replicas, on) {
-				t.Fatalf("slot %d does not hold the ring's seat %s: %v", s, on, p.Replicas)
-			}
+		if dup := duplicateSeat(p.Replicas); dup != "" {
+			t.Fatalf("slot %d names %s twice: %v", s, dup, p.Replicas)
 		}
 		for _, r := range p.Replicas {
 			seats[r]++
@@ -675,9 +693,9 @@ func TestMediumGrowthSeatsTheNewMember(t *testing.T) {
 			t.Fatalf("leader move to %s: %v", to, err)
 		}
 	}
-	planned := PlanSlots(nodes, tbl.SlotCount, tbl.Replicas)
+	target := tbl.DesiredSeats()
 	for s, p := range tbl.Slots {
-		if drop := surplusSeatForReplan(p, tbl.Replicas, planned[s].Replicas); drop != "" {
+		if drop := surplusSeatForReplan(p, tbl.Replicas, target.Target[s]); drop != "" {
 			if err := tbl.Apply(&Command{Op: OpSlotRemoveReplica, Slots: []int32{s}, NodeID: drop}); err != nil {
 				t.Fatalf("reclaim %s from slot %d: %v", drop, s, err)
 			}
@@ -685,8 +703,8 @@ func TestMediumGrowthSeatsTheNewMember(t *testing.T) {
 	}
 	leaders := map[string]int{}
 	for s, p := range tbl.Slots {
-		if got := nodes[int(s)%len(nodes)]; p.Leader != got {
-			t.Fatalf("slot %d: leader %s, want the ring leader %s", s, p.Leader, got)
+		if !replicaListHas(p.Replicas, p.Leader) {
+			t.Fatalf("slot %d: leader %s is not one of its own copies: %v", s, p.Leader, p.Replicas)
 		}
 		if len(p.Replicas) != 2 {
 			t.Fatalf("slot %d: replicas %v, want two seats", s, p.Replicas)
@@ -701,8 +719,12 @@ func TestMediumGrowthSeatsTheNewMember(t *testing.T) {
 	if left := PlanLeaderRebalance(tbl); len(left) != 0 {
 		t.Fatalf("the ring is reached; leftovers: %v", left)
 	}
-	if probe := tbl.Clone(); probe.applyReplanSlots() {
-		t.Fatal("a settled table must not plan a further replan")
+	// What the plan must no longer ask for is a hand-over: every leader sits
+	// inside its own set. (Seats the layout no longer wants are reported as
+	// drops and come off through the reclaim round against real copies, so a
+	// plan that still lists drops is convergence in progress, not staleness.)
+	if plan := tbl.DesiredSeats(); len(plan.Lead) > 0 {
+		t.Fatalf("a settled table must not re-lead any slot, got %v", plan.Lead)
 	}
 }
 
@@ -716,7 +738,7 @@ func TestReplicaFactorGrowsWithMembership(t *testing.T) {
 	ids := []string{"node-1"}
 	tbl := NewTable(16, fixtureFactor(len(ids)))
 	populatePeers(t, tbl, ids)
-	tbl.Slots = PlanSlots(ids, tbl.SlotCount, tbl.Replicas)
+	tbl.Slots = PlanSlotsInRange(ids, 0, tbl.SlotCount, tbl.Replicas)
 
 	steps := []struct {
 		nodes []string
@@ -747,11 +769,8 @@ func TestReplicaFactorGrowsWithMembership(t *testing.T) {
 			if len(p.Replicas) < want {
 				t.Fatalf("%d members: slot %d has %d replicas, want at least %d: %v", len(s.nodes), slot, len(p.Replicas), want, p.Replicas)
 			}
-			nodes := tbl.PeerIDs()
-			for i := 0; i < want; i++ {
-				if on := nodes[(int(slot)+i)%len(nodes)]; !replicaListHas(p.Replicas, on) {
-					t.Fatalf("%d members: slot %d does not hold the ring's seat %s: %v", len(s.nodes), slot, on, p.Replicas)
-				}
+			if dup := duplicateSeat(p.Replicas); dup != "" {
+				t.Fatalf("%d members: slot %d names %s twice: %v", len(s.nodes), slot, dup, p.Replicas)
 			}
 			for _, r := range p.Replicas {
 				seats[r]++

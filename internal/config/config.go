@@ -79,6 +79,13 @@ const (
 	// tune it with -drop-after.
 	DropAfter = 30 * time.Second
 
+	// SlotGroup is the slot generation a brand-new cluster serves: g3 (8
+	// slots, the smallest generation meant for production, DESIGN §7.2.7) by
+	// default; g0..g2 exist for development and tests, g4..g10 for larger
+	// deployments. It only seeds a cluster's FIRST plan — the generation lives
+	// in the replicated table afterwards.
+	SlotGroup = "g3"
+
 	// RebalanceInterval is how often the controller re-checks the
 	// ring layout. The layout only ever needs healing after a failover or a
 	// late-joined replica catches up; a fast tick matters because the batch
@@ -521,7 +528,11 @@ type Config struct {
 	// cluster.DefaultReplicaPolicy, and the raft knobs from the consensus
 	// package. Default leaves them
 	// zero; the command seeds them before the flags are registered.
-	SlotCount        int32
+	SlotCount int32
+	// SlotGroup is the -slot-group seed ("g0".."g10") for a new cluster's
+	// first plan; the served generation travels in the replicated table after
+	// that.
+	SlotGroup        string
 	ReplicaPolicy    string
 	SegmentBytes     int64
 	FlushMessages    int64
@@ -553,6 +564,8 @@ func Default() *Config {
 		StartupGrace:      StartupGrace,
 
 		GRPCMaxMsgBytes: GRPCMaxMsgBytes,
+
+		SlotGroup: SlotGroup,
 	}
 }
 
@@ -572,6 +585,8 @@ func (c *Config) Register(fs *flag.FlagSet) {
 	fs.StringVar(&c.Role, "role", envOr("PUSHUPES_ROLE", c.Role), "this node's place in the cluster, required: voter (control plane — votes in the consensus group and hosts NO slot replicas) or learner (data plane — receives the replicated layout from the control plane without voting). The smallest deployment is one control node plus one data node (env PUSHUPES_ROLE)")
 	fs.DurationVar(&c.AdoptInterval, "adopt-interval", envDurationOr("PUSHUPES_ADOPT_INTERVAL", c.AdoptInterval),
 		"how often a node that is not a cluster member yet retries offering itself through the -join targets, tried in rotation (env PUSHUPES_ADOPT_INTERVAL)")
+	fs.StringVar(&c.SlotGroup, "slot-group", envOr("PUSHUPES_SLOT_GROUP", c.SlotGroup),
+		"slot generation a NEW cluster serves: g0..g10 (g0 = 1 active slot, g10 = 1024; base = size = 2^g, segments never overlap). Applied on the table's first plan only — the generation lives in the replicated table afterwards. g0..g2 are for development/tests, g3 (8 slots) is the smallest production generation (env PUSHUPES_SLOT_GROUP)")
 	fs.StringVar(&c.ReplicaPolicy, "replica-policy", envOr("PUSHUPES_REPLICA_POLICY", c.ReplicaPolicy),
 		"replica policy tier for a NEW cluster: low (1 copy per slot), medium (2, the default), high (3 copies per slot), or a positive number used as the factor directly; applied on the table's first plan only — an existing cluster keeps the policy the admin endpoint last set (env PUSHUPES_REPLICA_POLICY)")
 	c.SegmentBytes = envByteSizeOr("PUSHUPES_SEGMENT_BYTES", c.SegmentBytes)

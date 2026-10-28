@@ -39,7 +39,7 @@ func TestMFetchAnswersEarlyOnWatermarkAdvance(t *testing.T) {
 
 	// Seed six records so the leader's LEO is 6.
 	for i := uint64(1); i <= 6; i++ {
-		if _, err := store.Append(makeRecord(aggInSlot(t, e, slot), uint32(i), fmt.Sprintf("seed-%d", i))); err != nil {
+		if _, err := store.AppendRouted(makeRecord(aggInSlot(t, e, slot), uint32(i), fmt.Sprintf("seed-%d", i))); err != nil {
 			t.Fatalf("seed %d: %v", i, err)
 		}
 	}

@@ -17,13 +17,14 @@ package storage
 import "testing"
 
 // The slot count is a permanent layout decision (routing, placement and
-// migration granularity, DESIGN §7.2), not a tuning knob: 1024 = 2^10 leaves
-// every node at least four slots up to the 256-data-node ceiling and divides
-// evenly over every even power-of-two node count in between. A change here is a
+// migration granularity, DESIGN §7.2.7), not a tuning knob: 2048 = 2^11 is the
+// generation budget — 11 generations of 1,2,…,1024 slots plus the reserved
+// slot-000 — and the largest generation (1024) is what a full deployment of
+// 1024 data nodes with one active slot each uses. A change here is a
 // cluster-wide layout change, so it has to be deliberate.
 func TestDefaultSlotCountIsFixed(t *testing.T) {
-	if DefaultSlotCount != 1024 {
-		t.Fatalf("DefaultSlotCount drifted: %d, want the fixed 1024 (DESIGN §7.2)", DefaultSlotCount)
+	if DefaultSlotCount != 2048 {
+		t.Fatalf("DefaultSlotCount drifted: %d, want the fixed 2048 (DESIGN §7.2.7)", DefaultSlotCount)
 	}
 }
 

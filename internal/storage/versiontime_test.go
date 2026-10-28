@@ -49,38 +49,38 @@ func TestVersionAtOrBeforeTime(t *testing.T) {
 	const agg = "time-agg"
 	// stamp v_i at 1000+i, so version v answers any T in [stamp(v), stamp(v+1)-1]
 	for v := uint32(1); v <= 40; v++ {
-		if _, err := st.Append(recAt(agg, v, int64(1000+v))); err != nil {
+		if _, err := st.AppendRouted(recAt(agg, v, int64(1000+v))); err != nil {
 			t.Fatalf("append v%d: %v", v, err)
 		}
 	}
 	// A query AT an exact stamp resolves THAT record (the <= boundary).
-	got, err := st.VersionAtOrBeforeTime(agg, 1010, 0)
+	got, err := st.VersionAtOrBeforeTimeRouted(agg, 1010, 0)
 	if err != nil || got != 10 {
 		t.Fatalf("exact stamp: want 10 got %d err %v", got, err)
 	}
 	// The next stamp advances the answer by exactly one version.
-	if got, _ := st.VersionAtOrBeforeTime(agg, 1011, 0); got != 11 {
+	if got, _ := st.VersionAtOrBeforeTimeRouted(agg, 1011, 0); got != 11 {
 		t.Fatalf("at stamp 1011: want 11 got %d", got)
 	}
 	// Before the first record: nothing resolves.
-	if got, err := st.VersionAtOrBeforeTime(agg, 1000, 0); err != nil || got != 0 {
+	if got, err := st.VersionAtOrBeforeTimeRouted(agg, 1000, 0); err != nil || got != 0 {
 		t.Fatalf("before head: want 0 got %d err %v", got, err)
 	}
 	// At the first record's stamp: that record answers.
-	if got, err := st.VersionAtOrBeforeTime(agg, 1001, 0); err != nil || got != 1 {
+	if got, err := st.VersionAtOrBeforeTimeRouted(agg, 1001, 0); err != nil || got != 1 {
 		t.Fatalf("at first stamp: want 1 got %d err %v", got, err)
 	}
 	// Past the last stamp: the whole tail answers.
-	if got, err := st.VersionAtOrBeforeTime(agg, 1100, 0); err != nil || got != 40 {
+	if got, err := st.VersionAtOrBeforeTimeRouted(agg, 1100, 0); err != nil || got != 40 {
 		t.Fatalf("past tail: want 40 got %d err %v", got, err)
 	}
 
 	// Non-monotonic stamps: v41 is stamped in the past, so a query exactly at
 	// its stamp answers 41 — the WALK from the tail decides, not monotonicity.
-	if _, err := st.Append(recAt(agg, 41, 1005)); err != nil {
+	if _, err := st.AppendRouted(recAt(agg, 41, 1005)); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := st.VersionAtOrBeforeTime(agg, 1005, 0); err != nil || got != 41 {
+	if got, err := st.VersionAtOrBeforeTimeRouted(agg, 1005, 0); err != nil || got != 41 {
 		t.Fatalf("non-monotonic tail hit at exact stamp: want 41 got %d err %v", got, err)
 	}
 
@@ -88,22 +88,22 @@ func TestVersionAtOrBeforeTime(t *testing.T) {
 	// stamps must not resolve a version beyond what is visible.
 	// (seqs 1..20 cover versions 1..20 for this single-aggregate stream.)
 	firstTwenty := func() uint64 {
-		recs, seqs, err := st.ReadAggregate(agg, 20, 1, 0)
+		recs, seqs, err := st.ReadAggregateRouted(agg, 20, 1, 0)
 		if err != nil || len(recs) != 1 {
 			t.Fatalf("locate v20 seq: %v %v", recs, err)
 		}
 		return seqs[0]
 	}
 	bound := firstTwenty()
-	if got, err := st.VersionAtOrBeforeTime(agg, 1100, bound); err != nil || got != 20 {
+	if got, err := st.VersionAtOrBeforeTimeRouted(agg, 1100, bound); err != nil || got != 20 {
 		t.Fatalf("bounded at v20 seq: want 20 got %d err %v", got, err)
 	}
-	if got, err := st.VersionAtOrBeforeTime(agg, 1100, st.LastSeqOf(st.SlotOf(agg))); err != nil || got != 41 {
+	if got, err := st.VersionAtOrBeforeTimeRouted(agg, 1100, st.LastSeqOf(st.SlotOf(agg))); err != nil || got != 41 {
 		t.Fatalf("full LEO: want 41 got %d err %v", got, err)
 	}
 
 	// Unknown aggregate: 0, no error (a missing stream is not a desync).
-	if got, err := st.VersionAtOrBeforeTime("no-such-agg", 1100, 0); err != nil || got != 0 {
+	if got, err := st.VersionAtOrBeforeTimeRouted("no-such-agg", 1100, 0); err != nil || got != 0 {
 		t.Fatalf("unknown agg: want 0 got %d err %v", got, err)
 	}
 }
@@ -120,7 +120,7 @@ func TestVersionAtOrBeforeTimeDesyncGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	for v := uint32(1); v <= 3; v++ {
-		if _, err := st.Append(recAt(agg, v, int64(1000+v))); err != nil {
+		if _, err := st.AppendRouted(recAt(agg, v, int64(1000+v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -147,7 +147,7 @@ func TestVersionAtOrBeforeTimeAfterReopen(t *testing.T) {
 	}
 	const agg = "time-reopen"
 	for v := uint32(1); v <= 30; v++ {
-		if _, err := st.Append(recAt(agg, v, int64(1000+v))); err != nil {
+		if _, err := st.AppendRouted(recAt(agg, v, int64(1000+v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -160,7 +160,7 @@ func TestVersionAtOrBeforeTimeAfterReopen(t *testing.T) {
 	}
 	t.Cleanup(func() { st2.Close() })
 	// stamp(v)=1000+v: a query at the exact stamp 1020 resolves v20 (<=).
-	if got, err := st2.VersionAtOrBeforeTime(agg, 1020, 0); err != nil || got != 20 {
+	if got, err := st2.VersionAtOrBeforeTimeRouted(agg, 1020, 0); err != nil || got != 20 {
 		t.Fatalf("after reopen at exact stamp: want 20 got %d err %v", got, err)
 	}
 }
@@ -179,7 +179,7 @@ func TestStaleIndexFilesAreRebuilt(t *testing.T) {
 	}
 	const agg = "stale-idx"
 	for v := uint32(1); v <= 30; v++ {
-		if _, err := st.Append(recAt(agg, v, int64(1000+v))); err != nil {
+		if _, err := st.AppendRouted(recAt(agg, v, int64(1000+v))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -217,7 +217,7 @@ func TestStaleIndexFilesAreRebuilt(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st2.Close()
-	if got, err := st2.VersionAtOrBeforeTime(agg, 1020, 0); err != nil || got != 20 {
+	if got, err := st2.VersionAtOrBeforeTimeRouted(agg, 1020, 0); err != nil || got != 20 {
 		t.Fatalf("time query after a stale-index repair: want 20 got %d err %v", got, err)
 	}
 	// The rewritten files must carry the CURRENT format version: a reset that

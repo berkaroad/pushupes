@@ -68,7 +68,7 @@ func TestDirectoryInvariantAcrossWritePaths(t *testing.T) {
 			name: "local-append-contiguous",
 			steps: []step{{"append v1..v3", func(t *testing.T, st *Store, slot int32) {
 				for v := uint32(1); v <= 3; v++ {
-					if _, err := st.Append(rec(agg, v)); err != nil {
+					if _, err := st.AppendRouted(rec(agg, v)); err != nil {
 						t.Fatalf("append v%d: %v", v, err)
 					}
 				}
@@ -88,7 +88,7 @@ func TestDirectoryInvariantAcrossWritePaths(t *testing.T) {
 			steps: []step{
 				{"append v1..v3", func(t *testing.T, st *Store, slot int32) {
 					for v := uint32(1); v <= 3; v++ {
-						if _, err := st.Append(rec(agg, v)); err != nil {
+						if _, err := st.AppendRouted(rec(agg, v)); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -106,7 +106,7 @@ func TestDirectoryInvariantAcrossWritePaths(t *testing.T) {
 			steps: []step{
 				{"append v1..v3", func(t *testing.T, st *Store, slot int32) {
 					for v := uint32(1); v <= 3; v++ {
-						if _, err := st.Append(rec(agg, v)); err != nil {
+						if _, err := st.AppendRouted(rec(agg, v)); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -124,7 +124,7 @@ func TestDirectoryInvariantAcrossWritePaths(t *testing.T) {
 			steps: []step{
 				{"append v1..v9", func(t *testing.T, st *Store, slot int32) {
 					for v := uint32(1); v <= 9; v++ {
-						if _, err := st.Append(rec(agg, v)); err != nil {
+						if _, err := st.AppendRouted(rec(agg, v)); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -143,10 +143,10 @@ func TestDirectoryInvariantAcrossWritePaths(t *testing.T) {
 				{"two aggregates on one slot, interleaved", func(t *testing.T, st *Store, slot int32) {
 					other := secondAggInSlot(t, st, slot, agg)
 					for v := uint32(1); v <= 3; v++ {
-						if _, err := st.Append(rec(agg, v)); err != nil {
+						if _, err := st.AppendRouted(rec(agg, v)); err != nil {
 							t.Fatal(err)
 						}
-						if _, err := st.Append(rec(other, v)); err != nil {
+						if _, err := st.AppendRouted(rec(other, v)); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -167,12 +167,12 @@ func TestDirectoryInvariantAcrossWritePaths(t *testing.T) {
 				// it the way a long-running slot does.
 				{"append v1..v3 past a tiny segment size", func(t *testing.T, st *Store, slot int32) {
 					for v := uint32(1); v <= 3; v++ {
-						if _, err := st.Append(rec(agg, v)); err != nil {
+						if _, err := st.AppendRouted(rec(agg, v)); err != nil {
 							t.Fatal(err)
 						}
 					}
 					// Force the roll: one more append is enough to cross 1 byte.
-					if _, err := st.Append(rec(agg, 4)); err != nil {
+					if _, err := st.AppendRouted(rec(agg, 4)); err != nil {
 						t.Fatal(err)
 					}
 				}},
@@ -210,7 +210,7 @@ func TestDirectoryInvariantAcrossWritePaths(t *testing.T) {
 
 			// The invariant is only worth asserting if the aggregate is still
 			// readable afterwards: that is what the two numbers protect.
-			if _, _, err := st.ReadAggregate(agg, 1, 0, 0); err != nil {
+			if _, _, err := st.ReadAggregateRouted(agg, 1, 0, 0); err != nil {
 				t.Fatalf("aggregate unreadable after %q: %v", tc.name, err)
 			}
 		})

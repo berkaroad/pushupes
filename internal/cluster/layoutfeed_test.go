@@ -236,8 +236,8 @@ func newTestLearner(t *testing.T, dir string, ap Applier) *learnerNode {
 	return ln
 }
 
-func entryFrame(idx uint64, cmd string) *pushupesv1.LayoutFrame {
-	return &pushupesv1.LayoutFrame{Kind: layoutEntry, Index: idx, Term: 1, EntryKind: uint32(raft.KindCommand), Data: []byte(cmd)}
+func entryFrame(idx uint64, cmd string) *pushupesv1.WatchLayoutResponse {
+	return &pushupesv1.WatchLayoutResponse{Kind: layoutEntry, Index: idx, Term: 1, EntryKind: uint32(raft.KindCommand), Data: []byte(cmd)}
 }
 
 // The apply loop is strict about indices: a replay is a no-op (cheap and
@@ -275,7 +275,7 @@ func TestLearnerGenerationChangeResetsTheStateMachine(t *testing.T) {
 	ln.topology, ln.applied, ln.appliedTerm = "gen-a", 12, 3
 	ln.saveState(true)
 
-	err := ln.onFrame(&pushupesv1.LayoutFrame{Kind: layoutHello, LeaderId: "node-1", LeaderPeerAddr: "127.0.0.1:1", Topology: "gen-b"})
+	err := ln.onFrame(&pushupesv1.WatchLayoutResponse{Kind: layoutHello, LeaderId: "node-1", LeaderPeerAddr: "127.0.0.1:1", Topology: "gen-b"})
 	if err == nil {
 		t.Fatal("a generation change must end the stream and re-subscribe from scratch")
 	}
@@ -297,7 +297,7 @@ func TestLearnerInstallsImages(t *testing.T) {
 	ap := &fakeApplier{}
 	ln := newTestLearner(t, t.TempDir(), ap)
 
-	if err := ln.onFrame(&pushupesv1.LayoutFrame{Kind: layoutSnapshot, Index: 7, Term: 2, Data: []byte("image")}); err != nil {
+	if err := ln.onFrame(&pushupesv1.WatchLayoutResponse{Kind: layoutSnapshot, Index: 7, Term: 2, Data: []byte("image")}); err != nil {
 		t.Fatalf("image: %v", err)
 	}
 	if len(ap.restored) != 1 || string(ap.restored[0]) != "image" {
@@ -307,7 +307,7 @@ func TestLearnerInstallsImages(t *testing.T) {
 		t.Fatalf("applied-index = %v, want 7", st["applied-index"])
 	}
 	// An empty image means "rebuild from nothing", which resets.
-	if err := ln.onFrame(&pushupesv1.LayoutFrame{Kind: layoutSnapshot, Index: 0, Term: 2}); err != nil {
+	if err := ln.onFrame(&pushupesv1.WatchLayoutResponse{Kind: layoutSnapshot, Index: 0, Term: 2}); err != nil {
 		t.Fatalf("empty image: %v", err)
 	}
 	if ap.resets != 1 {

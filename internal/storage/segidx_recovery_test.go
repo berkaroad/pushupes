@@ -35,11 +35,11 @@ func TestIndexDrivenRecoveryMatchesWalk(t *testing.T) {
 	// Two aggregates that share a slot, so the slot's directory holds more than
 	// one stream and the arena is exercised.
 	aggA := "agg-alpha"
-	slot := data.SlotOf(aggA, 8)
+	slot := data.LogicalSlotOf(aggA, 8)
 	var aggB string
 	for i := 0; i < 10000 && aggB == ""; i++ {
 		cand := fmt.Sprintf("agg-beta-%d", i)
-		if data.SlotOf(cand, 8) == slot && cand != aggA {
+		if data.LogicalSlotOf(cand, 8) == slot && cand != aggA {
 			aggB = cand
 		}
 	}
@@ -60,7 +60,7 @@ func TestIndexDrivenRecoveryMatchesWalk(t *testing.T) {
 				CommandID:   fmt.Sprintf("cmd-%s-%d", agg, v),
 				Events:      []data.Event{{Type: "t", Body: []byte(body)}},
 			}
-			if _, err := st.Append(rec); err != nil {
+			if _, err := st.AppendRouted(rec); err != nil {
 				t.Fatal(err)
 			}
 		}

@@ -545,14 +545,18 @@ type ByteRange struct {
 
 // ---- Slot routing ----------------------------------------------------------
 
-// SlotOf routes an aggregate ID to its slot. The algorithm lives in
-// pkg/client (see that package's doc): the client computes the same slot the
-// server routes by, from the same code. slotCount is the cluster's slot count
-// — the caller's view of the server-side constant (storage.DefaultSlotCount)
-// or the store's SlotCount.
-func SlotOf(aggregateID string, slotCount int) int32 {
-	return client.SlotOf(aggregateID, slotCount)
+// LogicalSlotOf routes an aggregate id onto a generation's logical slot ids
+// (0 .. size-1). Same delegation rule as SlotOf — internal/data never
+// re-implements the algorithm, and there is exactly one algorithm.
+func LogicalSlotOf(aggregateID string, size int) int32 {
+	return client.LogicalSlotOf(aggregateID, size)
 }
+
+// ReservedSlot is the one slot business routing can never produce: every
+// generation starts at slot-001, so index 0 stays free as the reserved
+// performance slot (DESIGN §7.2.7). A BatchAppend slot_override naming it is
+// the only override accepted.
+const ReservedSlot int32 = 0
 
 // ---- Append result --------------------------------------------------------
 //

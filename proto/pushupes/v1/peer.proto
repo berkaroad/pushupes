@@ -32,6 +32,19 @@ service PeerService {
   // Replicate pushes one leader-assigned record to the migration target
   // during the forwarding window (idempotent at seq).
   rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
+  // ReplicateAggregate streams one aggregate's records out of a slot, so a
+  // generation migration can replay them into the slot the new segment routes
+  // them to. The CALLER pulls (the destination asks the source); the cursor is
+  // the aggregate version, which is what makes the replay resumable.
+  rpc ReplicateAggregate(ReplicateAggregateRequest) returns (stream ReplicateAggregateResponse);
+  // SlotStreams lists the aggregates a slot holds, which is what a generation
+  // migration needs before it can replay: it walks the source slot's streams and
+  // asks the destination to pull each one.
+  rpc SlotStreams(SlotStreamsRequest) returns (SlotStreamsResponse);
+  // ReplayInto asks the DESTINATION to pull one aggregate out of a source slot
+  // and land it in a local slot. The bytes flow peer-to-peer; the controller only
+  // pairs the two ends.
+  rpc ReplayInto(ReplayIntoRequest) returns (ReplayIntoResponse);
   // SlotLeo answers a single slot's log end offset (migration catch-up).
   rpc SlotLeo(SlotLeoRequest) returns (SlotLeoResponse);
   // FenceSlot is the migration commit fence: the source stops accepting new
@@ -42,6 +55,13 @@ service PeerService {
   // applied, and is force-released after a bound so a lost controller cannot
   // wedge the slot's writes.
   rpc FenceSlot(FenceSlotRequest) returns (FenceSlotResponse);
+  // FreezeSlot closes a slot's write gate and keeps it closed until ThawSlot:
+  // a generation migration freezes the whole source segment, replays the tails,
+  // switches, and only then thaws (the slots are gone from the table by then).
+  // It is NOT FenceSlot: that one freezes in order to hand leadership over and
+  // waits for the demotion, which is a different contract.
+  rpc FreezeSlot(FreezeSlotRequest) returns (FreezeSlotResponse);
+  rpc ThawSlot(ThawSlotRequest) returns (ThawSlotResponse);
   // SlotLeader answers THIS node's local view of one slot: which node it
   // believes leads it and at which epoch. The migration source uses it to gate
   // the commit-fence release on the target having actually applied the leader
@@ -86,7 +106,7 @@ service PeerService {
   // and closes the stream when the caller falls too far behind to keep in a
   // bounded buffer: the caller reconnects, reports what it applied, and is
   // either caught up incrementally or handed an image.
-  rpc WatchLayout(WatchLayoutRequest) returns (stream LayoutFrame);
+  rpc WatchLayout(WatchLayoutRequest) returns (stream WatchLayoutResponse);
 }
 
 // WatchLayoutRequest names the caller and the point it resumes from.
@@ -105,7 +125,7 @@ message WatchLayoutRequest {
 }
 
 // LayoutFrame is one step of the feed. kind selects which fields carry.
-message LayoutFrame {
+message WatchLayoutResponse {
   uint32 kind = 1;
   uint64 index = 2;   // ENTRY/SNAPSHOT: the index this frame puts the caller at
   uint64 term = 3;    // ENTRY/SNAPSHOT: that index's term
@@ -247,6 +267,58 @@ message ReplicateRequest {
   bytes payload = 3; // one encoded record
 }
 message ReplicateResponse {}
+
+message FreezeSlotRequest {
+  int32 slot = 1;
+}
+message FreezeSlotResponse {
+  uint64 leo = 1;  // the log end offset the freeze settled on
+}
+message ThawSlotRequest {
+  int32 slot = 1;
+}
+message ThawSlotResponse {}
+
+message ReplicateAggregateRequest {
+  int32 slot = 1;          // source slot
+  string aggregate_id = 2;
+  uint32 from_version = 3; // inclusive cursor; 0 means the first version
+  uint32 max_records = 4;  // per chunk, 0 = server default
+  uint64 max_bytes = 5;    // per chunk, 0 = server default
+  uint64 upto_seq = 6;     // replay only records at or below this slot seq (0 = LEO)
+}
+
+message ReplicateAggregateResponse {
+  repeated bytes records = 1; // encoded EventRecord blobs, in version order
+  uint32 next_version = 2;    // version to resume from; 0 = the aggregate is done
+  uint32 versions = 3;        // versions replayed in this chunk
+}
+
+message ReplicateAggregateDone {}
+
+message SlotStreamsRequest {
+  int32 slot = 1;
+  string after = 2;  // cursor: aggregate id to resume after
+  int32 limit = 3;   // 0 = server default
+}
+
+message SlotStreamsResponse {
+  repeated string aggregates = 1;
+  string next_after = 2;  // "" = no more pages
+}
+
+message ReplayIntoRequest {
+  int32 src_slot = 1;
+  string src_addr = 2;   // peer-plane address of a node holding the source slot
+  int32 dst_slot = 3;
+  string aggregate_id = 4;
+  uint32 from_version = 5;
+}
+
+message ReplayIntoResponse {
+  uint32 landed = 1;        // records written into dst_slot by this call
+  uint32 next_version = 2;  // resume point (0 = nothing was replayed)
+}
 
 message SlotLeoRequest {
   int32 slot = 1;

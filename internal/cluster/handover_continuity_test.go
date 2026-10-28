@@ -192,14 +192,14 @@ func TestHandoverKeepsEveryAckedRecordVisible(t *testing.T) {
 		if want == 0 {
 			continue
 		}
-		records, _, err := pst.ReadAggregate(agg, 1, uint64(want)+10, 0)
+		records, _, err := pst.ReadAggregateRouted(agg, 1, uint64(want)+10, 0)
 		if err != nil {
 			t.Fatalf("agg %s unreadable on the final leader: %v", agg, err)
 		}
 		if len(records) == 0 || records[len(records)-1].Version < want {
 			gotN := 0
 			var gotV uint32
-			if rs, _, err2 := sst.ReadAggregate(agg, 1, uint64(want)+10, 0); err2 == nil && len(rs) > 0 {
+			if rs, _, err2 := sst.ReadAggregateRouted(agg, 1, uint64(want)+10, 0); err2 == nil && len(rs) > 0 {
 				gotN = len(rs)
 				gotV = rs[len(rs)-1].Version
 			}

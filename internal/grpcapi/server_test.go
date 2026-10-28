@@ -42,6 +42,22 @@ func newTestClient(t *testing.T) (pushupesv1.EventServiceClient, *storage.Store)
 	}
 	t.Cleanup(func() { st.Close() })
 	eng := cluster.NewEngine(nil, st, "node-1", nil)
+	// A cluster always serves a generation now (there is no flat fallback), so the
+	// fixture states one: an 8-slot store fits g2 = [4, 8).
+	eng.SetBootGroup(cluster.SlotGroup{Gen: 2, Base: 4, Size: 4, Epoch: 1})
+	// One data-plane member (this node) so the plan has somewhere to seat the four
+	// slots of g2.
+	self := &cluster.Peer{Role: cluster.RoleLearner, ID: "node-1",
+		PeerAddr: "127.0.0.1:1", AdminAddr: "127.0.0.1:2", ClientAddr: "127.0.0.1:3"}
+	for _, c := range []*cluster.Command{
+		{Op: cluster.OpJoinNode, Peer: self},
+		{Op: cluster.OpRegister, Peer: self},
+		{Op: cluster.OpPlanSlots, GroupGen: 2, GroupBase: 4, GroupSize: 4},
+	} {
+		if _, err := eng.ApplyCommand(c.Encode()); err != nil {
+			t.Fatalf("%s: %v", c.Op, err)
+		}
+	}
 
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer()
@@ -257,7 +273,7 @@ func TestBatchAppendResults(t *testing.T) {
 		}
 	}
 	// The rejected sameA v2 must NOT have been written: its tail is still 1.
-	if tv, _ := st.TailVersionOf(sameA, 0); tv != 1 {
+	if tv, _ := st.TailVersionOfRouted(sameA, 0); tv != 1 {
 		t.Fatalf("duplicate-agg record must not execute: tail %d want 1", tv)
 	}
 

@@ -130,7 +130,7 @@ func TestLocalReadReplicaShapes(t *testing.T) {
 	// Shape 3: synced at LEO with records on disk — local, ceiling = the
 	// sampled watermark.
 	appendOne := func(agg string) {
-		if _, err := st.Append(&data.EventRecord{
+		if _, err := st.AppendRouted(&data.EventRecord{
 			AggregateID: agg, Version: 1, CommandID: "cmd-" + agg,
 			Events: []data.Event{{Type: "E", Body: []byte("x")}},
 		}); err != nil {
@@ -221,7 +221,7 @@ func TestHwLedgerRoundTrip(t *testing.T) {
 	if slot < 0 {
 		t.Fatal("test setup: no slot led by node-1 with node-2 replicating")
 	}
-	if _, err := st.Append(&data.EventRecord{
+	if _, err := st.AppendRouted(&data.EventRecord{
 		AggregateID: "ledger-agg", Version: 1, CommandID: "ledger-cmd",
 		Events: []data.Event{{Type: "E", Body: []byte("x")}},
 	}); err != nil {

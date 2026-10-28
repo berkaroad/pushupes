@@ -65,7 +65,7 @@ func TestLeaderReadIsNotCappedByHighWatermark(t *testing.T) {
 	follower := ""
 	for i := 0; i < 4096 && agg == ""; i++ {
 		id := "hw-agg-" + itoa(i)
-		s := data.SlotOf(id, 8)
+		s := data.LogicalSlotOf(id, 8)
 		p, ok := tbl.Slots[s]
 		if !ok || p.Leader != "node-1" {
 			continue
@@ -95,7 +95,7 @@ func TestLeaderReadIsNotCappedByHighWatermark(t *testing.T) {
 	// a fourth record it reports late pins the watermark at 3. Before the fix a
 	// leader read stopped at the watermark.
 	appendV := func(v int) {
-		if _, err := store.Append(&data.EventRecord{
+		if _, err := store.AppendRouted(&data.EventRecord{
 			AggregateID: agg, Version: uint32(v),
 			CommandID: "hw-cmd-" + itoa(v),
 			Events:    []data.Event{{Type: "E", Body: []byte("x")}},
@@ -189,7 +189,7 @@ func TestSteppedDownReplicaForwardsUntilReProven(t *testing.T) {
 
 	appendV := func(v int) {
 		t.Helper()
-		if _, err := store.Append(&data.EventRecord{
+		if _, err := store.AppendRouted(&data.EventRecord{
 			AggregateID: agg, Version: uint32(v),
 			CommandID: "sd-cmd-" + itoa(v),
 			Events:    []data.Event{{Type: "E", Body: []byte("x")}},
@@ -323,7 +323,7 @@ func TestZeroWatermarkReplicaShowsNothing(t *testing.T) {
 	if repSlot < 0 {
 		t.Fatal("test setup: node-1 replicates no slot")
 	}
-	if _, err := store.Append(&data.EventRecord{
+	if _, err := store.AppendRouted(&data.EventRecord{
 		AggregateID: repAgg, Version: 1, CommandID: "zwhw-cmd",
 		Events: []data.Event{{Type: "E", Body: []byte("x")}},
 	}); err != nil {

@@ -203,7 +203,7 @@ func TestFenceDurabilityProbeMakesTheTailDurable(t *testing.T) {
 	slot := int32(1)
 	agg := aggInSlotOf(t, e, slot, "durable-")
 	for v := 1; v <= 3; v++ {
-		if _, err := st.Append(makeRecord(agg, uint32(v), fmt.Sprintf("d-%d", v))); err != nil {
+		if _, err := st.AppendRouted(makeRecord(agg, uint32(v), fmt.Sprintf("d-%d", v))); err != nil {
 			t.Fatal(err)
 		}
 	}

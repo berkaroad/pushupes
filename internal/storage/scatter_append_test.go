@@ -44,7 +44,7 @@ func TestAppendRecordLandsIdenticalBytes(t *testing.T) {
 			rec := mkRec("agg-scatter", uint32(i), fmt.Sprintf("cmd-s-%d", i))
 			rec.Events[0].Body = bytes.Repeat([]byte{byte(i), 0x00, 0xff}, 2048)
 			want = append(want, rec.EncodeBinary(nil)...)
-			if _, err := st.Append(rec); err != nil {
+			if _, err := st.AppendRouted(rec); err != nil {
 				t.Fatalf("scatter=%v append %d: %v", scatter, i, err)
 			}
 		}

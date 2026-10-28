@@ -258,13 +258,18 @@ func main() {
 			fatal("prefetch: row index %d outside %d addrs", idx, len(rt.NodeClientAddrs))
 		}
 	}
+	fmt.Printf("prefetch: slots=%d group_gen=%d base=%d size=%d epoch=%d\n",
+		len(rt.SlotNodeIndex), rt.GetGroupGen(), rt.GetGroupBase(), rt.GetGroupSize(), rt.GetLayoutEpoch())
 	for _, a := range addrs {
 		r2, err := cli(a).PrefetchRoutes(ctx, &pushupesv1.PrefetchRoutesRequest{})
 		check(err)
 		if len(r2.SlotNodeIndex) != len(rt.SlotNodeIndex) {
 			fatal("prefetch@%s: slot count %d != %d", a, len(r2.SlotNodeIndex), len(rt.SlotNodeIndex))
 		}
-		for slot, idx := range rt.SlotNodeIndex {
+		// slot_node_index is dense over LOGICAL slots, so every row belongs to the
+		// served generation: compare all of them.
+		for slot := 0; slot < len(rt.SlotNodeIndex); slot++ {
+			idx := rt.SlotNodeIndex[slot]
 			if r2.NodeClientAddrs[r2.SlotNodeIndex[slot]] != rt.NodeClientAddrs[idx] {
 				fatal("prefetch@%s: slot %d routes to %s, first answer said %s",
 					a, slot, r2.NodeClientAddrs[r2.SlotNodeIndex[slot]], rt.NodeClientAddrs[idx])
@@ -273,7 +278,10 @@ func main() {
 	}
 	slotCount := len(rt.SlotNodeIndex)
 	ragg := fmt.Sprintf("%s-r", agg)
-	row := rt.SlotNodeIndex[client.SlotOf(ragg, slotCount)]
+	// Route the way the cluster does: onto a LOGICAL slot of the served
+	// generation, which is the same id space the table is indexed by.
+	routed := client.LogicalSlotOf(ragg, slotCount)
+	row := rt.SlotNodeIndex[routed]
 	rr, err := cli(rt.NodeClientAddrs[row]).BatchAppend(ctx, &pushupesv1.BatchAppendRequest{
 		Records: []*pushupesv1.AppendRequest{{
 			AggregateId: ragg, Version: 1, CommandId: "rt-1",

@@ -104,10 +104,10 @@ const testSlotCount = 16
 func twoAggsOnOneSlot(t testing.TB) (string, string, int32) {
 	t.Helper()
 	a := "agg-a"
-	slot := data.SlotOf(a, testSlotCount)
+	slot := data.LogicalSlotOf(a, testSlotCount)
 	for i := 0; i < 100000; i++ {
 		b := fmt.Sprintf("agg-b%d", i)
-		if data.SlotOf(b, testSlotCount) == slot {
+		if data.LogicalSlotOf(b, testSlotCount) == slot {
 			return a, b, slot
 		}
 	}
@@ -130,7 +130,7 @@ func appendRecords(t testing.TB, st *Store, aggs []string, n, bodySize int) {
 			CommandID: fmt.Sprintf("cmd-%s-%d", aggs[k], vers[k]),
 			Events:    []data.Event{{Type: "t", Body: body}},
 		}
-		out, err := st.Append(rec)
+		out, err := st.AppendRouted(rec)
 		if err != nil || out.Status != data.StatusSuccess {
 			t.Fatalf("append %d: %+v %v", i, out, err)
 		}
@@ -260,7 +260,7 @@ func TestReadSlotBytesPayloadMatchesRecords(t *testing.T) {
 
 	want := map[uint64]string{} // slot seq -> "agg|version|command"
 	for _, agg := range []string{a, b} {
-		recs, seqs, err := st.ReadAggregate(agg, 1, 0, 0)
+		recs, seqs, err := st.ReadAggregateRouted(agg, 1, 0, 0)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -58,7 +58,7 @@ func TestLeaderWithoutCopyAnswersRetryable(t *testing.T) {
 
 	// Once the copy exists the very same append is served normally: the guard
 	// is about a MISSING copy, not about the slot's history.
-	if _, err := st.Append(&data.EventRecord{
+	if _, err := st.AppendRouted(&data.EventRecord{
 		AggregateID: agg, Version: 1, CommandID: "cmd-1",
 		Events: []data.Event{{Type: "E", Body: []byte("x")}},
 	}); err != nil {

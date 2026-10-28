@@ -70,7 +70,7 @@ func TestFlusherRunsOneFsyncAtATime(t *testing.T) {
 
 	for i := 0; i < 6; i++ {
 		rec := recFor("agg-one-fsync-"+string(rune('a'+i)), 1, fmt.Sprintf("cmd-%d", i))
-		out, err := st.Append(rec)
+		out, err := st.AppendRouted(rec)
 		if err != nil {
 			t.Fatalf("append: %v", err)
 		}
@@ -120,7 +120,7 @@ func TestFlusherSettlesOnlyWhatTheFsyncCovered(t *testing.T) {
 
 	rec := recFor("agg-settle", 1, "cmd-1")
 	slot := st.SlotOf(rec.AggregateID)
-	if _, err := st.Append(rec); err != nil {
+	if _, err := st.AppendRouted(rec); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 
@@ -139,7 +139,7 @@ func TestFlusherSettlesOnlyWhatTheFsyncCovered(t *testing.T) {
 
 	// The syscall is in flight; the slot lock is free, so this append lands.
 	rec2 := recFor("agg-settle", 2, "cmd-2")
-	if _, err := st.Append(rec2); err != nil {
+	if _, err := st.AppendRouted(rec2); err != nil {
 		t.Fatalf("append during fsync: %v", err)
 	}
 	close(release)
@@ -183,7 +183,7 @@ func TestFlusherSealedSegmentIsQueued(t *testing.T) {
 	// ~60-byte records against a 2 KiB roll threshold: a few hundred appends
 	// seal several segments, none of them via the policy (which never fires).
 	for v := uint32(1); v <= 400; v++ {
-		out, err := st.Append(recFor("agg-roll", v, fmt.Sprintf("cmd-%d", v)))
+		out, err := st.AppendRouted(recFor("agg-roll", v, fmt.Sprintf("cmd-%d", v)))
 		if err != nil {
 			t.Fatalf("append %d: %v", v, err)
 		}
@@ -209,7 +209,7 @@ func TestFlusherCloseDrainsQueue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	if _, err := st.Append(recFor("agg-close", 1, "cmd")); err != nil {
+	if _, err := st.AppendRouted(recFor("agg-close", 1, "cmd")); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	if got := st.FlushStats(); got.Dirty != 1 || got.FsyncCount != 0 {
@@ -235,7 +235,7 @@ func TestFlusherCloseIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	if _, err := st.Append(recFor("agg-close2", 1, "cmd-1")); err != nil {
+	if _, err := st.AppendRouted(recFor("agg-close2", 1, "cmd-1")); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	if err := st.Close(); err != nil {
