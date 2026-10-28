@@ -16,12 +16,14 @@
 // measure append throughput. Event traffic goes over the gRPC data plane
 // only: -nodes lists the client-plane (gRPC) addresses, from which the
 // slot -> leader routing table is resolved via one PrefetchRoutes call and
-// refreshed periodically. It spreads events across -aggs aggregate IDs
-// (default 100, which the routing hash scatters over many slots — the run
-// fails its own check if fewer than 2 slots end up touched), keeps appending
-// consecutive versions per aggregate, and keeps every single event body
-// within 1 KiB. It follows MOVED/ASK redirects per slot (they carry the
-// leader's gRPC address) and reports msg/sec.
+// refreshed periodically. The aggregate space is a computed value —
+// aggs = conns × max(batch,1), minimum 1 — so every worker owns exactly
+// max(batch,1) distinct aggregates and no two workers ever touch the same
+// stream (the routing hash scatters them; a run with >= 2 aggregates
+// fails its own check if fewer than 2 slots end up touched). It keeps
+// appending consecutive versions per aggregate, and keeps every single
+// event body within 1 KiB. It follows MOVED/ASK redirects per slot (they
+// carry the leader's gRPC address) and reports msg/sec.
 package main
 
 import (
@@ -49,7 +51,6 @@ func main() {
 	// denominator.
 	programStart := time.Now()
 	nodes := flag.String("nodes", "127.0.0.1:8591", "comma-separated node client-plane (gRPC) addrs; the routing table is resolved from one of them via PrefetchRoutes")
-	aggs := flag.Int("aggs", 100, "number of aggregate ids")
 	dur := flag.Duration("duration", 10*time.Second, "sustained write duration")
 	connsFlag := flag.Int("conns", 16, "workers; each worker owns a partition of the aggregates and appends one at a time (awaits each reply before sending the next), so throughput is bounded by conns / p50 — conns=1 measures a single serialized round trip, not cluster capacity")
 	size := flag.Int("size", 1024, "event body bytes (must be <= 1024 * 1024)")
@@ -68,6 +69,20 @@ func main() {
 		fmt.Println("no nodes given")
 		os.Exit(2)
 	}
+	// The aggregate space is computed, never asked for: every worker owns
+	// exactly max(batch,1) distinct aggregates (batch=0 is the single-
+	// record mode, one aggregate per round), so two workers can never
+	// collide on a stream and each aggregate's version chain stays linear.
+	// Floor 1: conns=1 and batch<=1 gives the one-serialized-stream run.
+	nw := *connsFlag
+	if nw < 1 {
+		nw = 1
+	}
+	perWorker := *batch
+	if perWorker < 1 {
+		perWorker = 1
+	}
+	aggCount := nw * perWorker
 	body := makeBody(*size)
 	var warmed int32 = 0
 	// The reusable client (pkg/client) owns everything routing-shaped:
@@ -86,19 +101,19 @@ func main() {
 		cl.SlotCount(), len(entryList))
 
 	// 1) pick aggregate ids, verify slot spread
-	aggIDs := make([]string, 0, *aggs)
+	aggIDs := make([]string, 0, aggCount)
 	slotSeen := map[int32]int{}
-	for i := 0; len(aggIDs) < *aggs; i++ {
+	for i := 0; len(aggIDs) < aggCount; i++ {
 		id := fmt.Sprintf("bench-%d", i)
 		aggIDs = append(aggIDs, id)
 		slotSeen[client.SlotOf(id, cl.SlotCount())]++
 	}
-	if len(slotSeen) < 2 {
+	if len(aggIDs) > 1 && len(slotSeen) < 2 {
 		fmt.Printf("FAIL: %d aggregates landed on %d slot(s), need >= 2\n", len(aggIDs), len(slotSeen))
 		os.Exit(1)
 	}
-	fmt.Printf("aggregates=%d across %d slots (body=%dB conns=%d duration=%s)\n",
-		len(aggIDs), len(slotSeen), *size, *connsFlag, *dur)
+	fmt.Printf("aggregates=%d (= conns %d x per-worker %d, from -batch) across %d slots (body=%dB duration=%s)\n",
+		len(aggIDs), nw, perWorker, len(slotSeen), *size, *dur)
 
 	// Every aggregate starts at version 1: the window assumes an empty
 	// aggregate space (the matrix cold-starts a cluster per cell). Aimed at a
@@ -139,10 +154,6 @@ func main() {
 	var bizSampleMu sync.Mutex
 	var bizSamples []string
 
-	nw := *connsFlag
-	if nw > len(aggIDs) {
-		nw = len(aggIDs)
-	}
 	// Each worker walks its partition strictly in sequence: it sends one
 	// append and awaits the reply before building the next request. With a
 	// single worker there is nothing to overlap, so the run measures one
@@ -151,7 +162,7 @@ func main() {
 	if nw == 1 {
 		fmt.Printf("notice: conns=1 -> appends are strictly serialized (one in flight);\n" +
 			"        throughput is a single round-trip measurement (~1/p50), not cluster capacity.\n" +
-			"        Raise -conns to overlap requests (conns partitions -aggs across workers).\n")
+			"        Raise -conns to overlap requests (the aggregate space is conns x max(batch,1)).\n")
 	}
 	var wg sync.WaitGroup
 	// per-run salt: a fixed RNG seed would reproduce last run's command_ids
