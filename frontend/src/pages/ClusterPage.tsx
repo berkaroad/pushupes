@@ -427,7 +427,7 @@ export default function ClusterPage() {
   const doCancelDrain = (id: string) => {
     modal.confirm({
       title: `取消 ${id} 的缩容？`,
-      content: '清掉 drain / 待移除标记，该节点重新参与布局（它的槽与副本按常规回切）。',
+      content: '清掉 drain / 待摘除标记，该节点重新参与布局（它的槽与副本按常规回切）。',
       okText: '取消缩容',
       cancelText: '算了',
       onOk: async () => {
@@ -554,8 +554,18 @@ export default function ClusterPage() {
   // 待就位；纯控制面与首个样本前显示 '-'；判定在 Engine.SyncedLeaderSlots，
   // 与槽抽屉的 ISR 字段同源。
   const syncSeats = syncGauge?.seats ?? 0
-  const syncRemaining = status.slot_count - (syncGauge?.synced ?? 0) - syncSeats
-  const syncValue = syncGauge === null || status.slot_count === 0 ? '-'
+  // The cluster serves a SEGMENT of the fixed table, not the whole table: the
+  // table holds 2048 ids while a generation names 1, 2, 4 … 1024 of them.
+  // Counting the sync backlog against the table's capacity would report every
+  // slot as missing forever once a generation is switched on.
+  // A backend that predates generations reports no group_size; fall back to the
+  // leader slots this round actually observed rather than to the whole table, so
+  // a one-slot generation does not look like 2047 slots still building.
+  const activeSlots = status.group_size && status.group_size > 0
+    ? status.group_size
+    : (syncGauge && syncGauge.led > 0 ? syncGauge.led : status.slot_count)
+  const syncRemaining = activeSlots - (syncGauge?.synced ?? 0) - syncSeats
+  const syncValue = syncGauge === null || activeSlots === 0 ? '-'
     : syncSeats > 0 ? `待就位（${syncSeats} 个槽位待补齐副本集）`
     : syncRemaining <= 0 ? '同步中' : `构建中（剩余 ${syncRemaining} 个槽位）`
   // The summary row splits the fleet by plane: control nodes are the raft
@@ -654,6 +664,13 @@ export default function ClusterPage() {
             <Space size={24}>
               <Statistic title="策略" value={status.replica_policy ?? '-'} />
               <Statistic title="副本因子" value={status.replica_factor ?? '-'} suffix="份 / 槽" />
+              <Statistic
+                title="当前代"
+                value={status.group_size ? `g${status.group_gen}` : '未启用'}
+                suffix={status.group_size
+                  ? `槽 ${status.group_base}–${(status.group_base ?? 0) + (status.group_size ?? 0) - 1} · epoch ${status.layout_epoch ?? '-'}`
+                  : undefined}
+              />
               <Statistic title="同步状态" value={syncValue}
                 valueStyle={syncValue.startsWith('构建中') ? { color: '#faad14' } : syncValue.startsWith('待就位') ? { color: '#fa8c16' } : undefined} />
             </Space>
@@ -661,6 +678,8 @@ export default function ClusterPage() {
               策略写入 Raft 复制的槽表，全集群生效并持久保留；启动参数 -replica-policy 只用于新集群的初始值，
               之后的修改都从这里提交。因子由策略与数据节点数推导（当前 {dataNodes} 个数据节点），控制器每轮把副本集收敛到该因子。
               同步状态看的是每个槽的副本集与 ISR 是否都达到因子——翻转档位后新席位在追平前，这里如实显示构建中。
+              当前代是集群实际服务的槽段（槽位表固定 {status.slot_count} 个 id，一代只启用其中一段）；
+              epoch 变化意味着布局刚切过，持有旧 epoch 的客户端会被要求刷新路由后重试。
             </Typography.Text>
           </Space>
         )}

@@ -545,7 +545,11 @@ assert('an online peer renders no 离线 tag', !onlineCard.includes('离线') &&
 const plainPeer = { id: 'node-9', peer_addr: 'http://h:8399', admin_addr: 'http://h:8099', client_addr: 'http://h:8599' }
 const plainCard = pc({ peer: plainPeer, current: true, slots: 0, plain: true, flowControlConfigured: true })
 const fullCard = pc({ peer: plainPeer, slots: 3, flowControlConfigured: true, onFlowControl: () => {} })
-assert('no peer card ever renders 移除', !plainCard.includes('移除') && !fullCard.includes('移除') && !fullCard.includes('ant-btn-dangerous'))
+// Membership stays out of the console, but "danger-styled" is not the same thing
+// as "removes a member": the drain card legitimately carries a danger 取消缩容
+// button (it undoes a scale-down the operator started), so the check is on the
+// wording, not on antd's danger class.
+assert('no peer card ever renders 移除', !plainCard.includes('移除') && !fullCard.includes('移除'))
 assert('a plain card renders no 流控 face', !plainCard.includes('流控') && !plainCard.includes('anticon-control'))
 assert('a plain card renders no rate chart',
   !plainCard.includes('evts/sec') && !plainCard.includes('polyline') && !plainCard.includes('采集中'))

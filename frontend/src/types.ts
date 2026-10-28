@@ -45,6 +45,24 @@ export interface ClusterStatus {
   peers: Record<string, Peer>
   slots: Record<string, Placement>
   slot_count: number
+  // physical_slot_count is the fixed table's id capacity (2048); slot_count is how
+  // many of those ids this cluster actually serves (the generation's size).
+  physical_slot_count?: number
+  // The served segment (DESIGN §4.5): the client plane addresses logical slots
+  // 0 .. group_size-1 and the server adds group_base, so the same console works
+  // against any base. layout_epoch is what clients compare against (a write under
+  // a stale epoch is answered 1010). group_size 0 means no generation is served
+  // yet: the cluster is not ready and clients refuse to route. slot_count is the
+  // number of slots the cluster serves (== group_size); physical_slot_count is the
+  // fixed table's 2048-id capacity.
+  group_gen?: number
+  group_base?: number
+  group_size?: number
+  layout_epoch?: number
+  // leader_slots is how many slots THIS node leads. A node that leads none has
+  // nothing to synchronise, so the console shows "-" rather than a backlog of
+  // slots it was never assigned.
+  leader_slots?: number
   replicas?: number
   // replica_factor is the per-slot copy count in force; replica_policy is the
   // tier behind it (low = 1 copy, medium = 2 — the default —, high = 3
