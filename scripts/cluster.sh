@@ -48,7 +48,7 @@
 #   ADMIN_BASE=8091        节点 i 的 admin 管理端口（HTTP admin + pprof）= ADMIN_BASE + i - 1
 #   PEER_BASE=8391         节点 i 的 peer 端口（Raft + peer gRPC，全部节点间通讯）= PEER_BASE + i - 1
 #   CLIENT_BASE=8591       节点 i 的客户端(gRPC)端口 = CLIENT_BASE + i - 1
-#   SEGMENT_BYTES=64MiB    段大小（默认 64MiB；须为 64MiB 的整数倍，最大 2GiB）
+#   SEGMENT_BYTES=256MiB   段大小（默认 256MiB；须为 2 的次幂，最小 256MiB，最大 2GiB）
 #   RAFT_ELECTION_TIMEOUT   raft 选举超时（默认 500ms，即节点默认值）：follower 等多久
 #                          没收到心跳就发起选举。必须是 RAFT_HEARTBEAT_TIMEOUT 的
 #                          至少 2 倍，否则一次迟到的心跳就会掀掉 leader（节点会拒绝启动）
@@ -122,8 +122,8 @@ HOST="${HOST:-127.0.0.1}"
 ADMIN_BASE="${ADMIN_BASE:-8091}"
 PEER_BASE="${PEER_BASE:-8391}"
 CLIENT_BASE="${CLIENT_BASE:-8591}"
-# 段大小：默认 256MiB（须为 64MiB 的整数倍，最大 2GiB；可写字节数或 256MiB/1GiB 带单位）
-SEGMENT_BYTES="${SEGMENT_BYTES:-64MiB}"
+# 段大小：默认 256MiB（须为 2 的次幂：256MiB/512MiB/1GiB/2GiB；可写字节数或带单位）
+SEGMENT_BYTES="${SEGMENT_BYTES:-256MiB}"
 seg_args=(-segment-bytes "$SEGMENT_BYTES")
 # 副本策略不在此转发：PUSHUPES_REPLICA_POLICY 若已在环境里，子进程自然继承；
 # 否则用节点自己的默认档（medium=每槽 2 份）。high=每槽 3 份。

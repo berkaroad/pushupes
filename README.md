@@ -223,7 +223,7 @@ medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(�
 | `-flush-messages` | `PUSHUPES_FLUSH_MESSAGES` | 1000 | 每 N 条 fsync（0 关闭）——这是无人等待时的后台节奏；写入确认不等窗口：停靠的确认即时触发该槽的组提交轮，合批 = 一轮 fsync 期间积累的全部追加 |
 | `-flush-interval` | `PUSHUPES_FLUSH_INTERVAL` | 100ms | 每周期 fsync（0 关闭）——同上，只定后台节奏；确认路径的本地落盘腿付的是 fsync 时长与队列深度，复制高水位腿与它并行，ack ≈ 两腿取最大 |
 | `-flush-parallelism` | `PUSHUPES_FLUSH_PARALLELISM` | 1 | 全存储同时在飞的段 fsync 上限（1=一次刷一个，即历史单刷盘链路）：一个许可信号量给所有 fsync 封顶，刷盘队列由持久 worker 池执行；显式 `Flush()`/`Close` 的 fsync 也在调用方 goroutine 上取同一许可、同受上限约束。刷盘轮按预算切片（每轮至多 8 个单元或 200ms）。<1 启动即报错；生效值可从 `/admin/stats` 的 `parallelism` 字段读回（机制见 DESIGN §3） |
-| `-segment-bytes` | `PUSHUPES_SEGMENT_BYTES` | 64MiB | WAL 段滚动大小：2 的次幂（64MiB/128MiB/256MiB…，192MiB 不接受），64MiB～2GiB；可写字节数或带单位（`64MiB`/`1GiB`），env 同样接受带单位形式 |
+| `-segment-bytes` | `PUSHUPES_SEGMENT_BYTES` | 256MiB | WAL 段滚动大小：2 的次幂（256MiB/512MiB/1GiB/2GiB，192MiB 不接受），最小 256MiB（4KiB 记录下的容量数学，见 DESIGN §7.2）、最大 2GiB；可写字节数或带单位（`256MiB`/`1GiB`），env 同样接受带单位形式 |
 | `-fetch-settle` | `PUSHUPES_FETCH_SETTLE` | 200µs | fetch 轮被数据唤醒后的合并窗口：一轮覆盖整批写入涉及的多个槽；每次 ack 都要付它一次，换的是轮次与上报次数；0=首个槽有数据就答（轮次更多） |
 | `-drop-after` | `PUSHUPES_DROP_AFTER` | 30s | 迁移后前源副本保留期；0=默认，负数启动即报错，不可关闭 |
 | `-rebalance-interval` | `PUSHUPES_REBALANCE_INTERVAL` | 2s | controller 每隔多久检查一次 leader 布局并执行回切（节点宕机恢复后把槽 leader 迁回环上预期节点）；**每轮只提交一次**（提交严格串行，任一时刻只有一个槽在交接栅栏上），所以收敛时间由这个间隔决定；0=关闭，负数启动即报错 |

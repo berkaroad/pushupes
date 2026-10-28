@@ -16,18 +16,19 @@ package storage
 
 import "testing"
 
-// The configured segment size is restricted to powers of two from 64MiB up to
-// 2GiB: the service entry point rejects anything else, so a typo in a flag or a
-// config file fails at startup instead of producing an odd layout. 192MiB is
-// the size that rule exists to reject.
+// The configured segment size is restricted to powers of two from 256MiB up
+// to 2GiB: the service entry point rejects anything else, so a typo in a flag
+// or a config file fails at startup instead of producing an odd layout.
+// 192MiB is the size that rule exists to reject; 64/128MiB fell below the
+// floor when the 4KiB-record capacity math moved it to 256MiB.
 func TestValidateSegmentBytes(t *testing.T) {
 	cases := []struct {
 		n    int64
 		want bool
 	}{
-		{64 << 20, true}, {128 << 20, true}, {256 << 20, true},
-		{512 << 20, true}, {1024 << 20, true}, {2 << 30, true},
-		{0, false}, {-1, false}, {32 << 20, false}, {63 << 20, false},
+		{256 << 20, true}, {512 << 20, true}, {1024 << 20, true}, {2 << 30, true},
+		{0, false}, {-1, false}, {32 << 20, false},
+		{64 << 20, false}, {128 << 20, false}, {63 << 20, false},
 		{192 << 20, false}, {96 << 20, false}, {100 << 20, false},
 		{1536 << 20, false}, {256<<20 + 1, false}, {2<<30 + (64 << 20), false},
 		{3 << 30, false},

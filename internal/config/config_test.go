@@ -26,7 +26,7 @@ import (
 // cycle). The command's own test pins the real seeded values.
 func seeded() *Config {
 	c := Default()
-	c.SegmentBytes = 64 << 20
+	c.SegmentBytes = 256 << 20
 	c.FlushMessages = 1000
 	c.FlushInterval = 100 * time.Millisecond
 	c.FlushParallelism = 1

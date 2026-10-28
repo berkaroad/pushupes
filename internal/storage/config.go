@@ -58,27 +58,29 @@ const (
 	DefaultSlotCount = 1024
 
 	// A configured segment size must be a power of two between MinSegmentBytes
-	// and MaxSegmentBytes: 64MiB, 128MiB, 256MiB ... 2GiB, one doubling per
-	// step. The sizing math scales linearly with the segment size, so every
-	// value in that sequence is a valid operating point and a tuning step is
+	// and MaxSegmentBytes: 256MiB, 512MiB, 1GiB, 2GiB, one doubling per step.
+	// The sizing math scales linearly with the segment size, so every value in
+	// that sequence is a valid operating point and a tuning step is
 	// unambiguous; 192MiB is the plausible-looking size the sequence does not
 	// admit.
 	// The floor exists because a smaller segment buys nothing — per-slot state,
 	// index files and file descriptors all scale with the segment count, while
-	// the memory a segment holds is bounded by its size either way. The ceiling
-	// exists because one segment's index files, its seal-time frame walk and the
-	// per-aggregate seq list it keeps in memory are all proportional to it.
-	MinSegmentBytes = int64(64 << 20)
+	// the memory a segment holds is bounded by its size either way. At 4KiB
+	// records a 64MiB segment holds only ~16K records, so a 1e9-record slot
+	// carried ~62K segments: seal-time index files, WAL fds, scan passes and
+	// the idempotency fallback (a false "maybe" costs one cidx probe per
+	// segment, ~312/append) all scaled with that count. 256MiB cuts it 4×.
+	// The ceiling exists because one segment's index files, its seal-time frame
+	// walk and the per-aggregate seq list it keeps in memory are all
+	// proportional to it.
+	MinSegmentBytes = int64(256 << 20)
 	MaxSegmentBytes = int64(2 << 30)
 
 	// DefaultSegmentBytes is the shipped roll threshold: the smallest legal
-	// segment (MinSegmentBytes, 64MiB). On the planned node (4 cores / 16GiB /
-	// 1TiB, records typically 1-4KiB) the live tail is 8 B/record per HOT slot
-	// and every slot on a single-data-node cluster is hot — 64MiB keeps the
-	// unsealed-seq term at ~0.25GiB for 1KiB records (DESIGN §7.2). Small
-	// segments cost segment count, WAL fds and index files; the planned
-	// historical-segment merge reclaims the segment count once it lands, which
-	// is why the default sits at the small end now.
+	// segment (MinSegmentBytes, 256MiB). The default follows the floor on
+	// purpose — the floor was just re-derived from the 1e9-record / 4KiB sizing
+	// of one slot per data node, and the operator who wants a different point
+	// on the doubling ladder says so with -segment-bytes.
 	DefaultSegmentBytes = MinSegmentBytes
 )
 
