@@ -143,6 +143,10 @@ func toRecord(req *pushupesv1.AppendRequest) (*data.EventRecord, *pushupesv1.App
 		UnixTime:    req.UnixTime,
 		CommandID:   req.CommandId,
 	}
+	// The wire enum IS the frame flags codec byte (0 raw, 1 gzip): what a
+	// writer stamps is exactly what the record header records. Anything
+	// else fails the Validate gate below (fail/1002).
+	rec.Codec = uint8(req.Compression)
 	rec.Events = make([]data.Event, len(req.Events))
 	for i, ev := range req.Events {
 		rec.Events[i] = data.Event{Type: ev.Type, Body: ev.Body}
@@ -589,7 +593,8 @@ func (s *Server) ReadVersionByTime(ctx context.Context, req *pushupesv1.ReadVers
 // ---- record conversion -----------------------------------------------------
 
 // recordToProto maps a stored record straight to its proto form: bodies are
-// raw bytes end to end, no JSON wrapping on this plane.
+// stored bytes end to end (a gzip stream when Compressed is set — the reader
+// library inflates), no JSON wrapping on this plane.
 func recordToProto(r *data.EventRecord, seq uint64) *pushupesv1.Record {
 	out := &pushupesv1.Record{
 		AggregateId: r.AggregateID,
@@ -597,6 +602,7 @@ func recordToProto(r *data.EventRecord, seq uint64) *pushupesv1.Record {
 		UnixTime:    r.UnixTime,
 		CommandId:   r.CommandID,
 		Seq:         seq,
+		Compressed:  r.Codec == data.CodecGzip,
 	}
 	out.Events = make([]*pushupesv1.Event, len(r.Events))
 	for i, ev := range r.Events {

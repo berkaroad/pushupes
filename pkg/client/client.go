@@ -36,7 +36,22 @@ type Config struct {
 	Attempts     int           // max send rounds per BatchAppend call, retries of redirected records included (default 3)
 	CallTimeout  time.Duration // per-attempt RPC timeout inside BatchAppend (default 30s)
 	FlowBackoff  time.Duration // pause after a node answers 1005 (flow control); the refused records re-send and the node's gate stays closed until one answer comes back un-throttled (default 100ms)
+	// Writer-side gzip (see compress.go). CompressMinTotalBody is the floor:
+	// a record whose combined event bodies are smaller stores raw. 0 (the
+	// default) disables compression entirely — the library keeps the
+	// store-what-you-send behaviour until a caller opts in. CompressLevel is
+	// the gzip level; 0 = gzip.BestSpeed (level 1: the writer-side codec
+	// trades ratio for the per-append CPU that the high-pressure write path
+	// does not have).
+	CompressMinTotalBody int
+	CompressLevel        int
+	// AutoDecompress inflates gzip-stamped records before they reach the
+	// caller (read responses and exists records). nil = on; only meaningful
+	// together with records written under the codec.
+	AutoDecompress *bool
 }
+
+func (a Config) decompressOn() bool { return a.AutoDecompress == nil || *a.AutoDecompress }
 
 // Client talks to a pushupes cluster's data plane: routing resolved and
 // maintained by PrefetchRoutes (seeded at New, refreshed on a timer,
@@ -327,6 +342,11 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 func (c *Client) BatchAppend(ctx context.Context,
 	recs []*pushupesv1.AppendRequest) ([]*pushupesv1.AppendResponse, error) {
 
+	// The writer-side codec runs before anything goes on the wire: every
+	// retry round re-sends these (possibly compressed) records verbatim,
+	// and the server persists whichever bytes it receives.
+	recs = c.applyCompression(recs)
+
 	out := make([]*pushupesv1.AppendResponse, len(recs))
 	if len(recs) == 0 {
 		return out, nil
@@ -375,6 +395,11 @@ func (c *Client) BatchAppend(ctx context.Context,
 		wg.Wait()
 		pending = next
 		c.rr.Add(1)
+	}
+	if c.cfg.decompressOn() {
+		if err := inflateBatchResponses(out); err != nil {
+			return out, err
+		}
 	}
 	return out, lastErr
 }
@@ -590,6 +615,13 @@ func (c *Client) ReadStream(ctx context.Context, aggID string,
 		if err != nil {
 			return nil, 0, "", err
 		}
+		if c.cfg.decompressOn() {
+			for _, rec := range resp.Records {
+				if derr := inflateRecord(rec); derr != nil {
+					return nil, 0, "", derr
+				}
+			}
+		}
 		return resp, resp.GetErrId(), resp.GetNode(), nil
 	})
 }
@@ -744,6 +776,11 @@ func (c *Client) ReadByCommand(ctx context.Context, aggID, commandID string) (*p
 		})
 		if err != nil {
 			return nil, 0, "", err
+		}
+		if c.cfg.decompressOn() && resp.GetFound() {
+			if derr := inflateRecord(resp.GetRecord()); derr != nil {
+				return nil, 0, "", derr
+			}
 		}
 		return resp, resp.GetErrId(), resp.GetNode(), nil
 	})

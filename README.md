@@ -254,6 +254,8 @@ resp, err := cl.ReadStream(ctx, "agg-1", fromVersion, 100)  // 读：按版本�
 
 **写：`EventService/BatchAppend`** —— 事件写入的唯一入口，单条写与批量写都是它：一条 `AppendRequest` 即单条，多条即批量。服务端逐条校验幂等与版本（见 DESIGN.md），按请求同序返回逐条结果（回显 `aggregate_id`）；槽不在本节点时不代理转发，而是用响应字段回答重定向（`err_id=1003/1004` + `node` 给出槽 leader 的 client 地址），由库重连重发。批内 `aggregate_id` 必须各不相同，重复的那组整组按 1002 拒绝且不执行。同槽串行、异槽并行，并发上限为进程级 worker 池 `16 × runtime.GOMAXPROCS(0)`。单批必须装进 client 面 gRPC 消息上限（`-grpc-max-msg-size`，默认 4MiB）。
 
+**记录压缩编解码（writer-side gzip）** —— 压缩与解压都发生在 `pkg/client`，服务端**从不解压、也从不压缩**：它只把请求声明的 codec（`AppendRequest.compression`，枚举值即帧头 flags 的 codec id：0 不压、1 gzip）盖进记录头的 flags 字节并**原样落盘**——复制、封段、迁移、fetch 追平搬运的都是这份存储字节，因此压缩缩的是追平带宽而不是换来服务端 CPU。`COMPRESSION_UNSPECIFIED`（字段缺席）= 按给定字节存储；已压记录必须显式带 `COMPRESSION_GZIP`，服务端按 gzip magic（`1f 8b`）浅验每段 body，不做全流校验（那是读者的库负责）。库侧旋钮：`Config.CompressMinTotalBody`（记录内 body 合计达到该字节数才压，0=功能关闭，默认关）、`Config.CompressLevel`（gzip 等级，默认 `BestSpeed`=1 级：写路径的高压下用比率换每-append CPU）、`Config.AutoDecompress`（nil=开：读响应与 exists 记录的压缩记录在返回调用方前透明解压，解压超 1MiB 上限拒绝，gzip CRC 顺带验证）。压制比不达 90% 收益（图片/protobuf 等已紧凑 payload）自动放弃、存明文；调用方预置的 codec 一律权威，库不二次压缩。`cmd/bench -compress <floor>` 可实测该档位。
+
 **读**——四个接口，和写一样走 MOVED 重定向（应答带 `err_id`/`slot`/`node`），`pkg/client` 对调用方透明跟随：
 
 - `ReadStream`：按聚合回放事件流（≤HW 语义）。

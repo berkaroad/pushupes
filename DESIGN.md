@@ -156,13 +156,15 @@ WAL 段文件格式（append-only，顺序读写）：
 
 ```
 Header(20B): magic "ESWL"(4) fmtVer(1) reserved(3) slotID(4be) baseSeq(8be)
-Body: Record*，每条记录：
+Body: Record*，每条记录（fmtVer=2，当前版本）：
   recLen(4be)                        # 记录体总长
   aggLen(2be) aggregate_id
   version(4be) unix_time(8be)
   cmdLen(2be) command_id
-  eventCount(2be)
+  eventCount(2be) flags(1)           # flags bit0-3=codec(0 明文/1 gzip)，bit4-7 保留(写 0；读者遇非 0/未知 codec 拒帧)
   Event*: typeLen(2be) type bodyLen(4be) body
+（fmtVer=1 的历史段无 flags 字节；解码器按段头版本分流，一个段内永不混版：
+启动打开时发现非当前版本的可写尾段即封存并滚动新段，空尾段就地翻转头部版本）
 ```
 
 - **段名即 baseSeq**：整段可独立滚动、拷贝、删除。

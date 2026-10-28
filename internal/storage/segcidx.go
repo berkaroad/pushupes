@@ -175,7 +175,7 @@ func collectSegCmdEntries(seg *Segment) ([]segCmdEntry, error) {
 		if err != nil {
 			return nil, err
 		}
-		meta, _, err := data.DecodeRecordMeta(frame)
+		meta, _, err := data.DecodeRecordMetaVer(frame, uint8(seg.fmtVer))
 		if err != nil {
 			return nil, fmt.Errorf("segment %s seq %d: %w", seg.Path, seq, err)
 		}

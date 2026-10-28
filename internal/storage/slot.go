@@ -339,11 +339,74 @@ func openSlot(dir string, slotID int32, segmentBytes int64, flush FlushPolicy, m
 		s.seqCounter.Store(0)
 	} else {
 		last := s.segments[len(s.segments)-1]
-		last.writable = true // resume appending where the log stopped
-		if last.RecordCnt > 0 {
+		if last.fmtVer != WALFormatVer && last.RecordCnt == 0 {
+			// An empty legacy tail: nothing was ever appended under the old
+			// layout, so the header is flipped to the current format and the
+			// segment resumes as the writable tail. Frames can never mix
+			// versions inside one segment.
+			if _, err := last.File.WriteAt(headerBuf(slotID, last.BaseSeq), 0); err != nil {
+				return nil, fmt.Errorf("slot %d tail %s: %w", slotID, last.Path, err)
+			}
+			last.fmtVer = WALFormatVer
+		}
+		if last.fmtVer != WALFormatVer {
+			// A non-empty legacy tail stays sealed history: its v1 frames are
+			// already indexed by the load walk above, and appending a
+			// current-format frame to it would mix layouts. Finalize it like
+			// the other history segments (a start writes the sidecar indexes;
+			// a segment left without them is skipped by lookups until the
+			// next start repairs it — the standing sealed-segment rule), then
+			// roll a fresh segment at the next seq.
+			if last.RecordCnt > 0 {
+				if mode == slotOpenLoadAndRepair {
+					ix, ierr := openSegCmdIndex(s.Dir, s.ID, last.BaseSeq)
+					usable := ierr == nil && ix != nil && ix.Valid()
+					if ix != nil {
+						_ = ix.Close()
+					}
+					if !usable {
+						if err := writeSegCmdIndex(last); err != nil {
+							segIndexUnusable.Add(1)
+						} else {
+							segCmdBuilt.Add(1)
+						}
+					}
+				}
+			}
+			_ = last.indexFlushAndClose()
+			if last.RecordCnt > 0 {
+				need := true
+				var covered map[uint64]bool
+				if ix, err := openSegAggIndex(s.Dir, s.ID, last.BaseSeq); err == nil && ix != nil {
+					if ix.Valid() {
+						need = false
+						covered = ix.Covered()
+					}
+					ix.Close()
+				}
+				if need {
+					if err := s.sealAggSeqsLocked(last); err != nil {
+						segIndexUnusable.Add(1)
+					} else {
+						segAggBuilt.Add(1)
+					}
+				} else {
+					s.dropSealedSeqsLocked(last, covered)
+				}
+			}
+			seg, err := CreateSegment(s.Dir, s.ID, last.LastSeq+1)
+			if err != nil {
+				return nil, err
+			}
+			s.segments = append(s.segments, seg)
 			s.seqCounter.Store(last.LastSeq)
 		} else {
-			s.seqCounter.Store(last.BaseSeq - 1)
+			last.writable = true // resume appending where the log stopped
+			if last.RecordCnt > 0 {
+				s.seqCounter.Store(last.LastSeq)
+			} else {
+				s.seqCounter.Store(last.BaseSeq - 1)
+			}
 		}
 	}
 	// A loaded copy IS its own disk image: everything it just read back is
@@ -861,7 +924,7 @@ func (s *Slot) sealedVersionSeqLocked(aggregateID string, v uint32) (uint64, *da
 			if !ok {
 				return false
 			}
-			rec, _, rerr := readRecordAt(seg.File, int64(off), buf[:])
+			rec, _, rerr := readRecordAt(seg.File, int64(off), buf[:], seg.fmtVer)
 			if rerr != nil || rec.AggregateID != aggregateID || rec.Version != v {
 				return false
 			}
@@ -1123,7 +1186,7 @@ func (s *Slot) lookupCommandLocked(commandID string, hash uint64) (*data.EventRe
 		var hit *data.EventRecord
 		var hitSeq uint64
 		found, err := ix.LookupCmd(uint32(hash>>32), func(e segCmdEntry) bool {
-			got, _, rerr := readRecordAt(seg.File, e.off, buf[:])
+			got, _, rerr := readRecordAt(seg.File, e.off, buf[:], seg.fmtVer)
 			if rerr != nil || got.CommandID != commandID {
 				return false
 			}

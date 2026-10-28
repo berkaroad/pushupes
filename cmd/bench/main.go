@@ -56,6 +56,7 @@ func main() {
 	batch := flag.Int("batch", 0, "records per BatchAppend call (the write path is always BatchAppend: 0 = one BatchAppend carrying a single record per round, >0 = a chunk of distinct aggregates grouped per slot leader). Latency lines report per-batch round trips")
 	reportEvery := flag.Duration("report", time.Second, "live report interval")
 	routeRefresh := flag.Duration("route-refresh", 30*time.Second, "how often the slot->leader table is re-fetched from PrefetchRoutes (0 = fetch once at startup; MOVED/ASK answers patch the table in between either way)")
+	compressFloor := flag.Int("compress", 0, "writer-side gzip: compress each record whose combined bodies reach this byte floor (0 disables; e.g. 4096 for 4KiB JSON events)")
 	flag.Parse()
 
 	if *size > 1024*1024 {
@@ -75,7 +76,7 @@ func main() {
 	// is cluster state), one goroutine refreshes it on -route-refresh, MOVED/
 	// ASK answers patch rows in between, and one long-lived gRPC connection
 	// per node backs every call.
-	cl, err := client.New(entryList, &client.Config{RouteRefresh: *routeRefresh})
+	cl, err := client.New(entryList, &client.Config{RouteRefresh: *routeRefresh, CompressMinTotalBody: *compressFloor})
 	if err != nil {
 		fmt.Printf("FAIL: %v\n", err)
 		os.Exit(1)

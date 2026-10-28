@@ -43,9 +43,15 @@ import (
 // Segments are contiguous: the next segment's baseSeq is this segment's last
 // seq + 1, which is what lets scans track seq incrementally.
 const (
-	WALMagic     = "ESWL"
-	WALFormatVer = int8(1)
-	WALHeaderLen = 20
+	WALMagic = "ESWL"
+	// WALFormatVer is the frame layout new segments carry: 2 adds the record
+	// header flags byte (data.FrameVerFlags). Readers still open 1-format
+	// segments sealed by older builds; nothing appends to one (the open path
+	// rolls a stale tail into a current-format segment before resuming, see
+	// openSlot), so a segment never mixes frame versions.
+	WALFormatVer       = int8(2)
+	WALFormatVerLegacy = int8(1)
+	WALHeaderLen       = 20
 	// indexIntervalB (the sparse seq -> offset hint) and the segment sizing
 	// bounds live in config.go with the rest of the layer's numbers.
 )
@@ -84,6 +90,7 @@ type Segment struct {
 	BaseSeq   uint64
 	Path      string
 	File      *os.File
+	fmtVer    int8 // frame layout stamped in the header (see WALFormatVer)
 	dataStart int64
 	sizeBytes int64
 	RecordCnt int64
@@ -120,22 +127,22 @@ func headerBuf(slotID int32, baseSeq uint64) []byte {
 	return h
 }
 
-func parseHeader(h []byte) (int32, uint64, error) {
+func parseHeader(h []byte) (int32, uint64, int8, error) {
 	if len(h) < WALHeaderLen {
-		return 0, 0, errors.New("short header")
+		return 0, 0, 0, errors.New("short header")
 	}
-	if string(h[0:4]) != WALMagic || h[4] != byte(WALFormatVer) {
-		return 0, 0, errors.New("bad WAL header magic/version")
+	if string(h[0:4]) != WALMagic || (h[4] != byte(WALFormatVer) && h[4] != byte(WALFormatVerLegacy)) {
+		return 0, 0, 0, errors.New("bad WAL header magic/version")
 	}
 	slot := int32(binary.BigEndian.Uint32(h[8:12]))
 	base := binary.BigEndian.Uint64(h[12:20])
-	return slot, base, nil
+	return slot, base, int8(h[4]), nil
 }
 
 // HeaderSlotID validates a WAL segment header and returns its slot id.
 // Used by the migration target before accepting a streamed segment file.
 func HeaderSlotID(payload []byte) (int32, error) {
-	slot, _, err := parseHeader(payload)
+	slot, _, _, err := parseHeader(payload)
 	return slot, err
 }
 
@@ -158,6 +165,7 @@ func CreateSegment(dir string, slotID int32, baseSeq uint64) (*Segment, error) {
 		BaseSeq:       baseSeq,
 		Path:          path,
 		File:          f,
+		fmtVer:        WALFormatVer,
 		dataStart:     WALHeaderLen,
 		sizeBytes:     WALHeaderLen,
 		syncedSize:    WALHeaderLen,
@@ -185,7 +193,7 @@ func OpenSegment(path string) (*Segment, error) {
 		f.Close()
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	slot, base, err := parseHeader(h)
+	slot, base, ver, err := parseHeader(h)
 	if err != nil {
 		f.Close()
 		return nil, fmt.Errorf("%s: %w", path, err)
@@ -200,6 +208,7 @@ func OpenSegment(path string) (*Segment, error) {
 		BaseSeq:   base,
 		Path:      path,
 		File:      f,
+		fmtVer:    ver,
 		dataStart: WALHeaderLen,
 		sizeBytes: st.Size(),
 	}, nil
@@ -415,8 +424,9 @@ func (s *Segment) indexSeqAt(off int64) uint64 {
 	return s.index[i-1].seq
 }
 
-// readRecordAt decodes the length-prefixed record starting at off.
-func readRecordAt(f *os.File, off int64, buf []byte) (data.EventRecord, int, error) {
+// readRecordAt decodes the length-prefixed record starting at off, in the
+// segment's stamped frame version.
+func readRecordAt(f *os.File, off int64, buf []byte, ver int8) (data.EventRecord, int, error) {
 	h := buf[:4]
 	if _, err := f.ReadAt(h, off); err != nil {
 		return data.EventRecord{}, 0, err
@@ -433,7 +443,7 @@ func readRecordAt(f *os.File, off int64, buf []byte) (data.EventRecord, int, err
 	if _, err := f.ReadAt(body, off); err != nil {
 		return data.EventRecord{}, 0, err
 	}
-	rec, consumed, err := data.DecodeRecord(body)
+	rec, consumed, err := data.DecodeRecordVer(body, uint8(ver))
 	if err != nil {
 		return rec, 0, err
 	}
@@ -456,7 +466,7 @@ func (s *Segment) ScanFrom(fromSeq uint64, fn func(uint64, *data.EventRecord) bo
 	seq := s.indexSeqAt(off)
 	buf := make([]byte, 64<<10)
 	for off < s.sizeBytes {
-		rec, consumed, err := readRecordAt(s.File, off, buf)
+		rec, consumed, err := readRecordAt(s.File, off, buf, s.fmtVer)
 		if err != nil {
 			return err
 		}
@@ -496,7 +506,7 @@ func (s *Segment) ScanHeaders(fromSeq uint64, fn func(uint64, data.RecordMeta) b
 			return err // LoadSegment validated the segment: no torn tail here
 		}
 		if seq >= fromSeq {
-			meta, _, err := data.DecodeRecordMeta(frame)
+			meta, _, err := data.DecodeRecordMetaVer(frame, uint8(s.fmtVer))
 			if err != nil {
 				return fmt.Errorf("segment %s seq %d: %w", s.Path, seq, err)
 			}

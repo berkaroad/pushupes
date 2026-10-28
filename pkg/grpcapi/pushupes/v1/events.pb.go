@@ -21,6 +21,60 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Compression states whether the event bodies of one record were already
+// compressed by the writer before going on the wire. The values are the
+// frame flags codec ids verbatim (0 raw, 1 gzip): what the writer stamps is
+// exactly what the record header records. The server never inflates and
+// never compresses — it validates the gzip magic, stamps the codec into the
+// record-header flags byte, and persists the body bytes verbatim. Readers
+// get the codec back on Record.compressed and decode in their client
+// library.
+type Compression int32
+
+const (
+	Compression_COMPRESSION_UNSPECIFIED Compression = 0 // absent means: store the bodies as given
+	Compression_COMPRESSION_GZIP        Compression = 1 // every event body of the record is one gzip stream
+)
+
+// Enum value maps for Compression.
+var (
+	Compression_name = map[int32]string{
+		0: "COMPRESSION_UNSPECIFIED",
+		1: "COMPRESSION_GZIP",
+	}
+	Compression_value = map[string]int32{
+		"COMPRESSION_UNSPECIFIED": 0,
+		"COMPRESSION_GZIP":        1,
+	}
+)
+
+func (x Compression) Enum() *Compression {
+	p := new(Compression)
+	*p = x
+	return p
+}
+
+func (x Compression) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (Compression) Descriptor() protoreflect.EnumDescriptor {
+	return file_pushupes_v1_events_proto_enumTypes[0].Descriptor()
+}
+
+func (Compression) Type() protoreflect.EnumType {
+	return &file_pushupes_v1_events_proto_enumTypes[0]
+}
+
+func (x Compression) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use Compression.Descriptor instead.
+func (Compression) EnumDescriptor() ([]byte, []int) {
+	return file_pushupes_v1_events_proto_rawDescGZIP(), []int{0}
+}
+
 type AppendResponse_Status int32
 
 const (
@@ -57,11 +111,11 @@ func (x AppendResponse_Status) String() string {
 }
 
 func (AppendResponse_Status) Descriptor() protoreflect.EnumDescriptor {
-	return file_pushupes_v1_events_proto_enumTypes[0].Descriptor()
+	return file_pushupes_v1_events_proto_enumTypes[1].Descriptor()
 }
 
 func (AppendResponse_Status) Type() protoreflect.EnumType {
-	return &file_pushupes_v1_events_proto_enumTypes[0]
+	return &file_pushupes_v1_events_proto_enumTypes[1]
 }
 
 func (x AppendResponse_Status) Number() protoreflect.EnumNumber {
@@ -76,7 +130,7 @@ func (AppendResponse_Status) EnumDescriptor() ([]byte, []int) {
 type Event struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Type          string                 `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`
-	Body          []byte                 `protobuf:"bytes,2,opt,name=body,proto3" json:"body,omitempty"` // raw payload bytes (no JSON/base64 layering)
+	Body          []byte                 `protobuf:"bytes,2,opt,name=body,proto3" json:"body,omitempty"` // raw payload bytes (no JSON/base64 layering); a gzip
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -133,7 +187,8 @@ type Record struct {
 	UnixTime      int64                  `protobuf:"varint,3,opt,name=unix_time,json=unixTime,proto3" json:"unix_time,omitempty"`
 	CommandId     string                 `protobuf:"bytes,4,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
 	Events        []*Event               `protobuf:"bytes,5,rep,name=events,proto3" json:"events,omitempty"`
-	Seq           uint64                 `protobuf:"varint,6,opt,name=seq,proto3" json:"seq,omitempty"` // slot sequence
+	Seq           uint64                 `protobuf:"varint,6,opt,name=seq,proto3" json:"seq,omitempty"`               // slot sequence
+	Compressed    bool                   `protobuf:"varint,7,opt,name=compressed,proto3" json:"compressed,omitempty"` // event bodies carry a gzip stream (stored codec)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -210,6 +265,13 @@ func (x *Record) GetSeq() uint64 {
 	return 0
 }
 
+func (x *Record) GetCompressed() bool {
+	if x != nil {
+		return x.Compressed
+	}
+	return false
+}
+
 type AppendRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	AggregateId   string                 `protobuf:"bytes,1,opt,name=aggregate_id,json=aggregateId,proto3" json:"aggregate_id,omitempty"`
@@ -217,6 +279,7 @@ type AppendRequest struct {
 	UnixTime      int64                  `protobuf:"varint,3,opt,name=unix_time,json=unixTime,proto3" json:"unix_time,omitempty"`   // 0 = server clock
 	CommandId     string                 `protobuf:"bytes,4,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"` // idempotency key
 	Events        []*Event               `protobuf:"bytes,5,rep,name=events,proto3" json:"events,omitempty"`
+	Compression   Compression            `protobuf:"varint,7,opt,name=compression,proto3,enum=pushupes.v1.Compression" json:"compression,omitempty"` // body codec as prepared by the writer
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -284,6 +347,13 @@ func (x *AppendRequest) GetEvents() []*Event {
 		return x.Events
 	}
 	return nil
+}
+
+func (x *AppendRequest) GetCompression() Compression {
+	if x != nil {
+		return x.Compression
+	}
+	return Compression_COMPRESSION_UNSPECIFIED
 }
 
 type AppendResponse struct {
@@ -1228,7 +1298,7 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\x18pushupes/v1/events.proto\x12\vpushupes.v1\"/\n" +
 	"\x05Event\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x12\n" +
-	"\x04body\x18\x02 \x01(\fR\x04body\"\xbf\x01\n" +
+	"\x04body\x18\x02 \x01(\fR\x04body\"\xdf\x01\n" +
 	"\x06Record\x12!\n" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1b\n" +
@@ -1236,14 +1306,18 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\n" +
 	"command_id\x18\x04 \x01(\tR\tcommandId\x12*\n" +
 	"\x06events\x18\x05 \x03(\v2\x12.pushupes.v1.EventR\x06events\x12\x10\n" +
-	"\x03seq\x18\x06 \x01(\x04R\x03seq\"\xba\x01\n" +
+	"\x03seq\x18\x06 \x01(\x04R\x03seq\x12\x1e\n" +
+	"\n" +
+	"compressed\x18\a \x01(\bR\n" +
+	"compressed\"\xf6\x01\n" +
 	"\rAppendRequest\x12!\n" +
 	"\faggregate_id\x18\x01 \x01(\tR\vaggregateId\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1b\n" +
 	"\tunix_time\x18\x03 \x01(\x03R\bunixTime\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x04 \x01(\tR\tcommandId\x12*\n" +
-	"\x06events\x18\x05 \x03(\v2\x12.pushupes.v1.EventR\x06eventsJ\x04\b\x06\x10\a\"\xe7\x02\n" +
+	"\x06events\x18\x05 \x03(\v2\x12.pushupes.v1.EventR\x06events\x12:\n" +
+	"\vcompression\x18\a \x01(\x0e2\x18.pushupes.v1.CompressionR\vcompressionJ\x04\b\x06\x10\a\"\xe7\x02\n" +
 	"\x0eAppendResponse\x12:\n" +
 	"\x06status\x18\x01 \x01(\x0e2\".pushupes.v1.AppendResponse.StatusR\x06status\x12\x15\n" +
 	"\x06err_id\x18\x02 \x01(\rR\x05errId\x12\x18\n" +
@@ -1307,7 +1381,10 @@ const file_pushupes_v1_events_proto_rawDesc = "" +
 	"\aversion\x18\x01 \x01(\rR\aversion\x12\x15\n" +
 	"\x06err_id\x18\x02 \x01(\rR\x05errId\x12\x12\n" +
 	"\x04slot\x18\x03 \x01(\x05R\x04slot\x12\x12\n" +
-	"\x04node\x18\x04 \x01(\tR\x04node2\x92\x04\n" +
+	"\x04node\x18\x04 \x01(\tR\x04node*@\n" +
+	"\vCompression\x12\x1b\n" +
+	"\x17COMPRESSION_UNSPECIFIED\x10\x00\x12\x14\n" +
+	"\x10COMPRESSION_GZIP\x10\x012\x92\x04\n" +
 	"\fEventService\x12P\n" +
 	"\vBatchAppend\x12\x1f.pushupes.v1.BatchAppendRequest\x1a .pushupes.v1.BatchAppendResponse\x12Y\n" +
 	"\x0ePrefetchRoutes\x12\".pushupes.v1.PrefetchRoutesRequest\x1a#.pushupes.v1.PrefetchRoutesResponse\x12M\n" +
@@ -1329,57 +1406,59 @@ func file_pushupes_v1_events_proto_rawDescGZIP() []byte {
 	return file_pushupes_v1_events_proto_rawDescData
 }
 
-var file_pushupes_v1_events_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_pushupes_v1_events_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
 var file_pushupes_v1_events_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
 var file_pushupes_v1_events_proto_goTypes = []any{
-	(AppendResponse_Status)(0),        // 0: pushupes.v1.AppendResponse.Status
-	(*Event)(nil),                     // 1: pushupes.v1.Event
-	(*Record)(nil),                    // 2: pushupes.v1.Record
-	(*AppendRequest)(nil),             // 3: pushupes.v1.AppendRequest
-	(*AppendResponse)(nil),            // 4: pushupes.v1.AppendResponse
-	(*BatchAppendRequest)(nil),        // 5: pushupes.v1.BatchAppendRequest
-	(*BatchAppendResult)(nil),         // 6: pushupes.v1.BatchAppendResult
-	(*BatchAppendResponse)(nil),       // 7: pushupes.v1.BatchAppendResponse
-	(*PrefetchRoutesRequest)(nil),     // 8: pushupes.v1.PrefetchRoutesRequest
-	(*PrefetchRoutesResponse)(nil),    // 9: pushupes.v1.PrefetchRoutesResponse
-	(*ReadStreamRequest)(nil),         // 10: pushupes.v1.ReadStreamRequest
-	(*ReadStreamResponse)(nil),        // 11: pushupes.v1.ReadStreamResponse
-	(*ReadTailsRequest)(nil),          // 12: pushupes.v1.ReadTailsRequest
-	(*ReadTailsResult)(nil),           // 13: pushupes.v1.ReadTailsResult
-	(*ReadTailsResponse)(nil),         // 14: pushupes.v1.ReadTailsResponse
-	(*ReadByCommandRequest)(nil),      // 15: pushupes.v1.ReadByCommandRequest
-	(*ReadByCommandResponse)(nil),     // 16: pushupes.v1.ReadByCommandResponse
-	(*ReadVersionByTimeRequest)(nil),  // 17: pushupes.v1.ReadVersionByTimeRequest
-	(*ReadVersionByTimeResponse)(nil), // 18: pushupes.v1.ReadVersionByTimeResponse
+	(Compression)(0),                  // 0: pushupes.v1.Compression
+	(AppendResponse_Status)(0),        // 1: pushupes.v1.AppendResponse.Status
+	(*Event)(nil),                     // 2: pushupes.v1.Event
+	(*Record)(nil),                    // 3: pushupes.v1.Record
+	(*AppendRequest)(nil),             // 4: pushupes.v1.AppendRequest
+	(*AppendResponse)(nil),            // 5: pushupes.v1.AppendResponse
+	(*BatchAppendRequest)(nil),        // 6: pushupes.v1.BatchAppendRequest
+	(*BatchAppendResult)(nil),         // 7: pushupes.v1.BatchAppendResult
+	(*BatchAppendResponse)(nil),       // 8: pushupes.v1.BatchAppendResponse
+	(*PrefetchRoutesRequest)(nil),     // 9: pushupes.v1.PrefetchRoutesRequest
+	(*PrefetchRoutesResponse)(nil),    // 10: pushupes.v1.PrefetchRoutesResponse
+	(*ReadStreamRequest)(nil),         // 11: pushupes.v1.ReadStreamRequest
+	(*ReadStreamResponse)(nil),        // 12: pushupes.v1.ReadStreamResponse
+	(*ReadTailsRequest)(nil),          // 13: pushupes.v1.ReadTailsRequest
+	(*ReadTailsResult)(nil),           // 14: pushupes.v1.ReadTailsResult
+	(*ReadTailsResponse)(nil),         // 15: pushupes.v1.ReadTailsResponse
+	(*ReadByCommandRequest)(nil),      // 16: pushupes.v1.ReadByCommandRequest
+	(*ReadByCommandResponse)(nil),     // 17: pushupes.v1.ReadByCommandResponse
+	(*ReadVersionByTimeRequest)(nil),  // 18: pushupes.v1.ReadVersionByTimeRequest
+	(*ReadVersionByTimeResponse)(nil), // 19: pushupes.v1.ReadVersionByTimeResponse
 }
 var file_pushupes_v1_events_proto_depIdxs = []int32{
-	1,  // 0: pushupes.v1.Record.events:type_name -> pushupes.v1.Event
-	1,  // 1: pushupes.v1.AppendRequest.events:type_name -> pushupes.v1.Event
-	0,  // 2: pushupes.v1.AppendResponse.status:type_name -> pushupes.v1.AppendResponse.Status
-	2,  // 3: pushupes.v1.AppendResponse.record:type_name -> pushupes.v1.Record
-	3,  // 4: pushupes.v1.BatchAppendRequest.records:type_name -> pushupes.v1.AppendRequest
-	4,  // 5: pushupes.v1.BatchAppendResult.response:type_name -> pushupes.v1.AppendResponse
-	6,  // 6: pushupes.v1.BatchAppendResponse.results:type_name -> pushupes.v1.BatchAppendResult
-	2,  // 7: pushupes.v1.ReadStreamResponse.records:type_name -> pushupes.v1.Record
-	13, // 8: pushupes.v1.ReadTailsResponse.results:type_name -> pushupes.v1.ReadTailsResult
-	2,  // 9: pushupes.v1.ReadByCommandResponse.record:type_name -> pushupes.v1.Record
-	5,  // 10: pushupes.v1.EventService.BatchAppend:input_type -> pushupes.v1.BatchAppendRequest
-	8,  // 11: pushupes.v1.EventService.PrefetchRoutes:input_type -> pushupes.v1.PrefetchRoutesRequest
-	10, // 12: pushupes.v1.EventService.ReadStream:input_type -> pushupes.v1.ReadStreamRequest
-	12, // 13: pushupes.v1.EventService.ReadTails:input_type -> pushupes.v1.ReadTailsRequest
-	15, // 14: pushupes.v1.EventService.ReadByCommand:input_type -> pushupes.v1.ReadByCommandRequest
-	17, // 15: pushupes.v1.EventService.ReadVersionByTime:input_type -> pushupes.v1.ReadVersionByTimeRequest
-	7,  // 16: pushupes.v1.EventService.BatchAppend:output_type -> pushupes.v1.BatchAppendResponse
-	9,  // 17: pushupes.v1.EventService.PrefetchRoutes:output_type -> pushupes.v1.PrefetchRoutesResponse
-	11, // 18: pushupes.v1.EventService.ReadStream:output_type -> pushupes.v1.ReadStreamResponse
-	14, // 19: pushupes.v1.EventService.ReadTails:output_type -> pushupes.v1.ReadTailsResponse
-	16, // 20: pushupes.v1.EventService.ReadByCommand:output_type -> pushupes.v1.ReadByCommandResponse
-	18, // 21: pushupes.v1.EventService.ReadVersionByTime:output_type -> pushupes.v1.ReadVersionByTimeResponse
-	16, // [16:22] is the sub-list for method output_type
-	10, // [10:16] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	2,  // 0: pushupes.v1.Record.events:type_name -> pushupes.v1.Event
+	2,  // 1: pushupes.v1.AppendRequest.events:type_name -> pushupes.v1.Event
+	0,  // 2: pushupes.v1.AppendRequest.compression:type_name -> pushupes.v1.Compression
+	1,  // 3: pushupes.v1.AppendResponse.status:type_name -> pushupes.v1.AppendResponse.Status
+	3,  // 4: pushupes.v1.AppendResponse.record:type_name -> pushupes.v1.Record
+	4,  // 5: pushupes.v1.BatchAppendRequest.records:type_name -> pushupes.v1.AppendRequest
+	5,  // 6: pushupes.v1.BatchAppendResult.response:type_name -> pushupes.v1.AppendResponse
+	7,  // 7: pushupes.v1.BatchAppendResponse.results:type_name -> pushupes.v1.BatchAppendResult
+	3,  // 8: pushupes.v1.ReadStreamResponse.records:type_name -> pushupes.v1.Record
+	14, // 9: pushupes.v1.ReadTailsResponse.results:type_name -> pushupes.v1.ReadTailsResult
+	3,  // 10: pushupes.v1.ReadByCommandResponse.record:type_name -> pushupes.v1.Record
+	6,  // 11: pushupes.v1.EventService.BatchAppend:input_type -> pushupes.v1.BatchAppendRequest
+	9,  // 12: pushupes.v1.EventService.PrefetchRoutes:input_type -> pushupes.v1.PrefetchRoutesRequest
+	11, // 13: pushupes.v1.EventService.ReadStream:input_type -> pushupes.v1.ReadStreamRequest
+	13, // 14: pushupes.v1.EventService.ReadTails:input_type -> pushupes.v1.ReadTailsRequest
+	16, // 15: pushupes.v1.EventService.ReadByCommand:input_type -> pushupes.v1.ReadByCommandRequest
+	18, // 16: pushupes.v1.EventService.ReadVersionByTime:input_type -> pushupes.v1.ReadVersionByTimeRequest
+	8,  // 17: pushupes.v1.EventService.BatchAppend:output_type -> pushupes.v1.BatchAppendResponse
+	10, // 18: pushupes.v1.EventService.PrefetchRoutes:output_type -> pushupes.v1.PrefetchRoutesResponse
+	12, // 19: pushupes.v1.EventService.ReadStream:output_type -> pushupes.v1.ReadStreamResponse
+	15, // 20: pushupes.v1.EventService.ReadTails:output_type -> pushupes.v1.ReadTailsResponse
+	17, // 21: pushupes.v1.EventService.ReadByCommand:output_type -> pushupes.v1.ReadByCommandResponse
+	19, // 22: pushupes.v1.EventService.ReadVersionByTime:output_type -> pushupes.v1.ReadVersionByTimeResponse
+	17, // [17:23] is the sub-list for method output_type
+	11, // [11:17] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_pushupes_v1_events_proto_init() }
@@ -1392,7 +1471,7 @@ func file_pushupes_v1_events_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pushupes_v1_events_proto_rawDesc), len(file_pushupes_v1_events_proto_rawDesc)),
-			NumEnums:      1,
+			NumEnums:      2,
 			NumMessages:   18,
 			NumExtensions: 0,
 			NumServices:   1,

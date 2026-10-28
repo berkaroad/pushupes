@@ -37,9 +37,23 @@ service EventService {
   rpc ReadVersionByTime(ReadVersionByTimeRequest) returns (ReadVersionByTimeResponse);
 }
 
+// Compression states whether the event bodies of one record were already
+// compressed by the writer before going on the wire. The values are the
+// frame flags codec ids verbatim (0 raw, 1 gzip): what the writer stamps is
+// exactly what the record header records. The server never inflates and
+// never compresses — it validates the gzip magic, stamps the codec into the
+// record-header flags byte, and persists the body bytes verbatim. Readers
+// get the codec back on Record.compressed and decode in their client
+// library.
+enum Compression {
+  COMPRESSION_UNSPECIFIED = 0; // absent means: store the bodies as given
+  COMPRESSION_GZIP = 1; // every event body of the record is one gzip stream
+}
+
 message Event {
   string type = 1;
-  bytes body = 2; // raw payload bytes (no JSON/base64 layering)
+  bytes body = 2; // raw payload bytes (no JSON/base64 layering); a gzip
+                  // stream when the record was appended with COMPRESSION_GZIP
 }
 
 // Record is one stored event-stream entry.
@@ -50,6 +64,7 @@ message Record {
   string command_id = 4;
   repeated Event events = 5;
   uint64 seq = 6; // slot sequence
+  bool compressed = 7; // event bodies carry a gzip stream (stored codec)
 }
 
 message AppendRequest {
@@ -59,6 +74,7 @@ message AppendRequest {
   string command_id = 4; // idempotency key
   repeated Event events = 5;
   reserved 6; // append success always means: high watermark covers it
+  Compression compression = 7; // body codec as prepared by the writer
 }
 
 message AppendResponse {

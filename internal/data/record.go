@@ -36,6 +36,30 @@ const (
 	MaxEventsPerRec   = 1024
 )
 
+// ---- Frame format versions -------------------------------------------------
+//
+// The record header carries a flags byte from frame version 2 on. Storage
+// segments stamp the version in their file header, so decoders dispatch on it
+// and v1 history on disk keeps reading unchanged. Encoders only ever write the
+// current version.
+const (
+	FrameVerLegacy uint8 = 1 // v1: no flags byte in the record header
+	FrameVerFlags  uint8 = 2 // v2: flags(1) after eventCount
+	// CurrentFrameVer is what every new frame is encoded with.
+	CurrentFrameVer = FrameVerFlags
+)
+
+// Record-level flag bits. Codecs must be declared before use: a reader that
+// meets an unknown codec or a set reserved bit refuses the frame outright,
+// which is what keeps forward additions safe.
+const (
+	codecMask     uint8 = 0x0F
+	CodecRaw      uint8 = 0x00
+	CodecGzip     uint8 = 0x01
+	CodecMax      uint8 = 0x01 // highest codec id any reader understands
+	flagsRsvdMask uint8 = 0xF0
+)
+
 // ---- Domain types ---------------------------------------------------------
 
 // Event is a single domain event inside a record's event list.
@@ -47,13 +71,24 @@ type Event struct {
 // EventRecord is one entry of an event stream: a command's resulting events
 // for one aggregate at one contiguous version. Records are appended to the
 // WAL of the slot that aggregate_id hashes to.
+//
+// Codec applies to EVERY event body of the record as one decision (the
+// client library that produced the bodies chose compress-all or
+// store-raw). The server never inflates: it persists the stored bytes
+// verbatim, stamps the codec in the frame header, and only checks the gzip
+// magic at the gate. CodecGzip therefore means "Body holds a gzip stream";
+// readers decode.
 type EventRecord struct {
 	AggregateID string
 	Version     uint32
 	UnixTime    int64
 	CommandID   string
+	Codec       uint8
 	Events      []Event
 }
+
+// Compressed reports whether the event bodies carry a gzip stream.
+func (r *EventRecord) Compressed() bool { return r.Codec == CodecGzip }
 
 // RecordMeta is the header portion of an encoded record frame: exactly the
 // fields the WAL indexes need, with no event bodies retained.
@@ -134,14 +169,20 @@ func CommandIDBytes(frame []byte) ([]byte, error) {
 //
 // Record layout (all integers big-endian):
 //
+//	v1:
 //	recLen(4) aggLen(2) aggregate_id
 //	version(4) unix_time(8)
 //	cmdLen(2) command_id
 //	eventCount(2) { typeLen(2) type bodyLen(4) body }*
 //
-// recLen covers everything after itself.
+//	v2: same, with flags(1) between eventCount and the event list:
+//	eventCount(2) flags(1) { typeLen(2) type bodyLen(4) body }*
+//	flags bit0-3 = codec (0 raw, 1 gzip), bit4-7 reserved (must be 0).
+//
+// recLen covers everything after itself. Encoders write CurrentFrameVer;
+// decoders dispatch on the storage segment's stamped version.
 func (r *EventRecord) EncodedSize() int {
-	n := 2 + len(r.AggregateID) + 4 + 8 + 2 + len(r.CommandID) + 2
+	n := 2 + len(r.AggregateID) + 4 + 8 + 2 + len(r.CommandID) + 2 + 1
 	for i := range r.Events {
 		n += 2 + len(r.Events[i].Type) + 4 + len(r.Events[i].Body)
 	}
@@ -151,15 +192,27 @@ func (r *EventRecord) EncodedSize() int {
 // ScatterSize is the number of bytes EncodeScatter needs in its scratch
 // buffer: everything in the frame except the event bodies.
 func (r *EventRecord) ScatterSize() int {
-	n := 4 + 2 + len(r.AggregateID) + 4 + 8 + 2 + len(r.CommandID) + 2
+	n := 4 + 2 + len(r.AggregateID) + 4 + 8 + 2 + len(r.CommandID) + 2 + 1
 	for i := range r.Events {
 		n += 2 + len(r.Events[i].Type) + 4
 	}
 	return n
 }
 
-// Validate checks field-length limits and non-empty events.
+// Validate checks field-length limits, non-empty events and the codec gate.
+// A compressed record is checked only shallowly — the gzip magic on each
+// body — because the server never inflates: full-stream integrity belongs to
+// the reader library (and to gzip's own trailer). Bodies are size-checked as
+// stored bytes; a gzip stream is always shorter than its input, so the
+// ceiling holds for the original payloads too, and the reader's own limits
+// guard against bombs.
 func (r *EventRecord) Validate() error {
+	if r.Codec&flagsRsvdMask != 0 {
+		return fmt.Errorf("%w: flags reserved bits set", ErrBadRequest)
+	}
+	if r.Codec > CodecMax {
+		return fmt.Errorf("%w: unknown codec %d", ErrBadRequest, r.Codec)
+	}
 	if r.AggregateID == "" {
 		return fmt.Errorf("%w: empty aggregate_id", ErrBadRequest)
 	}
@@ -188,11 +241,18 @@ func (r *EventRecord) Validate() error {
 		if len(r.Events[i].Body) > MaxBodySize {
 			return fmt.Errorf("%w: event body too large", ErrBadRequest)
 		}
+		if r.Codec == CodecGzip {
+			b := r.Events[i].Body
+			if len(b) < 2 || b[0] != 0x1f || b[1] != 0x8b {
+				return fmt.Errorf("%w: gzip codec but body lacks 1f8b magic", ErrBadRequest)
+			}
+		}
 	}
 	return nil
 }
 
-// EncodeBinary serialises the record including its 4-byte length prefix.
+// EncodeBinary serialises the record including its 4-byte length prefix, in
+// the current frame version (flags byte present).
 func (r *EventRecord) EncodeBinary(buf []byte) []byte {
 	size := r.EncodedSize()
 	if len(buf) < size {
@@ -208,6 +268,7 @@ func (r *EventRecord) EncodeBinary(buf []byte) []byte {
 	putU16(&rest, uint16(len(r.CommandID)))
 	putString(&rest, r.CommandID)
 	putU16(&rest, uint16(len(r.Events)))
+	rest = putU8(&rest, r.Codec)
 	for i := range r.Events {
 		putU16(&rest, uint16(len(r.Events[i].Type)))
 		putString(&rest, r.Events[i].Type)
@@ -219,9 +280,15 @@ func (r *EventRecord) EncodeBinary(buf []byte) []byte {
 }
 
 // scanRecord parses one length-prefixed record frame from buf, validating the
-// full frame shape. When withBodies is false the event bodies are validated
-// but not copied — replication lands the very bytes it received.
-func scanRecord(buf []byte, withBodies bool) (EventRecord, RecordMeta, int, error) {
+// full frame shape under the given frame version. When withBodies is false the
+// event bodies are validated but not copied — replication lands the very
+// bytes it received.
+func scanRecord(buf []byte, withBodies bool, ver uint8) (EventRecord, RecordMeta, int, error) {
+	switch ver {
+	case FrameVerLegacy, FrameVerFlags:
+	default:
+		return EventRecord{}, RecordMeta{}, 0, fmt.Errorf("unknown frame version %d", ver)
+	}
 	var r EventRecord
 	var m RecordMeta
 	if len(buf) < 4 {
@@ -274,6 +341,17 @@ func scanRecord(buf []byte, withBodies bool) (EventRecord, RecordMeta, int, erro
 	if int(count) > MaxEventsPerRec {
 		return r, m, 0, fmt.Errorf("event count %d exceeds max %d", count, MaxEventsPerRec)
 	}
+	if ver == FrameVerFlags {
+		var flags uint8
+		flags, err = takeU8(&rest)
+		if err != nil {
+			return r, m, 0, err
+		}
+		if flags&flagsRsvdMask != 0 || flags&codecMask > CodecMax {
+			return r, m, 0, fmt.Errorf("record flags %02x: unknown codec or reserved bits", flags)
+		}
+		r.Codec = flags
+	}
 	r.AggregateID, r.Version, r.UnixTime = m.AggregateID, m.Version, m.UnixTime
 	if withBodies {
 		r.Events = make([]Event, 0, count)
@@ -305,20 +383,33 @@ func scanRecord(buf []byte, withBodies bool) (EventRecord, RecordMeta, int, erro
 	return r, m, 4 + recLen, nil
 }
 
-// DecodeRecord parses one length-prefixed record from buf, materialising its
-// event bodies as fresh slices (safe to retain after buf is reused).
+// DecodeRecord parses one length-prefixed record from buf in the current
+// frame version, materialising its event bodies as fresh slices (safe to
+// retain after buf is reused).
 func DecodeRecord(buf []byte) (EventRecord, int, error) {
-	r, _, n, err := scanRecord(buf, true)
+	return DecodeRecordVer(buf, CurrentFrameVer)
+}
+
+// DecodeRecordVer parses one record frame under an explicit frame version:
+// storage passes the segment's stamped header version so sealed v1 history
+// keeps decoding byte-correct.
+func DecodeRecordVer(buf []byte, ver uint8) (EventRecord, int, error) {
+	r, _, n, err := scanRecord(buf, true, ver)
 	return r, n, err
 }
 
-// DecodeRecordMeta validates one length-prefixed record frame and returns only
-// its header fields plus the frame's total length (4+recLen). Event bodies are
-// checked for bounds but never copied and never retained: the replication hot
-// path indexes from the metadata and writes the received bytes straight
-// through.
+// DecodeRecordMeta validates one length-prefixed record frame (current
+// version) and returns only its header fields plus the frame's total length
+// (4+recLen). Event bodies are checked for bounds but never copied and never
+// retained: the replication hot path indexes from the metadata and writes the
+// received bytes straight through.
 func DecodeRecordMeta(buf []byte) (RecordMeta, int, error) {
-	_, m, n, err := scanRecord(buf, false)
+	return DecodeRecordMetaVer(buf, CurrentFrameVer)
+}
+
+// DecodeRecordMetaVer is DecodeRecordMeta with an explicit frame version.
+func DecodeRecordMetaVer(buf []byte, ver uint8) (RecordMeta, int, error) {
+	_, m, n, err := scanRecord(buf, false, ver)
 	return m, n, err
 }
 
@@ -351,6 +442,8 @@ func (r *EventRecord) EncodeScatter(scratch []byte, parts [][]byte) ([][]byte, i
 	off += copy(buf[off:], r.CommandID)
 	binary.BigEndian.PutUint16(buf[off:], uint16(len(r.Events)))
 	off += 2
+	buf[off] = r.Codec
+	off++
 
 	parts = parts[:0]
 	parts = append(parts, buf[:off])
@@ -375,6 +468,13 @@ func (r *EventRecord) EncodeScatter(scratch []byte, parts [][]byte) ([][]byte, i
 func putU16(rest *[]byte, v uint16) []byte {
 	binary.BigEndian.PutUint16(*rest, v)
 	out := (*rest)[2:]
+	*rest = out
+	return out
+}
+
+func putU8(rest *[]byte, v uint8) []byte {
+	(*rest)[0] = v
+	out := (*rest)[1:]
 	*rest = out
 	return out
 }
@@ -405,6 +505,15 @@ func takeU16(rest *[]byte) (uint16, error) {
 	}
 	v := binary.BigEndian.Uint16(*rest)
 	*rest = (*rest)[2:]
+	return v, nil
+}
+
+func takeU8(rest *[]byte) (uint8, error) {
+	if len(*rest) < 1 {
+		return 0, errors.New("truncated uint8")
+	}
+	v := (*rest)[0]
+	*rest = (*rest)[1:]
 	return v, nil
 }
 
