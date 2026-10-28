@@ -25,6 +25,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -73,6 +74,9 @@ func New(eng *cluster.Engine, store *storage.Store) *Server {
 	s.mux.HandleFunc("POST /admin/slots/{slot}/remove-replica", s.handleRemoveReplica)
 	s.mux.HandleFunc("POST /admin/cluster/plan", s.handlePlan)
 	s.mux.HandleFunc("POST /admin/cluster/replica-policy", s.handleSetReplicaPolicy)
+	s.mux.HandleFunc("POST /admin/cluster/slot-group", s.handleSetSlotGroup)
+	s.mux.HandleFunc("POST /admin/cluster/group-expand", s.handleGroupExpand)
+	s.mux.HandleFunc("GET /admin/cluster/migration", s.handleMigrationStatus)
 	s.mux.HandleFunc("POST /admin/flow-control", s.handleSetFlowControl)
 	s.mux.HandleFunc("GET /admin/flow-control", s.handleGetFlowControl)
 	s.mux.HandleFunc("DELETE /admin/flow-control", s.handleSetFlowControl)
@@ -127,18 +131,18 @@ func (g *gzipWriter) Write(b []byte) (int, error) { return g.gz.Write(b) }
 // view has no business doing either. A cold slot reports loaded=false with
 // zeroed numbers instead.
 func (s *Server) handleSlotDescribe(w http.ResponseWriter, r *http.Request) {
-	slot, err := strconv.ParseInt(r.PathValue("slot"), 10, 32)
+	logical, slot, err := s.logicalSlot(r.PathValue("slot"))
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "bad slot")
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, err.Error())
 		return
 	}
-	sl, err := s.Store.SlotIfLoaded(int32(slot))
+	sl, err := s.Store.SlotIfLoaded(slot)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, data.ErrIDBadRequest, err.Error())
 		return
 	}
 	tbl := s.Engine.TableSnapshot()
-	p := tbl.Slots[int32(slot)]
+	p := tbl.Slots[slot]
 	self := s.Engine.Self()
 	role := "none"
 	switch {
@@ -164,7 +168,7 @@ func (s *Server) handleSlotDescribe(w http.ResponseWriter, r *http.Request) {
 	// retention window). The copy is no longer part of the slot's replica
 	// set, so it is surplus data waiting to be cleaned up.
 	pendingDropAt := int64(0)
-	if t, ok := s.Engine.PendingDrop(int32(slot)); ok {
+	if t, ok := s.Engine.PendingDrop(slot); ok {
 		pendingDropAt = t.Unix()
 	}
 	// The copy's digest — the same sums the leader rebalancer and the
@@ -175,22 +179,23 @@ func (s *Server) handleSlotDescribe(w http.ResponseWriter, r *http.Request) {
 	// records its aggregate directory never adopted, so those records cannot
 	// be read on this node. Surfacing it here is what makes that visible
 	// without a leader round to notice it (see storage.Slot.SlotDigest).
-	digestAgg, digestVers, digestResolvable := s.Store.SlotDigest(int32(slot))
+	digestAgg, digestVers, digestResolvable := s.Store.SlotDigest(slot)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"slot":        slot,
-		"node":        self,
-		"role":        role,
-		"loaded":      sl != nil,
-		"last_seq":    lastSeq,
-		"hw":          s.Engine.HW(int32(slot)),
-		"segments":    segments,
-		"total_bytes": totalBytes,
-		"placement":   p,
-		"isr":         s.Engine.ISR(int32(slot)),
-		"writes":      s.Store.WriteCount(int32(slot)),
-		"aggregates":  digestAgg,
-		"versions":    digestVers,
-		"resolvable":  digestResolvable,
+		"slot":          logical,
+		"physical_slot": slot,
+		"node":          self,
+		"role":          role,
+		"loaded":        sl != nil,
+		"last_seq":      lastSeq,
+		"hw":            s.Engine.HW(slot),
+		"segments":      segments,
+		"total_bytes":   totalBytes,
+		"placement":     p,
+		"isr":           s.Engine.ISR(slot),
+		"writes":        s.Store.WriteCount(slot),
+		"aggregates":    digestAgg,
+		"versions":      digestVers,
+		"resolvable":    digestResolvable,
 		// A non-zero value means this node has queued the automatic
 		// post-migration cleanup of its local copy of the slot.
 		"pending_drop_at": pendingDropAt,
@@ -205,9 +210,9 @@ func (s *Server) handleSlotDescribe(w http.ResponseWriter, r *http.Request) {
 // here, which would walk every segment of it (storage.StreamPage has the
 // reasoning). Pages are cursor walked: ?after=<aggregate_id>&limit=<n>.
 func (s *Server) handleSlotStreams(w http.ResponseWriter, r *http.Request) {
-	slot, err := strconv.ParseInt(r.PathValue("slot"), 10, 32)
+	logical, slot, err := s.logicalSlot(r.PathValue("slot"))
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "bad slot")
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, err.Error())
 		return
 	}
 	limit := storage.DefaultStreamPage
@@ -219,22 +224,95 @@ func (s *Server) handleSlotStreams(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
-	page, err := s.Store.StreamPage(int32(slot), r.URL.Query().Get("after"), limit)
+	page, err := s.Store.StreamPage(slot, r.URL.Query().Get("after"), limit)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, data.ErrIDBadRequest, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"node":       s.Engine.Self(),
-		"slot":       page.Slot,
-		"loaded":     page.Loaded,
-		"total":      page.Total,
-		"streams":    page.Streams,
-		"next_after": page.NextAfter,
+		"node":          s.Engine.Self(),
+		"slot":          logical,
+		"physical_slot": slot,
+		"loaded":        page.Loaded,
+		"total":         page.Total,
+		"streams":       page.Streams,
+		"next_after":    page.NextAfter,
 	})
 }
 
 // ---- admin ---------------------------------------------------------------------
+
+// Admin addresses slots the way a client does: LOGICAL ids, 0 .. group_size-1.
+// The table underneath keeps physical ids (that is what the disk layout, the
+// Raft table and every placement row use), so the conversion happens here, at
+// the admin boundary, and nowhere else. An operator reading /admin/status sees
+// one number per served slot instead of a 2048-entry array of zeros.
+
+// logicalSlot resolves a path parameter into the pair the handlers need: the
+// logical id to echo back and the physical id to look up.
+func (s *Server) logicalSlot(raw string) (logical, physical int32, err error) {
+	l, perr := strconv.ParseInt(raw, 10, 32)
+	if perr != nil {
+		return 0, 0, fmt.Errorf("bad slot")
+	}
+	spec := s.Engine.GroupSpec()
+	if spec.Size <= 0 {
+		return 0, 0, fmt.Errorf("no slot generation is served")
+	}
+	if l < 0 || l >= int64(spec.Size) {
+		return 0, 0, fmt.Errorf("logical slot out of range [0, %d)", spec.Size)
+	}
+	return int32(l), spec.Physical(int32(l)), nil
+}
+
+// projectSlice re-indexes a physical-indexed array onto logical ids. Entries
+// outside the served segment are dropped: they belong to generations this
+// cluster does not serve, and reading a 0 there would be a lie.
+func projectSlice[V any](phys []V, spec cluster.SlotGroup) []V {
+	if spec.Size <= 0 {
+		return []V{}
+	}
+	out := make([]V, spec.Size)
+	for l := int32(0); l < spec.Size; l++ {
+		if p := int(spec.Physical(l)); p >= 0 && p < len(phys) {
+			out[l] = phys[p]
+		}
+	}
+	return out
+}
+
+// projectPendingViews keeps the fenced copies that belong to the served segment
+// and renumbers them onto logical ids. The view list is built per physical slot,
+// so both steps are needed (a filter would leave the wrong ids behind).
+func projectPendingViews(views []cluster.PendingSlotView, spec cluster.SlotGroup) []cluster.PendingSlotView {
+	out := make([]cluster.PendingSlotView, 0, len(views))
+	if spec.Size <= 0 {
+		return out
+	}
+	for _, v := range views {
+		if v.Slot < spec.Base || v.Slot >= spec.Base+spec.Size {
+			continue
+		}
+		v.Slot = spec.Logical(v.Slot)
+		out = append(out, v)
+	}
+	return out
+}
+
+// projectMap re-keys a physical-keyed map onto logical ids, keeping only the
+// served segment.
+func projectMap[V any](phys map[int32]V, spec cluster.SlotGroup) map[int32]V {
+	out := make(map[int32]V, spec.Size)
+	if spec.Size <= 0 {
+		return out
+	}
+	for l := int32(0); l < spec.Size; l++ {
+		if v, ok := phys[spec.Physical(l)]; ok {
+			out[l] = v
+		}
+	}
+	return out
+}
 
 // handleClusterStatus answers from THIS node's view. controller_* is the
 // machine-readable redirect the console follows to pin its traffic to the
@@ -245,11 +323,25 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	leaderID, leaderAdmin := s.Engine.Controller()
 	storageBytes, storageCount, storageComplete := s.Engine.ClusterStorageStats()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"node":       s.Engine.Self(),
-		"raft":       s.Engine.RaftStats(),
-		"peers":      tbl.Peers,
-		"slots":      tbl.Slots,
-		"slot_count": tbl.SlotCount,
+		"node":  s.Engine.Self(),
+		"raft":  s.Engine.RaftStats(),
+		"peers": tbl.Peers,
+		// slots is keyed by LOGICAL slot id (0 .. group_size-1): the same id a
+		// client routes by and an operator passes back in a path.
+		"slots": projectMap(tbl.Slots, cluster.SlotGroup{Base: tbl.GroupBase, Size: tbl.GroupSize}),
+		// slot_count is how many slots this cluster SERVES (the generation's
+		// size) — that is what "how many slots are still building" arithmetic
+		// needs. The table's physical id capacity rides separately.
+		"slot_count":          tbl.GroupSize,
+		"physical_slot_count": tbl.SlotCount,
+		// The served segment: the routing formula, the generation it belongs to,
+		// and the layout epoch clients compare against (DESIGN §4.5). Without these
+		// an operator cannot tell "which slots does this cluster actually serve"
+		// from "how many slot ids exist".
+		"group_gen":    tbl.GroupGen,
+		"group_base":   tbl.GroupBase,
+		"group_size":   tbl.GroupSize,
+		"layout_epoch": tbl.LayoutEpoch,
 		// topology is the cluster's consensus generation, read from the
 		// replicated state (cluster.Table.Topology): the value a data node
 		// fences its copies against. Every node reports the same one — a
@@ -301,9 +393,22 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	// under replMu+tableMu; calling it per field would double that per poll).
 	sLed, sSynced, sSeats := s.Engine.SyncedLeaderSlots()
 	bytesOnDisk, streams := s.Store.SlotGauges()
+	tbl := s.Engine.TableSnapshot()
+	spec := cluster.SlotGroup{Base: tbl.GroupBase, Size: tbl.GroupSize}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"node":       s.Engine.Self(),
-		"slot_count": s.Store.SlotCount,
+		"node": s.Engine.Self(),
+		// slot_count is the served generation's size: every per-slot array below
+		// has exactly this many entries, indexed by LOGICAL slot id.
+		"slot_count":          tbl.GroupSize,
+		"physical_slot_count": s.Store.SlotCount,
+		// The served segment, on the per-node view too: the console computes the
+		// sync backlog against the slots this cluster actually serves, and a node
+		// that leads none of them must not look "still building" forever.
+		"group_gen":    tbl.GroupGen,
+		"group_base":   tbl.GroupBase,
+		"group_size":   tbl.GroupSize,
+		"layout_epoch": tbl.LayoutEpoch,
+		"leader_slots": sLed,
 		// storage_count is THIS node's stored record count: the sum of the
 		// seq ledgers of the leader copies it holds (Engine.LeaderSeqTotal —
 		// its own view of the replicated table, so no fold belongs to the
@@ -314,18 +419,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		// (client appends and catch-up alike). The name pairs it against
 		// client_writes below: totals vs client-origin. Clients diff
 		// successive snapshots to derive write rates.
-		"total_writes": s.Engine.WriteCounts(),
+		"total_writes": projectSlice(s.Engine.WriteCounts(), spec),
 		// Durable record bytes per slot (frame bytes on disk), index-aligned
 		// with `total_writes`: clients diff the two arrays against their last
 		// snapshot to get a message rate and a byte rate for one window.
-		"total_write_bytes": s.Engine.WriteByteCounts(),
+		"total_write_bytes": projectSlice(s.Engine.WriteByteCounts(), spec),
 		// Client-origin counters (see Engine.ClientWriteCounts): the total
 		// pair above also grows when the catch-up paths land a leader's
 		// records here — node-to-node movement, not client write speed — so
 		// the console diffs THESE for the 写入速度 cards and the node charts.
 		// Index-aligned with `total_writes`; read at each slot's leader.
-		"client_writes":      s.Engine.ClientWriteCounts(),
-		"client_write_bytes": s.Engine.ClientWriteByteCounts(),
+		"client_writes":      projectSlice(s.Engine.ClientWriteCounts(), spec),
+		"client_write_bytes": projectSlice(s.Engine.ClientWriteByteCounts(), spec),
 		// Console gauges, one entry per slot id: on-disk bytes of THIS
 		// node's copy when it LEADS that slot (a slot it only replicates
 		// reports 0 — the byte twin of storage_count, so summing the array
@@ -333,14 +438,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		// slot this node has not loaded reads as zero instead of being
 		// opened (that would scan every segment of it) — the console takes
 		// the answer from whichever node holds the slot.
-		"storage_bytes": s.Engine.LeaderSlotBytes(bytesOnDisk),
-		"streams":       streams,
+		"storage_bytes": projectSlice(s.Engine.LeaderSlotBytes(bytesOnDisk), spec),
+		"streams":       projectSlice(streams, spec),
 		// Post-migration cleanup queue of THIS node: 0, or the unix second at
 		// which this node's local copy of the slot is due to be dropped. It is
 		// per-node by nature (only the node holding the copy knows), so the
 		// console asks every node and marks the replica whose copy is on its
 		// way out. Same shape as storage_bytes/streams.
-		"dropping": s.Engine.PendingDrops(),
+		"dropping": projectSlice(s.Engine.PendingDrops(), spec),
 		// Sync gauge for the console's 同步状态 card: [slots this node leads
 		// whose placement is complete, of those ones converged on the table's
 		// replica factor — replica set AND in-sync copies (leader included,
@@ -357,14 +462,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		// adopted. The console rides the SAME poll to hang the red 已围栏 N
 		// tag on the node's card — an independent poll per node would be pure
 		// extra traffic (same piggyback shape as synced_slots).
-		"pending_slots": s.Engine.PendingSlots(),
+		"pending_slots": projectPendingViews(s.Engine.PendingSlots(), spec),
 		// Flow control (node-level throttle of this node's slot leaders):
 		// the config currently in force, and the per-slot cumulative
 		// rejection counts index-aligned with total_writes. The console diffs
 		// successive hit arrays to mark the slots whose throttle FIRED in
 		// the last window; the config (not the hits) drives the node card's
 		// 流控 tag, which says "this node is configured to throttle".
-		"flow_control_hits": s.Engine.FlowHitsPerSlot(),
+		"flow_control_hits": projectSlice(s.Engine.FlowHitsPerSlot(), spec),
 		"flow_control":      flowControlView(s.Engine.FlowConfigForAdmin()),
 	})
 }
@@ -402,9 +507,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 // forwarding, so the console reads status, takes the controller's admin
 // address and posts here directly.
 func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
-	slot, err := strconv.ParseInt(r.PathValue("slot"), 10, 32)
+	_, slot, err := s.logicalSlot(r.PathValue("slot"))
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "bad slot")
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, err.Error())
 		return
 	}
 	var req struct {
@@ -416,7 +521,7 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), config.AdminMigrateTimeout)
 	defer cancel()
-	if err := s.Engine.MigrateSlot(ctx, int32(slot), req.ToNode); err != nil {
+	if err := s.Engine.MigrateSlot(ctx, slot, req.ToNode); err != nil {
 		if refuseNotController(w, r, err) {
 			return
 		}
@@ -438,9 +543,9 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 // handleMigrate's. The
 // removed node's local copy is deliberately NOT deleted — an operator drops it.
 func (s *Server) handleRemoveReplica(w http.ResponseWriter, r *http.Request) {
-	slot, err := strconv.ParseInt(r.PathValue("slot"), 10, 32)
+	_, slot, err := s.logicalSlot(r.PathValue("slot"))
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "bad slot")
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, err.Error())
 		return
 	}
 	var req struct {
@@ -452,7 +557,7 @@ func (s *Server) handleRemoveReplica(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), config.AdminRemoveReplicaTimeout)
 	defer cancel()
-	if err := s.Engine.RemoveReplica(ctx, int32(slot), req.Node); err != nil {
+	if err := s.Engine.RemoveReplica(ctx, slot, req.Node); err != nil {
 		if refuseNotController(w, r, err) {
 			return
 		}
@@ -488,6 +593,78 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 // entry point for every change after that.
 //
 //	POST /admin/cluster/replica-policy  {"policy":"high"}
+//
+// handleSetSlotGroup switches the served slot generation (controller-only):
+//
+//	POST /admin/cluster/slot-group  {"group":"g4"}
+//
+// It refuses while the current generation still holds records (the segment
+// migration moves them first, DESIGN §4.5.8) and answers 409 with the reason.
+// The switch itself is one Raft command: every node re-plans the new segment and
+// bumps layout_epoch, and clients holding the old epoch are told 1010 until they
+// refresh their routing table — the read side needs no epoch, because routing by
+// aggregate already lands on the new segment.
+// handleGroupExpand starts a generation migration in the background:
+//
+//	POST /admin/cluster/group-expand  {"group":"g4"}
+//
+// A segment move replays every aggregate of the served segment into the new one
+// and takes hours at the calibration target, so the call answers 202 with the
+// initial status and the operator polls GET /admin/cluster/migration. Only one
+// migration may run at a time.
+func (s *Server) handleGroupExpand(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Group string `json:"group"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Group == "" {
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "group required (e.g. g4)")
+		return
+	}
+	st, err := s.Engine.StartGroupExpand(req.Group)
+	if err != nil {
+		if refuseNotController(w, r, err) {
+			return
+		}
+		writeErr(w, http.StatusConflict, data.ErrIDBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, st)
+}
+
+// handleMigrationStatus reports the running (or last) generation migration.
+func (s *Server) handleMigrationStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.Engine.GroupMigrationStatus())
+}
+
+func (s *Server) handleSetSlotGroup(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Group string `json:"group"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Group == "" {
+		writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest, "group required (g0..g10, e.g. g4)")
+		return
+	}
+	from, err := s.Engine.SetSlotGroup(r.Context(), req.Group)
+	if err != nil {
+		if refuseNotController(w, r, err) {
+			return
+		}
+		writeErr(w, http.StatusConflict, data.ErrIDBadRequest, err.Error())
+		return
+	}
+	tbl := s.Engine.TableSnapshot()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"from_gen":          from.Gen,
+		"from_size":         from.Size,
+		"from_layout_epoch": from.Epoch,
+		"group_gen":         tbl.GroupGen,
+		"group_base":        tbl.GroupBase,
+		"group_size":        tbl.GroupSize,
+		"layout_epoch":      tbl.LayoutEpoch,
+		"slots":             len(tbl.Slots),
+	})
+}
+
 func (s *Server) handleSetReplicaPolicy(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Policy string `json:"policy"`
@@ -672,7 +849,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // by itself).
 
 func (s *Server) handlePendingSlots(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"node": s.Engine.Self(), "slots": s.Engine.PendingSlots()})
+	tbl := s.Engine.TableSnapshot()
+	spec := cluster.SlotGroup{Base: tbl.GroupBase, Size: tbl.GroupSize}
+	writeJSON(w, http.StatusOK, map[string]any{"node": s.Engine.Self(),
+		"slots": projectPendingViews(s.Engine.PendingSlots(), spec)})
 }
 
 // handleAdoptPending stamps the fenced copies of THIS node and puts them
@@ -692,7 +872,25 @@ func (s *Server) handleAdoptPending(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	adopted, skipped := s.Engine.AdoptPending(req.Slots)
+	// The body names LOGICAL slots (the ids every other admin surface speaks);
+	// the fence bookkeeping underneath is physical.
+	spec := s.Engine.GroupSpec()
+	phys := make([]int32, 0, len(req.Slots))
+	for _, l := range req.Slots {
+		if spec.Size <= 0 || l < 0 || l >= int32(spec.Size) {
+			writeErr(w, http.StatusBadRequest, data.ErrIDBadRequest,
+				fmt.Sprintf("logical slot %d out of range [0, %d)", l, spec.Size))
+			return
+		}
+		phys = append(phys, spec.Physical(l))
+	}
+	adopted, skipped := s.Engine.AdoptPending(phys)
+	// The skipped list comes back as physical ids; echo logical ones.
+	if spec.Size > 0 {
+		for i, v := range skipped {
+			skipped[i] = spec.Logical(v)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"adopted": adopted, "skipped": skipped})
 }
 
