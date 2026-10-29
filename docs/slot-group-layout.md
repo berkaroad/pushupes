@@ -12,7 +12,7 @@
 | D3 | 路由 `LogicalSlotOf(agg, size) = hash&(size-1)`（组内逻辑槽），物理 = 基址 + 逻辑 | 客户端不学基址 |
 | D13 | 术语：表里的槽位号是「物理槽位」，客户端面只说「逻辑槽位」（0..size-1），`物理 = 逻辑 + 基址`；协议按逻辑号携带，服务端换算 | 客户端不学基址，换代只换路由表 |
 | D14 | 管理面同用逻辑槽：每槽数组长度 = `group_size`，路径 `{slot}` 与 `slots` 键均为逻辑槽，`describe` 带 `physical_slot` 对照；`slot_count` = 组大小，新增 `physical_slot_count` = 2048 | 控制台的「剩余槽位」按服务槽数算 |
-| D4 | slot-000 预留，业务路由不可达；`slot_override` 概念删除（proto 字段 3 保留），预留槽没有任何读写入口 | 表里固定常量 0 + 字段冗余校验 |
+| D4 | slot-000 预留，业务路由不可达，没有任何读写入口 | 表里固定常量 0 |
 | D5 | g0~g2 仅开发/测试，g3 起生产 | 生产最小代的规模门槛见 DESIGN §7.2.7 |
 | D6 | 满配 1024 节点 × 1 活跃槽 × 1e9 条 = 1.06 PiB 逻辑 | 硬上限：节点数与活跃槽同时到顶 |
 | D7 | 跳代扩容允许（g_src → g_dst，dst > src+1） | 数据一次迁到位，实例可分批上线 |
@@ -42,10 +42,10 @@
 - 引用点全量替换：`internal/grpcapi/server.go:278/401/488/519/568`、`pkg/client/client.go:848`、`cmd/*`
 
 ### C 协议面
-- `proto/pushupes/v1/events.proto`：`PrefetchRoutesResponse` 加 `group_gen/group_base/group_size/layout_epoch`；`BatchAppendRequest` 加 `layout_epoch` 与 `optional int32 slot_override`；跑 `scripts/genproto.sh`
+- `proto/pushupes/v1/events.proto`：`PrefetchRoutesResponse` 加 `group_gen/group_base/group_size/layout_epoch`；`BatchAppendRequest` 加 `layout_epoch`；跑 `scripts/genproto.sh`
 - `internal/grpcapi/server.go`：分组与四个读 RPC 改组路由；epoch 不符回 1010；无代（GroupSize=0）直接拒绝写入
-- `internal/data/errs.go` + DESIGN 错误表 + proto 注释：新增 1010 GROUP_MISMATCH（1011 SLOT_NOT_RESERVED 已随 slot_override 一并删除）
-- `pkg/client/client.go`：routeTable 持 (base,size,epoch)；1010 → 刷新 PrefetchRoutes 并计入 Attempts；预留槽 override 透传
+- `internal/data/errs.go` + DESIGN 错误表 + proto 注释：新增 1010 GROUP_MISMATCH
+- `pkg/client/client.go`：routeTable 持 (size,epoch)；1010 → 刷新 PrefetchRoutes 并计入 Attempts；路由只产出逻辑槽号
 
 ### D 布局表与规划
 - `internal/cluster/table.go:103` Table 加 GroupGen/GroupBase/GroupSize/LayoutEpoch/ReservedSlot；`Clone` 显式携带；新 `OpSetGroup`（apply 校验 base=size=2^gen、段落 1..2047、互不重叠、epoch 单调）
@@ -68,7 +68,7 @@
 - 回滚：replay 失败丢弃目标段；切换后不可回滚（与 leader_move 同口径）
 
 ### F 工具与脚本
-- `cmd/bench`：组路由 + `-slot-override 0` + 打印组参数
+- `cmd/bench`：组路由 + 打印组参数
 - `cmd/slotcheck`：只扫活跃段
 - `cmd/seed / grpccheck / batchsmoke / flowcheck / writeping`：槽计算与断言
 - `scripts/cluster.sh`（status 解析）、`scripts/admin-storage-check.py`（数组长度）、`policy-flip-writes.sh`、`check-leader-ring.py`

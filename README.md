@@ -220,6 +220,7 @@ medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(�
 | `-adopt-interval` | `PUSHUPES_ADOPT_INTERVAL` | 3s | 尚未成为集群成员的节点每隔多久向 `-join` 目标重试一次自报（多地址轮转，个别成员不可达不影响加入） |
 | `-bootstrap` | — | false | 由本节点撰写集群的初始配置：配合 `-peers` 用于点名非最小 id 的作者；单独使用（无 `-peers`）时撰写只有自己的单 voter 配置，后续 voter 用 `-join` 加入。learner 不能撰写，与 `-join` 同用启动即报错 |
 | `-replica-policy` | `PUSHUPES_REPLICA_POLICY` | medium | 副本策略档位：`low`=每槽 1 份、`medium`=2 份（默认）、`high`=每槽 3 份（容忍失去 2 个数据节点），或**正整数直接指定副本因子**。**只用于新集群的初始值**：策略存放在 Raft 复制的槽表里，之后只能经 `POST /admin/cluster/replica-policy` 修改，重启不会重刷；副本因子 = MIN(数据节点数（布局池 `HostingIDs()`）, 策略要求份数)。`GET /admin/cluster/status` 的 `replica_policy` / `replica_factor` 读回当前值；非法值启动即报错 |
+| `-slot-group` | `PUSHUPES_SLOT_GROUP` | g3 | 新集群服务的槽位代：`g0`..`g10`（g0 = 1 个槽、g3 = 8 个、g10 = 1024 个；代 g 的物理槽段是 `[2^g, 2^(g+1))`，各代段互不重叠，g0..g2 仅用于开发与测试）。**只用于新集群的第一次布局**——代存在 Raft 复制的槽表里，节点启动参数不会改写已有集群；客户端按代内的逻辑槽号路由（物理 = 基址 + 逻辑），非法值启动即报错 |
 | `-flush-messages` | `PUSHUPES_FLUSH_MESSAGES` | 1000 | 每 N 条 fsync（0 关闭）——这是无人等待时的后台节奏；写入确认不等窗口：停靠的确认即时触发该槽的组提交轮，合批 = 一轮 fsync 期间积累的全部追加 |
 | `-flush-interval` | `PUSHUPES_FLUSH_INTERVAL` | 100ms | 每周期 fsync（0 关闭）——同上，只定后台节奏；确认路径的本地落盘腿付的是 fsync 时长与队列深度，复制高水位腿与它并行，ack ≈ 两腿取最大 |
 | `-flush-parallelism` | `PUSHUPES_FLUSH_PARALLELISM` | 1 | 全存储同时在飞的段 fsync 上限（1=一次刷一个，即历史单刷盘链路）：一个许可信号量给所有 fsync 封顶，刷盘队列由持久 worker 池执行；显式 `Flush()`/`Close` 的 fsync 也在调用方 goroutine 上取同一许可、同受上限约束。刷盘轮按预算切片（每轮至多 8 个单元或 200ms）。<1 启动即报错；生效值可从 `/admin/stats` 的 `parallelism` 字段读回（机制见 DESIGN §3） |
@@ -263,16 +264,20 @@ resp, err := cl.ReadStream(ctx, "agg-1", fromVersion, 100)  // 读：按版本�
 - `ReadVersionByTime`：取「该时间点及之前」的最大版本锚点，再用 `ReadStream` 回放。
 - `ReadByCommand`：按 `command_id` 查已写入的记录（幂等排查用）。
 
-**调用方需要处理的错误 ID**（其余都被库消化掉了）：
+**错误 ID 表**（定义在 `pkg/client/errs.go`，服务端 `internal/data` 只做同号别名；编号从 1001 起连续、无保留号）：
 
-- `1001` 版本冲突（附 `current_version`）：按应答给出的版本重发即可。
-- `1002` 参数非法：批内 `aggregate_id` 重复、字段越界等，整组不执行。
-- `1003` MOVED / `1004` ASK：`pkg/client` 自动跟随；用库时看不到这两个码。
-- `1005` 节点级流控拒绝（见「节点级流控」）：用库时被吸收为回压，调用方看不到；直连 gRPC 才需要自己退避。
-- `1006` 本地副本来源未证实：owner 围栏拦下该槽——leader 拒写、本地读答空。数据没丢，但 client 面没有可自愈的动作，要运维确认该副本属于当前世代后采纳、或删掉该槽目录才解除（命令在 admin 面，见 DESIGN §3.1）。
-- `1007` 确认等待超时：记录**已落 leader WAL**，只是同步副本高水位或 leader 本地 fsync 没等到。带同一 `command_id` 重试会命中 exists——重试即确认，不是重写。
-- `1008` 本节点是该槽 leader 但暂不可服务（无本地副本，或副本是空壳而别处有历史）：**什么都没写**，稍后重试即可。
-- `1009` 纯控制面节点：集群还没有数据面成员持有该槽（布局未规划）。什么都没写，重试无用，需要先规划布局（admin 面的运维动作）。
+| 错误 ID | 名称 | 含义 | 调用方动作 |
+|---|---|---|---|
+| 1001 | ERR_VERSION_CONFLICT | 版本非递增 1（应答附 `current_version`） | 按应答给出的版本重发 |
+| 1002 | ERR_BAD_REQUEST | 参数非法：批内 `aggregate_id` 重复、字段越界等 | 整组不执行，修请求后重发 |
+| 1003 | ERR_SLOT_NOT_LOCAL | 槽不在本节点（MOVED，应答带槽 leader 的 client 地址） | `pkg/client` 自动跟随重发；直连 gRPC 时按 `node` 重发 |
+| 1004 | ERR_MIGRATING | 槽迁移中（ASK，应答带目标节点） | `pkg/client` 自动跟随重发；直连时按 `node` 重发 |
+| 1005 | ERR_FLOW_CONTROL | 本节点流控拒绝，未写入 | 用库时被吸收为回压；直连时自行退避重试 |
+| 1006 | ERR_SLOT_UNPROVEN | 本地副本来源未证实（owner 围栏）：leader 拒写、本地读答空 | client 面没有自愈动作；运维确认该副本属于当前世代后采纳，或删掉该槽目录 |
+| 1007 | ERR_ACK_TIMEOUT | 确认等待超时，记录**已落 leader WAL**（同步副本高水位或 leader 本地 fsync 未在期限内覆盖） | 带同一 `command_id` 重试即命中 exists——重试即确认，不是重写 |
+| 1008 | ERR_REPLICA_CATCHING_UP | 本节点是该槽 leader 但暂无可用本地副本（无副本 / 空壳副本），未写入 | 稍后重试 |
+| 1009 | ERR_NO_DATA_PLANE | 纯控制面成员（集群尚无数据面成员持有该槽），未写入 | 重试无用；先规划布局（admin 面运维动作） |
+| 1010 | ERR_GROUP_MISMATCH | 请求的 `layout_epoch` 与当前布局不符，或集群尚未服务任何槽位代，整批未执行 | 重新拉取 `PrefetchRoutes`（拿到新的 `layout_epoch` 与代）后重试 |
 
 仓库自带工具：
 

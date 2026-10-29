@@ -273,12 +273,11 @@ func (s *Server) BatchAppend(ctx context.Context, req *pushupesv1.BatchAppendReq
 		return out, nil
 	}
 
-	// Layout gate first: a stale layout_epoch means the client routes by a
-	// generation this cluster no longer serves (1010: refresh PrefetchRoutes and
-	// retry), and a slot_override outside the reserved slot is a client bug
-	// (1011: retrying cannot help). Both are answerable per record and neither
-	// executes anything. layout_epoch 0 means "no opinion" and is accepted, so a
-	// client that never fetched a table keeps working.
+	// Layout gate first: a stale layout_epoch — or a table that serves no
+	// generation at all — means the client routes by something this cluster does
+	// not serve (1010: refresh PrefetchRoutes and retry). It is answerable per
+	// record and executes nothing. layout_epoch 0 means "no opinion" and is
+	// accepted, so a client that never fetched a table keeps working.
 	spec := s.engine.GroupSpec()
 	if errID, msg := batchRejection(req.LayoutEpoch, spec); errID != 0 {
 		for i, r := range req.Records {

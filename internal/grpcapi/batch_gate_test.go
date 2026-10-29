@@ -10,10 +10,6 @@ import (
 // TestBatchRejection pins the pre-execution refusal of BatchAppend: a stale
 // layout_epoch is retryable after a route refresh (1010), and a zero epoch is
 // "no opinion" — a client that never fetched a table keeps working.
-//
-// There used to be a second refusal here for slot_override; the concept is gone
-// (routing is always the generation's, and the reserved slot has no entry at
-// all), so the only gate left is the layout epoch.
 func TestBatchRejection(t *testing.T) {
 	spec := cluster.SlotGroup{Gen: 10, Base: 1024, Size: 1024, Epoch: 7}
 

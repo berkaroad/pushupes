@@ -553,9 +553,8 @@ func LogicalSlotOf(aggregateID string, size int) int32 {
 }
 
 // ReservedSlot is the one slot business routing can never produce: every
-// generation starts at slot-001, so index 0 stays free as the reserved
-// performance slot (DESIGN §7.2.7). A BatchAppend slot_override naming it is
-// the only override accepted.
+// generation starts at slot-001, so index 0 stays free as the reserved slot
+// (DESIGN §7.2.7). No client-facing call can address it.
 const ReservedSlot int32 = 0
 
 // ---- Append result --------------------------------------------------------
