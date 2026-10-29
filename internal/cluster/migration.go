@@ -726,7 +726,7 @@ func (e *Engine) HandleDropSlot(slot int32, from string) error {
 
 // peerDropSlot asks a target to discard its local copy of a slot.
 func (e *Engine) peerDropSlot(ctx context.Context, addr string, slot int32, self string) error {
-	c, err := e.peerRPC(addr)
+	c, err := e.peerData(addr)
 	if err != nil {
 		return err
 	}
@@ -749,7 +749,7 @@ func (e *Engine) HandleSlotFlush(slot int32) (uint64, error) {
 // peerDurableLEO asks a peer to flush one slot and answers the offset it holds
 // on disk afterwards.
 func (e *Engine) peerDurableLEO(ctx context.Context, addr string, slot int32) (uint64, error) {
-	c, err := e.peerRPC(addr)
+	c, err := e.peerData(addr)
 	if err != nil {
 		return 0, err
 	}

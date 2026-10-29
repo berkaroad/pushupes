@@ -325,7 +325,7 @@ func (e *Engine) replaySourceSlots(ctx context.Context, tbl *Table, slots []int3
 		}
 		after := ""
 		for {
-			cli, err := e.peers.client(srcAddr)
+			cli, err := e.peerData(srcAddr)
 			if err != nil {
 				return err
 			}
@@ -343,7 +343,7 @@ func (e *Engine) replaySourceSlots(ctx context.Context, tbl *Table, slots []int3
 				if dstAddr == "" {
 					return fmt.Errorf("group expand: destination slot %d leader %s has no peer address", dst, dpl.Leader)
 				}
-				dcli, err := e.peers.client(dstAddr)
+				dcli, err := e.peerData(dstAddr)
 				if err != nil {
 					return err
 				}
@@ -546,7 +546,7 @@ func (e *Engine) segmentGap(ctx context.Context, tbl *Table, src []int32, want S
 		if addr == "" {
 			return 0, nil
 		}
-		cli, err := e.peers.client(addr)
+		cli, err := e.peerData(addr)
 		if err != nil {
 			return 0, err
 		}
@@ -587,7 +587,7 @@ func (e *Engine) freezeSourceSlots(ctx context.Context, tbl *Table, src []int32)
 		if addr == "" {
 			continue
 		}
-		cli, err := e.peers.client(addr)
+		cli, err := e.peerData(addr)
 		if err != nil {
 			continue
 		}
@@ -604,7 +604,7 @@ func (e *Engine) freezeSourceSlots(ctx context.Context, tbl *Table, src []int32)
 // safe to call twice (ThawSlot is a no-op on an open gate).
 func (e *Engine) thawSourceSlots(ctx context.Context, frozen map[string][]int32) {
 	for addr, slots := range frozen {
-		cli, err := e.peers.client(addr)
+		cli, err := e.peerData(addr)
 		if err != nil {
 			continue
 		}

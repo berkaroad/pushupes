@@ -2040,7 +2040,7 @@ func (e *Engine) reportLeaderUnreachable(suspect string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), config.PeerPingTimeout)
 		defer cancel()
-		c, err := e.peerRPC(addr)
+		c, err := e.peerController(addr)
 		if err != nil {
 			return
 		}

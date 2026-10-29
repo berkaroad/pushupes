@@ -604,7 +604,7 @@ func TestUnreachableQuorumMarksPeerDown(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	cli := pushupesv1.NewPeerServiceClient(conn)
+	cli := pushupesv1.NewControllerPeerServiceClient(conn) // ReportUnreachable is control-plane
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	report := func(reporter, suspect string) {

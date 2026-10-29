@@ -405,7 +405,7 @@ func (l *learnerNode) stream(addr string) error {
 	}
 	l.mu.Unlock()
 
-	stream, err := pushupesv1.NewPeerServiceClient(conn).WatchLayout(ctx, req)
+	stream, err := pushupesv1.NewControllerPeerServiceClient(conn).WatchLayout(ctx, req)
 	if err != nil {
 		return fmt.Errorf("watch layout at %s: %w", addr, err)
 	}

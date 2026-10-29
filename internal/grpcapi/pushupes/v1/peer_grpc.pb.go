@@ -19,39 +19,27 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	PeerService_Ping_FullMethodName               = "/pushupes.v1.PeerService/Ping"
-	PeerService_Register_FullMethodName           = "/pushupes.v1.PeerService/Register"
-	PeerService_Adopt_FullMethodName              = "/pushupes.v1.PeerService/Adopt"
-	PeerService_MFetch_FullMethodName             = "/pushupes.v1.PeerService/MFetch"
-	PeerService_ReplicaProgress_FullMethodName    = "/pushupes.v1.PeerService/ReplicaProgress"
-	PeerService_Replicate_FullMethodName          = "/pushupes.v1.PeerService/Replicate"
-	PeerService_ReplicateAggregate_FullMethodName = "/pushupes.v1.PeerService/ReplicateAggregate"
-	PeerService_SlotStreams_FullMethodName        = "/pushupes.v1.PeerService/SlotStreams"
-	PeerService_ReplayInto_FullMethodName         = "/pushupes.v1.PeerService/ReplayInto"
-	PeerService_SlotLeo_FullMethodName            = "/pushupes.v1.PeerService/SlotLeo"
-	PeerService_FenceSlot_FullMethodName          = "/pushupes.v1.PeerService/FenceSlot"
-	PeerService_FreezeSlot_FullMethodName         = "/pushupes.v1.PeerService/FreezeSlot"
-	PeerService_ThawSlot_FullMethodName           = "/pushupes.v1.PeerService/ThawSlot"
-	PeerService_SlotLeader_FullMethodName         = "/pushupes.v1.PeerService/SlotLeader"
-	PeerService_DropSlot_FullMethodName           = "/pushupes.v1.PeerService/DropSlot"
-	PeerService_ReportUnreachable_FullMethodName  = "/pushupes.v1.PeerService/ReportUnreachable"
-	PeerService_SlotLeos_FullMethodName           = "/pushupes.v1.PeerService/SlotLeos"
-	PeerService_SlotSizes_FullMethodName          = "/pushupes.v1.PeerService/SlotSizes"
-	PeerService_WatchLayout_FullMethodName        = "/pushupes.v1.PeerService/WatchLayout"
+	ControllerPeerService_Ping_FullMethodName              = "/pushupes.v1.ControllerPeerService/Ping"
+	ControllerPeerService_Register_FullMethodName          = "/pushupes.v1.ControllerPeerService/Register"
+	ControllerPeerService_Adopt_FullMethodName             = "/pushupes.v1.ControllerPeerService/Adopt"
+	ControllerPeerService_ReportUnreachable_FullMethodName = "/pushupes.v1.ControllerPeerService/ReportUnreachable"
+	ControllerPeerService_WatchLayout_FullMethodName       = "/pushupes.v1.ControllerPeerService/WatchLayout"
 )
 
-// PeerServiceClient is the client API for PeerService service.
+// ControllerPeerServiceClient is the client API for ControllerPeerService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// PeerService is the inter-node data plane. It is served on the SAME port
-// as the Raft transport (the peer port): the connection demux routes the
-// HTTP/2 preface (first byte 'P') here and every other first byte to
-// Raft. All node-to-node communication — replication fetch, LEO progress,
-// commit-fence forwarding, liveness probing and address
-// registration — rides this one gRPC surface; the admin port is
-// management-only.
-type PeerServiceClient interface {
+// The inter-node surface is split by responsibility — control plane vs data
+// plane — not by port: both services are served on the SAME peer port as the
+// Raft transport (the demux sends the HTTP/2 preface, first byte 'P', here and
+// every other first byte to Raft). Every node registers both; what it can
+// actually answer follows its role, and the per-RPC notes say what a node
+// that holds nothing answers.
+//
+// ControllerPeerService is the control-plane half: membership, layout
+// distribution, and the liveness view the controller acts on.
+type ControllerPeerServiceClient interface {
 	// Ping is the liveness probe (controller failover).
 	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
 	// Register announces a node's admin/client addresses into the routing
@@ -63,6 +51,324 @@ type PeerServiceClient interface {
 	// after the cluster was formed would have to be typed into an operator's
 	// admin call by hand. Non-leaders relay to the leader, like Register.
 	Adopt(ctx context.Context, in *AdoptRequest, opts ...grpc.CallOption) (*AdoptResponse, error)
+	// ReportUnreachable is a follower's evidence that a node it fetches slot
+	// data from stopped answering at the transport level. It is sent to the
+	// CONTROLLER (a follower's report is a witness, not a verdict): the
+	// controller acts on a quorum of witnesses instead of waiting out its own
+	// probe threshold. Best effort — a dropped report costs a probe round, and
+	// the liveness sweep remains the fallback when nobody is watching.
+	ReportUnreachable(ctx context.Context, in *ReportUnreachableRequest, opts ...grpc.CallOption) (*ReportUnreachableResponse, error)
+	// WatchLayout is the data-plane node's feed: a node running with
+	// role=learner holds slot replicas but is not a voter (DESIGN §12), so it
+	// takes the replicated metadata from here instead of running a Raft group.
+	// Only the leader serves it (any voter answers with a REDIRECT frame naming
+	// the leader, and the caller re-dials). The server side streams the state
+	// machine's inputs — HELLO (leader, term, voter set, generation), ENTRY
+	// (committed command), COMMIT (progress) and SNAPSHOT (rebuild-from-here) —
+	// and closes the stream when the caller falls too far behind to keep in a
+	// bounded buffer: the caller reconnects, reports what it applied, and is
+	// either caught up incrementally or handed an image.
+	WatchLayout(ctx context.Context, in *WatchLayoutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchLayoutResponse], error)
+}
+
+type controllerPeerServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewControllerPeerServiceClient(cc grpc.ClientConnInterface) ControllerPeerServiceClient {
+	return &controllerPeerServiceClient{cc}
+}
+
+func (c *controllerPeerServiceClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PingResponse)
+	err := c.cc.Invoke(ctx, ControllerPeerService_Ping_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controllerPeerServiceClient) Register(ctx context.Context, in *RegisterRequest, opts ...grpc.CallOption) (*RegisterResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RegisterResponse)
+	err := c.cc.Invoke(ctx, ControllerPeerService_Register_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controllerPeerServiceClient) Adopt(ctx context.Context, in *AdoptRequest, opts ...grpc.CallOption) (*AdoptResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AdoptResponse)
+	err := c.cc.Invoke(ctx, ControllerPeerService_Adopt_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controllerPeerServiceClient) ReportUnreachable(ctx context.Context, in *ReportUnreachableRequest, opts ...grpc.CallOption) (*ReportUnreachableResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportUnreachableResponse)
+	err := c.cc.Invoke(ctx, ControllerPeerService_ReportUnreachable_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controllerPeerServiceClient) WatchLayout(ctx context.Context, in *WatchLayoutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchLayoutResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ControllerPeerService_ServiceDesc.Streams[0], ControllerPeerService_WatchLayout_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchLayoutRequest, WatchLayoutResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ControllerPeerService_WatchLayoutClient = grpc.ServerStreamingClient[WatchLayoutResponse]
+
+// ControllerPeerServiceServer is the server API for ControllerPeerService service.
+// All implementations must embed UnimplementedControllerPeerServiceServer
+// for forward compatibility.
+//
+// The inter-node surface is split by responsibility — control plane vs data
+// plane — not by port: both services are served on the SAME peer port as the
+// Raft transport (the demux sends the HTTP/2 preface, first byte 'P', here and
+// every other first byte to Raft). Every node registers both; what it can
+// actually answer follows its role, and the per-RPC notes say what a node
+// that holds nothing answers.
+//
+// ControllerPeerService is the control-plane half: membership, layout
+// distribution, and the liveness view the controller acts on.
+type ControllerPeerServiceServer interface {
+	// Ping is the liveness probe (controller failover).
+	Ping(context.Context, *PingRequest) (*PingResponse, error)
+	// Register announces a node's admin/client addresses into the routing
+	// table (leader commits an OpRegister; non-leaders relay).
+	Register(context.Context, *RegisterRequest) (*RegisterResponse, error)
+	// Adopt is a node announcing itself to the cluster it is joining: the node
+	// is running but is not a voter yet, so it names itself (id + peer address)
+	// and the leader adds it to the configuration. Without it a node started
+	// after the cluster was formed would have to be typed into an operator's
+	// admin call by hand. Non-leaders relay to the leader, like Register.
+	Adopt(context.Context, *AdoptRequest) (*AdoptResponse, error)
+	// ReportUnreachable is a follower's evidence that a node it fetches slot
+	// data from stopped answering at the transport level. It is sent to the
+	// CONTROLLER (a follower's report is a witness, not a verdict): the
+	// controller acts on a quorum of witnesses instead of waiting out its own
+	// probe threshold. Best effort — a dropped report costs a probe round, and
+	// the liveness sweep remains the fallback when nobody is watching.
+	ReportUnreachable(context.Context, *ReportUnreachableRequest) (*ReportUnreachableResponse, error)
+	// WatchLayout is the data-plane node's feed: a node running with
+	// role=learner holds slot replicas but is not a voter (DESIGN §12), so it
+	// takes the replicated metadata from here instead of running a Raft group.
+	// Only the leader serves it (any voter answers with a REDIRECT frame naming
+	// the leader, and the caller re-dials). The server side streams the state
+	// machine's inputs — HELLO (leader, term, voter set, generation), ENTRY
+	// (committed command), COMMIT (progress) and SNAPSHOT (rebuild-from-here) —
+	// and closes the stream when the caller falls too far behind to keep in a
+	// bounded buffer: the caller reconnects, reports what it applied, and is
+	// either caught up incrementally or handed an image.
+	WatchLayout(*WatchLayoutRequest, grpc.ServerStreamingServer[WatchLayoutResponse]) error
+	mustEmbedUnimplementedControllerPeerServiceServer()
+}
+
+// UnimplementedControllerPeerServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedControllerPeerServiceServer struct{}
+
+func (UnimplementedControllerPeerServiceServer) Ping(context.Context, *PingRequest) (*PingResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Ping not implemented")
+}
+func (UnimplementedControllerPeerServiceServer) Register(context.Context, *RegisterRequest) (*RegisterResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Register not implemented")
+}
+func (UnimplementedControllerPeerServiceServer) Adopt(context.Context, *AdoptRequest) (*AdoptResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Adopt not implemented")
+}
+func (UnimplementedControllerPeerServiceServer) ReportUnreachable(context.Context, *ReportUnreachableRequest) (*ReportUnreachableResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportUnreachable not implemented")
+}
+func (UnimplementedControllerPeerServiceServer) WatchLayout(*WatchLayoutRequest, grpc.ServerStreamingServer[WatchLayoutResponse]) error {
+	return status.Error(codes.Unimplemented, "method WatchLayout not implemented")
+}
+func (UnimplementedControllerPeerServiceServer) mustEmbedUnimplementedControllerPeerServiceServer() {}
+func (UnimplementedControllerPeerServiceServer) testEmbeddedByValue()                               {}
+
+// UnsafeControllerPeerServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ControllerPeerServiceServer will
+// result in compilation errors.
+type UnsafeControllerPeerServiceServer interface {
+	mustEmbedUnimplementedControllerPeerServiceServer()
+}
+
+func RegisterControllerPeerServiceServer(s grpc.ServiceRegistrar, srv ControllerPeerServiceServer) {
+	// If the following call panics, it indicates UnimplementedControllerPeerServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&ControllerPeerService_ServiceDesc, srv)
+}
+
+func _ControllerPeerService_Ping_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControllerPeerServiceServer).Ping(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControllerPeerService_Ping_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControllerPeerServiceServer).Ping(ctx, req.(*PingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControllerPeerService_Register_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControllerPeerServiceServer).Register(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControllerPeerService_Register_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControllerPeerServiceServer).Register(ctx, req.(*RegisterRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControllerPeerService_Adopt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AdoptRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControllerPeerServiceServer).Adopt(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControllerPeerService_Adopt_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControllerPeerServiceServer).Adopt(ctx, req.(*AdoptRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControllerPeerService_ReportUnreachable_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportUnreachableRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControllerPeerServiceServer).ReportUnreachable(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControllerPeerService_ReportUnreachable_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControllerPeerServiceServer).ReportUnreachable(ctx, req.(*ReportUnreachableRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControllerPeerService_WatchLayout_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchLayoutRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ControllerPeerServiceServer).WatchLayout(m, &grpc.GenericServerStream[WatchLayoutRequest, WatchLayoutResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ControllerPeerService_WatchLayoutServer = grpc.ServerStreamingServer[WatchLayoutResponse]
+
+// ControllerPeerService_ServiceDesc is the grpc.ServiceDesc for ControllerPeerService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ControllerPeerService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "pushupes.v1.ControllerPeerService",
+	HandlerType: (*ControllerPeerServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Ping",
+			Handler:    _ControllerPeerService_Ping_Handler,
+		},
+		{
+			MethodName: "Register",
+			Handler:    _ControllerPeerService_Register_Handler,
+		},
+		{
+			MethodName: "Adopt",
+			Handler:    _ControllerPeerService_Adopt_Handler,
+		},
+		{
+			MethodName: "ReportUnreachable",
+			Handler:    _ControllerPeerService_ReportUnreachable_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "WatchLayout",
+			Handler:       _ControllerPeerService_WatchLayout_Handler,
+			ServerStreams: true,
+		},
+	},
+	Metadata: "pushupes/v1/peer.proto",
+}
+
+const (
+	DataPeerService_MFetch_FullMethodName             = "/pushupes.v1.DataPeerService/MFetch"
+	DataPeerService_ReplicaProgress_FullMethodName    = "/pushupes.v1.DataPeerService/ReplicaProgress"
+	DataPeerService_Replicate_FullMethodName          = "/pushupes.v1.DataPeerService/Replicate"
+	DataPeerService_ReplicateAggregate_FullMethodName = "/pushupes.v1.DataPeerService/ReplicateAggregate"
+	DataPeerService_SlotStreams_FullMethodName        = "/pushupes.v1.DataPeerService/SlotStreams"
+	DataPeerService_ReplayInto_FullMethodName         = "/pushupes.v1.DataPeerService/ReplayInto"
+	DataPeerService_SlotLeo_FullMethodName            = "/pushupes.v1.DataPeerService/SlotLeo"
+	DataPeerService_FenceSlot_FullMethodName          = "/pushupes.v1.DataPeerService/FenceSlot"
+	DataPeerService_FreezeSlot_FullMethodName         = "/pushupes.v1.DataPeerService/FreezeSlot"
+	DataPeerService_ThawSlot_FullMethodName           = "/pushupes.v1.DataPeerService/ThawSlot"
+	DataPeerService_SlotLeader_FullMethodName         = "/pushupes.v1.DataPeerService/SlotLeader"
+	DataPeerService_DropSlot_FullMethodName           = "/pushupes.v1.DataPeerService/DropSlot"
+	DataPeerService_SlotLeos_FullMethodName           = "/pushupes.v1.DataPeerService/SlotLeos"
+	DataPeerService_SlotSizes_FullMethodName          = "/pushupes.v1.DataPeerService/SlotSizes"
+)
+
+// DataPeerServiceClient is the client API for DataPeerService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// DataPeerService is the data-plane half: everything that touches a slot's
+// content — replica fetch and progress, migration fences, copy removal, and
+// the per-slot gauges the controller reads off the nodes that hold the copies.
+type DataPeerServiceClient interface {
 	// MFetch is the multiplexed replica fetch: every slot this follower
 	// copies from the serving leader is one item; the call long-polls when
 	// everything is empty (wait_ms budget, server-held).
@@ -117,13 +423,6 @@ type PeerServiceClient interface {
 	// the copy is rebuilt from the source instead. The caller owns the slot's
 	// placement and must not be asking a node that serves it.
 	DropSlot(ctx context.Context, in *DropSlotRequest, opts ...grpc.CallOption) (*DropSlotResponse, error)
-	// ReportUnreachable is a follower's evidence that a node it fetches slot
-	// data from stopped answering at the transport level. It is sent to the
-	// CONTROLLER (a follower's report is a witness, not a verdict): the
-	// controller acts on a quorum of witnesses instead of waiting out its own
-	// probe threshold. Best effort — a dropped report costs a probe round, and
-	// the liveness sweep remains the fallback when nobody is watching.
-	ReportUnreachable(ctx context.Context, in *ReportUnreachableRequest, opts ...grpc.CallOption) (*ReportUnreachableResponse, error)
 	// SlotLeos answers the durable LEO of many slots at once. The controller asks
 	// it of every candidate before failing a node over: the failover must hand a
 	// slot's leadership to a replica that HOLDS what was acknowledged, and only
@@ -136,90 +435,49 @@ type PeerServiceClient interface {
 	// holder of a copy can report its bytes and its seq. A slot this node does
 	// not hold answers 0 on both arrays.
 	SlotSizes(ctx context.Context, in *SlotSizesRequest, opts ...grpc.CallOption) (*SlotSizesResponse, error)
-	// WatchLayout is the data-plane node's feed: a node running with
-	// role=learner holds slot replicas but is not a voter (DESIGN §12), so it
-	// takes the replicated metadata from here instead of running a Raft group.
-	// Only the leader serves it (any voter answers with a REDIRECT frame naming
-	// the leader, and the caller re-dials). The server side streams the state
-	// machine's inputs — HELLO (leader, term, voter set, generation), ENTRY
-	// (committed command), COMMIT (progress) and SNAPSHOT (rebuild-from-here) —
-	// and closes the stream when the caller falls too far behind to keep in a
-	// bounded buffer: the caller reconnects, reports what it applied, and is
-	// either caught up incrementally or handed an image.
-	WatchLayout(ctx context.Context, in *WatchLayoutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchLayoutResponse], error)
 }
 
-type peerServiceClient struct {
+type dataPeerServiceClient struct {
 	cc grpc.ClientConnInterface
 }
 
-func NewPeerServiceClient(cc grpc.ClientConnInterface) PeerServiceClient {
-	return &peerServiceClient{cc}
+func NewDataPeerServiceClient(cc grpc.ClientConnInterface) DataPeerServiceClient {
+	return &dataPeerServiceClient{cc}
 }
 
-func (c *peerServiceClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(PingResponse)
-	err := c.cc.Invoke(ctx, PeerService_Ping_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *peerServiceClient) Register(ctx context.Context, in *RegisterRequest, opts ...grpc.CallOption) (*RegisterResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(RegisterResponse)
-	err := c.cc.Invoke(ctx, PeerService_Register_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *peerServiceClient) Adopt(ctx context.Context, in *AdoptRequest, opts ...grpc.CallOption) (*AdoptResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(AdoptResponse)
-	err := c.cc.Invoke(ctx, PeerService_Adopt_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *peerServiceClient) MFetch(ctx context.Context, in *MFetchRequest, opts ...grpc.CallOption) (*MFetchResponse, error) {
+func (c *dataPeerServiceClient) MFetch(ctx context.Context, in *MFetchRequest, opts ...grpc.CallOption) (*MFetchResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(MFetchResponse)
-	err := c.cc.Invoke(ctx, PeerService_MFetch_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, DataPeerService_MFetch_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *peerServiceClient) ReplicaProgress(ctx context.Context, in *ReplicaProgressRequest, opts ...grpc.CallOption) (*ReplicaProgressResponse, error) {
+func (c *dataPeerServiceClient) ReplicaProgress(ctx context.Context, in *ReplicaProgressRequest, opts ...grpc.CallOption) (*ReplicaProgressResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReplicaProgressResponse)
-	err := c.cc.Invoke(ctx, PeerService_ReplicaProgress_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, DataPeerService_ReplicaProgress_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *peerServiceClient) Replicate(ctx context.Context, in *ReplicateRequest, opts ...grpc.CallOption) (*ReplicateResponse, error) {
+func (c *dataPeerServiceClient) Replicate(ctx context.Context, in *ReplicateRequest, opts ...grpc.CallOption) (*ReplicateResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReplicateResponse)
-	err := c.cc.Invoke(ctx, PeerService_Replicate_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, DataPeerService_Replicate_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *peerServiceClient) ReplicateAggregate(ctx context.Context, in *ReplicateAggregateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ReplicateAggregateResponse], error) {
+func (c *dataPeerServiceClient) ReplicateAggregate(ctx context.Context, in *ReplicateAggregateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ReplicateAggregateResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PeerService_ServiceDesc.Streams[0], PeerService_ReplicateAggregate_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &DataPeerService_ServiceDesc.Streams[0], DataPeerService_ReplicateAggregate_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -234,160 +492,116 @@ func (c *peerServiceClient) ReplicateAggregate(ctx context.Context, in *Replicat
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type PeerService_ReplicateAggregateClient = grpc.ServerStreamingClient[ReplicateAggregateResponse]
+type DataPeerService_ReplicateAggregateClient = grpc.ServerStreamingClient[ReplicateAggregateResponse]
 
-func (c *peerServiceClient) SlotStreams(ctx context.Context, in *SlotStreamsRequest, opts ...grpc.CallOption) (*SlotStreamsResponse, error) {
+func (c *dataPeerServiceClient) SlotStreams(ctx context.Context, in *SlotStreamsRequest, opts ...grpc.CallOption) (*SlotStreamsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SlotStreamsResponse)
-	err := c.cc.Invoke(ctx, PeerService_SlotStreams_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, DataPeerService_SlotStreams_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *peerServiceClient) ReplayInto(ctx context.Context, in *ReplayIntoRequest, opts ...grpc.CallOption) (*ReplayIntoResponse, error) {
+func (c *dataPeerServiceClient) ReplayInto(ctx context.Context, in *ReplayIntoRequest, opts ...grpc.CallOption) (*ReplayIntoResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReplayIntoResponse)
-	err := c.cc.Invoke(ctx, PeerService_ReplayInto_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, DataPeerService_ReplayInto_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *peerServiceClient) SlotLeo(ctx context.Context, in *SlotLeoRequest, opts ...grpc.CallOption) (*SlotLeoResponse, error) {
+func (c *dataPeerServiceClient) SlotLeo(ctx context.Context, in *SlotLeoRequest, opts ...grpc.CallOption) (*SlotLeoResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SlotLeoResponse)
-	err := c.cc.Invoke(ctx, PeerService_SlotLeo_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, DataPeerService_SlotLeo_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *peerServiceClient) FenceSlot(ctx context.Context, in *FenceSlotRequest, opts ...grpc.CallOption) (*FenceSlotResponse, error) {
+func (c *dataPeerServiceClient) FenceSlot(ctx context.Context, in *FenceSlotRequest, opts ...grpc.CallOption) (*FenceSlotResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(FenceSlotResponse)
-	err := c.cc.Invoke(ctx, PeerService_FenceSlot_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, DataPeerService_FenceSlot_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *peerServiceClient) FreezeSlot(ctx context.Context, in *FreezeSlotRequest, opts ...grpc.CallOption) (*FreezeSlotResponse, error) {
+func (c *dataPeerServiceClient) FreezeSlot(ctx context.Context, in *FreezeSlotRequest, opts ...grpc.CallOption) (*FreezeSlotResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(FreezeSlotResponse)
-	err := c.cc.Invoke(ctx, PeerService_FreezeSlot_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, DataPeerService_FreezeSlot_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *peerServiceClient) ThawSlot(ctx context.Context, in *ThawSlotRequest, opts ...grpc.CallOption) (*ThawSlotResponse, error) {
+func (c *dataPeerServiceClient) ThawSlot(ctx context.Context, in *ThawSlotRequest, opts ...grpc.CallOption) (*ThawSlotResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ThawSlotResponse)
-	err := c.cc.Invoke(ctx, PeerService_ThawSlot_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, DataPeerService_ThawSlot_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *peerServiceClient) SlotLeader(ctx context.Context, in *SlotLeaderRequest, opts ...grpc.CallOption) (*SlotLeaderResponse, error) {
+func (c *dataPeerServiceClient) SlotLeader(ctx context.Context, in *SlotLeaderRequest, opts ...grpc.CallOption) (*SlotLeaderResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SlotLeaderResponse)
-	err := c.cc.Invoke(ctx, PeerService_SlotLeader_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, DataPeerService_SlotLeader_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *peerServiceClient) DropSlot(ctx context.Context, in *DropSlotRequest, opts ...grpc.CallOption) (*DropSlotResponse, error) {
+func (c *dataPeerServiceClient) DropSlot(ctx context.Context, in *DropSlotRequest, opts ...grpc.CallOption) (*DropSlotResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DropSlotResponse)
-	err := c.cc.Invoke(ctx, PeerService_DropSlot_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, DataPeerService_DropSlot_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *peerServiceClient) ReportUnreachable(ctx context.Context, in *ReportUnreachableRequest, opts ...grpc.CallOption) (*ReportUnreachableResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ReportUnreachableResponse)
-	err := c.cc.Invoke(ctx, PeerService_ReportUnreachable_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *peerServiceClient) SlotLeos(ctx context.Context, in *SlotLeosRequest, opts ...grpc.CallOption) (*SlotLeosResponse, error) {
+func (c *dataPeerServiceClient) SlotLeos(ctx context.Context, in *SlotLeosRequest, opts ...grpc.CallOption) (*SlotLeosResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SlotLeosResponse)
-	err := c.cc.Invoke(ctx, PeerService_SlotLeos_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, DataPeerService_SlotLeos_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *peerServiceClient) SlotSizes(ctx context.Context, in *SlotSizesRequest, opts ...grpc.CallOption) (*SlotSizesResponse, error) {
+func (c *dataPeerServiceClient) SlotSizes(ctx context.Context, in *SlotSizesRequest, opts ...grpc.CallOption) (*SlotSizesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SlotSizesResponse)
-	err := c.cc.Invoke(ctx, PeerService_SlotSizes_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, DataPeerService_SlotSizes_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *peerServiceClient) WatchLayout(ctx context.Context, in *WatchLayoutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchLayoutResponse], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PeerService_ServiceDesc.Streams[1], PeerService_WatchLayout_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[WatchLayoutRequest, WatchLayoutResponse]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type PeerService_WatchLayoutClient = grpc.ServerStreamingClient[WatchLayoutResponse]
-
-// PeerServiceServer is the server API for PeerService service.
-// All implementations must embed UnimplementedPeerServiceServer
+// DataPeerServiceServer is the server API for DataPeerService service.
+// All implementations must embed UnimplementedDataPeerServiceServer
 // for forward compatibility.
 //
-// PeerService is the inter-node data plane. It is served on the SAME port
-// as the Raft transport (the peer port): the connection demux routes the
-// HTTP/2 preface (first byte 'P') here and every other first byte to
-// Raft. All node-to-node communication — replication fetch, LEO progress,
-// commit-fence forwarding, liveness probing and address
-// registration — rides this one gRPC surface; the admin port is
-// management-only.
-type PeerServiceServer interface {
-	// Ping is the liveness probe (controller failover).
-	Ping(context.Context, *PingRequest) (*PingResponse, error)
-	// Register announces a node's admin/client addresses into the routing
-	// table (leader commits an OpRegister; non-leaders relay).
-	Register(context.Context, *RegisterRequest) (*RegisterResponse, error)
-	// Adopt is a node announcing itself to the cluster it is joining: the node
-	// is running but is not a voter yet, so it names itself (id + peer address)
-	// and the leader adds it to the configuration. Without it a node started
-	// after the cluster was formed would have to be typed into an operator's
-	// admin call by hand. Non-leaders relay to the leader, like Register.
-	Adopt(context.Context, *AdoptRequest) (*AdoptResponse, error)
+// DataPeerService is the data-plane half: everything that touches a slot's
+// content — replica fetch and progress, migration fences, copy removal, and
+// the per-slot gauges the controller reads off the nodes that hold the copies.
+type DataPeerServiceServer interface {
 	// MFetch is the multiplexed replica fetch: every slot this follower
 	// copies from the serving leader is one item; the call long-polls when
 	// everything is empty (wait_ms budget, server-held).
@@ -442,13 +656,6 @@ type PeerServiceServer interface {
 	// the copy is rebuilt from the source instead. The caller owns the slot's
 	// placement and must not be asking a node that serves it.
 	DropSlot(context.Context, *DropSlotRequest) (*DropSlotResponse, error)
-	// ReportUnreachable is a follower's evidence that a node it fetches slot
-	// data from stopped answering at the transport level. It is sent to the
-	// CONTROLLER (a follower's report is a witness, not a verdict): the
-	// controller acts on a quorum of witnesses instead of waiting out its own
-	// probe threshold. Best effort — a dropped report costs a probe round, and
-	// the liveness sweep remains the fallback when nobody is watching.
-	ReportUnreachable(context.Context, *ReportUnreachableRequest) (*ReportUnreachableResponse, error)
 	// SlotLeos answers the durable LEO of many slots at once. The controller asks
 	// it of every candidate before failing a node over: the failover must hand a
 	// slot's leadership to a replica that HOLDS what was acknowledged, and only
@@ -461,518 +668,388 @@ type PeerServiceServer interface {
 	// holder of a copy can report its bytes and its seq. A slot this node does
 	// not hold answers 0 on both arrays.
 	SlotSizes(context.Context, *SlotSizesRequest) (*SlotSizesResponse, error)
-	// WatchLayout is the data-plane node's feed: a node running with
-	// role=learner holds slot replicas but is not a voter (DESIGN §12), so it
-	// takes the replicated metadata from here instead of running a Raft group.
-	// Only the leader serves it (any voter answers with a REDIRECT frame naming
-	// the leader, and the caller re-dials). The server side streams the state
-	// machine's inputs — HELLO (leader, term, voter set, generation), ENTRY
-	// (committed command), COMMIT (progress) and SNAPSHOT (rebuild-from-here) —
-	// and closes the stream when the caller falls too far behind to keep in a
-	// bounded buffer: the caller reconnects, reports what it applied, and is
-	// either caught up incrementally or handed an image.
-	WatchLayout(*WatchLayoutRequest, grpc.ServerStreamingServer[WatchLayoutResponse]) error
-	mustEmbedUnimplementedPeerServiceServer()
+	mustEmbedUnimplementedDataPeerServiceServer()
 }
 
-// UnimplementedPeerServiceServer must be embedded to have
+// UnimplementedDataPeerServiceServer must be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
 // pointer dereference when methods are called.
-type UnimplementedPeerServiceServer struct{}
+type UnimplementedDataPeerServiceServer struct{}
 
-func (UnimplementedPeerServiceServer) Ping(context.Context, *PingRequest) (*PingResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method Ping not implemented")
-}
-func (UnimplementedPeerServiceServer) Register(context.Context, *RegisterRequest) (*RegisterResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method Register not implemented")
-}
-func (UnimplementedPeerServiceServer) Adopt(context.Context, *AdoptRequest) (*AdoptResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method Adopt not implemented")
-}
-func (UnimplementedPeerServiceServer) MFetch(context.Context, *MFetchRequest) (*MFetchResponse, error) {
+func (UnimplementedDataPeerServiceServer) MFetch(context.Context, *MFetchRequest) (*MFetchResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method MFetch not implemented")
 }
-func (UnimplementedPeerServiceServer) ReplicaProgress(context.Context, *ReplicaProgressRequest) (*ReplicaProgressResponse, error) {
+func (UnimplementedDataPeerServiceServer) ReplicaProgress(context.Context, *ReplicaProgressRequest) (*ReplicaProgressResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReplicaProgress not implemented")
 }
-func (UnimplementedPeerServiceServer) Replicate(context.Context, *ReplicateRequest) (*ReplicateResponse, error) {
+func (UnimplementedDataPeerServiceServer) Replicate(context.Context, *ReplicateRequest) (*ReplicateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Replicate not implemented")
 }
-func (UnimplementedPeerServiceServer) ReplicateAggregate(*ReplicateAggregateRequest, grpc.ServerStreamingServer[ReplicateAggregateResponse]) error {
+func (UnimplementedDataPeerServiceServer) ReplicateAggregate(*ReplicateAggregateRequest, grpc.ServerStreamingServer[ReplicateAggregateResponse]) error {
 	return status.Error(codes.Unimplemented, "method ReplicateAggregate not implemented")
 }
-func (UnimplementedPeerServiceServer) SlotStreams(context.Context, *SlotStreamsRequest) (*SlotStreamsResponse, error) {
+func (UnimplementedDataPeerServiceServer) SlotStreams(context.Context, *SlotStreamsRequest) (*SlotStreamsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SlotStreams not implemented")
 }
-func (UnimplementedPeerServiceServer) ReplayInto(context.Context, *ReplayIntoRequest) (*ReplayIntoResponse, error) {
+func (UnimplementedDataPeerServiceServer) ReplayInto(context.Context, *ReplayIntoRequest) (*ReplayIntoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReplayInto not implemented")
 }
-func (UnimplementedPeerServiceServer) SlotLeo(context.Context, *SlotLeoRequest) (*SlotLeoResponse, error) {
+func (UnimplementedDataPeerServiceServer) SlotLeo(context.Context, *SlotLeoRequest) (*SlotLeoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SlotLeo not implemented")
 }
-func (UnimplementedPeerServiceServer) FenceSlot(context.Context, *FenceSlotRequest) (*FenceSlotResponse, error) {
+func (UnimplementedDataPeerServiceServer) FenceSlot(context.Context, *FenceSlotRequest) (*FenceSlotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method FenceSlot not implemented")
 }
-func (UnimplementedPeerServiceServer) FreezeSlot(context.Context, *FreezeSlotRequest) (*FreezeSlotResponse, error) {
+func (UnimplementedDataPeerServiceServer) FreezeSlot(context.Context, *FreezeSlotRequest) (*FreezeSlotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method FreezeSlot not implemented")
 }
-func (UnimplementedPeerServiceServer) ThawSlot(context.Context, *ThawSlotRequest) (*ThawSlotResponse, error) {
+func (UnimplementedDataPeerServiceServer) ThawSlot(context.Context, *ThawSlotRequest) (*ThawSlotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ThawSlot not implemented")
 }
-func (UnimplementedPeerServiceServer) SlotLeader(context.Context, *SlotLeaderRequest) (*SlotLeaderResponse, error) {
+func (UnimplementedDataPeerServiceServer) SlotLeader(context.Context, *SlotLeaderRequest) (*SlotLeaderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SlotLeader not implemented")
 }
-func (UnimplementedPeerServiceServer) DropSlot(context.Context, *DropSlotRequest) (*DropSlotResponse, error) {
+func (UnimplementedDataPeerServiceServer) DropSlot(context.Context, *DropSlotRequest) (*DropSlotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DropSlot not implemented")
 }
-func (UnimplementedPeerServiceServer) ReportUnreachable(context.Context, *ReportUnreachableRequest) (*ReportUnreachableResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ReportUnreachable not implemented")
-}
-func (UnimplementedPeerServiceServer) SlotLeos(context.Context, *SlotLeosRequest) (*SlotLeosResponse, error) {
+func (UnimplementedDataPeerServiceServer) SlotLeos(context.Context, *SlotLeosRequest) (*SlotLeosResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SlotLeos not implemented")
 }
-func (UnimplementedPeerServiceServer) SlotSizes(context.Context, *SlotSizesRequest) (*SlotSizesResponse, error) {
+func (UnimplementedDataPeerServiceServer) SlotSizes(context.Context, *SlotSizesRequest) (*SlotSizesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SlotSizes not implemented")
 }
-func (UnimplementedPeerServiceServer) WatchLayout(*WatchLayoutRequest, grpc.ServerStreamingServer[WatchLayoutResponse]) error {
-	return status.Error(codes.Unimplemented, "method WatchLayout not implemented")
-}
-func (UnimplementedPeerServiceServer) mustEmbedUnimplementedPeerServiceServer() {}
-func (UnimplementedPeerServiceServer) testEmbeddedByValue()                     {}
+func (UnimplementedDataPeerServiceServer) mustEmbedUnimplementedDataPeerServiceServer() {}
+func (UnimplementedDataPeerServiceServer) testEmbeddedByValue()                         {}
 
-// UnsafePeerServiceServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to PeerServiceServer will
+// UnsafeDataPeerServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to DataPeerServiceServer will
 // result in compilation errors.
-type UnsafePeerServiceServer interface {
-	mustEmbedUnimplementedPeerServiceServer()
+type UnsafeDataPeerServiceServer interface {
+	mustEmbedUnimplementedDataPeerServiceServer()
 }
 
-func RegisterPeerServiceServer(s grpc.ServiceRegistrar, srv PeerServiceServer) {
-	// If the following call panics, it indicates UnimplementedPeerServiceServer was
+func RegisterDataPeerServiceServer(s grpc.ServiceRegistrar, srv DataPeerServiceServer) {
+	// If the following call panics, it indicates UnimplementedDataPeerServiceServer was
 	// embedded by pointer and is nil.  This will cause panics if an
 	// unimplemented method is ever invoked, so we test this at initialization
 	// time to prevent it from happening at runtime later due to I/O.
 	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
 		t.testEmbeddedByValue()
 	}
-	s.RegisterService(&PeerService_ServiceDesc, srv)
+	s.RegisterService(&DataPeerService_ServiceDesc, srv)
 }
 
-func _PeerService_Ping_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(PingRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(PeerServiceServer).Ping(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: PeerService_Ping_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).Ping(ctx, req.(*PingRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _PeerService_Register_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RegisterRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(PeerServiceServer).Register(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: PeerService_Register_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).Register(ctx, req.(*RegisterRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _PeerService_Adopt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(AdoptRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(PeerServiceServer).Adopt(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: PeerService_Adopt_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).Adopt(ctx, req.(*AdoptRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _PeerService_MFetch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _DataPeerService_MFetch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(MFetchRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PeerServiceServer).MFetch(ctx, in)
+		return srv.(DataPeerServiceServer).MFetch(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PeerService_MFetch_FullMethodName,
+		FullMethod: DataPeerService_MFetch_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).MFetch(ctx, req.(*MFetchRequest))
+		return srv.(DataPeerServiceServer).MFetch(ctx, req.(*MFetchRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PeerService_ReplicaProgress_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _DataPeerService_ReplicaProgress_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReplicaProgressRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PeerServiceServer).ReplicaProgress(ctx, in)
+		return srv.(DataPeerServiceServer).ReplicaProgress(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PeerService_ReplicaProgress_FullMethodName,
+		FullMethod: DataPeerService_ReplicaProgress_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).ReplicaProgress(ctx, req.(*ReplicaProgressRequest))
+		return srv.(DataPeerServiceServer).ReplicaProgress(ctx, req.(*ReplicaProgressRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PeerService_Replicate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _DataPeerService_Replicate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReplicateRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PeerServiceServer).Replicate(ctx, in)
+		return srv.(DataPeerServiceServer).Replicate(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PeerService_Replicate_FullMethodName,
+		FullMethod: DataPeerService_Replicate_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).Replicate(ctx, req.(*ReplicateRequest))
+		return srv.(DataPeerServiceServer).Replicate(ctx, req.(*ReplicateRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PeerService_ReplicateAggregate_Handler(srv interface{}, stream grpc.ServerStream) error {
+func _DataPeerService_ReplicateAggregate_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(ReplicateAggregateRequest)
 	if err := stream.RecvMsg(m); err != nil {
 		return err
 	}
-	return srv.(PeerServiceServer).ReplicateAggregate(m, &grpc.GenericServerStream[ReplicateAggregateRequest, ReplicateAggregateResponse]{ServerStream: stream})
+	return srv.(DataPeerServiceServer).ReplicateAggregate(m, &grpc.GenericServerStream[ReplicateAggregateRequest, ReplicateAggregateResponse]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type PeerService_ReplicateAggregateServer = grpc.ServerStreamingServer[ReplicateAggregateResponse]
+type DataPeerService_ReplicateAggregateServer = grpc.ServerStreamingServer[ReplicateAggregateResponse]
 
-func _PeerService_SlotStreams_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _DataPeerService_SlotStreams_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SlotStreamsRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PeerServiceServer).SlotStreams(ctx, in)
+		return srv.(DataPeerServiceServer).SlotStreams(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PeerService_SlotStreams_FullMethodName,
+		FullMethod: DataPeerService_SlotStreams_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).SlotStreams(ctx, req.(*SlotStreamsRequest))
+		return srv.(DataPeerServiceServer).SlotStreams(ctx, req.(*SlotStreamsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PeerService_ReplayInto_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _DataPeerService_ReplayInto_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReplayIntoRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PeerServiceServer).ReplayInto(ctx, in)
+		return srv.(DataPeerServiceServer).ReplayInto(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PeerService_ReplayInto_FullMethodName,
+		FullMethod: DataPeerService_ReplayInto_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).ReplayInto(ctx, req.(*ReplayIntoRequest))
+		return srv.(DataPeerServiceServer).ReplayInto(ctx, req.(*ReplayIntoRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PeerService_SlotLeo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _DataPeerService_SlotLeo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SlotLeoRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PeerServiceServer).SlotLeo(ctx, in)
+		return srv.(DataPeerServiceServer).SlotLeo(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PeerService_SlotLeo_FullMethodName,
+		FullMethod: DataPeerService_SlotLeo_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).SlotLeo(ctx, req.(*SlotLeoRequest))
+		return srv.(DataPeerServiceServer).SlotLeo(ctx, req.(*SlotLeoRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PeerService_FenceSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _DataPeerService_FenceSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(FenceSlotRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PeerServiceServer).FenceSlot(ctx, in)
+		return srv.(DataPeerServiceServer).FenceSlot(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PeerService_FenceSlot_FullMethodName,
+		FullMethod: DataPeerService_FenceSlot_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).FenceSlot(ctx, req.(*FenceSlotRequest))
+		return srv.(DataPeerServiceServer).FenceSlot(ctx, req.(*FenceSlotRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PeerService_FreezeSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _DataPeerService_FreezeSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(FreezeSlotRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PeerServiceServer).FreezeSlot(ctx, in)
+		return srv.(DataPeerServiceServer).FreezeSlot(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PeerService_FreezeSlot_FullMethodName,
+		FullMethod: DataPeerService_FreezeSlot_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).FreezeSlot(ctx, req.(*FreezeSlotRequest))
+		return srv.(DataPeerServiceServer).FreezeSlot(ctx, req.(*FreezeSlotRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PeerService_ThawSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _DataPeerService_ThawSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ThawSlotRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PeerServiceServer).ThawSlot(ctx, in)
+		return srv.(DataPeerServiceServer).ThawSlot(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PeerService_ThawSlot_FullMethodName,
+		FullMethod: DataPeerService_ThawSlot_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).ThawSlot(ctx, req.(*ThawSlotRequest))
+		return srv.(DataPeerServiceServer).ThawSlot(ctx, req.(*ThawSlotRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PeerService_SlotLeader_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _DataPeerService_SlotLeader_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SlotLeaderRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PeerServiceServer).SlotLeader(ctx, in)
+		return srv.(DataPeerServiceServer).SlotLeader(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PeerService_SlotLeader_FullMethodName,
+		FullMethod: DataPeerService_SlotLeader_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).SlotLeader(ctx, req.(*SlotLeaderRequest))
+		return srv.(DataPeerServiceServer).SlotLeader(ctx, req.(*SlotLeaderRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PeerService_DropSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _DataPeerService_DropSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DropSlotRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PeerServiceServer).DropSlot(ctx, in)
+		return srv.(DataPeerServiceServer).DropSlot(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PeerService_DropSlot_FullMethodName,
+		FullMethod: DataPeerService_DropSlot_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).DropSlot(ctx, req.(*DropSlotRequest))
+		return srv.(DataPeerServiceServer).DropSlot(ctx, req.(*DropSlotRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PeerService_ReportUnreachable_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ReportUnreachableRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(PeerServiceServer).ReportUnreachable(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: PeerService_ReportUnreachable_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).ReportUnreachable(ctx, req.(*ReportUnreachableRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _PeerService_SlotLeos_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _DataPeerService_SlotLeos_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SlotLeosRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PeerServiceServer).SlotLeos(ctx, in)
+		return srv.(DataPeerServiceServer).SlotLeos(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PeerService_SlotLeos_FullMethodName,
+		FullMethod: DataPeerService_SlotLeos_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).SlotLeos(ctx, req.(*SlotLeosRequest))
+		return srv.(DataPeerServiceServer).SlotLeos(ctx, req.(*SlotLeosRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PeerService_SlotSizes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _DataPeerService_SlotSizes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SlotSizesRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PeerServiceServer).SlotSizes(ctx, in)
+		return srv.(DataPeerServiceServer).SlotSizes(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PeerService_SlotSizes_FullMethodName,
+		FullMethod: DataPeerService_SlotSizes_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PeerServiceServer).SlotSizes(ctx, req.(*SlotSizesRequest))
+		return srv.(DataPeerServiceServer).SlotSizes(ctx, req.(*SlotSizesRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PeerService_WatchLayout_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(WatchLayoutRequest)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(PeerServiceServer).WatchLayout(m, &grpc.GenericServerStream[WatchLayoutRequest, WatchLayoutResponse]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type PeerService_WatchLayoutServer = grpc.ServerStreamingServer[WatchLayoutResponse]
-
-// PeerService_ServiceDesc is the grpc.ServiceDesc for PeerService service.
+// DataPeerService_ServiceDesc is the grpc.ServiceDesc for DataPeerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
-var PeerService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "pushupes.v1.PeerService",
-	HandlerType: (*PeerServiceServer)(nil),
+var DataPeerService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "pushupes.v1.DataPeerService",
+	HandlerType: (*DataPeerServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "Ping",
-			Handler:    _PeerService_Ping_Handler,
-		},
-		{
-			MethodName: "Register",
-			Handler:    _PeerService_Register_Handler,
-		},
-		{
-			MethodName: "Adopt",
-			Handler:    _PeerService_Adopt_Handler,
-		},
-		{
 			MethodName: "MFetch",
-			Handler:    _PeerService_MFetch_Handler,
+			Handler:    _DataPeerService_MFetch_Handler,
 		},
 		{
 			MethodName: "ReplicaProgress",
-			Handler:    _PeerService_ReplicaProgress_Handler,
+			Handler:    _DataPeerService_ReplicaProgress_Handler,
 		},
 		{
 			MethodName: "Replicate",
-			Handler:    _PeerService_Replicate_Handler,
+			Handler:    _DataPeerService_Replicate_Handler,
 		},
 		{
 			MethodName: "SlotStreams",
-			Handler:    _PeerService_SlotStreams_Handler,
+			Handler:    _DataPeerService_SlotStreams_Handler,
 		},
 		{
 			MethodName: "ReplayInto",
-			Handler:    _PeerService_ReplayInto_Handler,
+			Handler:    _DataPeerService_ReplayInto_Handler,
 		},
 		{
 			MethodName: "SlotLeo",
-			Handler:    _PeerService_SlotLeo_Handler,
+			Handler:    _DataPeerService_SlotLeo_Handler,
 		},
 		{
 			MethodName: "FenceSlot",
-			Handler:    _PeerService_FenceSlot_Handler,
+			Handler:    _DataPeerService_FenceSlot_Handler,
 		},
 		{
 			MethodName: "FreezeSlot",
-			Handler:    _PeerService_FreezeSlot_Handler,
+			Handler:    _DataPeerService_FreezeSlot_Handler,
 		},
 		{
 			MethodName: "ThawSlot",
-			Handler:    _PeerService_ThawSlot_Handler,
+			Handler:    _DataPeerService_ThawSlot_Handler,
 		},
 		{
 			MethodName: "SlotLeader",
-			Handler:    _PeerService_SlotLeader_Handler,
+			Handler:    _DataPeerService_SlotLeader_Handler,
 		},
 		{
 			MethodName: "DropSlot",
-			Handler:    _PeerService_DropSlot_Handler,
-		},
-		{
-			MethodName: "ReportUnreachable",
-			Handler:    _PeerService_ReportUnreachable_Handler,
+			Handler:    _DataPeerService_DropSlot_Handler,
 		},
 		{
 			MethodName: "SlotLeos",
-			Handler:    _PeerService_SlotLeos_Handler,
+			Handler:    _DataPeerService_SlotLeos_Handler,
 		},
 		{
 			MethodName: "SlotSizes",
-			Handler:    _PeerService_SlotSizes_Handler,
+			Handler:    _DataPeerService_SlotSizes_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
 			StreamName:    "ReplicateAggregate",
-			Handler:       _PeerService_ReplicateAggregate_Handler,
-			ServerStreams: true,
-		},
-		{
-			StreamName:    "WatchLayout",
-			Handler:       _PeerService_WatchLayout_Handler,
+			Handler:       _DataPeerService_ReplicateAggregate_Handler,
 			ServerStreams: true,
 		},
 	},

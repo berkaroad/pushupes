@@ -4,14 +4,16 @@ package pushupes.v1;
 
 option go_package = "github.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1;pushupesv1";
 
-// PeerService is the inter-node data plane. It is served on the SAME port
-// as the Raft transport (the peer port): the connection demux routes the
-// HTTP/2 preface (first byte 'P') here and every other first byte to
-// Raft. All node-to-node communication — replication fetch, LEO progress,
-// commit-fence forwarding, liveness probing and address
-// registration — rides this one gRPC surface; the admin port is
-// management-only.
-service PeerService {
+// The inter-node surface is split by responsibility — control plane vs data
+// plane — not by port: both services are served on the SAME peer port as the
+// Raft transport (the demux sends the HTTP/2 preface, first byte 'P', here and
+// every other first byte to Raft). Every node registers both; what it can
+// actually answer follows its role, and the per-RPC notes say what a node
+// that holds nothing answers.
+//
+// ControllerPeerService is the control-plane half: membership, layout
+// distribution, and the liveness view the controller acts on.
+service ControllerPeerService {
   // Ping is the liveness probe (controller failover).
   rpc Ping(PingRequest) returns (PingResponse);
   // Register announces a node's admin/client addresses into the routing
@@ -23,6 +25,30 @@ service PeerService {
   // after the cluster was formed would have to be typed into an operator's
   // admin call by hand. Non-leaders relay to the leader, like Register.
   rpc Adopt(AdoptRequest) returns (AdoptResponse);
+  // ReportUnreachable is a follower's evidence that a node it fetches slot
+  // data from stopped answering at the transport level. It is sent to the
+  // CONTROLLER (a follower's report is a witness, not a verdict): the
+  // controller acts on a quorum of witnesses instead of waiting out its own
+  // probe threshold. Best effort — a dropped report costs a probe round, and
+  // the liveness sweep remains the fallback when nobody is watching.
+  rpc ReportUnreachable(ReportUnreachableRequest) returns (ReportUnreachableResponse);
+  // WatchLayout is the data-plane node's feed: a node running with
+  // role=learner holds slot replicas but is not a voter (DESIGN §12), so it
+  // takes the replicated metadata from here instead of running a Raft group.
+  // Only the leader serves it (any voter answers with a REDIRECT frame naming
+  // the leader, and the caller re-dials). The server side streams the state
+  // machine's inputs — HELLO (leader, term, voter set, generation), ENTRY
+  // (committed command), COMMIT (progress) and SNAPSHOT (rebuild-from-here) —
+  // and closes the stream when the caller falls too far behind to keep in a
+  // bounded buffer: the caller reconnects, reports what it applied, and is
+  // either caught up incrementally or handed an image.
+  rpc WatchLayout(WatchLayoutRequest) returns (stream WatchLayoutResponse);
+}
+
+// DataPeerService is the data-plane half: everything that touches a slot's
+// content — replica fetch and progress, migration fences, copy removal, and
+// the per-slot gauges the controller reads off the nodes that hold the copies.
+service DataPeerService {
   // MFetch is the multiplexed replica fetch: every slot this follower
   // copies from the serving leader is one item; the call long-polls when
   // everything is empty (wait_ms budget, server-held).
@@ -77,13 +103,6 @@ service PeerService {
   // the copy is rebuilt from the source instead. The caller owns the slot's
   // placement and must not be asking a node that serves it.
   rpc DropSlot(DropSlotRequest) returns (DropSlotResponse);
-  // ReportUnreachable is a follower's evidence that a node it fetches slot
-  // data from stopped answering at the transport level. It is sent to the
-  // CONTROLLER (a follower's report is a witness, not a verdict): the
-  // controller acts on a quorum of witnesses instead of waiting out its own
-  // probe threshold. Best effort — a dropped report costs a probe round, and
-  // the liveness sweep remains the fallback when nobody is watching.
-  rpc ReportUnreachable(ReportUnreachableRequest) returns (ReportUnreachableResponse);
   // SlotLeos answers the durable LEO of many slots at once. The controller asks
   // it of every candidate before failing a node over: the failover must hand a
   // slot's leadership to a replica that HOLDS what was acknowledged, and only
@@ -96,17 +115,6 @@ service PeerService {
   // holder of a copy can report its bytes and its seq. A slot this node does
   // not hold answers 0 on both arrays.
   rpc SlotSizes(SlotSizesRequest) returns (SlotSizesResponse);
-  // WatchLayout is the data-plane node's feed: a node running with
-  // role=learner holds slot replicas but is not a voter (DESIGN §12), so it
-  // takes the replicated metadata from here instead of running a Raft group.
-  // Only the leader serves it (any voter answers with a REDIRECT frame naming
-  // the leader, and the caller re-dials). The server side streams the state
-  // machine's inputs — HELLO (leader, term, voter set, generation), ENTRY
-  // (committed command), COMMIT (progress) and SNAPSHOT (rebuild-from-here) —
-  // and closes the stream when the caller falls too far behind to keep in a
-  // bounded buffer: the caller reconnects, reports what it applied, and is
-  // either caught up incrementally or handed an image.
-  rpc WatchLayout(WatchLayoutRequest) returns (stream WatchLayoutResponse);
 }
 
 // WatchLayoutRequest names the caller and the point it resumes from.

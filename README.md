@@ -9,7 +9,7 @@ leader→follower 专用拉取协议**（ISR + 高水位语义），两条链路
 ```
 客户端 ──gRPC(EventService)──▶ 槽 leader ──append-only WAL──▶ 本地落盘
                                   │
-                     follower 长轮询拉取（PeerService.MFetch，与 Raft 同端口）
+                     follower 长轮询拉取（DataPeerService.MFetch，与 Raft 同端口）
                                   │
 Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分配表 / epoch / 集群成员
 ```
@@ -17,12 +17,14 @@ Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分
 ## 集群拓扑
 
 以 **3 个控制节点 + 2 个数据节点** 为例（medium 副本策略：每槽 2 份，
-两个数据节点互为对方的副本）：
+两个数据节点互为对方的副本）。默认槽组 `g3`：本集群只服务**物理槽 8–15** 这一段
+（代 g 的段是 `[2^g, 2^(g+1))`，基址 = 大小 = 8），客户端按**逻辑槽 0–7** 寻址
+（物理 = 基址 + 逻辑），槽位表里其余 2040 个 id 不参与本代布局：
 
 ```
 客户端（CQRS 框架）
   │ gRPC EventService（client 面 85xx）：读写都直连槽 leader
-  │ 收 MOVED(1003)/ASK(1004) → 刷新本地 slot→node 路由缓存后重试
+  │ 路由表按逻辑槽 0–7 索引；收 MOVED(1003)/ASK(1004) → 刷新路由缓存后重试
   ▼
 控制面 · 3 个控制节点（role=voter）—— Raft 法定数 2/3
   ctrl-1 ◀──Raft 日志复制──▶ ctrl-2 ◀──Raft 日志复制──▶ ctrl-3
@@ -33,8 +35,8 @@ Raft（自研简化 Raft + 自研分段 WAL，仅元数据）──▶ 槽位分
   │ 探活 / 新节点报名（peer 面 83xx）
   ▼
 数据面 · 2 个数据节点（role=learner）—— 承载槽副本：append-only WAL + 派生索引
-  data-1：leader 槽 0–511 ┃ 副本 槽 512–1023
-  data-2：leader 槽 512–1023 ┃ 副本 槽 0–511
+  data-1：leader 物理槽 8,10,12,14（逻辑 0,2,4,6）┃ 副本 9,11,13,15（逻辑 1,3,5,7）
+  data-2：leader 物理槽 9,11,13,15（逻辑 1,3,5,7）┃ 副本 8,10,12,14（逻辑 0,2,4,6）
   data-1 ◀──MFetch 长轮询拉取（peer 面 83xx，与 Raft 同端口族）──▶ data-2
   follower 按 leader 分组批量拉增量，应答是裸 WAL 字节、原样落盘，
   批量回报 LEO，leader 推进 HW = ISR 内最小 LEO；
@@ -211,7 +213,7 @@ medium：1/2/3 份，或正整数直接指定副本因子；副本因子 = MIN(�
 |---|---|---|---|
 | `-node` | `PUSHUPES_NODE` | `node-1` | 节点 id |
 | `-role` | `PUSHUPES_ROLE` | 无（必填） | 节点角色，只能是两者之一：`voter`=控制面（参与选举、**不承载槽副本**）、`learner`=数据面（不投票，从控制面接收布局分发）。最小部署 = 1 个 `voter` + 1 个 `learner`；缺失或非法值启动即报错。角色由节点自报进复制目录，布局池只认 `learner` 成员。`learner` 的槽表由控制面经 `WatchLayout` 流分发（DESIGN §12.4），它不建共识组、不提交、也不报名成为投票者 |
-| `-peer` | `PUSHUPES_PEER` | `http://127.0.0.1:8391` | peer 面：Raft + PeerService gRPC（全部节点间流量，运维只需配这个端口） |
+| `-peer` | `PUSHUPES_PEER` | `http://127.0.0.1:8391` | peer 面：Raft + 节点间 gRPC（`ControllerPeerService` 成员/布局/探活、`DataPeerService` 槽数据与复制），全部节点间流量都走这个端口 |
 | `-admin` | `PUSHUPES_ADMIN` | `http://127.0.0.1:8091` | admin 面：HTTP 管理 API + pprof |
 | `-client` | `PUSHUPES_CLIENT` | `http://127.0.0.1:8591` | client 面：gRPC 事件读写唯一入口 |
 | `-data` | `PUSHUPES_DATA` | `./data` | 数据目录 |

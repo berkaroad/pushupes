@@ -57,13 +57,19 @@ const (
 // peerServer adapts Engine onto pushupesv1.PeerServiceServer. The adapter
 // is stateless: every RPC delegates to the same Engine logic the old HTTP
 // internal endpoints drove.
+// peerServer implements BOTH halves of the inter-node surface. They are
+// separate services in the proto because they answer different questions —
+// membership and layout vs slot content — but one node has one code path for
+// each RPC, so a single type satisfies both interfaces and ServePeer registers
+// it twice.
 type peerServer struct {
-	pushupesv1.UnimplementedPeerServiceServer
+	pushupesv1.UnimplementedControllerPeerServiceServer
+	pushupesv1.UnimplementedDataPeerServiceServer
 	e *Engine
 }
 
 // NewPeerServer returns the gRPC implementation of the inter-node plane.
-func (e *Engine) NewPeerServer() pushupesv1.PeerServiceServer {
+func (e *Engine) NewPeerServer() *peerServer {
 	return &peerServer{e: e}
 }
 
@@ -187,7 +193,7 @@ func (s *peerServer) Replicate(_ context.Context, req *pushupesv1.ReplicateReque
 // the re-routing: one source slot's aggregates scatter across several
 // destination slots, and a replay that resumed on a byte offset would be
 // meaningless on the other side. The last chunk carries NextVersion = 0.
-func (s *peerServer) ReplicateAggregate(req *pushupesv1.ReplicateAggregateRequest, stream pushupesv1.PeerService_ReplicateAggregateServer) error {
+func (s *peerServer) ReplicateAggregate(req *pushupesv1.ReplicateAggregateRequest, stream pushupesv1.DataPeerService_ReplicateAggregateServer) error {
 	const defRecords, defBytes = 256, 1 << 20
 	maxRecords := int(req.GetMaxRecords())
 	if maxRecords <= 0 {
@@ -264,7 +270,7 @@ func (s *peerServer) ReplayInto(ctx context.Context, req *pushupesv1.ReplayIntoR
 	if req.GetSrcAddr() == "" || req.GetAggregateId() == "" {
 		return nil, fmt.Errorf("replay_into: src_addr and aggregate_id are required")
 	}
-	cli, err := s.e.peers.client(req.GetSrcAddr())
+	cli, err := s.e.peers.data(req.GetSrcAddr())
 	if err != nil {
 		return nil, fmt.Errorf("replay_into: dial %s: %w", req.GetSrcAddr(), err)
 	}
@@ -403,11 +409,14 @@ type peerClient struct {
 
 func newPeerClient() *peerClient { return &peerClient{conns: map[string]*grpc.ClientConn{}} }
 
-func (pc *peerClient) client(addr string) (pushupesv1.PeerServiceClient, error) {
+// conn returns the cached connection to addr, dialing on first use. Both
+// service halves ride it: the split is about which RPCs you call, not about
+// opening two connections to the same node.
+func (pc *peerClient) conn(addr string) (*grpc.ClientConn, error) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	if c, ok := pc.conns[addr]; ok {
-		return pushupesv1.NewPeerServiceClient(c), nil
+		return c, nil
 	}
 	conn, err := grpc.NewClient(HostPort(addr),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -422,7 +431,25 @@ func (pc *peerClient) client(addr string) (pushupesv1.PeerServiceClient, error) 
 		return nil, err
 	}
 	pc.conns[addr] = conn
-	return pushupesv1.NewPeerServiceClient(conn), nil
+	return conn, nil
+}
+
+// controller is the control-plane stub: membership, layout feed, liveness.
+func (pc *peerClient) controller(addr string) (pushupesv1.ControllerPeerServiceClient, error) {
+	conn, err := pc.conn(addr)
+	if err != nil {
+		return nil, err
+	}
+	return pushupesv1.NewControllerPeerServiceClient(conn), nil
+}
+
+// data is the data-plane stub: replica fetch, migration fences, slot content.
+func (pc *peerClient) data(addr string) (pushupesv1.DataPeerServiceClient, error) {
+	conn, err := pc.conn(addr)
+	if err != nil {
+		return nil, err
+	}
+	return pushupesv1.NewDataPeerServiceClient(conn), nil
 }
 
 // reset drops the cached connection to addr. A ClientConn carries the backoff
@@ -461,13 +488,21 @@ func (e *Engine) peerAddr(nodeID string) string {
 	return e.table.Peers[nodeID].PeerAddr
 }
 
-// peerRPC resolves a client for a peer address ("" is a hard error: every
-// peer-plane call site must have a registered peer first).
-func (e *Engine) peerRPC(addr string) (pushupesv1.PeerServiceClient, error) {
+// peerController resolves the CONTROL-plane stub for a peer address
+// ("" is a hard error: every peer-plane call site must have a registered peer).
+func (e *Engine) peerController(addr string) (pushupesv1.ControllerPeerServiceClient, error) {
 	if addr == "" {
 		return nil, fmt.Errorf("peer plane: no address for target")
 	}
-	return e.peers.client(addr)
+	return e.peers.controller(addr)
+}
+
+// peerData resolves the DATA-plane stub for a peer address.
+func (e *Engine) peerData(addr string) (pushupesv1.DataPeerServiceClient, error) {
+	if addr == "" {
+		return nil, fmt.Errorf("peer plane: no address for target")
+	}
+	return e.peers.data(addr)
 }
 
 // resetPeerConn forgets the cached connection to addr (see peerClient.reset):
@@ -480,7 +515,7 @@ func (e *Engine) resetPeerConn(addr string) {
 }
 
 func (e *Engine) peerMFetch(ctx context.Context, addr string, req *MFetchRequest) (*MFetchResponse, func(), error) {
-	c, err := e.peerRPC(addr)
+	c, err := e.peerData(addr)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -502,7 +537,7 @@ func (e *Engine) peerMFetch(ctx context.Context, addr string, req *MFetchRequest
 }
 
 func (e *Engine) peerReplicate(ctx context.Context, addr string, slot int32, seq uint64, payload []byte) error {
-	c, err := e.peerRPC(addr)
+	c, err := e.peerData(addr)
 	if err != nil {
 		return err
 	}
@@ -511,7 +546,7 @@ func (e *Engine) peerReplicate(ctx context.Context, addr string, slot int32, seq
 }
 
 func (e *Engine) peerProgress(ctx context.Context, addr, follower string, slots []int32, froms []uint64, stamp bool) error {
-	c, err := e.peerRPC(addr)
+	c, err := e.peerData(addr)
 	if err != nil {
 		return err
 	}
@@ -546,7 +581,7 @@ type slotState struct {
 // peerSlotState asks a peer for one slot's LEO and directory summary in a single
 // round trip.
 func (e *Engine) peerSlotState(ctx context.Context, addr string, slot int32) (uint64, uint64, uint64, uint64, error) {
-	c, err := e.peerRPC(addr)
+	c, err := e.peerData(addr)
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
@@ -571,7 +606,7 @@ func (e *Engine) remoteSlotState(ctx context.Context, addr string, slot int32) (
 // peerFence asks a peer (the migration source) to take the commit fence for a
 // slot and returns the frozen LEO it confirmed the target holds.
 func (e *Engine) peerFence(ctx context.Context, addr string, slot int32, target string) (uint64, error) {
-	c, err := e.peerRPC(addr)
+	c, err := e.peerData(addr)
 	if err != nil {
 		return 0, err
 	}
@@ -586,7 +621,7 @@ func (e *Engine) peerFence(ctx context.Context, addr string, slot int32, target 
 // leader it believes in and the epoch. Used by the migration source to gate the
 // fence release on the target having applied the leader move.
 func (e *Engine) peerSlotLeader(ctx context.Context, addr string, slot int32) (string, int64, error) {
-	c, err := e.peerRPC(addr)
+	c, err := e.peerData(addr)
 	if err != nil {
 		return "", 0, err
 	}
@@ -598,7 +633,7 @@ func (e *Engine) peerSlotLeader(ctx context.Context, addr string, slot int32) (s
 }
 
 func (e *Engine) peerPing(ctx context.Context, addr string) error {
-	c, err := e.peerRPC(addr)
+	c, err := e.peerController(addr)
 	if err != nil {
 		return err
 	}
@@ -630,7 +665,9 @@ func (e *Engine) ServePeer(d net.Listener) *grpc.Server {
 			Timeout: 10 * time.Second,
 		}),
 	)
-	pushupesv1.RegisterPeerServiceServer(srv, e.NewPeerServer())
+	impl := e.NewPeerServer()
+	pushupesv1.RegisterControllerPeerServiceServer(srv, impl)
+	pushupesv1.RegisterDataPeerServiceServer(srv, impl)
 	go func() { _ = srv.Serve(d) }()
 	return srv
 }
@@ -705,7 +742,7 @@ func toPBFrame(f *layoutFrame) *pushupesv1.WatchLayoutResponse {
 // peerSlotSizes asks a peer for the on-disk bytes and the seq ledger of the
 // given slots — one round trip feeds both cluster storage folds.
 func (e *Engine) peerSlotSizes(ctx context.Context, addr string, slots []int32) (bytes, seqs []uint64, err error) {
-	c, err := e.peerRPC(addr)
+	c, err := e.peerData(addr)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -723,7 +760,7 @@ func (e *Engine) peerSlotSizes(ctx context.Context, addr string, slots []int32) 
 
 // peerSlotLeos asks a peer for the durable LEOs of the given slots.
 func (e *Engine) peerSlotLeos(ctx context.Context, addr string, slots []int32) ([]uint64, error) {
-	c, err := e.peerRPC(addr)
+	c, err := e.peerData(addr)
 	if err != nil {
 		return nil, err
 	}

@@ -66,7 +66,7 @@ func (r *Registration) validate() error {
 func (e *Engine) sendRegistration(ctx context.Context, peerAddr string, reg *Registration) error {
 	cctx, cancel := context.WithTimeout(ctx, config.RegisterRPCTimeout)
 	defer cancel()
-	c, err := e.peerRPC(peerAddr)
+	c, err := e.peerController(peerAddr)
 	if err != nil {
 		return err
 	}

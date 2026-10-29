@@ -348,7 +348,7 @@ func (e *refusedError) Unwrap() error { return ErrBadMember }
 func (e *Engine) sendAdoption(ctx context.Context, id, offerAddr, targetAddr, role string) error {
 	cctx, cancel := context.WithTimeout(ctx, config.RegisterRPCTimeout)
 	defer cancel()
-	c, err := e.peerRPC(targetAddr)
+	c, err := e.peerController(targetAddr)
 	if err != nil {
 		return err
 	}

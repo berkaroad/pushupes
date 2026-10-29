@@ -38,7 +38,7 @@ func TestRegistrationMarksARecoveredPeerUp(t *testing.T) {
 	}
 	// A connection the controller dialed during the outage: it is what carries
 	// the stale backoff, so it must be dropped on recovery.
-	if _, err := e.peerRPC(addr); err != nil {
+	if _, err := e.peers.conn(addr); err != nil {
 		t.Fatalf("setup: cache a peer conn: %v", err)
 	}
 	e.failMu.Lock()
@@ -105,7 +105,7 @@ func TestLivenessSweepDropsAStaleConnection(t *testing.T) {
 	join(t, e, "node-2", addr)
 	applyCmd(t, e, &Command{Op: OpPlanSlots})
 
-	if _, err := e.peerRPC(addr); err != nil {
+	if _, err := e.peers.conn(addr); err != nil {
 		t.Fatalf("setup: cache a peer conn: %v", err)
 	}
 	if _, cached := e.peers.conns[addr]; !cached {

@@ -61,7 +61,7 @@
 - 故障重建：fetch 第三类优先级 + 并发限速（`SeatGrant` 增 `rebuild`）
 
 ### E 迁移实现（实验特性：链路已完整，并发写收尾未闭合，禁止用于生产扩容）
-- `PeerService.ReplicateAgg`（源槽→目标槽，按聚合重放与增量转发）
+- `DataPeerService.ReplicateAgg`（源槽→目标槽，按聚合重放与增量转发）
 - replay 复用 `Slot.AggregateVersion(agg, from, limit, upto)`（`storage/slot.go:1205`）分页；游标 (agg, version) 断点续传；预算低于 ring/factor
 - 切换：逐槽 `enterWriteFence`（段内 size 个槽）+ 一次 `OpSetGroup(epoch+1)`；窗口 = 尾巴
 - 退役：源段逐槽 `DropSlot`；plan 置 inactive

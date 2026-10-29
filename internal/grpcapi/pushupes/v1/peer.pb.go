@@ -2515,11 +2515,14 @@ const file_pushupes_v1_peer_proto_rawDesc = "" +
 	"\x0fDropSlotRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\x05R\x04slot\x12\x12\n" +
 	"\x04node\x18\x02 \x01(\tR\x04node\"\x12\n" +
-	"\x10DropSlotResponse2\xd9\v\n" +
-	"\vPeerService\x12;\n" +
+	"\x10DropSlotResponse2\x95\x03\n" +
+	"\x15ControllerPeerService\x12;\n" +
 	"\x04Ping\x12\x18.pushupes.v1.PingRequest\x1a\x19.pushupes.v1.PingResponse\x12G\n" +
 	"\bRegister\x12\x1c.pushupes.v1.RegisterRequest\x1a\x1d.pushupes.v1.RegisterResponse\x12>\n" +
-	"\x05Adopt\x12\x19.pushupes.v1.AdoptRequest\x1a\x1a.pushupes.v1.AdoptResponse\x12A\n" +
+	"\x05Adopt\x12\x19.pushupes.v1.AdoptRequest\x1a\x1a.pushupes.v1.AdoptResponse\x12b\n" +
+	"\x11ReportUnreachable\x12%.pushupes.v1.ReportUnreachableRequest\x1a&.pushupes.v1.ReportUnreachableResponse\x12R\n" +
+	"\vWatchLayout\x12\x1f.pushupes.v1.WatchLayoutRequest\x1a .pushupes.v1.WatchLayoutResponse0\x012\xdf\b\n" +
+	"\x0fDataPeerService\x12A\n" +
 	"\x06MFetch\x12\x1a.pushupes.v1.MFetchRequest\x1a\x1b.pushupes.v1.MFetchResponse\x12\\\n" +
 	"\x0fReplicaProgress\x12#.pushupes.v1.ReplicaProgressRequest\x1a$.pushupes.v1.ReplicaProgressResponse\x12J\n" +
 	"\tReplicate\x12\x1d.pushupes.v1.ReplicateRequest\x1a\x1e.pushupes.v1.ReplicateResponse\x12g\n" +
@@ -2534,11 +2537,9 @@ const file_pushupes_v1_peer_proto_rawDesc = "" +
 	"\bThawSlot\x12\x1c.pushupes.v1.ThawSlotRequest\x1a\x1d.pushupes.v1.ThawSlotResponse\x12M\n" +
 	"\n" +
 	"SlotLeader\x12\x1e.pushupes.v1.SlotLeaderRequest\x1a\x1f.pushupes.v1.SlotLeaderResponse\x12G\n" +
-	"\bDropSlot\x12\x1c.pushupes.v1.DropSlotRequest\x1a\x1d.pushupes.v1.DropSlotResponse\x12b\n" +
-	"\x11ReportUnreachable\x12%.pushupes.v1.ReportUnreachableRequest\x1a&.pushupes.v1.ReportUnreachableResponse\x12G\n" +
+	"\bDropSlot\x12\x1c.pushupes.v1.DropSlotRequest\x1a\x1d.pushupes.v1.DropSlotResponse\x12G\n" +
 	"\bSlotLeos\x12\x1c.pushupes.v1.SlotLeosRequest\x1a\x1d.pushupes.v1.SlotLeosResponse\x12J\n" +
-	"\tSlotSizes\x12\x1d.pushupes.v1.SlotSizesRequest\x1a\x1e.pushupes.v1.SlotSizesResponse\x12R\n" +
-	"\vWatchLayout\x12\x1f.pushupes.v1.WatchLayoutRequest\x1a .pushupes.v1.WatchLayoutResponse0\x01BGZEgithub.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1;pushupesv1b\x06proto3"
+	"\tSlotSizes\x12\x1d.pushupes.v1.SlotSizesRequest\x1a\x1e.pushupes.v1.SlotSizesResponseBGZEgithub.com/berkaroad/pushupes/internal/grpcapi/pushupes/v1;pushupesv1b\x06proto3"
 
 var (
 	file_pushupes_v1_peer_proto_rawDescOnce sync.Once
@@ -2599,44 +2600,44 @@ var file_pushupes_v1_peer_proto_goTypes = []any{
 var file_pushupes_v1_peer_proto_depIdxs = []int32{
 	2,  // 0: pushupes.v1.WatchLayoutResponse.voters:type_name -> pushupes.v1.LayoutVoter
 	15, // 1: pushupes.v1.MFetchResponse.items:type_name -> pushupes.v1.FetchItem
-	3,  // 2: pushupes.v1.PeerService.Ping:input_type -> pushupes.v1.PingRequest
-	11, // 3: pushupes.v1.PeerService.Register:input_type -> pushupes.v1.RegisterRequest
-	13, // 4: pushupes.v1.PeerService.Adopt:input_type -> pushupes.v1.AdoptRequest
-	16, // 5: pushupes.v1.PeerService.MFetch:input_type -> pushupes.v1.MFetchRequest
-	18, // 6: pushupes.v1.PeerService.ReplicaProgress:input_type -> pushupes.v1.ReplicaProgressRequest
-	20, // 7: pushupes.v1.PeerService.Replicate:input_type -> pushupes.v1.ReplicateRequest
-	26, // 8: pushupes.v1.PeerService.ReplicateAggregate:input_type -> pushupes.v1.ReplicateAggregateRequest
-	29, // 9: pushupes.v1.PeerService.SlotStreams:input_type -> pushupes.v1.SlotStreamsRequest
-	31, // 10: pushupes.v1.PeerService.ReplayInto:input_type -> pushupes.v1.ReplayIntoRequest
-	33, // 11: pushupes.v1.PeerService.SlotLeo:input_type -> pushupes.v1.SlotLeoRequest
-	35, // 12: pushupes.v1.PeerService.FenceSlot:input_type -> pushupes.v1.FenceSlotRequest
-	22, // 13: pushupes.v1.PeerService.FreezeSlot:input_type -> pushupes.v1.FreezeSlotRequest
-	24, // 14: pushupes.v1.PeerService.ThawSlot:input_type -> pushupes.v1.ThawSlotRequest
-	37, // 15: pushupes.v1.PeerService.SlotLeader:input_type -> pushupes.v1.SlotLeaderRequest
-	39, // 16: pushupes.v1.PeerService.DropSlot:input_type -> pushupes.v1.DropSlotRequest
-	5,  // 17: pushupes.v1.PeerService.ReportUnreachable:input_type -> pushupes.v1.ReportUnreachableRequest
-	7,  // 18: pushupes.v1.PeerService.SlotLeos:input_type -> pushupes.v1.SlotLeosRequest
-	9,  // 19: pushupes.v1.PeerService.SlotSizes:input_type -> pushupes.v1.SlotSizesRequest
-	0,  // 20: pushupes.v1.PeerService.WatchLayout:input_type -> pushupes.v1.WatchLayoutRequest
-	4,  // 21: pushupes.v1.PeerService.Ping:output_type -> pushupes.v1.PingResponse
-	12, // 22: pushupes.v1.PeerService.Register:output_type -> pushupes.v1.RegisterResponse
-	14, // 23: pushupes.v1.PeerService.Adopt:output_type -> pushupes.v1.AdoptResponse
-	17, // 24: pushupes.v1.PeerService.MFetch:output_type -> pushupes.v1.MFetchResponse
-	19, // 25: pushupes.v1.PeerService.ReplicaProgress:output_type -> pushupes.v1.ReplicaProgressResponse
-	21, // 26: pushupes.v1.PeerService.Replicate:output_type -> pushupes.v1.ReplicateResponse
-	27, // 27: pushupes.v1.PeerService.ReplicateAggregate:output_type -> pushupes.v1.ReplicateAggregateResponse
-	30, // 28: pushupes.v1.PeerService.SlotStreams:output_type -> pushupes.v1.SlotStreamsResponse
-	32, // 29: pushupes.v1.PeerService.ReplayInto:output_type -> pushupes.v1.ReplayIntoResponse
-	34, // 30: pushupes.v1.PeerService.SlotLeo:output_type -> pushupes.v1.SlotLeoResponse
-	36, // 31: pushupes.v1.PeerService.FenceSlot:output_type -> pushupes.v1.FenceSlotResponse
-	23, // 32: pushupes.v1.PeerService.FreezeSlot:output_type -> pushupes.v1.FreezeSlotResponse
-	25, // 33: pushupes.v1.PeerService.ThawSlot:output_type -> pushupes.v1.ThawSlotResponse
-	38, // 34: pushupes.v1.PeerService.SlotLeader:output_type -> pushupes.v1.SlotLeaderResponse
-	40, // 35: pushupes.v1.PeerService.DropSlot:output_type -> pushupes.v1.DropSlotResponse
-	6,  // 36: pushupes.v1.PeerService.ReportUnreachable:output_type -> pushupes.v1.ReportUnreachableResponse
-	8,  // 37: pushupes.v1.PeerService.SlotLeos:output_type -> pushupes.v1.SlotLeosResponse
-	10, // 38: pushupes.v1.PeerService.SlotSizes:output_type -> pushupes.v1.SlotSizesResponse
-	1,  // 39: pushupes.v1.PeerService.WatchLayout:output_type -> pushupes.v1.WatchLayoutResponse
+	3,  // 2: pushupes.v1.ControllerPeerService.Ping:input_type -> pushupes.v1.PingRequest
+	11, // 3: pushupes.v1.ControllerPeerService.Register:input_type -> pushupes.v1.RegisterRequest
+	13, // 4: pushupes.v1.ControllerPeerService.Adopt:input_type -> pushupes.v1.AdoptRequest
+	5,  // 5: pushupes.v1.ControllerPeerService.ReportUnreachable:input_type -> pushupes.v1.ReportUnreachableRequest
+	0,  // 6: pushupes.v1.ControllerPeerService.WatchLayout:input_type -> pushupes.v1.WatchLayoutRequest
+	16, // 7: pushupes.v1.DataPeerService.MFetch:input_type -> pushupes.v1.MFetchRequest
+	18, // 8: pushupes.v1.DataPeerService.ReplicaProgress:input_type -> pushupes.v1.ReplicaProgressRequest
+	20, // 9: pushupes.v1.DataPeerService.Replicate:input_type -> pushupes.v1.ReplicateRequest
+	26, // 10: pushupes.v1.DataPeerService.ReplicateAggregate:input_type -> pushupes.v1.ReplicateAggregateRequest
+	29, // 11: pushupes.v1.DataPeerService.SlotStreams:input_type -> pushupes.v1.SlotStreamsRequest
+	31, // 12: pushupes.v1.DataPeerService.ReplayInto:input_type -> pushupes.v1.ReplayIntoRequest
+	33, // 13: pushupes.v1.DataPeerService.SlotLeo:input_type -> pushupes.v1.SlotLeoRequest
+	35, // 14: pushupes.v1.DataPeerService.FenceSlot:input_type -> pushupes.v1.FenceSlotRequest
+	22, // 15: pushupes.v1.DataPeerService.FreezeSlot:input_type -> pushupes.v1.FreezeSlotRequest
+	24, // 16: pushupes.v1.DataPeerService.ThawSlot:input_type -> pushupes.v1.ThawSlotRequest
+	37, // 17: pushupes.v1.DataPeerService.SlotLeader:input_type -> pushupes.v1.SlotLeaderRequest
+	39, // 18: pushupes.v1.DataPeerService.DropSlot:input_type -> pushupes.v1.DropSlotRequest
+	7,  // 19: pushupes.v1.DataPeerService.SlotLeos:input_type -> pushupes.v1.SlotLeosRequest
+	9,  // 20: pushupes.v1.DataPeerService.SlotSizes:input_type -> pushupes.v1.SlotSizesRequest
+	4,  // 21: pushupes.v1.ControllerPeerService.Ping:output_type -> pushupes.v1.PingResponse
+	12, // 22: pushupes.v1.ControllerPeerService.Register:output_type -> pushupes.v1.RegisterResponse
+	14, // 23: pushupes.v1.ControllerPeerService.Adopt:output_type -> pushupes.v1.AdoptResponse
+	6,  // 24: pushupes.v1.ControllerPeerService.ReportUnreachable:output_type -> pushupes.v1.ReportUnreachableResponse
+	1,  // 25: pushupes.v1.ControllerPeerService.WatchLayout:output_type -> pushupes.v1.WatchLayoutResponse
+	17, // 26: pushupes.v1.DataPeerService.MFetch:output_type -> pushupes.v1.MFetchResponse
+	19, // 27: pushupes.v1.DataPeerService.ReplicaProgress:output_type -> pushupes.v1.ReplicaProgressResponse
+	21, // 28: pushupes.v1.DataPeerService.Replicate:output_type -> pushupes.v1.ReplicateResponse
+	27, // 29: pushupes.v1.DataPeerService.ReplicateAggregate:output_type -> pushupes.v1.ReplicateAggregateResponse
+	30, // 30: pushupes.v1.DataPeerService.SlotStreams:output_type -> pushupes.v1.SlotStreamsResponse
+	32, // 31: pushupes.v1.DataPeerService.ReplayInto:output_type -> pushupes.v1.ReplayIntoResponse
+	34, // 32: pushupes.v1.DataPeerService.SlotLeo:output_type -> pushupes.v1.SlotLeoResponse
+	36, // 33: pushupes.v1.DataPeerService.FenceSlot:output_type -> pushupes.v1.FenceSlotResponse
+	23, // 34: pushupes.v1.DataPeerService.FreezeSlot:output_type -> pushupes.v1.FreezeSlotResponse
+	25, // 35: pushupes.v1.DataPeerService.ThawSlot:output_type -> pushupes.v1.ThawSlotResponse
+	38, // 36: pushupes.v1.DataPeerService.SlotLeader:output_type -> pushupes.v1.SlotLeaderResponse
+	40, // 37: pushupes.v1.DataPeerService.DropSlot:output_type -> pushupes.v1.DropSlotResponse
+	8,  // 38: pushupes.v1.DataPeerService.SlotLeos:output_type -> pushupes.v1.SlotLeosResponse
+	10, // 39: pushupes.v1.DataPeerService.SlotSizes:output_type -> pushupes.v1.SlotSizesResponse
 	21, // [21:40] is the sub-list for method output_type
 	2,  // [2:21] is the sub-list for method input_type
 	2,  // [2:2] is the sub-list for extension type_name
@@ -2657,7 +2658,7 @@ func file_pushupes_v1_peer_proto_init() {
 			NumEnums:      0,
 			NumMessages:   41,
 			NumExtensions: 0,
-			NumServices:   1,
+			NumServices:   2,
 		},
 		GoTypes:           file_pushupes_v1_peer_proto_goTypes,
 		DependencyIndexes: file_pushupes_v1_peer_proto_depIdxs,

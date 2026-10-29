@@ -284,7 +284,7 @@ Body: Record*，每条记录（fmtVer=2，当前版本）：
     client 面；leader 追加本地
     WAL 得到 seq。
   - follower 把「我作为副本跟随的槽」按 leader 分组，**每个 leader 一条
-    常驻 PeerService.MFetch 长轮询会话**（gRPC，`peer.proto`，与 Raft 共用
+    常驻 DataPeerService.MFetch 长轮询会话**（gRPC，`peer.proto`，与 Raft 共用
     peer 端口；payload 是裸 WAL 字节区间 `FetchItem.payload`，不经 base64、
     事件体不重编码、不进 Raft 日志），一次请求多槽复用、空闲轮零额外往返。
     请求里的位置用 **packed 并行数组**表达（`slots[i]` 从 `from_seqs[i]` 起），
@@ -294,7 +294,7 @@ Body: Record*，每条记录（fmtVer=2，当前版本）：
     每个槽单独建 select 分支，而是监听一条**全 store 唤醒总线**（任一槽
     append 时触发），命中后再对处于等待中的各槽句柄做一次非阻塞扫描，
     确认究竟哪些槽有了新数据。
-  - follower 追加到自己 WAL 后回报 LEO（批量 PeerService.ReplicaProgress）；
+  - follower 追加到自己 WAL 后回报 LEO（批量 DataPeerService.ReplicaProgress）；
     leader 推进 **HW**（高水位 = ISR 内最小 LEO）。**follower 的落盘是帧直写**：
     收到的裸 WAL 字节按 seq 校验后**原样写入**（`Slot.AppendFrameAtSeq` /
     `Segment.AppendFrame`），内存索引只从帧头解析（`data.DecodeRecordMeta`，
@@ -356,7 +356,7 @@ Body: Record*，每条记录（fmtVer=2，当前版本）：
     command_id 重试，命中 `exists` 即确认。
   - ISR 维护：follower 在 `replica.lag.time.max` 内跟上进 ISR；
     掉出后按自己 LEO 重新追。
-- **故障切换**：controller（Raft leader）每 1s 经 peer 面 `PeerService.Ping` 探活，
+- **故障切换**：controller（Raft leader）每 1s 经 peer 面 `ControllerPeerService.Ping` 探活，
   连续 3 次失败判定失联 → 经 Raft 提交 `mark_down`：为该节点名下所有槽从存活
   副本重选 leader（epoch+1）→ 客户端收到 MOVED 重定向。**择主取「LEO 最高」的存活
   副本**（见下「择主的依据」）。
@@ -367,7 +367,7 @@ Body: Record*，每条记录（fmtVer=2，当前版本）：
   重启的数据节点 1s 内绑好），一次拒绝就判死会把一次干净的快速重启变成一次多余的故障切换
   + 回切；过了窗口，判定不再依赖 3 次计数（一轮跑多久都不影响），这是它比阈值快的地方
   （黑障/慢节点仍走 3 次阈值——那种失败不是「没有进程在听」）。② **多个 follower 上报
-  「该 leader 传输层不可达」**（`PeerService.ReportUnreachable`，观测者只在连续两次传输
+  「该 leader 传输层不可达」**（`ControllerPeerService.ReportUnreachable`，观测者只在连续两次传输
   失败后才报、每 1s 至多一条）：
   controller 收下证据，**在同一 1s 窗口内出现 ≥2 个不同观测者**就立刻 `mark_down`
   （单个观测者的链路坏掉不算证据；探活仍是兜底——没人复制它的槽、或观测者自身被隔离时
@@ -379,7 +379,7 @@ Body: Record*，每条记录（fmtVer=2，当前版本）：
   这个纯表内规则会把槽交到一个缺数据的副本手上，那些已确认的写入就静默消失了（同类的
   症状实测过一次：整表重排后 71 个槽的 leader 是空副本、真数据留在副本上）。表里没有
   任何偏移量，能回答「谁最全」的只有副本自己，于是：提交 `mark_down` 之前，controller 用
-  `PeerService.SlotLeos`（一次批量问一个候选节点：你手上这批槽的 LEO 分别是多少）问遍
+  `DataPeerService.SlotLeos`（一次批量问一个候选节点：你手上这批槽的 LEO 分别是多少）问遍
   该节点名下槽的存活副本（候选按 slot 分组的并行一轮，`failoverPickTimeout=1s`，best
   effort），逐槽取 LEO 最高者，作为 `Command.NewLeaders{slot→node}` **随命令一起提交**。
   带上命令是因为 `mark_down` 要在每个节点上重放出同一个结果：表内应用时校验这个 pick
@@ -670,7 +670,7 @@ leader 数超过 ceil 的节点，在它领导的槽里挑一个让给该槽副�
 1. **入场（stage，Raft 命令，便宜）**：把目标节点加入该槽的副本集
    （`OpSlotAddReplica`，幂等）。不动 leader、不搬数据、不冻结写入。目标从此以**普通副本**身份
    跟随该槽——与晚加入的副本完全同构。
-2. **追平（catch up，只走 fetch）**：目标用复制协议（`PeerService.MFetch`）按 seq 拉取，
+2. **追平（catch up，只走 fetch）**：目标用复制协议（`DataPeerService.MFetch`）按 seq 拉取，
    每槽每轮 ≤4MiB、整轮 ≤`maxPayloadBytes`（32MiB，尾巴优先）。追平中的席位不参与该槽的
    水位 min（`advanceHW` 排除），也不被写入等待（`waitForHW` 只等 ack holder），
    所以写入不受影响：追平速度只影响布局收敛时间。
@@ -687,7 +687,7 @@ leader 数超过 ceil 的节点，在它领导的槽里挑一个让给该槽副�
 3. **提交（commit，有界、串行）**：只有 leader 交还需要提交——
    （a）置 `slot → migrating_out, migrating_to=T`（读客户端提前改道，写请求进入栅栏排队）；
    （b）**commit fence**：源端冻结该槽写入（排队，不失败）、吸干在途写、把**冻结尾巴**按 seq
-   推给目标（`PeerService.Replicate`，O(尾巴)），并只在目标**确认持有冻结 LEO 且已落盘**
+   推给目标（`DataPeerService.Replicate`，O(尾巴)），并只在目标**确认持有冻结 LEO 且已落盘**
    （`SlotLeo{flush:true}` → `durable_leo ≥ 冻结 LEO`，有界等待）后才返回——已提交的 leader_move
    是终态，源端副本随后不再是可恢复的那一份，单副本布局下目标若带着未刷盘的尾巴掉电会丢已确认写；
    （c）`OpLeaderMove`（epoch+1）原子切换 leader；
@@ -704,7 +704,7 @@ leader 数超过 ceil 的节点，在它领导的槽里挑一个让给该槽副�
 - 目标 LEO 落后 ⇒ 等待（fetch 还有活干，不累计退避）；
 - 摘要一致且不落后 ⇒ 可提交；
 - **同一 LEO、摘要不同** ⇒ 目标的结构性短缺（§1.1 规则 3），fetch 永远修不好 ⇒
-  丢弃该副本（`PeerService.DropSlot`）让它从空重新拉，而不是原地修。这个「分叉」判定要
+  丢弃该副本（`DataPeerService.DropSlot`）让它从空重新拉，而不是原地修。这个「分叉」判定要
   **复核确认**：副本的聚合目录在 apply 批落地前会短暂落后于自己的 LEO，读起来与分叉一样
   （实测抓到过这种瞬时读数，一分钟后再读已干净）。所以门只在**同一分叉读数持续到下一轮**时
   才动手丢（`confirmDiverged`，窗口 2s），读到一致或仅落后即清候选。
@@ -796,7 +796,7 @@ leader 数超过 ceil 的节点，在它领导的槽里挑一个让给该槽副�
   `PrefetchRoutes` 应答的数组长度读取。
 - **admin 面（HTTP，默认 `-admin http://127.0.0.1:8091`，`PUSHUPES_ADMIN`）**：**仅管理**——
   status/writes/plan/migrate/槽 describe/healthz/pprof，**不承载任何节点间流量**
-  （原 `/internal/*` 复制/迁移端点已全部迁到 peer 面 PeerService gRPC，admin HTTP
+  （原 `/internal/*` 复制/迁移端点已全部迁到 peer 面 gRPC（`ControllerPeerService` / `DataPeerService`），admin HTTP
   路由已删除）。
 
   **append 的回显是不对称的**：`exists` 回显存储记录本体（`*EventRecord`，零拷贝引用；
@@ -807,8 +807,8 @@ leader 数超过 ceil 的节点，在它领导的槽里挑一个让给该槽副�
   旧的 `{"_b64":...}` 方案在大 body 上要付出 json.Valid 全量校验 + base64 重建 +
   解码往返的 CPU（实测 100KiB body 下占 leader CPU 一半），已随 HTTP 事件面退役
   一并删除。
-- **peer 面（Raft + PeerService gRPC，默认 `-peer http://127.0.0.1:8391`，`PUSHUPES_PEER`）**：复制槽位分配表等元数据（Raft），并承载**全部节点间数据面**——副本拉取、LEO 上报/探活、提交栅栏的冻结尾巴推送、LEO 追平、地址注册协议（proto3 契约 `proto/pushupes/v1/peer.proto`，`pushupes.v1.PeerService`，服务端 `peersvc.go`）。**运维只配这一个端口**：`-peers` 主格式 `node-id=http://ip:peerport`（或裸 `ip:peerport`，地址兼作节点 id）。**地址统一规范：存储/路由表/status JSON 中所有 admin/client/peer 地址都带 scheme——未写协议默认补 `http://`，显式协议以传入为准；TCP 拨号（listen/dial/gRPC/Raft transport）前再剥掉 scheme**（`cluster.NormalizeAddr`/`HostPort`）。admin/client 地址不配置，由各节点自报进路由表：
-  - peer 端口上是复用监听器（`peerMux`/`peer_mux.go`，实现共识层的 `raft.Transport`）：按连接**首字节 `P`**（HTTP/2 client preface `"PRI ..."` 以 `P` 开头）把 PeerService gRPC 流量与共识流量分流（自研 Raft 的握手首字节是 magic `0x9E`，**断言 ≠ 'P'**，永不冲突；两路都经 `replayConn` 回填被 peek 消费的字节）。gRPC 服务端由 `Engine.ServePeer` 挂在该分流 listener 上，peer 面与共识层从此共用一个端口、一套 gRPC 语义（HTTP/2 多路复用，每对节点一条缓存连接 `peerClient`，keepalive 10s，服务端放宽 enforcement）。
+- **peer 面（Raft + 节点间 gRPC（`ControllerPeerService` / `DataPeerService`），默认 `-peer http://127.0.0.1:8391`，`PUSHUPES_PEER`）**：复制槽位分配表等元数据（Raft），并承载**全部节点间流量**——副本拉取、LEO 上报/探活、提交栅栏的冻结尾巴推送、LEO 追平、地址注册协议（proto3 契约 `proto/pushupes/v1/peer.proto`，`pushupes.v1.PeerService`，服务端 `peersvc.go`）。**运维只配这一个端口**：`-peers` 主格式 `node-id=http://ip:peerport`（或裸 `ip:peerport`，地址兼作节点 id）。**地址统一规范：存储/路由表/status JSON 中所有 admin/client/peer 地址都带 scheme——未写协议默认补 `http://`，显式协议以传入为准；TCP 拨号（listen/dial/gRPC/Raft transport）前再剥掉 scheme**（`cluster.NormalizeAddr`/`HostPort`）。admin/client 地址不配置，由各节点自报进路由表：
+  - peer 端口上是复用监听器（`peerMux`/`peer_mux.go`，实现共识层的 `raft.Transport`）：按连接**首字节 `P`**（HTTP/2 client preface `"PRI ..."` 以 `P` 开头）把节点间 gRPC 流量与共识流量分流（自研 Raft 的握手首字节是 magic `0x9E`，**断言 ≠ 'P'**，永不冲突；两路都经 `replayConn` 回填被 peek 消费的字节）。gRPC 服务端由 `Engine.ServePeer` 挂在该分流 listener 上，peer 面与共识层从此共用一个端口、一套 gRPC 语义（HTTP/2 多路复用，每对节点一条缓存连接 `peerClient`，keepalive 10s，服务端放宽 enforcement）。
   - leader 收到注册 RPC 后提交 `OpRegister`（就地修补路由表中该成员的 `AdminAddr/ClientAddr`，不新增成员——成员集合仍由 Raft 配置决定）；follower 收到则转发给 leader 的 peer 地址。**条目还不存在时不提交**、回「尚未入目录」让心跳下一轮再试：冷启动时自报按 1s 快轮从进程一起来就发，而入群自报走 3s adopt 间隔，公告常早于入群命令落地；提交这种公告会写进一条任何状态机都应用不了的日志项（数据面的 feed 会卡在它上面反复重连）。FSM 侧对这类条目按无操作处理（`register` 只修补既有条目，绝不能凭空造出成员）。**同一条规则适用于所有「判据来自某一刻的表、提交后可能已过期」的命令**：`mark_down` / `mark_up` 对已不在目录里的 id 同样按无操作落地（条目已被 `leave_node` 摘掉，那些槽的领导权与席位早已重排），哨兵报错只会让每条数据面的 feed 掉线。
   - announcer 幂等周期重试（启动期 1s，收敛后转 10s 心跳），任意启动顺序都能收敛；目标地址每轮现取，优先级为控制面 leader 的 peer 地址（由它直接提交）、`-join` 列表、`-peers` 静态目录、复制目录里已知的全部 peer 地址——voter 加入者按设计不带 `-peers`（它的配置来自 leader 的日志），自报只能从 `-join` 起步。节点换端口重启也会被自报值修补。
   - 旧多端口格式 `id:peerport:adminport:clientport` / `id:host:peerport:adminport:clientport` 仍兼容（作为静态种子，注册落地后以自报值为准）。
@@ -821,16 +821,16 @@ gRPC  EventService/ReadTails      批量取多个聚合的最新版本（resume 
 gRPC  EventService/ReadVersionByTime  按聚合 id + unix_time 查询「时间戳早于或等于给定时间」的最大 version（客户端按时间点追溯历史：先定锚点版本，再 ReadStream 回放；恰好写在给定时刻的记录计入锚点；0=该时间点及之前无可见记录；从索引作答、不读 WAL 帧；可见性按读准入判据（leader=自身 LEO、同步副本=已证水位），未证明同步的副本与非持有者答 1003+node 重定向）
 gRPC  EventService/PrefetchRoutes  路由表预取（无请求参数；返回全集群节点 client 地址表 + 按槽稠密的 leader 下标表，长度即槽数；客户端初始一次 + 周期刷新 + MOVED 即时修补）
 
-# ---- peer 面（PeerService gRPC，与 Raft 同端口，proto/pushupes/v1/peer.proto）----
-gRPC  PeerService/MFetch          副本拉取（长轮询，多槽复用，payload=裸 WAL 字节）
-gRPC  PeerService/ReplicaProgress 副本 LEO 上报（批量）
-gRPC  PeerService/Replicate       提交栅栏的冻结尾巴推送（同 seq 落盘，幂等）
-gRPC  PeerService/SlotLeo         查询节点某槽 LEO（提交前置判据，见 §5）
-gRPC  PeerService/DropSlot        丢弃对端某槽本地副本（分叉副本重新入场用）
+# ---- peer 面（ControllerPeerService + DataPeerService，与 Raft 同端口，peer.proto）----
+gRPC  DataPeerService/MFetch          副本拉取（长轮询，多槽复用，payload=裸 WAL 字节）
+gRPC  DataPeerService/ReplicaProgress 副本 LEO 上报（批量）
+gRPC  DataPeerService/Replicate       提交栅栏的冻结尾巴推送（同 seq 落盘，幂等）
+gRPC  DataPeerService/SlotLeo         查询节点某槽 LEO（提交前置判据，见 §5）
+gRPC  DataPeerService/DropSlot        丢弃对端某槽本地副本（分叉副本重新入场用）
 
-gRPC  PeerService/Ping            探活（controller 故障切换）
-gRPC  PeerService/Register        数据面地址自报（OpRegister 提交/转发）
-gRPC  PeerService/Adopt           新节点自报入编（add_member 提交/转发，见 §6.1）
+gRPC  ControllerPeerService/Ping            探活（controller 故障切换）
+gRPC  ControllerPeerService/Register        数据面地址自报（OpRegister 提交/转发）
+gRPC  ControllerPeerService/Adopt           新节点自报入编（add_member 提交/转发，见 §6.1）
 
 # ---- admin 面（HTTP，仅管理）----
 GET  /admin/slots/{slot}/describe              # 本节点视角的槽状态/seq/HW/大小（不代开槽，带 node/role/loaded）
@@ -885,7 +885,7 @@ Raft 配置（谁投票）与复制的成员目录（槽表里的成员列表）
 重定向的调用方直接改投；尚无 controller 时没有可指向的节点，改回 503 + `Retry-After`。
 admin 面从不转发，也**不占用数据面错误码**：controller 归属用 HTTP 307/503 表达（见 §6.1 末段）。
 
-- **加成员 = 新节点自己的 `-join` 声明**（`PeerService/Adopt`，非 leader 转递；
+- **加成员 = 新节点自己的 `-join` 声明**（`ControllerPeerService/Adopt`，非 leader 转递；
   admin 面没有加成员接口）：只给 peer（共识）地址，`role` 必填（见 §12.1），
   地址权威在节点自己（占位地址由 `UpdatePeer` 修正，见 §12.3）。加 `voter` 时 leader 先把新节点当
   **raft 追赶者**（只收日志、不计入 quorum）复制，追到 leader 当时的 commit index
@@ -947,7 +947,7 @@ admin 面从不转发，也**不占用数据面错误码**：controller 归属�
   内容不同的配置项（同 term、同 index、内容不同），集群随之劈成多个各自成多数派、
   彼此都不完整的 raft 组（实测 `REPLICAS=1 → 3 → 5 → 7` 依次 `start` 得到 4 个互不
   隶属的组）。二进制侧的同款判断保证手工启动也走同一条路。
-- 节点自报与手动加成员都走 peer 面的 `Adopt` RPC（`PeerService/Adopt`，非
+- 节点自报与手动加成员都走 peer 面的 `Adopt` RPC（`ControllerPeerService/Adopt`，非
   leader 转发），与 `Register` 同一套 relay 语义。
 
 读语义只暴露 `seq ≤ HW` 的记录：查询不读未达高水位的数据，防止副本回滚后
@@ -1103,7 +1103,7 @@ UI 只在治理发生的对象——节点——上呈现。数据都不走新�
 - **顺序追加 + 页缓存**：写路径 = memcpy 进段缓冲 + write()；fsync 交给
   flush 策略与复制确认语义（leader 等 ISR 高水位覆盖该 seq 才回 success），
   组提交合并（dirty 集合定向刷盘，不遍历全槽）。
-- **二进制协议面**：节点间流量全部 PeerService gRPC（protobuf 二进制帧，
+- **二进制协议面**：节点间流量全部走 peer 面 gRPC（`ControllerPeerService` / `DataPeerService`，protobuf 二进制帧，
   `FetchItem.payload`（以及 `ReplicateRequest` 的裸记录）为裸 WAL 字节区间，不经
   base64/重编码）；客户端事件面 gRPC protobuf，body 原始 bytes。
   路由表快照同为二进制编码（字符串字典 + varint + gzip）。
@@ -1187,8 +1187,8 @@ pushupes/
 │   │                          #   追加、幂等/版本校验、恢复、字节区间读
 │   ├── segment.go  slot.go  store.go
 ├── internal/cluster/          # 控制面 cluster.go+fsm.go（Raft/分配表/路由表二进制编码
-│   │                          #   table_bin.go），数据面 replication.go（PeerService 会话/ISR/HW）
-│   │                          #   + peersvc.go（PeerService gRPC 服务端/客户端）+ peer.proto 生成码，
+│   │                          #   table_bin.go），数据面 replication.go（复制会话/ISR/HW）
+│   │                          #   + peersvc.go（两个 peer 服务的服务端/客户端）+ peer.proto 生成码，
 │   │                          #   peer_mux.go（peer 端口首字节分流 Raft/gRPC），
 │   │                          #   migration.go（槽位迁移），register.go（地址自报 announcer+RPC）
 ├── internal/api/              # handler.go（仅管理：status/writes/plan/migrate/describe/pprof），server.go
@@ -1206,7 +1206,7 @@ pushupes/
 | 分段/索引 | 256MiB 段 + 64KiB 稀疏索引（常驻 seek 提示） |
 | 共识层 | Raft 只复制元数据：slot 分配表/epoch/节点地址注册 |
 | 客户端协议 | gRPC EventService（事件读写唯一入口） |
-| 数据复制 | PeerService.MFetch 会话（gRPC/HTTP2 与 Raft 同端口，seq 坐标，多槽复用长轮询，有数据即答） |
+| 数据复制 | DataPeerService.MFetch 会话（gRPC/HTTP2 与 Raft 同端口，seq 坐标，多槽复用长轮询，有数据即答） |
 | 可靠性语义 | ISR + HW（success 的条件是高水位覆盖该 seq，单点故障不丢已确认写入） |
 | 再平衡 | 槽位迁移（快照+增量+转发窗口，不停写）；leader 回切：controller 定期把偏离环布局的槽经槽位迁移迁回预期 leader（摘要等价即跳过快照） |
 | 幂等 | command_id 槽内索引 |
