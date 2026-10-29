@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { RailContext } from './rail'
-import { Layout, Menu, Segmented, Typography } from 'antd'
+import { Layout, Menu, Segmented } from 'antd'
 import { SunOutlined, MoonOutlined, ClusterOutlined, AppstoreOutlined } from '@ant-design/icons'
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { useThemeMode } from './theme'
@@ -15,11 +15,11 @@ const items = [
 export default function App() {
   const { mode, toggle } = useThemeMode()
   const loc = useLocation()
-  // The brand word follows the Sider: the rail auto-collapses on a narrow
-  // viewport (breakpoint="lg"), and "PushupES" would spill out of the 64px
-  // gutter, so a collapsed rail shows the short form "PES". onCollapse only
-  // fires on the breakpoint transition and the trigger click, so this state
-  // mirrors the rail without making the Sider controlled.
+  // The brand mark follows the Sider width: the rail auto-collapses on a narrow
+  // viewport (breakpoint="lg"), and the logo scales down with it instead of a
+  // word spilling out of the 64px gutter. onCollapse only fires on the
+  // breakpoint transition and the trigger click, so this state mirrors the rail
+  // without making the Sider controlled.
   const [collapsed, setCollapsed] = useState(false)
   useEffect(() => {
     // Seed from the real width on mount: a session that starts narrow never
@@ -34,10 +34,17 @@ export default function App() {
     <Layout style={{ minHeight: '100vh' }}>
       <Layout.Sider breakpoint="lg" collapsedWidth={64} onCollapse={setCollapsed}
         style={{ background: mode === 'dark' ? '#141414' : '#fff', borderRight: '1px solid rgba(128,128,128,0.2)' }}>
-        <div style={{ padding: '16px 12px' }}>
-          <Typography.Text strong style={{ fontSize: 16 }}>
-            {collapsed ? 'PES' : 'PushupES'}
-          </Typography.Text>
+        <div style={{ padding: collapsed ? '16px 14px' : '12px 12px' }}>
+          {collapsed
+            // The rail is 64px wide: show the mark alone. The SVG is one square
+            // (cube above, wordmark below), so a fixed-height window crops the
+            // wordmark instead of shrinking it into an illegible smear.
+            ? (
+              <span style={{ display: 'block', width: 32, height: 22, overflow: 'hidden', borderRadius: 4 }}>
+                <img src="/logo.svg" alt="PushupES" style={{ width: 32, display: 'block' }} />
+              </span>
+            )
+            : <img src="/logo.svg" alt="PushupES" style={{ width: 120, display: 'block', borderRadius: 6 }} />}
         </div>
         <Menu
           theme="light"

@@ -38,7 +38,7 @@ const checks = []
 const assert = (name, cond) => checks.push([name, !!cond])
 
 assert('layout rendered', light.includes('ant-layout'))
-assert('sider brand', light.includes('PushupES'))
+assert('sider brand logo', light.includes('src="/logo.svg"') && light.includes('alt="PushupES"'))
 assert('menu 集群', light.includes('集群') && !light.includes('集群总览'))
 assert('menu 槽位', light.includes('槽位'))
 assert('theme switch present', light.includes('Light') && light.includes('Dark'))
